@@ -53,6 +53,7 @@ fn render_transcript(app: &mut App, frame: &mut Frame, rect: Rect) {
     };
     app.scroll = scroll;
     app.viewport = rect.height;
+    app.max_scroll = max_scroll;
 
     let paragraph =
         Paragraph::new(Text::from(lines)).scroll((scroll.min(u16::MAX as usize) as u16, 0));
@@ -93,15 +94,17 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                         )));
                     }
                 }
-                let wrapped = wrap(text, width);
-                let last = wrapped.len().saturating_sub(1);
-                for (i, segment) in wrapped.into_iter().enumerate() {
-                    let mut spans = vec![Span::raw(segment)];
-                    if *streaming && i == last {
-                        spans.push(Span::styled("▌", Style::new().fg(Color::DarkGray)));
-                    }
-                    lines.push(Line::from(spans));
+                let mut rendered = crate::markdown::lines(text, width);
+                if rendered.is_empty() {
+                    rendered.push(Line::default());
                 }
+                if *streaming {
+                    if let Some(last) = rendered.last_mut() {
+                        last.spans
+                            .push(Span::styled("▌", Style::new().fg(Color::DarkGray)));
+                    }
+                }
+                lines.extend(rendered);
                 if !*streaming && (!text.is_empty() || !reasoning.is_empty()) {
                     lines.push(Line::default());
                 }
@@ -221,7 +224,7 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
     let hint = if app.busy {
         " running — Ctrl+C to interrupt "
     } else if app.input.text.is_empty() {
-        " Enter to send · Ctrl+C to quit · PgUp/PgDn to scroll "
+        " Enter to send · Ctrl+C to quit · wheel/PgUp/PgDn to scroll "
     } else {
         " Enter to send "
     };
@@ -306,6 +309,35 @@ fn clip(s: &str, max_cols: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_markdown_is_rendered() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::AssistantDone {
+            text: "# Title\n- item\nplain `code`".into(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = buffer.content.iter().map(|c| c.symbol()).collect();
+
+        assert!(screen.contains("Title"));
+        assert!(!screen.contains('#'));
+        assert!(screen.contains("• item"));
+        assert!(screen.contains("plain code"));
+
+        // Inline code keeps its accent color all the way to the framebuffer.
+        let at = screen.find("code").expect("code visible");
+        let cell = &buffer.content[at];
+        assert_eq!(cell.fg, Color::Rgb(229, 192, 123));
+        assert_ne!(buffer.content[at - 6].fg, Color::Rgb(229, 192, 123));
+    }
 
     #[test]
     fn clipping() {

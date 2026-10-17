@@ -4,6 +4,7 @@
 //! `Action`s from key presses, and drives the terminal.
 
 mod app;
+mod markdown;
 mod render;
 mod wrap;
 

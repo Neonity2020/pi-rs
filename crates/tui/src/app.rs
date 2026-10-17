@@ -87,6 +87,8 @@ pub struct App {
     pub follow: bool,
     /// Viewport height of the transcript, refreshed on every render.
     pub viewport: u16,
+    /// Largest valid `scroll`, refreshed on every render.
+    pub max_scroll: usize,
     pub spinner: usize,
     /// Bumped whenever the rendered transcript may be stale.
     pub version: u64,
@@ -102,6 +104,7 @@ impl App {
             scroll: 0,
             follow: true,
             viewport: 20,
+            max_scroll: 0,
             spinner: 0,
             version: 0,
         }
@@ -252,6 +255,26 @@ impl App {
         }
     }
 
+    /// Mouse-wheel scrolling of the transcript. Negative = up, positive = down.
+    pub fn on_scroll(&mut self, delta: i32) {
+        const WHEEL_LINES: usize = 3;
+        if delta < 0 {
+            self.follow = false;
+            self.scroll = self
+                .scroll
+                .saturating_sub(delta.unsigned_abs() as usize * WHEEL_LINES);
+        } else if !self.follow {
+            self.scroll = self
+                .scroll
+                .saturating_add(delta as usize * WHEEL_LINES)
+                .min(self.max_scroll);
+            // Reaching the bottom resumes following new output.
+            if self.scroll >= self.max_scroll {
+                self.follow = true;
+            }
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -318,8 +341,9 @@ impl App {
             KeyCode::PageDown => {
                 self.scroll = self
                     .scroll
-                    .saturating_add(self.viewport.max(1) as usize / 2 + 1);
-                self.follow = false;
+                    .saturating_add(self.viewport.max(1) as usize / 2 + 1)
+                    .min(self.max_scroll);
+                self.follow = self.scroll >= self.max_scroll;
                 Action::None
             }
             KeyCode::Enter => {
@@ -494,6 +518,43 @@ mod tests {
         assert_eq!(input.text, "b");
         input.history_next();
         assert_eq!(input.text, "");
+    }
+
+    #[test]
+    fn wheel_scrolls_transcript_and_resumes_follow_at_bottom() {
+        let mut app = App::new(StatusInfo::default());
+        app.max_scroll = 10;
+        app.scroll = 10;
+        assert!(app.follow);
+
+        // Wheel up detaches from the tail.
+        app.on_scroll(-1);
+        assert!(!app.follow);
+        assert_eq!(app.scroll, 7);
+
+        // Wheel up past the top clamps at 0 and leaves the input untouched.
+        app.on_scroll(-100);
+        assert_eq!(app.scroll, 0);
+        assert!(app.input.text.is_empty());
+
+        // Wheel down returns to the bottom and follows again.
+        app.on_scroll(100);
+        assert_eq!(app.scroll, 10);
+        assert!(app.follow);
+    }
+
+    #[test]
+    fn wheel_never_moves_the_input_history() {
+        let mut app = App::new(StatusInfo::default());
+        app.input.insert('a');
+        let _ = app.input.take();
+        app.apply(UiEvent::User("older".into()));
+        app.max_scroll = 5;
+        app.scroll = 5;
+
+        app.on_scroll(-1);
+        assert_eq!(app.input.text, "");
+        assert_eq!(app.scroll, 2);
     }
 
     #[test]

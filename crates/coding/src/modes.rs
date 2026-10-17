@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use crate::sinks::{JsonSink, PrintSink, Shared};
 use crate::stats::format_tokens;
 use crate::ui::{self, Action, App, UiEvent};
+use ui::crossterm::event::MouseEventKind;
 
 type Tools = Vec<Arc<dyn Tool>>;
 
@@ -163,6 +164,16 @@ pub async fn run_interactive(
                     break;
                 }
             }
+            Ok(ui::crossterm::event::Event::Mouse(mouse)) => {
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => -1,
+                    MouseEventKind::ScrollDown => 1,
+                    _ => continue,
+                };
+                if key_tx.send(InputMsg::Scroll(delta)).is_err() {
+                    break;
+                }
+            }
             Ok(ui::crossterm::event::Event::Resize(..)) => {
                 if key_tx.send(InputMsg::Resize).is_err() {
                     break;
@@ -189,6 +200,10 @@ pub async fn run_interactive(
                 let Some(message) = message else { break };
                 match message {
                     InputMsg::Resize => dirty = true,
+                    InputMsg::Scroll(delta) => {
+                        app.on_scroll(delta);
+                        dirty = true;
+                    }
                     InputMsg::Key(key) => match app.on_key(key) {
                         Action::Submit(text) => {
                             let cancel = Cancel::new();
@@ -267,6 +282,7 @@ fn spawn_turn(
 
 enum InputMsg {
     Key(ui::crossterm::event::KeyEvent),
+    Scroll(i32),
     Resize,
 }
 
@@ -277,10 +293,11 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
+        use ui::crossterm::event::EnableMouseCapture;
         use ui::crossterm::terminal as ct;
         ct::enable_raw_mode().context("enable raw mode")?;
         let mut stdout = std::io::stdout();
-        ui::crossterm::execute!(stdout, ct::EnterAlternateScreen)
+        ui::crossterm::execute!(stdout, ct::EnterAlternateScreen, EnableMouseCapture)
             .context("enter alternate screen")?;
         let backend = ui::ratatui::backend::CrosstermBackend::new(stdout);
         let terminal = ui::ratatui::Terminal::new(backend).context("create terminal")?;
@@ -290,9 +307,14 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        use ui::crossterm::event::DisableMouseCapture;
         use ui::crossterm::terminal as ct;
         let _ = ct::disable_raw_mode();
-        let _ = ui::crossterm::execute!(self.terminal.backend_mut(), ct::LeaveAlternateScreen);
+        let _ = ui::crossterm::execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            ct::LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
