@@ -54,13 +54,15 @@ pi -c                       # 继续本目录最近一次会话
 --tools <list>        限制工具集，如 --tools read,bash
 ```
 
-TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
+TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
 
 `Up` / `Down` 在输入框里翻阅历史 prompt（跨会话，按工作目录保存于 `~/.pi-rs/history/<cwd 的 slug>`）；正在编辑的内容会先暂存，翻回最新一条后还原。
 
 `Ctrl+V` 从剪贴板读一张图（macOS 用系统 `osascript`，Linux 用 `wl-paste` / `xclip`），显示在输入框下方；`Enter` 连同文字一起发送，`Esc` 删除最后一张。图片以 base64 存进会话，发送时按 OpenAI 多模态 `content` parts 展开，所以需要模型/端点支持图片输入；超过 10 MB 会被拒绝。
 
 模型的推理过程默认折叠成一行 `Thinking`；`Ctrl+T` 展开或收起全部推理内容。
+
+接近模型上下文窗口时，pi-rs 会先压缩再发请求：把较早的对话交给当前模型总结成结构化 checkpoint，保留最近一段原文（默认约 20k token 的尾部），摘要作为一条 `compaction` 记录写进会话。压缩只发生在完整消息边界，不会拆开 tool call 与它的结果，也不会改写仍在上下文里的 `reasoning_content`。每次请求前检查；如果服务端先报了 context overflow，会压缩并重试一次。`/compact` 随时手动触发；未知窗口的 OpenAI 兼容端点不会自动压缩，但 `/compact` 和 overflow 恢复仍会尝试；窗口太小导致摘要本身放不下时，只能开新会话。
 
 ## 设计决定（对 Pi 的忠实翻译）
 
@@ -79,6 +81,8 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 **没有 max steps。** 循环到模型不再调用工具为止，或者被 `Ctrl+C`（取消令牌贯穿 HTTP 请求与工具进程）、或者失败。没有"步数上限"这种旋钮，因为从没用过。
 
+**上下文是预算，不是终止条件。** 接近窗口上限时，旧消息被总结成结构化 checkpoint，最近一段保持原文；摘要作为 `compaction` 记录留在会话里，`-c` 能从这里继续。只丢完整的旧前缀，不拆 tool call 与结果，也不改写仍在上下文里的 reasoning——压缩是为了继续工作，不是悄悄改变历史。
+
 **YOLO 默认。** 没有权限弹窗。如果 agent 能写代码就能跑代码，确认对话框只是安全剧场。真正的安全边界是容器/沙箱，属于你的环境，不属于 harness。
 
 **有意不做的事：** plan mode、sub-agent、MCP、内置 todo、后台 bash。计划写 `PLAN.md`，任务写 `TODO.md`——文件可以被 git、被 grep、跨会话存活；隐藏状态不行。需要子代理就开第二个 `pi`。这些"拒绝"不是缺口，是产品决定：核心越小，你能看懂的部分越多。
@@ -96,7 +100,9 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 ## 会话
 
-每次会话一个 JSONL 文件：`~/.pi-rs/sessions/<cwd 的 slug>/<时间戳>.jsonl`。第一行是 header，之后每行一条消息记录，带 `id` + `parent` —— 文件是棵树而不是日志，目前读取时取活动分支（最后一条回溯到根）。assistant 的 `reasoning` 一并落盘，因为带 `tools` 的 DeepSeek 请求要求把历史 `reasoning_content` 原样带回（否则 API 返回 400），消息格式与线上格式共享同一个 `Message`；图片在发送时由 provider 展开为 content parts，会话里仍存 base64 的同一个 `Message`，所以不需要新的消息类型。
+每次会话一个 JSONL 文件：`~/.pi-rs/sessions/<cwd 的 slug>/<时间戳>.jsonl`。第一行是 header，之后每行一条记录（消息或 compaction），带 `id` + `parent` —— 文件是棵树而不是日志，目前读取时取活动分支（最后一条回溯到根）。assistant 的 `reasoning` 一并落盘，因为带 `tools` 的 DeepSeek 请求要求把历史 `reasoning_content` 原样带回（否则 API 返回 400），消息格式与线上格式共享同一个 `Message`；图片在发送时由 provider 展开为 content parts，会话里仍存 base64 的同一个 `Message`，所以不需要新的消息类型。
+
+压缩不会删掉旧消息：文件里追加一条 `{"type":"compaction"}` 记录，保存摘要、`first_kept_id` 与压缩前后的 token 估算。恢复时从这条记录重建上下文：一条合成的 summary 用户消息 + 从 `first_kept_id` 开始的消息。旧消息仍在文件里，只是不再发给模型。
 
 ## 成本
 
@@ -105,10 +111,10 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 ## 测试
 
 ```bash
-cargo test          # 137 个测试，不需要 API key
+cargo test          # 160 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、TUI 状态机、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 12 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi login` 保存与复用 auth.json、坏 key 不落盘、logout）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、TUI 状态机、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 13 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

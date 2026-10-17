@@ -42,6 +42,19 @@ impl Shared {
                     .unwrap()
                     .append_message(&Message::tool(call.id.clone(), result.content.clone()));
             }
+            AgentEvent::Compaction {
+                summary,
+                tokens_before,
+                tokens_after,
+                first_kept_index,
+            } => {
+                let _ = self.session.lock().unwrap().append_compaction(
+                    summary,
+                    *first_kept_index,
+                    *tokens_before,
+                    *tokens_after,
+                );
+            }
             AgentEvent::Usage { usage } => {
                 self.stats.lock().unwrap().add(*usage, &self.model);
             }
@@ -124,6 +137,20 @@ impl Sink for PrintSink {
                     }
                 }
             }
+            AgentEvent::Compaction {
+                tokens_before,
+                tokens_after,
+                ..
+            } => {
+                eprintln!(
+                    "{d}⏺ compacted context: {} → {} tokens{r}",
+                    crate::stats::format_tokens(tokens_before),
+                    crate::stats::format_tokens(tokens_after)
+                );
+            }
+            AgentEvent::CompactionFailed { message } => {
+                eprintln!("{d}warning: {message}{r}");
+            }
             _ => {}
         }
     }
@@ -141,5 +168,40 @@ impl Sink for JsonSink {
             Ok(line) => println!("{line}"),
             Err(error) => eprintln!("failed to serialize event: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::{AgentEvent, Message};
+    use std::path::Path;
+
+    #[test]
+    fn compaction_events_extend_the_session_branch() {
+        let dir = crate::testutil::temp_dir("sink-compaction");
+        let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+        session.append_message(&Message::user("old")).unwrap();
+        session
+            .append_message(&Message::assistant(Some("old answer".into()), None, vec![]))
+            .unwrap();
+        let shared = Shared::new(session, Model::unknown("mock", "m"));
+
+        shared.record(&AgentEvent::Compaction {
+            summary: "summary".into(),
+            tokens_before: 100,
+            tokens_after: 20,
+            first_kept_index: 1,
+        });
+        shared.record(&AgentEvent::Assistant {
+            message: Message::assistant(Some("new".into()), None, vec![]),
+        });
+
+        let (loaded, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+        assert_eq!(loaded.summary(), Some("summary"));
+        assert_eq!(messages.len(), 3);
+        assert!(agent::is_summary_message(&messages[0]));
+        assert_eq!(messages[1].text(), "old answer");
+        assert_eq!(messages[2].text(), "new");
     }
 }

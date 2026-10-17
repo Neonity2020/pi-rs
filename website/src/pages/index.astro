@@ -183,10 +183,10 @@ mosaicPattern.forEach((row, r) => {
   <div class="tape" aria-hidden="true">
     <div class="tape-track">
       <div class="tape-group">
-        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span>
+        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span><span>上下文会自动压缩</span><span class="star">✦</span>
       </div>
       <div class="tape-group">
-        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span>
+        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span><span>上下文会自动压缩</span><span class="star">✦</span>
       </div>
     </div>
   </div>
@@ -197,7 +197,7 @@ mosaicPattern.forEach((row, r) => {
       <div class="stat stat--blue"><b>3</b><span>种运行模式</span></div>
       <div class="stat stat--yellow"><b>1</b><span>个 agent 循环</span></div>
       <div class="stat stat--mint"><b>~300</b><span>token 系统提示</span></div>
-      <div class="stat stat--violet"><b>137</b><span>个测试，零 API key</span></div>
+      <div class="stat stat--violet"><b>160</b><span>个测试，零 API key</span></div>
     </div>
   </section>
 
@@ -317,7 +317,7 @@ mosaicPattern.forEach((row, r) => {
               <span class="t-bullet">●</span> <span class="t-tool">bash</span>{" "}
               <span class="t-arg">cargo test</span>
             </div>
-            <div class="line t-out">  137 passed; 0 failed</div>
+            <div class="line t-out">  160 passed; 0 failed</div>
             <div class="line t-ok">✓ 改好了：验证失败时重试两次，再报错。</div>
             <div class="line t-out">  auth.json 仍然只在验证通过后写入，坏 key 不落盘。</div>
             <div class="line t-dim">  <span class="t-violet">~</span> 继续调用工具，或者停下来回答你。<span class="cursor" aria-hidden="true"></span></div>
@@ -335,6 +335,7 @@ mosaicPattern.forEach((row, r) => {
           <span>▸ 流式 Markdown：表格、带行号和高亮的代码块</span>
           <span>▸ DeepSeek 高峰 / 低谷价自动切换</span>
           <span>▸ Ctrl+T 展开推理 · Ctrl+V 贴图 · Ctrl+C 贯穿请求和子进程</span>
+          <span>▸ 上下文将满时自动总结旧消息，/compact 可手动触发</span>
         </div>
       </div>
     </div>
@@ -452,7 +453,7 @@ mosaicPattern.forEach((row, r) => {
         <article class="mode-card mode-card--violet reveal">
           <span class="mode-tag">TUI</span>
           <h3>交互式</h3>
-          <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理默认折叠成一行 Thinking，Ctrl+T 展开。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。没有 key 也能启动，先提示你 /login。</p>
+          <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理默认折叠成一行 Thinking，Ctrl+T 展开。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。上下文接近窗口上限时自动把旧消息总结成 checkpoint，保留最近一段原文；/compact 可手动触发，摘要写进会话可恢复。没有 key 也能启动，先提示你 /login。</p>
           <code class="mode-cmd">pi</code>
         </article>
 
@@ -575,7 +576,7 @@ mosaicPattern.forEach((row, r) => {
         <a class="btn" href={`${GITHUB}/tree/main/docs`} target="_blank" rel="noreferrer">
           读维护者文档 <span aria-hidden="true">→</span>
         </a>
-        <span class="test-note">cargo test · 137 个测试 · 0 个真 API 调用</span>
+        <span class="test-note">cargo test · 160 个测试 · 0 个真 API 调用</span>
       </div>
     </div>
   </section>

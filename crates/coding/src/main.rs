@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     } else {
         (session::Session::create(&cwd, &model.id)?, Vec::new(), None)
     };
+    let summary = session.summary().map(str::to_owned);
     let shared = sinks::Shared::new(session, model.clone());
     let turn = modes::Turn {
         provider,
@@ -100,6 +101,7 @@ async fn main() -> Result<()> {
         tools: tool_list,
         shared,
         messages,
+        summary,
     };
 
     match args.mode() {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use agent::{Agent, Cancel, Image, Message, Outcome, Provider, Tool};
+use agent::{Agent, Cancel, CompactionMode, Image, Message, Outcome, Provider, Tool};
 use anyhow::Context;
 use llm::Model;
 use serde_json::json;
@@ -30,6 +30,9 @@ pub struct Turn {
     pub tools: Tools,
     pub shared: Shared,
     pub messages: Vec<Message>,
+    /// Summary from the latest compaction, so the agent updates it instead of
+    /// re-summarizing the whole prefix.
+    pub summary: Option<String>,
 }
 
 /// Cancel on Ctrl+C; a second Ctrl+C exits immediately.
@@ -62,8 +65,11 @@ fn build_agent(
     system: String,
     tools: Tools,
     messages: Vec<Message>,
+    summary: Option<String>,
 ) -> Agent {
-    Agent::new(provider, model.clone(), system, tools, messages)
+    let mut agent = Agent::new(provider, model.clone(), system, tools, messages);
+    agent.set_previous_summary(summary);
+    agent
 }
 
 pub async fn run_print(turn: Turn, prompt: String) -> anyhow::Result<()> {
@@ -74,9 +80,10 @@ pub async fn run_print(turn: Turn, prompt: String) -> anyhow::Result<()> {
         tools,
         shared,
         messages,
+        summary,
     } = turn;
     let message = Message::user(prompt);
-    let mut agent = build_agent(provider, &model, system, tools, messages);
+    let mut agent = build_agent(provider, &model, system, tools, messages, summary);
     shared.session.lock().unwrap().append_message(&message)?;
 
     let cancel = Cancel::new();
@@ -115,9 +122,10 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
         tools,
         shared,
         messages,
+        summary,
     } = turn;
     let message = Message::user(prompt);
-    let mut agent = build_agent(provider, &model, system, tools, messages);
+    let mut agent = build_agent(provider, &model, system, tools, messages, summary);
     shared.session.lock().unwrap().append_message(&message)?;
 
     println!(
@@ -170,9 +178,10 @@ pub async fn run_interactive(
         tools,
         shared,
         messages,
+        summary,
     } = turn;
     let agent = Arc::new(Mutex::new(build_agent(
-        provider, &model, system, tools, messages,
+        provider, &model, system, tools, messages, summary,
     )));
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<InputMsg>();
@@ -247,9 +256,58 @@ pub async fn run_interactive(
                                 Some(Slash::Help) => {
                                     let _ = ui_tx.send(UiEvent::Info(HELP.into()));
                                 }
+                                Some(Slash::Compact) => {
+                                    if app.busy {
+                                        let _ = ui_tx.send(UiEvent::Error(
+                                            "wait for the current turn to finish before /compact"
+                                                .into(),
+                                        ));
+                                    } else {
+                                        app.busy = true;
+                                        let _ = ui_tx.send(UiEvent::Busy(true));
+                                        let cancel = Cancel::new();
+                                        *cancel_cell.lock().unwrap() = cancel.clone();
+                                        let agent = agent.clone();
+                                        let shared = shared.clone();
+                                        let ui = ui_tx.clone();
+                                        tokio::spawn(async move {
+                                            let mut sink = ui::TuiSink {
+                                                shared,
+                                                ui: ui.clone(),
+                                            };
+                                            let mut agent = agent.lock().await;
+                                            match agent
+                                                .compact(
+                                                    CompactionMode::Manual,
+                                                    &mut sink,
+                                                    cancel,
+                                                )
+                                                .await
+                                            {
+                                                Ok(Some(_)) => {}
+                                                Ok(None) => {
+                                                    let _ = ui.send(UiEvent::Info(
+                                                        "nothing to compact — the session is already small"
+                                                            .into(),
+                                                    ));
+                                                }
+                                                Err(agent::Error::Cancelled) => {
+                                                    let _ = ui
+                                                        .send(UiEvent::Info("compaction cancelled".into()));
+                                                }
+                                                Err(error) => {
+                                                    let _ = ui.send(UiEvent::Error(format!(
+                                                        "compact failed: {error}"
+                                                    )));
+                                                }
+                                            }
+                                            let _ = ui.send(UiEvent::Busy(false));
+                                        });
+                                    }
+                                }
                                 Some(Slash::Unknown(name)) => {
                                     let _ = ui_tx.send(UiEvent::Error(format!(
-                                        "unknown command: {name} — try /login, /logout, /help"
+                                        "unknown command: {name} — try /login, /logout, /compact, /help"
                                     )));
                                 }
                                 None if !app.logged_in => {
@@ -320,12 +378,13 @@ pub async fn run_interactive(
     Ok(())
 }
 
-const HELP: &str = "/login   sign in and save your API key to auth.json\n/logout  remove the saved API key\n/help    show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
+const HELP: &str = "/login    sign in and save your API key to auth.json\n/logout   remove the saved API key\n/compact  summarize older messages to free context\n/help     show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Slash {
     Login,
     Logout,
+    Compact,
     Help,
     Unknown(String),
 }
@@ -339,6 +398,7 @@ fn slash_command(text: &str) -> Option<Slash> {
     Some(match command {
         "/login" => Slash::Login,
         "/logout" => Slash::Logout,
+        "/compact" => Slash::Compact,
         "/help" => Slash::Help,
         other => Slash::Unknown(other.to_string()),
     })
@@ -560,6 +620,7 @@ mod tests {
         assert_eq!(slash_command("/login"), Some(Slash::Login));
         assert_eq!(slash_command("  /logout  "), Some(Slash::Logout));
         assert_eq!(slash_command("/help me"), Some(Slash::Help));
+        assert_eq!(slash_command("/compact"), Some(Slash::Compact));
         assert_eq!(
             slash_command("/nope"),
             Some(Slash::Unknown("/nope".to_string()))

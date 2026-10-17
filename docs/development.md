@@ -42,6 +42,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 | e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
 | PTY | Python + 伪终端，跑真实二进制 | 验证 raw mode、流式渲染、干净退出 |
 | 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
+| 压缩 | `ScriptedProvider` 按“摘要 → 最终回答”排脚本；会话测试覆盖 compaction 重放 | 不需要真实窗口；断言摘要请求、保留尾部与 session 记录 |
 
 写测试的几条规矩：
 
@@ -55,6 +56,8 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 
 - 错误边界：provider 用 `llm::Error`（thiserror）；工具失败是 `ToolResult::is_error`，绝不 `Err`；`coding` 用 anyhow。
 - 消息只有 `llm::Message` 一种；不要加 wire/session 转换层。图片是用户消息上的 base64 字段，由 provider 在发送时展开成 content parts。
+- 压缩摘要是一条普通 user 消息（`agent::summary_message`），会话里对应 `type:"compaction"` 记录；不要把摘要做成新的 message role。
+- 切点只能是 user/assistant，永远不能把 assistant 的 tool_calls 和后面的 tool 结果分开；保留的消息不要改 reasoning。
 - DeepSeek 的 `reasoning` 必须原样回传，任何清理都是 bug。
 - 每个模块顶部用一句话说明职责；说不清就说明边界错了。
 - 新增依赖前先看根 `AGENTS.md` 的依赖清单和 `docs/goals.md` 的预算原则。
@@ -109,8 +112,9 @@ impl Tool for MyTool {
 
 ## 改会话格式
 
-- 文件头有 `v`；改格式必须升版本，并保留对旧文件的可读性，或明确拒绝并给出错误。
+- 文件头有 `v`；改格式必须升版本，并保留对旧文件的可读性，或明确拒绝并给出错误。当前 `v: 2` 增加了 compaction 记录；`v: 1` 的消息文件仍按原样读取。
 - 新增字段优先 `Option` + `#[serde(default)]`，避免旧会话无法加载。
+- compaction 记录保存 `first_kept_id` 而不是复制消息；加载时重放，`first_kept_id` 坏了就退回完整历史。
 - 保持每行一个 JSON、追加写；不要引入重写整文件的路径。
 - 用 e2e 覆盖“旧文件仍能恢复”和“末行损坏仍能恢复”。
 
@@ -130,6 +134,8 @@ impl Tool for MyTool {
 | 提示词内容 | 读 `crates/coding/src/prompt.rs` 的测试；临时打印 `build()` |
 | TUI 是否干净退出 | `scripts/tui_smoke.py` |
 | 图片是否随请求发出 | 会话 JSONL 的 `images` 字段；或临时 mock 服务器打印请求体 |
+| 是否触发了压缩 | `--json` 事件里的 `compaction`；TUI 的 `context compacted` 提示；会话 JSONL 的 `type:"compaction"` |
+| 压缩后保留了什么 | 恢复会话看消息；或读 `agent/compaction.rs` 的切点/序列化测试 |
 | 流式解析边界 | `llm/openai.rs` 的 SSE 单元测试；构造分块输入 |
 
 ## 提交前检查清单
@@ -161,7 +167,8 @@ python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi
 |---|---|
 | `missing API key` | 环境变量、`.env`（工作目录或上级）、`--api-key`；空值视为未设置 |
 | DeepSeek 返回 400 | 历史 assistant 的 `reasoning_content` 是否原样带回 |
-| 恢复会话少消息 | 检查 JSONL 的 `id`/`parent` 链与末行是否损坏 |
+| 恢复会话少消息 | 检查 JSONL 的 `id`/`parent` 链、末行是否损坏、`first_kept_id` 是否存在 |
+| 压缩后行为变差 | 看摘要 prompt、tool 结果截断、保留尾部大小；必要时先 `/compact` 前导出会话 |
 | TUI 花屏 | 是否走了 `TerminalGuard`；PTY 冒烟是否通过 |
 | 成本显示 `-` | 模型不在注册表，或 provider 不提供价格 |
 | e2e 读到本机 key | e2e 必须在全新临时 cwd 运行 |

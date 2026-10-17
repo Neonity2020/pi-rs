@@ -40,6 +40,7 @@
 2. 模式层先把用户输入写成一条 `Message` 并追加到会话文件（`append_message`），交互模式同时发一个 `UiEvent::User`（只带图片标签，不带字节）。
 3. `Agent::run_turn(message, sink, cancel)` 把用户消息追加到内存历史，开始 step 循环。图片随消息进入历史。
 4. 每个 step：
+   - 先估算上下文；超过模型窗口减去预留时，压缩旧消息（见“上下文压缩”），发 `AgentEvent::Compaction`；
    - 发 `AgentEvent::Step { step }`；
    - 调 `Provider::stream(ChatRequest, tx, cancel)`；
    - 事件经 `UnboundedSender<StreamEvent>` 回到 agent，边收边发 `AgentEvent::{Text, Reasoning, Usage}` 给 sink，同时累积成一条 assistant `Message`；
@@ -91,14 +92,34 @@ pub trait Provider: Send + Sync {
 | 失败 | 未知工具、参数 JSON 坏、panic、取消 → `ToolResult::err`，继续循环 |
 | panic 隔离 | 每个工具再套一层 `tokio::spawn`，panic 变成错误结果 |
 | 历史 | assistant 消息与 tool 结果都进入 `Agent::messages`，下一 step 原样回传 |
+| 压缩 | 超阈值时总结旧前缀，替换为 summary + 最近尾部；只丢完整前缀，不拆 tool 对 |
+| overflow | provider 报 context 超限时压缩并重试一次；仍失败才返回错误 |
 
 `AgentEvent` 是唯一的对外事实来源：
 
 ```
-Step · Text · Reasoning · Assistant · ToolStart · ToolEnd · Usage
+Step · Text · Reasoning · Assistant · ToolStart · ToolEnd · Compaction · CompactionFailed · Usage
 ```
 
 `Sink` 是同步、内联调用的消费者；因此实现者不应做长时间阻塞操作。`coding` 的 sinks 在此处落盘并转发 UI。
+
+## 上下文压缩
+
+目标是让长会话继续，而不是缩短回答。核心算法参考 Pi 的 `core/compaction`（阈值、overflow、结构化摘要、保留尾部），去掉了 extensions、branch summary 与独立的 turn-prefix 摘要；切在 turn 中间时只用一句提示告诉摘要器后续消息会原样保留。
+
+**估算。** 优先用上一次 assistant usage 的实际上下文 token（输入 + 输出），之后新增的消息再按字符数 / 4 估算；没有 usage（例如刚恢复会话）时全部按字符估算。图片按固定 4800 字符估算（base64 字节数与图片 token 不成比例）。system prompt 与 tool schema 也计入。`context_window == 0` 的未知模型不自动压缩。
+
+**阈值。** `tokens > context_window - reserve`，默认 `reserve = 16k`、保留尾部 `keep = 20k`；窗口较小时按 `window/4`、`window/2` 收紧。未知窗口用手动/overflow 模式，使用默认值。
+
+**切点。** 从最新往旧累计，落在 user 或 assistant 消息上，**永不落在 tool 结果上**。切在 assistant 时，它后面的 tool 结果天然被保留，因此 tool call / result 不会被拆开。若第一条旧消息本身超过预算，则退到下一个合法切点，而不是声称“无可压缩”。
+
+**摘要请求。** 使用当前 provider/模型，独立 system prompt + 一条包含 `<conversation>` 的 user 消息；不传工具，`max_tokens` 上限 8k。旧消息序列化为文本：assistant 的 reasoning 省略，tool 结果截到 2000 字符，图片只留类型标记；总字符数按窗口限制（最多 400k）。已有摘要时用 update prompt，把旧摘要放进 `<previous-summary>`。切点落在 assistant（同一 turn 中间）时，额外提示摘要器后续消息会原样保留。摘要末尾附 `<read-files>` / `<modified-files>`。
+
+**替换。** 内存历史变成 `summary user message + 旧历史[cut..]`。summary 仍是普通 `Message::user`，线上/会话格式不变；`AgentEvent::Compaction` 带 `first_kept_index`，由 sink 落盘。**旧消息不删除**，只是不再发送。
+
+**恢复。** 会话里的 `{"type":"compaction"}` 记录摘要、`first_kept_id`、压缩前后估算。加载时取最新一条，重放出 summary 消息 + 保留尾部。坏掉的 `first_kept_id` 回退到完整历史，避免静默丢消息。
+
+**触发。** 每个 step 前自动检查；`/compact` 手动触发（忙时拒绝）；provider 返回 context overflow 时强制压缩并重试一次。自动压缩失败只发 `CompactionFailed`，不中止循环；overflow 恢复失败才返回原始错误。
 
 ## crates/coding
 
@@ -189,16 +210,18 @@ ToolResult { content: String, is_error: bool }
 
 ### 会话
 
-路径：`$PI_RS_HOME/sessions/<cwd slug>/<timestamp>-<id>.jsonl`（默认 `~/.pi-rs`）。
+路径：`$PI_RS_HOME/sessions/<cwd slug>/<timestamp>-<id>.jsonl`（默认 `~/.pi-rs`）。每行是一条 message 或 compaction 记录。
 
 ```jsonl
-{"type":"session","v":1,"id":"...","cwd":"/work","model":"deepseek-flash","created":"2026-..."}
+{"type":"session","v":2,"id":"...","cwd":"/work","model":"deepseek-flash","created":"2026-..."}
 {"id":"...","parent":null,"ts":"...","type":"message","message":{"role":"user","content":"..."}}
 {"id":"...","parent":"...","ts":"...","type":"message","message":{"role":"assistant","content":"...","reasoning":"..."}}
 {"id":"...","parent":"...","ts":"...","type":"message","message":{"role":"tool","content":"...","tool_call_id":"..."}}
+{"id":"...","parent":"...","ts":"...","type":"compaction","compaction":{"summary":"## Goal...","first_kept_id":"...","tokens_before":984000,"tokens_after":21000}}
 ```
 
 - 每行一个 JSON，追加写；`id` + `parent` 使文件在格式上是一棵树。
+- compaction 行只描述“从哪里开始保留 + 摘要”，不复制或删除旧消息；加载时重放最新一条。
 - 恢复时从最后一条沿 `parent` 回溯到根，得到活动分支。
 - 最后一行损坏（写到一半崩溃）会被跳过，不影响恢复。
 - 当前没有分支导航 UI；需要分支时再实现，不重写历史格式。
@@ -211,7 +234,8 @@ ToolResult { content: String, is_error: bool }
 |---|---|
 | `Assistant` | 会话追加 assistant 消息 |
 | `ToolEnd` | 会话追加 tool 消息 |
-| `Usage` | 累加 token 与估价 |
+| `Compaction` | 追加 compaction 记录，更新会话上下文映射 |
+| `Usage` | 累加 token 与估价（含摘要请求） |
 
 之后 print/json/tui sink 再做各自的展示。TUI 状态栏的缓存命中率按 `cached_tokens / input_tokens` 四舍五入，尚未收到 usage 或输入为 0 时显示 `cache -`。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按 DeepSeek 峰谷价估算（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日）。
 
@@ -219,7 +243,8 @@ ToolResult { content: String, is_error: bool }
 
 - 独立线程跑 `crossterm::event::read`，把按键/滚轮/尺寸变化送进 channel。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
-- `Action::Submit` 先看首 token：`/login`、`/logout`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。
+- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。
+- `/compact` 在空闲时拿 agent 锁执行一次强制压缩；`TuiSink` 负责落盘并把 `Compaction` / `CompactionFailed` 翻成提示。忙时直接拒绝，不打断当前 turn。
 - `Ctrl+V` 在 `tui` 里只产生 `Action::PasteImage`；`coding::clipboard` 读系统剪贴板（macOS `osascript`、Linux `wl-paste`/`xclip`、Windows PowerShell），把图片元数据装进 `UiEvent::ImageAttached`。字节留在 `App` 的待发送附件里，提交时随 `Message` 进会话。
 - 未登录时普通提交被拦下并提示 `/login`，不产生模型请求；已附的图片会退回输入框，避免静默丢失。
 - `/login` 的掩码输入属于 `App`（`Action::Login(key)`）；验证、写盘、换 provider 都在后台任务，结果以 `UiEvent::LoginDone` 回到主循环（关闭输入框、显示成功/失败）。
@@ -254,6 +279,7 @@ ToolResult { content: String, is_error: bool }
 10. provider 不知道会话、提示词文件或终端。
 11. 取消是协作式的，贯穿 HTTP 请求与工具子进程。
 12. 预览/渲染失败不能吞掉内容。
+13. 压缩只丢完整的旧前缀；切点不落在 tool 结果上，不拆 tool call/result，不改写仍在上下文里的 reasoning。摘要是一条普通 user 消息，不新增消息类型。
 
 违反任意一条，视为架构变更：同时更新本文件与测试。
 
@@ -272,6 +298,9 @@ ToolResult { content: String, is_error: bool }
 | 工具 panic | 捕获为错误结果 | 循环继续 |
 | 用户取消 | `Outcome::Aborted`，保留已产出文本 | 重新提问 |
 | 会话末行损坏 | 跳过该行 | 自动恢复 |
+| compaction 行损坏 / `first_kept_id` 丢失 | 回退到完整历史，不静默丢消息 | 继续对话；必要时重新 `/compact` |
+| 上下文超过窗口 | 自动/手动压缩；provider 报 overflow 时压缩并重试一次 | 仍失败则开新会话或减小输入 |
+| 摘要请求失败 / 返回工具调用 / 被长度截断 | 自动/overflow 发 `CompactionFailed`；手动压缩返回错误；历史不变 | 自动压缩继续发原请求；手动压缩重试 |
 | 历史 prompt 文件损坏 | 跳过坏行；读不出就是空历史 | 继续使用，新 prompt 照常追加 |
 | 剪贴板没有图片 | 输入框上方提示，不产生消息 | 复制图片后重试 |
 | 剪贴板图片过大/格式不支持 | 错误提示，不进入会话 | 压缩或转成 PNG/JPEG |
@@ -294,10 +323,10 @@ ToolResult { content: String, is_error: bool }
 | 层 | 位置 | 保护什么 |
 |---|---|---|
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
-| agent 单元 | `crates/agent/src/agent.rs` | 工具回环、并行顺序、中止、空流、panic |
-| coding 单元 | `crates/coding/src/*` | CLI、会话树、提示词合并、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
+| agent 单元 | `crates/agent/src/*` | 工具回环、并行顺序、中止、空流、panic、token 估算、切点、摘要序列化、自动/手动/overflow 压缩 |
+| coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
 | tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、换行、图片附件、Markdown/表格/高亮 |
-| e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi login`/`logout`、key 优先级、错误路径 |
+| e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi login`/`logout`、key 优先级、错误路径、context overflow 压缩重试与会话落盘 |
 | PTY 冒烟 | `scripts/tui_*.py` | 真实终端：启动、输入、流式渲染、干净退出 |
 
 ## 改代码前的定位表
@@ -306,7 +335,9 @@ ToolResult { content: String, is_error: bool }
 |---|---|
 | 模型返回空 / 流断了 | `llm/openai.rs` 的 SSE 循环 |
 | tool call 丢参数 / 顺序乱 | `agent::Acc`、`execute_tools` |
-| 恢复会话少了消息 | `coding/session.rs` 的 parent 回溯 |
+| 恢复会话少了消息 | `coding/session.rs` 的 parent 回溯与 compaction 重放 |
+| 压缩后模型忘了目标 / 摘要质量差 | `agent/compaction.rs` 的摘要 prompt、序列化截断、保留尾部 |
+| 压缩后 tool call 与结果对不上 | `agent/compaction.rs` 的 `find_cut_index`；切点不能是 tool 结果 |
 | Ctrl+V 没有附上图片 | `coding/clipboard.rs` 的平台工具、`tui::Action::PasteImage` 的接线 |
 | 提示词里没有项目规则 | `coding/prompt.rs` 的搜索顺序 |
 | TUI 花屏 / 宽度错 | `tui/render.rs`、`tui/wrap.rs` |

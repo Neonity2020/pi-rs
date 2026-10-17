@@ -29,6 +29,21 @@ pub enum AgentEvent {
         result: ToolResult,
         duration_ms: u64,
     },
+    /// Older messages were summarized. `first_kept_index` points into the
+    /// pre-compaction message list; the session layer uses it to record which
+    /// entry stays. The summary is carried so the session writer does not
+    /// have to recompute it.
+    Compaction {
+        summary: String,
+        tokens_before: u64,
+        tokens_after: u64,
+        first_kept_index: usize,
+    },
+    /// Compaction was attempted but failed; the history it would have
+    /// replaced is unchanged.
+    CompactionFailed {
+        message: String,
+    },
     Usage {
         usage: Usage,
     },

@@ -40,6 +40,16 @@ impl Sink for TuiSink {
                 output: result.content,
                 duration_ms,
             }),
+            AgentEvent::Compaction {
+                tokens_before,
+                tokens_after,
+                ..
+            } => Some(UiEvent::Info(format!(
+                "context compacted: {} → {} tokens",
+                crate::stats::format_tokens(tokens_before),
+                crate::stats::format_tokens(tokens_after)
+            ))),
+            AgentEvent::CompactionFailed { message } => Some(UiEvent::Error(message)),
             AgentEvent::Usage { .. } => Some(UiEvent::Status(self.shared.status_info())),
         };
         if let Some(event) = translated {

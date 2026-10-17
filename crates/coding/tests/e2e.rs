@@ -28,19 +28,31 @@ impl RecordedRequest {
 /// A minimal HTTP/1.1 server that answers each request with one canned SSE
 /// body and records each request (headers + body).
 fn start_mock_api(sse_bodies: Vec<String>) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+    start_mock_api_responses(
+        sse_bodies
+            .into_iter()
+            .map(|body| (200u16, "text/event-stream".to_string(), body))
+            .collect(),
+    )
+}
+
+fn start_mock_api_responses(
+    responses: Vec<(u16, String, String)>,
+) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
 
     std::thread::spawn(move || {
-        for body in sse_bodies {
+        for (status, content_type, body) in responses {
             let (mut stream, _) = listener.accept().unwrap();
             if let Some(request) = read_request(&mut stream) {
                 recorded.lock().unwrap().push(request);
             }
+            let reason = if status == 200 { "OK" } else { "Bad Request" };
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -522,4 +534,136 @@ fn logout_removes_the_saved_credential() {
     let auth: Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
     assert!(auth.get("deepseek").is_none(), "auth.json: {auth}");
+}
+
+#[test]
+fn context_overflow_compacts_the_session_and_retries() {
+    let home = test_dir();
+
+    // Seed a session with a large tool result: 100k characters, which the
+    // compaction cut can drop while keeping the rest of the conversation.
+    let huge = serde_json::json!({
+        "command": "yes x | head -c 200000 | tr -d '\\n'"
+    })
+    .to_string();
+    let tool_call = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "bash", "arguments": huge }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let (seed_url, _) = start_mock_api(vec![
+        sse(&[
+            &tool_call,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]),
+        sse(&[
+            r#"{"choices":[{"delta":{"content":"seeded"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]),
+    ]);
+    let seed = pi_in(&home)
+        .args([
+            "-p",
+            "seed",
+            "--base-url",
+            &seed_url,
+            "--api-key",
+            "test-key",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        seed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    // The next run overflows. The agent should summarize the old prefix, keep
+    // the recent tail, retry, and persist a compaction entry.
+    let (base_url, requests) = start_mock_api_responses(vec![
+        (
+            400,
+            "application/json".into(),
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#.into(),
+        ),
+        (
+            200,
+            "text/event-stream".into(),
+            sse(&[
+                r###"{"choices":[{"delta":{"content":"## Goal\nrecovered"}}]}"###,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ]),
+        ),
+        (
+            200,
+            "text/event-stream".into(),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"all done"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ]),
+        ),
+    ]);
+
+    let output = pi_in(&home)
+        .args([
+            "-c",
+            "-p",
+            "next",
+            "--base-url",
+            &base_url,
+            "--api-key",
+            "test-key",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("all done"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("compacted context"), "stderr: {stderr}");
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "overflow, summary, retry");
+    let summary_request = requests[1].body["messages"][1]["content"].as_str().unwrap();
+    assert!(summary_request.contains("<conversation>"));
+    assert!(summary_request.contains("more characters truncated"));
+
+    let retried = requests[2].body["messages"].as_array().unwrap();
+    assert!(retried[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("compacted into the following summary"));
+    assert!(
+        retried.iter().all(|message| message["content"]
+            .as_str()
+            .is_none_or(|text| text.len() < 10_000)),
+        "the huge tool result must not be sent again"
+    );
+
+    let slug_dir = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let session = std::fs::read_dir(slug_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let text = std::fs::read_to_string(session).unwrap();
+    assert!(text.contains("\"type\":\"compaction\""), "session: {text}");
+    assert!(text.contains("recovered"), "session: {text}");
 }

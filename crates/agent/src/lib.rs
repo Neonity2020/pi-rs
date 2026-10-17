@@ -9,12 +9,17 @@
 //! cancelled, or until it fails.
 
 mod agent;
+mod compaction;
 mod event;
 mod tool;
 
 pub use llm;
 
-pub use agent::{Agent, Outcome};
+pub use agent::{Agent, Compaction, CompactionMode, Outcome};
+pub use compaction::{
+    estimate_context_tokens, estimate_messages_tokens, estimate_tokens, find_cut_index,
+    is_context_overflow, is_summary_message, summary_message, summary_prompt,
+};
 pub use event::{AgentEvent, Sink};
 pub use tool::{Tool, ToolResult};
 

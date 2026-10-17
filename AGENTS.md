@@ -11,7 +11,8 @@ Repository: https://github.com/Neonity2020/pi-rs
 - `crates/llm` — provider layer. `Provider` trait, streaming SSE client,
   DeepSeek + OpenAI-compatible backends, model registry & pricing.
 - `crates/agent` — agent loop. Requests → tool execution → `AgentEvent`
-  stream. Knows nothing about terminals, sessions, or prompts.
+  stream, plus Pi-style context compaction (threshold and overflow). Knows
+  nothing about terminals, sessions, or prompts.
 - `crates/tui` — ratatui state and rendering. Owns no I/O; the coding layer
   feeds it `UiEvent`/keys and returns `Action`.
 - `crates/coding` — the `pi` binary. CLI, session JSONL, system prompt
@@ -35,6 +36,11 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   record. Do not add a conversion layer.
 - DeepSeek requires assistant `reasoning_content` to be echoed back verbatim
   whenever `tools` is present. Never strip it.
+- Compaction is a `type:"compaction"` session entry. The summary is replayed
+  as a synthetic user message (`agent::summary_message`), so `Message` stays
+  the only message type. Cut only at user/assistant messages, never between a
+  tool call and its results; never rewrite retained `reasoning`. Summary
+  requests count toward token/cost stats.
 - Images are base64 `llm::Image` values on user messages (session format).
   Clipboard capture lives in `coding::clipboard` and shells out to the OS
   (osascript / wl-paste / xclip / powershell) — no image crate, no new

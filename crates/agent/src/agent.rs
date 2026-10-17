@@ -4,11 +4,37 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use crate::compaction::{
+    collect_file_ops, estimate_context_tokens, estimate_messages_tokens, find_cut_index,
+    format_file_ops, is_context_overflow, is_summary_message, keep_recent_tokens,
+    serialize_conversation, should_compact, summary_char_budget, summary_message, summary_prompt,
+    SUMMARIZATION_SYSTEM_PROMPT,
+};
 use crate::event::{AgentEvent, Sink};
 use crate::tool::ToolResult;
 use crate::{
-    Cancel, ChatRequest, Error, Message, Model, Provider, StreamEvent, Tool, ToolCall, ToolSpec,
+    Cancel, ChatRequest, Error, Message, Model, Provider, StopReason, StreamEvent, Tool, ToolCall,
+    ToolSpec,
 };
+
+/// Why compaction ran. Automatic compaction respects the threshold; manual
+/// and overflow modes always try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionMode {
+    Auto,
+    Manual,
+    Overflow,
+}
+
+/// What one compaction changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compaction {
+    pub summary: String,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    /// Index into the pre-compaction message list where the kept tail starts.
+    pub first_kept_index: usize,
+}
 
 /// How a turn ended. Failures are `Err`; this only distinguishes "the model
 /// finished" from "the user interrupted".
@@ -25,6 +51,15 @@ pub struct Agent {
     tools: Vec<Arc<dyn Tool>>,
     specs: Vec<ToolSpec>,
     messages: Vec<Message>,
+    /// Latest compaction summary, used to update rather than re-summarize.
+    previous_summary: Option<String>,
+    /// Set after an auto-compaction that could not get below the threshold,
+    /// so the loop does not spend a summary call before every step.
+    compaction_stalled: bool,
+    /// Actual context size from the last assistant usage, plus the number of
+    /// messages it covered. More accurate than re-estimating the whole
+    /// conversation; cleared whenever compaction rewrites the history.
+    last_usage: Option<(u64, usize)>,
 }
 
 impl Agent {
@@ -50,6 +85,9 @@ impl Agent {
             tools,
             specs,
             messages,
+            previous_summary: None,
+            compaction_stalled: false,
+            last_usage: None,
         }
     }
 
@@ -66,6 +104,24 @@ impl Agent {
         &self.messages
     }
 
+    /// Continue from a session that already has a compaction summary.
+    pub fn set_previous_summary(&mut self, summary: Option<String>) {
+        self.previous_summary = summary;
+    }
+
+    pub fn previous_summary(&self) -> Option<&str> {
+        self.previous_summary.as_deref()
+    }
+
+    fn context_tokens(&self) -> u64 {
+        match self.last_usage {
+            Some((tokens, covered)) if covered > 0 && covered <= self.messages.len() => {
+                tokens + estimate_messages_tokens(&self.messages[covered..])
+            }
+            _ => estimate_context_tokens(&self.system, &self.specs, &self.messages),
+        }
+    }
+
     /// Run one user turn: append the input, then loop (model request → tool
     /// execution) until the model stops calling tools.
     pub async fn run_turn(
@@ -75,16 +131,27 @@ impl Agent {
         cancel: Cancel,
     ) -> Result<Outcome, Error> {
         self.messages.push(input);
+        self.compaction_stalled = false;
         let mut step = 0u32;
+        let mut overflow_retried = false;
 
         loop {
             if cancel.is_cancelled() {
                 return Ok(Outcome::Aborted);
             }
+
+            if let Err(error) = self.maybe_compact(sink, &cancel).await {
+                if matches!(error, Error::Cancelled) {
+                    return Ok(Outcome::Aborted);
+                }
+                return Err(error);
+            }
+
             step += 1;
             sink.on(AgentEvent::Step { step });
 
             let (acc, aborted, failure) = self.stream_step(sink, &cancel).await;
+            let usage = acc.usage();
             let empty = acc.was_empty();
             let message = acc.into_message();
 
@@ -104,6 +171,43 @@ impl Agent {
             }
 
             if let Some(error) = failure {
+                // A context overflow is recoverable once: summarize and retry
+                // the same request. Keep any partial text, drop partial tool
+                // calls (they have no matching results).
+                if is_context_overflow(&error) && !overflow_retried {
+                    overflow_retried = true;
+                    let mut message = message;
+                    message.tool_calls.clear();
+                    if message.content.is_some() {
+                        sink.on(AgentEvent::Assistant {
+                            message: message.clone(),
+                        });
+                        self.messages.push(message);
+                    }
+                    match self
+                        .compact(CompactionMode::Overflow, sink, cancel.clone())
+                        .await
+                    {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {
+                            sink.on(AgentEvent::CompactionFailed {
+                                message: "context overflow, but there was nothing left to compact"
+                                    .into(),
+                            });
+                            return Err(error);
+                        }
+                        Err(Error::Cancelled) => return Ok(Outcome::Aborted),
+                        Err(compact_error) => {
+                            sink.on(AgentEvent::CompactionFailed {
+                                message: format!(
+                                    "context overflow recovery failed: {compact_error}"
+                                ),
+                            });
+                            return Err(error);
+                        }
+                    }
+                }
+
                 // Keep whatever text the model managed to produce.
                 let mut message = message;
                 message.tool_calls.clear();
@@ -125,6 +229,12 @@ impl Agent {
                     message: message.clone(),
                 });
                 self.messages.push(message.clone());
+                if let Some(usage) = usage {
+                    let total = usage.input_tokens.saturating_add(usage.output_tokens);
+                    if total > 0 {
+                        self.last_usage = Some((total, self.messages.len()));
+                    }
+                }
             }
 
             if message.tool_calls.is_empty() {
@@ -150,6 +260,216 @@ impl Agent {
                 return Ok(Outcome::Aborted);
             }
         }
+    }
+
+    /// Compact if the next request would exceed the model window.
+    ///
+    /// Failures are reported but do not abort the turn: the request may still
+    /// fit, and a session the user can keep is better than a dead loop.
+    async fn maybe_compact(&mut self, sink: &mut dyn Sink, cancel: &Cancel) -> Result<(), Error> {
+        if self.compaction_stalled {
+            return Ok(());
+        }
+        if !should_compact(self.context_tokens(), self.model.context_window) {
+            return Ok(());
+        }
+        match self
+            .compact(CompactionMode::Auto, sink, cancel.clone())
+            .await
+        {
+            Ok(Some(_)) => {
+                if should_compact(self.context_tokens(), self.model.context_window) {
+                    self.compaction_stalled = true;
+                    sink.on(AgentEvent::CompactionFailed {
+                        message: "compaction did not get below the context threshold".into(),
+                    });
+                }
+                Ok(())
+            }
+            Ok(None) => {
+                self.compaction_stalled = true;
+                sink.on(AgentEvent::CompactionFailed {
+                    message: "context is over the threshold, but there was nothing to compact"
+                        .into(),
+                });
+                Ok(())
+            }
+            Err(Error::Cancelled) => Err(Error::Cancelled),
+            Err(error) => {
+                self.compaction_stalled = true;
+                sink.on(AgentEvent::CompactionFailed {
+                    message: format!("auto-compaction failed: {error}"),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Summarize older messages and keep a recent tail.
+    ///
+    /// The provider request after this starts with a synthetic user message
+    /// carrying the summary. Nothing in the session or wire format changes.
+    pub async fn compact(
+        &mut self,
+        mode: CompactionMode,
+        sink: &mut dyn Sink,
+        cancel: Cancel,
+    ) -> Result<Option<Compaction>, Error> {
+        let tokens_before = self.context_tokens();
+        if mode == CompactionMode::Auto && !should_compact(tokens_before, self.model.context_window)
+        {
+            return Ok(None);
+        }
+
+        // A resumed session starts with the summary message. It is passed as
+        // `previous_summary`, not summarized again as conversation.
+        let start = usize::from(self.messages.first().is_some_and(is_summary_message));
+        let keep = keep_recent_tokens(self.model.context_window);
+        let Some(cut) = find_cut_index(&self.messages, start, keep) else {
+            return Ok(None);
+        };
+        if cut <= start || cut >= self.messages.len() {
+            return Ok(None);
+        }
+
+        let old = &self.messages[start..cut];
+        if old.is_empty() {
+            return Ok(None);
+        }
+        let conversation =
+            serialize_conversation(old, summary_char_budget(self.model.context_window));
+        let file_ops = collect_file_ops(old);
+        let split_turn = self
+            .messages
+            .get(cut)
+            .is_some_and(|message| message.role == crate::Role::Assistant);
+        let prompt = summary_prompt(&conversation, self.previous_summary.as_deref(), split_turn);
+
+        let summary = self.generate_summary(&prompt, sink, &cancel).await?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let summary = format!("{}{}", summary.trim(), format_file_ops(&file_ops));
+
+        let kept = self.messages.split_off(cut);
+        self.messages = Vec::with_capacity(kept.len() + 1);
+        self.messages.push(summary_message(&summary));
+        self.messages.extend(kept);
+        self.previous_summary = Some(summary.clone());
+        self.last_usage = None;
+        let tokens_after = self.context_tokens();
+
+        sink.on(AgentEvent::Compaction {
+            summary: summary.clone(),
+            tokens_before,
+            tokens_after,
+            first_kept_index: cut,
+        });
+
+        Ok(Some(Compaction {
+            summary,
+            tokens_before,
+            tokens_after,
+            first_kept_index: cut,
+        }))
+    }
+
+    /// Run the summarization request. Text only; tool calls and truncated
+    /// summaries are errors, never session checkpoints.
+    async fn generate_summary(
+        &self,
+        prompt: &str,
+        sink: &mut dyn Sink,
+        cancel: &Cancel,
+    ) -> Result<String, Error> {
+        let messages = [Message::user(prompt)];
+        let max_tokens = if self.model.max_output > 0 {
+            self.model.max_output.min(8_192)
+        } else {
+            4_096
+        };
+        let request = ChatRequest {
+            model: &self.model.id,
+            system: Some(SUMMARIZATION_SYSTEM_PROMPT),
+            messages: &messages,
+            tools: &[],
+            max_tokens: Some(max_tokens),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let fut = self.provider.stream(request, tx.clone(), cancel.clone());
+        tokio::pin!(fut);
+        let stop = cancel.cancelled();
+        tokio::pin!(stop);
+
+        let mut text = String::new();
+        let mut stop_reason = None;
+        let mut saw_tool_call = false;
+        let mut aborted = false;
+        let mut failure = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop => {
+                    aborted = true;
+                    break;
+                }
+                result = &mut fut => {
+                    match result {
+                        Ok(()) => {}
+                        Err(Error::Cancelled) => aborted = true,
+                        Err(error) => failure = Some(error),
+                    }
+                    break;
+                }
+                event = rx.recv() => {
+                    if let Some(event) = event {
+                        match event {
+                            StreamEvent::Text(delta) => text.push_str(&delta),
+                            StreamEvent::Usage(usage) => sink.on(AgentEvent::Usage { usage }),
+                            StreamEvent::Stop(reason) => stop_reason = Some(reason),
+                            StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallDelta { .. } => {
+                                saw_tool_call = true;
+                            }
+                            StreamEvent::Reasoning(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Text(delta) => text.push_str(&delta),
+                StreamEvent::Usage(usage) => sink.on(AgentEvent::Usage { usage }),
+                StreamEvent::Stop(reason) => stop_reason = Some(reason),
+                StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallDelta { .. } => {
+                    saw_tool_call = true;
+                }
+                StreamEvent::Reasoning(_) => {}
+            }
+        }
+        drop(tx);
+
+        if aborted {
+            return Err(Error::Cancelled);
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if saw_tool_call || matches!(stop_reason, Some(StopReason::ToolCalls)) {
+            return Err(Error::Stream(
+                "summarization attempted to call a tool".into(),
+            ));
+        }
+        if matches!(stop_reason, Some(StopReason::Length)) {
+            return Err(Error::Stream(
+                "summarization hit the token cap; the summary is incomplete".into(),
+            ));
+        }
+        if text.trim().is_empty() {
+            return Err(Error::Stream("summarization returned no text".into()));
+        }
+        Ok(text)
     }
 
     /// Stream one model response into an accumulator.
@@ -273,6 +593,7 @@ struct Acc {
     reasoning: String,
     calls: Vec<CallAcc>,
     saw_anything: bool,
+    usage: Option<crate::Usage>,
 }
 
 #[derive(Default)]
@@ -307,6 +628,7 @@ impl Acc {
                 self.slot(index).args.push_str(&args);
             }
             StreamEvent::Usage(usage) => {
+                self.usage = Some(usage);
                 sink.on(AgentEvent::Usage { usage });
             }
             StreamEvent::Stop(_) => {}
@@ -322,6 +644,10 @@ impl Acc {
 
     fn was_empty(&self) -> bool {
         !self.saw_anything
+    }
+
+    fn usage(&self) -> Option<crate::Usage> {
+        self.usage
     }
 
     fn into_message(self) -> Message {
@@ -583,6 +909,240 @@ mod tests {
         let observed = provider.observed();
         assert_eq!(observed[0][0].images.len(), 1);
         assert_eq!(observed[0][0].images[0].data, "AAAA");
+    }
+
+    fn long_history(pairs: usize) -> Vec<Message> {
+        let text = "x".repeat(40);
+        let mut messages = Vec::new();
+        for i in 0..pairs {
+            messages.push(Message::user(format!("{i} {text}")));
+            messages.push(Message::assistant(
+                Some(format!("{i} {text}")),
+                None,
+                vec![],
+            ));
+        }
+        messages
+    }
+
+    fn small_window_agent(
+        steps: Vec<Vec<StreamEvent>>,
+        history: Vec<Message>,
+    ) -> (Agent, Arc<ScriptedProvider>) {
+        let provider = Arc::new(ScriptedProvider::new(steps));
+        let mut model = crate::Model::unknown("mock", "small");
+        model.context_window = 200;
+        let agent = Agent::new(provider.clone(), model, "system".into(), vec![], history);
+        (agent, provider)
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_summarizes_before_the_request() {
+        let (mut agent, provider) = small_window_agent(
+            vec![
+                vec![
+                    StreamEvent::Text("## Goal\nkeep going".into()),
+                    StreamEvent::Stop(StopReason::EndTurn),
+                ],
+                vec![
+                    StreamEvent::Text("done".into()),
+                    StreamEvent::Stop(StopReason::EndTurn),
+                ],
+            ],
+            long_history(10),
+        );
+        let mut sink = CollectSink::default();
+        let outcome = agent
+            .run_turn(Message::user("latest"), &mut sink, Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Completed);
+        assert_eq!(agent.messages().first().unwrap().role, crate::Role::User);
+        assert!(crate::is_summary_message(agent.messages().first().unwrap()));
+        assert!(agent
+            .messages()
+            .first()
+            .unwrap()
+            .text()
+            .contains("keep going"));
+
+        let observed = provider.observed();
+        assert_eq!(observed.len(), 2, "summary call, then the model call");
+        assert!(crate::is_summary_message(&observed[1][0]));
+        assert!(
+            observed[1].len() < 21,
+            "the request should be smaller than the history"
+        );
+        assert!(matches!(
+            sink.0.lock().unwrap().iter().find(|event| matches!(event, AgentEvent::Compaction { .. })),
+            Some(AgentEvent::Compaction { first_kept_index, .. }) if *first_kept_index > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_previous_summary_is_updated_not_resummarized() {
+        let mut history = vec![crate::summary_message("old summary")];
+        history.extend(long_history(10));
+        let (mut agent, provider) = small_window_agent(
+            vec![
+                vec![
+                    StreamEvent::Text("updated summary".into()),
+                    StreamEvent::Stop(StopReason::EndTurn),
+                ],
+                vec![
+                    StreamEvent::Text("ok".into()),
+                    StreamEvent::Stop(StopReason::EndTurn),
+                ],
+            ],
+            history,
+        );
+        agent.set_previous_summary(Some("old summary".into()));
+        let mut sink = CollectSink::default();
+        agent
+            .run_turn(Message::user("latest"), &mut sink, Cancel::new())
+            .await
+            .unwrap();
+
+        let observed = provider.observed();
+        let prompt = observed[0][0].text();
+        assert!(prompt.contains("<previous-summary>\nold summary\n</previous-summary>"));
+        assert!(!prompt.contains("<summary>\nold summary"));
+        assert!(crate::is_summary_message(&observed[1][0]));
+        assert!(observed[1][0].text().contains("updated summary"));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_works_without_a_known_window() {
+        let (mut agent, _provider) = agent(vec![vec![
+            StreamEvent::Text("manual summary".into()),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]]);
+        // Default test model has context_window 0, but manual compaction can
+        // still use the default keep budget.
+        let long = "x".repeat(100_000);
+        agent.messages = vec![
+            Message::user(format!("old {long}")),
+            Message::assistant(Some("old answer".into()), None, vec![]),
+            Message::user("latest"),
+        ];
+        let mut sink = CollectSink::default();
+        let result = agent
+            .compact(CompactionMode::Manual, &mut sink, Cancel::new())
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert!(crate::is_summary_message(agent.messages().first().unwrap()));
+        assert_eq!(agent.messages().last().unwrap().text(), "latest");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_reports_nothing_to_do() {
+        let (mut agent, _provider) = agent(vec![]);
+        let mut sink = CollectSink::default();
+        let result = agent
+            .compact(CompactionMode::Manual, &mut sink, Cancel::new())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    struct OverflowOnce {
+        calls: StdMutex<usize>,
+        observed: StdMutex<Vec<Vec<Message>>>,
+    }
+
+    impl Default for OverflowOnce {
+        fn default() -> Self {
+            Self {
+                calls: StdMutex::new(0),
+                observed: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::Provider for OverflowOnce {
+        fn name(&self) -> &'static str {
+            "overflow-once"
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: ChatRequest<'a>,
+            sink: mpsc::UnboundedSender<StreamEvent>,
+            _cancel: Cancel,
+        ) -> crate::BoxFuture<'a, Result<(), Error>> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                let call = *calls;
+                *calls += 1;
+                call
+            };
+            Box::pin(async move {
+                match call {
+                    0 => Err(Error::Api {
+                        status: 400,
+                        body: "This model's maximum context length is 100 tokens".into(),
+                    }),
+                    1 => {
+                        let _ = sink.send(StreamEvent::Text("## Goal\nrecovered".into()));
+                        let _ = sink.send(StreamEvent::Stop(StopReason::EndTurn));
+                        Ok(())
+                    }
+                    _ => {
+                        let _ = sink.send(StreamEvent::Text("done".into()));
+                        let _ = sink.send(StreamEvent::Stop(StopReason::EndTurn));
+                        Ok(())
+                    }
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_once() {
+        let provider = Arc::new(OverflowOnce::default());
+        let mut agent = Agent::new(
+            provider.clone(),
+            crate::Model::unknown("mock", "overflow"),
+            "system".into(),
+            vec![],
+            vec![
+                Message::user(format!("old {}", "x".repeat(100_000))),
+                Message::assistant(Some("old answer".into()), None, vec![]),
+            ],
+        );
+        let mut sink = CollectSink::default();
+        let outcome = agent
+            .run_turn(Message::user("latest"), &mut sink, Cancel::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Completed);
+        let observed = provider.observed.lock().unwrap();
+        assert_eq!(observed.len(), 3, "overflow, summary, retry");
+        assert!(crate::is_summary_message(&observed[2][0]));
+        assert_eq!(agent.messages().last().unwrap().text(), "done");
+    }
+
+    #[test]
+    fn usage_backed_context_estimate_only_counts_trailing_messages() {
+        let (mut agent, _provider) = agent(vec![]);
+        agent.messages = vec![
+            Message::user("x".repeat(4_000)),
+            Message::assistant(Some("y".repeat(4_000)), None, vec![]),
+        ];
+        let without_usage = agent.context_tokens();
+        agent.last_usage = Some((10, 2));
+        assert!(agent.context_tokens() < without_usage);
+
+        agent.messages.push(Message::user("trailing"));
+        assert_eq!(
+            agent.context_tokens(),
+            10 + crate::estimate_tokens(&agent.messages[2])
+        );
     }
 
     #[tokio::test]
