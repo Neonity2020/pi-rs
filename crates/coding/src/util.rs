@@ -13,14 +13,16 @@ pub fn home_dir() -> PathBuf {
     }
 }
 
-/// Sessions live under a slug of the working directory, mirroring pi:
-/// `/Users/andi/ws/oc/pi-rs` → `Users-andi-ws-oc-pi-rs`.
-pub fn sessions_dir(cwd: &Path) -> PathBuf {
-    let slug = cwd
-        .to_string_lossy()
+/// Sessions and prompt history live under a slug of the working directory,
+/// mirroring pi: `/Users/andi/ws/oc/pi-rs` → `Users-andi-ws-oc-pi-rs`.
+pub fn cwd_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
         .trim_start_matches('/')
-        .replace('/', "-");
-    home_dir().join("sessions").join(slug)
+        .replace('/', "-")
+}
+
+pub fn sessions_dir(cwd: &Path) -> PathBuf {
+    home_dir().join("sessions").join(cwd_slug(cwd))
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);

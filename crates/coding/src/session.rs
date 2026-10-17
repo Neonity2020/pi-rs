@@ -95,10 +95,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn append_user(&mut self, text: &str) -> Result<()> {
-        self.append(Message::user(text))
-    }
-
     pub fn append_message(&mut self, message: &Message) -> Result<()> {
         self.append(message.clone())
     }
@@ -193,7 +189,7 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let cwd = Path::new("/tmp/project");
         let mut session = Session::create_in(&dir, cwd, "deepseek-flash").unwrap();
-        session.append_user("hi").unwrap();
+        session.append_message(&Message::user("hi")).unwrap();
         session
             .append_message(&Message::assistant(
                 Some("calling".into()),
@@ -220,16 +216,36 @@ mod tests {
     }
 
     #[test]
+    fn images_survive_a_session_roundtrip() {
+        let dir = temp_dir("images");
+        let cwd = Path::new("/tmp/project");
+        let mut session = Session::create_in(&dir, cwd, "m").unwrap();
+        session
+            .append_message(&Message::user_with_images(
+                "look",
+                vec![llm::Image::new("image/png", "iVBORw0KGgo=")],
+            ))
+            .unwrap();
+
+        let (_, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].images.len(), 1);
+        assert_eq!(messages[0].images[0].media_type, "image/png");
+        assert_eq!(messages[0].images[0].data, "iVBORw0KGgo=");
+        assert_eq!(messages[0].text(), "look");
+    }
+
+    #[test]
     fn resume_continues_the_branch() {
         let dir = temp_dir("resume");
         let cwd = Path::new("/tmp/project");
         let mut session = Session::create_in(&dir, cwd, "m").unwrap();
-        session.append_user("one").unwrap();
+        session.append_message(&Message::user("one")).unwrap();
         drop(session);
 
         let (mut session, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
         assert_eq!(messages.len(), 1);
-        session.append_user("two").unwrap();
+        session.append_message(&Message::user("two")).unwrap();
 
         let (_, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
         assert_eq!(messages.len(), 2);

@@ -197,7 +197,7 @@ mosaicPattern.forEach((row, r) => {
       <div class="stat stat--blue"><b>3</b><span>种运行模式</span></div>
       <div class="stat stat--yellow"><b>1</b><span>个 agent 循环</span></div>
       <div class="stat stat--mint"><b>~300</b><span>token 系统提示</span></div>
-      <div class="stat stat--violet"><b>112</b><span>个测试，零 API key</span></div>
+      <div class="stat stat--violet"><b>137</b><span>个测试，零 API key</span></div>
     </div>
   </section>
 
@@ -303,7 +303,7 @@ mosaicPattern.forEach((row, r) => {
 
           <div class="term-body">
             <div class="line"><span class="t-prompt">$</span> <span class="t-cmd">pi "给 auth.json 的写入加个重试"</span></div>
-            <div class="line t-think" data-delay="520">● thinking… 2.1s</div>
+            <div class="line t-think" data-delay="520">▸ Thinking · 12 lines</div>
             <div class="line">
               <span class="t-bullet">●</span> <span class="t-tool">read</span>{" "}
               <span class="t-arg">crates/coding/src/auth.rs</span>
@@ -317,7 +317,7 @@ mosaicPattern.forEach((row, r) => {
               <span class="t-bullet">●</span> <span class="t-tool">bash</span>{" "}
               <span class="t-arg">cargo test</span>
             </div>
-            <div class="line t-out">  112 passed; 0 failed</div>
+            <div class="line t-out">  137 passed; 0 failed</div>
             <div class="line t-ok">✓ 改好了：验证失败时重试两次，再报错。</div>
             <div class="line t-out">  auth.json 仍然只在验证通过后写入，坏 key 不落盘。</div>
             <div class="line t-dim">  <span class="t-violet">~</span> 继续调用工具，或者停下来回答你。<span class="cursor" aria-hidden="true"></span></div>
@@ -332,9 +332,9 @@ mosaicPattern.forEach((row, r) => {
 
         <div class="demo-caption">
           <span>▸ 示意会话，不是录屏</span>
-          <span>▸ 流式 Markdown，表格和代码块都能渲染</span>
+          <span>▸ 流式 Markdown：表格、带行号和高亮的代码块</span>
           <span>▸ DeepSeek 高峰 / 低谷价自动切换</span>
-          <span>▸ Ctrl+C 贯穿请求和子进程</span>
+          <span>▸ Ctrl+T 展开推理 · Ctrl+V 贴图 · Ctrl+C 贯穿请求和子进程</span>
         </div>
       </div>
     </div>
@@ -452,7 +452,7 @@ mosaicPattern.forEach((row, r) => {
         <article class="mode-card mode-card--violet reveal">
           <span class="mode-tag">TUI</span>
           <h3>交互式</h3>
-          <p>流式回答、Markdown、代码块高亮、token 与成本状态栏。没有 key 也能启动，先提示你 /login。</p>
+          <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理默认折叠成一行 Thinking，Ctrl+T 展开。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。没有 key 也能启动，先提示你 /login。</p>
           <code class="mode-cmd">pi</code>
         </article>
 
@@ -541,7 +541,7 @@ mosaicPattern.forEach((row, r) => {
             <span class="step-num" aria-hidden="true">2</span>
             <h3>登录</h3>
           </div>
-          <p>隐藏输入；先用 <code>GET /models</code> 验证，再把凭据写进 auth.json（0600）。TUI 里输入 <code>/login</code> 也行。</p>
+          <p>隐藏输入；先用 <code>GET /models</code> 验证，再把凭据写进 auth.json（0600）。TUI 里还有 <code>/login</code>、<code>/logout</code>、<code>/help</code>。</p>
           <div class="cmd-box">
             <span class="dollar" aria-hidden="true">$</span>
             <code>pi login</code>
@@ -575,7 +575,7 @@ mosaicPattern.forEach((row, r) => {
         <a class="btn" href={`${GITHUB}/tree/main/docs`} target="_blank" rel="noreferrer">
           读维护者文档 <span aria-hidden="true">→</span>
         </a>
-        <span class="test-note">cargo test · 112 个测试 · 0 个真 API 调用</span>
+        <span class="test-note">cargo test · 137 个测试 · 0 个真 API 调用</span>
       </div>
     </div>
   </section>

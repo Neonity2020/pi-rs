@@ -70,11 +70,11 @@ impl Agent {
     /// execution) until the model stops calling tools.
     pub async fn run_turn(
         &mut self,
-        input: String,
+        input: Message,
         sink: &mut dyn Sink,
         cancel: Cancel,
     ) -> Result<Outcome, Error> {
-        self.messages.push(Message::user(input));
+        self.messages.push(input);
         let mut step = 0u32;
 
         loop {
@@ -429,7 +429,7 @@ mod tests {
         ]]);
         let mut sink = CollectSink::default();
         let outcome = agent
-            .run_turn("hi".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("hi"), &mut sink, Cancel::new())
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Completed);
@@ -454,7 +454,7 @@ mod tests {
         ]);
         let mut sink = CollectSink::default();
         let outcome = agent
-            .run_turn("run".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("run"), &mut sink, Cancel::new())
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Completed);
@@ -481,7 +481,7 @@ mod tests {
         ]);
         let mut sink = CollectSink::default();
         let outcome = agent
-            .run_turn("run".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("run"), &mut sink, Cancel::new())
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Completed);
@@ -503,7 +503,7 @@ mod tests {
         ]);
         let mut sink = CollectSink::default();
         agent
-            .run_turn("run".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("run"), &mut sink, Cancel::new())
             .await
             .unwrap();
         assert!(agent.messages()[2].text().contains("Invalid JSON"));
@@ -535,7 +535,7 @@ mod tests {
         let (mut agent, _p) = agent(vec![first, vec![StreamEvent::Text("ok".into())]]);
         let mut sink = CollectSink::default();
         agent
-            .run_turn("run".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("run"), &mut sink, Cancel::new())
             .await
             .unwrap();
         let messages = agent.messages();
@@ -551,7 +551,10 @@ mod tests {
         let cancel = Cancel::new();
         cancel.cancel();
         let mut sink = CollectSink::default();
-        let outcome = agent.run_turn("x".into(), &mut sink, cancel).await.unwrap();
+        let outcome = agent
+            .run_turn(Message::user("x"), &mut sink, cancel)
+            .await
+            .unwrap();
         assert_eq!(outcome, Outcome::Aborted);
         assert_eq!(agent.messages().len(), 1, "only the user message");
     }
@@ -561,10 +564,25 @@ mod tests {
         let (mut agent, _p) = agent(vec![vec![]]);
         let mut sink = CollectSink::default();
         let error = agent
-            .run_turn("x".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("x"), &mut sink, Cancel::new())
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Stream(_)));
+    }
+
+    #[tokio::test]
+    async fn user_images_reach_the_provider() {
+        let (mut agent, provider) = agent(vec![vec![StreamEvent::Text("seen".into())]]);
+        let message =
+            Message::user_with_images("look", vec![crate::Image::new("image/png", "AAAA")]);
+        let mut sink = CollectSink::default();
+        agent
+            .run_turn(message, &mut sink, Cancel::new())
+            .await
+            .unwrap();
+        let observed = provider.observed();
+        assert_eq!(observed[0][0].images.len(), 1);
+        assert_eq!(observed[0][0].images[0].data, "AAAA");
     }
 
     #[tokio::test]
@@ -580,7 +598,7 @@ mod tests {
         ]]);
         let mut sink = CollectSink::default();
         agent
-            .run_turn("x".into(), &mut sink, Cancel::new())
+            .run_turn(Message::user("x"), &mut sink, Cancel::new())
             .await
             .unwrap();
         let events = sink.0.lock().unwrap();

@@ -41,6 +41,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 | agent | `llm::mock::ScriptedProvider` + 假工具 | 不碰网络，验证事件顺序 |
 | e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
 | PTY | Python + 伪终端，跑真实二进制 | 验证 raw mode、流式渲染、干净退出 |
+| 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
 
 写测试的几条规矩：
 
@@ -53,7 +54,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 ## 代码约定
 
 - 错误边界：provider 用 `llm::Error`（thiserror）；工具失败是 `ToolResult::is_error`，绝不 `Err`；`coding` 用 anyhow。
-- 消息只有 `llm::Message` 一种；不要加 wire/session 转换层。
+- 消息只有 `llm::Message` 一种；不要加 wire/session 转换层。图片是用户消息上的 base64 字段，由 provider 在发送时展开成 content parts。
 - DeepSeek 的 `reasoning` 必须原样回传，任何清理都是 bug。
 - 每个模块顶部用一句话说明职责；说不清就说明边界错了。
 - 新增依赖前先看根 `AGENTS.md` 的依赖清单和 `docs/goals.md` 的预算原则。
@@ -115,7 +116,7 @@ impl Tool for MyTool {
 
 ## 改 TUI
 
-- `crates/tui` 不碰 I/O：需要外部信息时，让 `coding` 通过 `UiEvent` 送进来。
+- `crates/tui` 不碰 I/O：需要外部信息时，让 `coding` 通过 `UiEvent` 送进来。剪贴板同理——`Ctrl+V` 只返回 `Action::PasteImage`。
 - 渲染宽度以 `wrap::display_width` 为准（CJK 宽字符、tab）。
 - Markdown 无法识别的语法按字面输出；宁可少样式，不可丢字。
 - 改动渲染逻辑后跑单元测试 + 两个 PTY 冒烟脚本。
@@ -128,6 +129,7 @@ impl Tool for MyTool {
 | agent 循环顺序 | 单元测试里用 `ScriptedProvider`，检查事件序列 |
 | 提示词内容 | 读 `crates/coding/src/prompt.rs` 的测试；临时打印 `build()` |
 | TUI 是否干净退出 | `scripts/tui_smoke.py` |
+| 图片是否随请求发出 | 会话 JSONL 的 `images` 字段；或临时 mock 服务器打印请求体 |
 | 流式解析边界 | `llm/openai.rs` 的 SSE 单元测试；构造分块输入 |
 
 ## 提交前检查清单

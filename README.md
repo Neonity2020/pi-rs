@@ -56,6 +56,12 @@ pi -c                       # 继续本目录最近一次会话
 
 TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
 
+`Up` / `Down` 在输入框里翻阅历史 prompt（跨会话，按工作目录保存于 `~/.pi-rs/history/<cwd 的 slug>`）；正在编辑的内容会先暂存，翻回最新一条后还原。
+
+`Ctrl+V` 从剪贴板读一张图（macOS 用系统 `osascript`，Linux 用 `wl-paste` / `xclip`），显示在输入框下方；`Enter` 连同文字一起发送，`Esc` 删除最后一张。图片以 base64 存进会话，发送时按 OpenAI 多模态 `content` parts 展开，所以需要模型/端点支持图片输入；超过 10 MB 会被拒绝。
+
+模型的推理过程默认折叠成一行 `Thinking`；`Ctrl+T` 展开或收起全部推理内容。
+
 ## 设计决定（对 Pi 的忠实翻译）
 
 **极短系统提示。** 基础提示约 300 token：模型已经知道什么是 coding agent，长篇说明只会在注意力里和你的代码竞争。个性化全部走 `AGENTS.md`（全局 `~/.pi-rs/AGENTS.md`，然后从文件系统根目录逐级合并到 cwd，深者优先），或用 `SYSTEM.md` 整体替换基础提示。
@@ -90,7 +96,7 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 ## 会话
 
-每次会话一个 JSONL 文件：`~/.pi-rs/sessions/<cwd 的 slug>/<时间戳>.jsonl`。第一行是 header，之后每行一条消息记录，带 `id` + `parent` —— 文件是棵树而不是日志，目前读取时取活动分支（最后一条回溯到根）。assistant 的 `reasoning` 一并落盘，因为带 `tools` 的 DeepSeek 请求要求把历史 `reasoning_content` 原样带回（否则 API 返回 400），我们的消息格式与线上格式本来就一致，所以不需要任何转换。
+每次会话一个 JSONL 文件：`~/.pi-rs/sessions/<cwd 的 slug>/<时间戳>.jsonl`。第一行是 header，之后每行一条消息记录，带 `id` + `parent` —— 文件是棵树而不是日志，目前读取时取活动分支（最后一条回溯到根）。assistant 的 `reasoning` 一并落盘，因为带 `tools` 的 DeepSeek 请求要求把历史 `reasoning_content` 原样带回（否则 API 返回 400），消息格式与线上格式共享同一个 `Message`；图片在发送时由 provider 展开为 content parts，会话里仍存 base64 的同一个 `Message`，所以不需要新的消息类型。
 
 ## 成本
 
@@ -99,10 +105,10 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 ## 测试
 
 ```bash
-cargo test          # 112 个测试，不需要 API key
+cargo test          # 137 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行、Markdown 渲染（表格、代码块行号与语法高亮），以及 12 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi login` 保存与复用 auth.json、坏 key 不落盘、logout）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、TUI 状态机、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 12 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi login` 保存与复用 auth.json、坏 key 不落盘、logout）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

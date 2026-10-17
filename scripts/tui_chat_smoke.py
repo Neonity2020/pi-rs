@@ -25,7 +25,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", 0))
         self.rfile.read(length)
         body = (
-            'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n'
+            'data: {"choices":[{"delta":{"reasoning_content":"secret reasoning"}}]}\n\n'
             f'data: {{"choices":[{{"delta":{{"content":"{ANSWER}"}}}}]}}\n\n'
             'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
             'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_cache_hit_tokens":0}}\n\n'
@@ -127,6 +127,12 @@ def main():
         ok = False
     if "hithere" not in flat:
         print("FAIL: user message never rendered")
+        ok = False
+    if "Thinking" not in flat:
+        print("FAIL: collapsed thinking header missing")
+        ok = False
+    if "secret" in flat:
+        print("FAIL: reasoning was not collapsed")
         ok = False
     if "session:" not in text:
         print("FAIL: session line missing on exit")

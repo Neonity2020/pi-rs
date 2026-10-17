@@ -9,12 +9,39 @@ pub enum Role {
     Tool,
 }
 
+/// A base64-encoded image attached to a user message.
+///
+/// The session record keeps the bytes inline so a resumed conversation can
+/// send them again. The provider layer expands the images into OpenAI
+/// `content` parts at the wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    /// MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// Base64 without a data-URL prefix.
+    pub data: String,
+}
+
+impl Image {
+    pub fn new(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
+
 /// The one message type of the whole system.
 ///
 /// It doubles as the wire format (OpenAI chat completions) and the session
 /// record format, so nothing has to be converted at the boundaries.
 /// `reasoning` is kept because DeepSeek requires `reasoning_content` to be
 /// passed back on every assistant turn while tools are in play.
+/// `images` is only used on user messages; an image-only turn is allowed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -26,6 +53,8 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,7 +73,15 @@ impl Message {
             reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
+    }
+
+    /// A user message with images; the text may be empty.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<Image>) -> Self {
+        let mut message = Self::user(text);
+        message.images = images;
+        message
     }
 
     pub fn assistant(
@@ -58,6 +95,7 @@ impl Message {
             reasoning,
             tool_calls,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -68,6 +106,7 @@ impl Message {
             reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            images: Vec::new(),
         }
     }
 

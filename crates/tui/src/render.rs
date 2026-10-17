@@ -14,11 +14,12 @@ const TOOL_PREVIEW_LINES: usize = 6;
 /// Draw the whole UI. Also keeps viewport/scroll bookkeeping in sync.
 pub fn render(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
-    if area.width < 8 || area.height < STATUS_HEIGHT + INPUT_HEIGHT + 1 {
+    let input_height = INPUT_HEIGHT + u16::from(!app.images.is_empty());
+    if area.width < 8 || area.height < STATUS_HEIGHT + input_height + 1 {
         return;
     }
 
-    let transcript_height = area.height - INPUT_HEIGHT - STATUS_HEIGHT;
+    let transcript_height = area.height - input_height - STATUS_HEIGHT;
     let transcript_rect = Rect {
         x: area.x,
         y: area.y,
@@ -35,7 +36,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         x: area.x,
         y: area.y + transcript_height + STATUS_HEIGHT,
         width: area.width,
-        height: INPUT_HEIGHT,
+        height: input_height,
     };
 
     render_transcript(app, frame, transcript_rect);
@@ -60,21 +61,83 @@ fn render_transcript(app: &mut App, frame: &mut Frame, rect: Rect) {
     frame.render_widget(paragraph, rect);
 }
 
+/// Render an assistant's reasoning either as a one-line collapsed summary or
+/// as the full transcript. Collapsed streaming blocks animate with the spinner.
+fn thinking_lines(
+    reasoning: &str,
+    streaming: bool,
+    expanded: bool,
+    width: usize,
+    spinner: &str,
+) -> Vec<Line<'static>> {
+    if reasoning.is_empty() {
+        return Vec::new();
+    }
+    let style = Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let mut lines = Vec::new();
+    if expanded {
+        let title = if streaming {
+            "▾ Thinking…"
+        } else {
+            "▾ Thinking"
+        };
+        lines.push(Line::from(Span::styled(title, style)));
+        for segment in wrap(reasoning, width.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(format!("  {segment}"), style)));
+        }
+    } else if streaming {
+        lines.push(Line::from(Span::styled(
+            format!("{spinner} Thinking…"),
+            style,
+        )));
+    } else {
+        let count = reasoning.lines().count().max(1);
+        let unit = if count == 1 { "line" } else { "lines" };
+        lines.push(Line::from(Span::styled(
+            format!("▸ Thinking · {count} {unit}"),
+            style,
+        )));
+    }
+    lines
+}
+
 fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for item in &app.items {
         match item {
-            Item::User(text) => {
-                for (i, segment) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
-                    let prefix = if i == 0 { "❯ " } else { "  " };
+            Item::User { text, images } => {
+                if text.is_empty() {
+                    if !images.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "❯ ",
+                                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("[image]", Style::new().fg(Color::DarkGray)),
+                        ]));
+                    }
+                } else {
+                    for (i, segment) in wrap(text, width.saturating_sub(2)).into_iter().enumerate()
+                    {
+                        let prefix = if i == 0 { "❯ " } else { "  " };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                prefix.to_string(),
+                                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(segment),
+                        ]));
+                    }
+                }
+                for (i, label) in images.iter().enumerate() {
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            prefix.to_string(),
-                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(segment),
+                        Span::styled("  ▣ ", Style::new().fg(Color::Magenta)),
+                        Span::styled(format!("[{}] ", i + 1), Style::new().fg(Color::Cyan)),
+                        Span::styled(label.clone(), Style::new().fg(Color::DarkGray)),
                     ]));
                 }
                 lines.push(Line::default());
@@ -84,26 +147,28 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 reasoning,
                 streaming,
             } => {
-                if !reasoning.is_empty() {
-                    for segment in wrap(reasoning, width.saturating_sub(2)) {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {segment}"),
-                            Style::new()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                    }
-                }
+                let mut thinking = thinking_lines(
+                    reasoning,
+                    *streaming,
+                    app.show_thinking,
+                    width,
+                    app.spinner_char(),
+                );
                 let mut rendered = crate::markdown::lines(text, width);
-                if rendered.is_empty() {
+                if rendered.is_empty() && !text.is_empty() {
                     rendered.push(Line::default());
                 }
                 if *streaming {
+                    let cursor = Span::styled("▌", Style::new().fg(Color::DarkGray));
                     if let Some(last) = rendered.last_mut() {
-                        last.spans
-                            .push(Span::styled("▌", Style::new().fg(Color::DarkGray)));
+                        last.spans.push(cursor);
+                    } else if let Some(last) = thinking.last_mut() {
+                        last.spans.push(cursor);
+                    } else {
+                        rendered.push(Line::from(cursor));
                     }
                 }
+                lines.extend(thinking);
                 lines.extend(rendered);
                 if !*streaming && (!text.is_empty() || !reasoning.is_empty()) {
                     lines.push(Line::default());
@@ -230,13 +295,20 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
         return;
     }
     let hint = if app.busy {
-        " running — Ctrl+C to interrupt "
+        " running — Ctrl+C to interrupt ".to_string()
     } else if !app.logged_in {
-        " Not logged in · type /login for DeepSeek · Ctrl+C to quit "
+        " Not logged in · type /login for DeepSeek · Ctrl+C to quit ".to_string()
+    } else if !app.images.is_empty() {
+        let plural = if app.images.len() == 1 { "" } else { "s" };
+        format!(
+            " Enter to send · {} image{plural} · Ctrl+V add · Esc remove image ",
+            app.images.len()
+        )
     } else if app.input.text.is_empty() {
-        " Enter to send · Ctrl+C to quit · wheel/PgUp/PgDn to scroll "
+        " Enter to send · Ctrl+V image · Ctrl+T thinking · Ctrl+C quit · wheel to scroll "
+            .to_string()
     } else {
-        " Enter to send "
+        " Enter to send · Ctrl+V image ".to_string()
     };
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
@@ -274,6 +346,30 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
     ]);
     frame.render_widget(Paragraph::new(line), inner);
     frame.set_cursor_position((inner.x + 2 + (cursor_col - h_scroll) as u16, inner.y));
+
+    if !app.images.is_empty() && inner.height >= 2 {
+        let mut spans = Vec::new();
+        for (i, image) in app.images.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("   "));
+            }
+            spans.push(Span::styled(
+                format!("[{}]", i + 1),
+                Style::new().fg(Color::Cyan),
+            ));
+            spans.push(Span::styled(
+                format!(" {}", image.label()),
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+        let attachments = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(Line::from(spans)), attachments);
+    }
 }
 
 /// Masked key entry: the key itself never reaches the framebuffer.
@@ -388,6 +484,88 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_collapsed_until_ctrl_t() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("secret plan\nsecond line".into()));
+        app.apply(UiEvent::AssistantDelta("answer".into()));
+        app.apply(UiEvent::AssistantDone {
+            text: "answer".into(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("▸ Thinking · 2 lines"),
+            "missing header: {screen}"
+        );
+        assert!(screen.contains("answer"));
+        assert!(
+            !screen.contains("secret plan"),
+            "reasoning leaked: {screen}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("▾ Thinking"),
+            "missing expanded header: {screen}"
+        );
+        assert!(
+            screen.contains("secret plan"),
+            "reasoning not expanded: {screen}"
+        );
+    }
+
+    #[test]
+    fn streaming_thinking_shows_a_live_header() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("still thinking".into()));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("Thinking…"),
+            "missing live header: {screen}"
+        );
+        assert!(
+            !screen.contains("still thinking"),
+            "reasoning leaked: {screen}"
+        );
+    }
+
+    #[test]
     fn status_bar_shows_cache_hit_rate() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -446,6 +624,39 @@ mod tests {
         assert!(!screen.contains("sk-secret"), "key leaked: {screen}");
         assert!(screen.contains("DeepSeek login"), "missing title: {screen}");
         assert!(screen.contains("••••"), "missing mask: {screen}");
+    }
+
+    #[test]
+    fn attachments_are_visible_in_the_input() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{ImageAttachment, StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ImageAttached(ImageAttachment {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+            bytes: 1536,
+            width: Some(640),
+            height: Some(480),
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("[1]"), "missing attachment index: {screen}");
+        assert!(screen.contains("PNG 640×480"), "missing label: {screen}");
+        assert!(
+            screen.contains("Esc remove image"),
+            "missing image hint: {screen}"
+        );
     }
 
     #[test]

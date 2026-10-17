@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use agent::{Agent, Cancel, Message, Outcome, Provider, Tool};
+use agent::{Agent, Cancel, Image, Message, Outcome, Provider, Tool};
 use anyhow::Context;
 use llm::Model;
 use serde_json::json;
@@ -15,8 +15,8 @@ use tokio::sync::Mutex;
 
 use crate::sinks::{JsonSink, PrintSink, Shared};
 use crate::stats::format_tokens;
-use crate::ui::{self, Action, App, UiEvent};
-use crate::{auth, cli, login};
+use crate::ui::{self, Action, App, ImageAttachment, Submission, UiEvent};
+use crate::{auth, cli, history, login};
 use ui::crossterm::event::MouseEventKind;
 
 type Tools = Vec<Arc<dyn Tool>>;
@@ -75,14 +75,15 @@ pub async fn run_print(turn: Turn, prompt: String) -> anyhow::Result<()> {
         shared,
         messages,
     } = turn;
+    let message = Message::user(prompt);
     let mut agent = build_agent(provider, &model, system, tools, messages);
-    shared.session.lock().unwrap().append_user(&prompt)?;
+    shared.session.lock().unwrap().append_message(&message)?;
 
     let cancel = Cancel::new();
     spawn_ctrl_c(cancel.clone());
 
     let mut sink = PrintSink::new(shared.clone());
-    match agent.run_turn(prompt, &mut sink, cancel).await {
+    match agent.run_turn(message, &mut sink, cancel).await {
         Ok(Outcome::Completed) => {
             if sink.wrote_text {
                 println!();
@@ -115,8 +116,9 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
         shared,
         messages,
     } = turn;
+    let message = Message::user(prompt);
     let mut agent = build_agent(provider, &model, system, tools, messages);
-    shared.session.lock().unwrap().append_user(&prompt)?;
+    shared.session.lock().unwrap().append_message(&message)?;
 
     println!(
         "{}",
@@ -127,7 +129,7 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
             "model": model.id,
         })
     );
-    println!("{}", json!({ "type": "user", "text": prompt }));
+    println!("{}", json!({ "type": "user", "text": message.text() }));
 
     let cancel = Cancel::new();
     spawn_ctrl_c(cancel.clone());
@@ -135,7 +137,7 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
     let mut sink = JsonSink {
         shared: shared.clone(),
     };
-    let outcome = agent.run_turn(prompt, &mut sink, cancel).await;
+    let outcome = agent.run_turn(message, &mut sink, cancel).await;
     let failed = outcome.is_err();
     let stats = shared.stats.lock().unwrap();
     let result = match outcome {
@@ -203,6 +205,8 @@ pub async fn run_interactive(
 
     let mut app = App::new(shared.status_info());
     app.logged_in = logged_in;
+    // Up/Down recall prompts from this and earlier runs in this directory.
+    app.input.seed_history(history::load());
     if let Some(count) = resumed {
         app.apply(UiEvent::Info(format!("resumed session ({count} messages)")));
     }
@@ -223,8 +227,19 @@ pub async fn run_interactive(
                         dirty = true;
                     }
                     InputMsg::Key(key) => match app.on_key(key) {
-                        Action::Submit(text) => {
-                            match slash_command(&text) {
+                        Action::Submit(mut submission) => {
+                            // Persist the prompt even if it is a slash command:
+                            // recalling `/login` later is useful too.
+                            history::append(&submission.text);
+                            // Slash commands are text-only. Keep any attached
+                            // images in the input box for the next prompt.
+                            let command = slash_command(&submission.text);
+                            if command.is_some() {
+                                for image in std::mem::take(&mut submission.images) {
+                                    let _ = ui_tx.send(UiEvent::ImageAttached(image));
+                                }
+                            }
+                            match command {
                                 Some(Slash::Login) => begin_login(&mut app, &args, &ui_tx),
                                 Some(Slash::Logout) => {
                                     logout(&mut app, &args, &agent, &ui_tx).await
@@ -238,6 +253,11 @@ pub async fn run_interactive(
                                     )));
                                 }
                                 None if !app.logged_in => {
+                                    // Give the images back instead of silently
+                                    // dropping what may be a 2 MB screenshot.
+                                    for image in submission.images {
+                                        let _ = ui_tx.send(UiEvent::ImageAttached(image));
+                                    }
                                     let _ = ui_tx.send(UiEvent::Info(
                                         "not logged in — type /login to sign in with DeepSeek, or run `pi login`"
                                             .into(),
@@ -250,11 +270,15 @@ pub async fn run_interactive(
                                         agent.clone(),
                                         shared.clone(),
                                         ui_tx.clone(),
-                                        text,
+                                        submission,
                                         cancel,
                                     );
                                 }
                             }
+                            dirty = true;
+                        }
+                        Action::PasteImage => {
+                            paste_image(&ui_tx);
                             dirty = true;
                         }
                         Action::Login(key) => {
@@ -296,7 +320,7 @@ pub async fn run_interactive(
     Ok(())
 }
 
-const HELP: &str = "/login   sign in and save your API key to auth.json\n/logout  remove the saved API key\n/help    show this";
+const HELP: &str = "/login   sign in and save your API key to auth.json\n/logout  remove the saved API key\n/help    show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Slash {
@@ -417,11 +441,27 @@ fn spawn_turn(
     agent: Arc<Mutex<Agent>>,
     shared: Shared,
     ui: UnboundedSender<UiEvent>,
-    text: String,
+    submission: Submission,
     cancel: Cancel,
 ) {
-    let _ = ui.send(UiEvent::User(text.clone()));
-    let _ = shared.session.lock().unwrap().append_user(&text);
+    let Submission { text, images } = submission;
+    let labels = images
+        .iter()
+        .map(ImageAttachment::label)
+        .collect::<Vec<_>>();
+    let message = Message::user_with_images(
+        text,
+        images
+            .into_iter()
+            .map(|image| Image::new(image.media_type, image.data))
+            .collect(),
+    );
+
+    let _ = ui.send(UiEvent::User {
+        text: message.text().to_string(),
+        images: labels,
+    });
+    let _ = shared.session.lock().unwrap().append_message(&message);
     let _ = ui.send(UiEvent::Busy(true));
 
     tokio::spawn(async move {
@@ -431,7 +471,7 @@ fn spawn_turn(
         };
         let result = {
             let mut agent = agent.lock().await;
-            agent.run_turn(text, &mut sink, cancel).await
+            agent.run_turn(message, &mut sink, cancel).await
         };
         match result {
             Ok(Outcome::Completed) => {}
@@ -445,6 +485,31 @@ fn spawn_turn(
         let _ = ui.send(UiEvent::Status(shared.status_info()));
         let _ = ui.send(UiEvent::Busy(false));
     });
+}
+
+/// Ctrl+V. Clipboard access is synchronous and cheap (one platform process);
+/// the UI is frozen for a few milliseconds, which is less surprising than
+/// images appearing after the prompt was already sent.
+fn paste_image(ui: &UnboundedSender<UiEvent>) {
+    match crate::clipboard::read_image() {
+        Ok(Some(image)) => {
+            let _ = ui.send(UiEvent::ImageAttached(ImageAttachment {
+                media_type: image.media_type.to_string(),
+                data: image.data,
+                bytes: image.bytes,
+                width: image.width,
+                height: image.height,
+            }));
+        }
+        Ok(None) => {
+            let _ = ui.send(UiEvent::Info(
+                "clipboard has no image — copy a screenshot first".into(),
+            ));
+        }
+        Err(error) => {
+            let _ = ui.send(UiEvent::Error(format!("paste image: {error}")));
+        }
+    }
 }
 
 enum InputMsg {

@@ -19,8 +19,8 @@ pub use event::{AgentEvent, Sink};
 pub use tool::{Tool, ToolResult};
 
 pub use llm::{
-    Cancel, ChatRequest, Error, Message, Model, Provider, Role, StopReason, StreamEvent, ToolCall,
-    ToolSpec, Usage,
+    Cancel, ChatRequest, Error, Image, Message, Model, Provider, Role, StopReason, StreamEvent,
+    ToolCall, ToolSpec, Usage,
 };
 
 /// The provider layer is upstream of everything; re-export the boxed-future

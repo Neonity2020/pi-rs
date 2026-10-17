@@ -2,7 +2,7 @@
 
 pub use tui::render as tui_render;
 pub use tui::{crossterm, ratatui};
-pub use tui::{Action, App, StatusInfo, UiEvent};
+pub use tui::{Action, App, ImageAttachment, StatusInfo, Submission, UiEvent};
 
 use agent::{AgentEvent, Sink};
 

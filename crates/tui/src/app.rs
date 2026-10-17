@@ -2,10 +2,58 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::wrap::display_width;
 
+/// An image waiting in the input box. The bytes stay in the app layer until
+/// the user submits; the TUI only needs the metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub media_type: String,
+    /// Base64, no data-URL prefix.
+    pub data: String,
+    pub bytes: usize,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl ImageAttachment {
+    pub fn label(&self) -> String {
+        let mut label = self
+            .media_type
+            .strip_prefix("image/")
+            .unwrap_or(&self.media_type)
+            .to_ascii_uppercase();
+        if let (Some(width), Some(height)) = (self.width, self.height) {
+            label.push_str(&format!(" {width}×{height}"));
+        }
+        label.push_str(" · ");
+        label.push_str(&human_bytes(self.bytes));
+        label
+    }
+}
+
+fn human_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else if bytes >= 10.0 * KB {
+        format!("{:.0} KB", bytes / KB)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes as usize)
+    }
+}
+
 /// Events pushed from the app layer into the UI.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    User(String),
+    User {
+        text: String,
+        /// Image labels for the transcript, not the image bytes.
+        images: Vec<String>,
+    },
+    ImageAttached(ImageAttachment),
     Info(String),
     Error(String),
     AssistantDelta(String),
@@ -59,11 +107,20 @@ impl StatusInfo {
     }
 }
 
+/// One submitted prompt: text plus any images attached to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
 /// What the key handler asks the app layer to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
-    Submit(String),
+    Submit(Submission),
+    /// Ctrl+V: read an image from the clipboard (I/O stays in the app layer).
+    PasteImage,
     /// The user pressed Enter in the login prompt with a non-empty key.
     Login(String),
     Interrupt,
@@ -87,7 +144,10 @@ pub enum ToolStatus {
 
 #[derive(Debug, Clone)]
 pub enum Item {
-    User(String),
+    User {
+        text: String,
+        images: Vec<String>,
+    },
     Assistant {
         text: String,
         reasoning: String,
@@ -110,11 +170,15 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub struct App {
     pub items: Vec<Item>,
     pub input: Input,
+    /// Images attached to the prompt being edited.
+    pub images: Vec<ImageAttachment>,
     /// Present while the mask takes over the input box.
     pub login: Option<LoginPrompt>,
     /// Whether an API key is available. Drives the input-box hint.
     pub logged_in: bool,
     pub busy: bool,
+    /// Whether the agent's reasoning blocks are expanded. Collapsed by default.
+    pub show_thinking: bool,
     pub status: StatusInfo,
     pub scroll: usize,
     pub follow: bool,
@@ -132,9 +196,11 @@ impl App {
         Self {
             items: Vec::new(),
             input: Input::default(),
+            images: Vec::new(),
             login: None,
             logged_in: true,
             busy: false,
+            show_thinking: false,
             status,
             scroll: 0,
             follow: true,
@@ -147,10 +213,11 @@ impl App {
 
     pub fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::User(text) => {
+            UiEvent::User { text, images } => {
                 self.finish_streaming();
-                self.items.push(Item::User(text));
+                self.items.push(Item::User { text, images });
             }
+            UiEvent::ImageAttached(image) => self.images.push(image),
             UiEvent::Info(text) => self.items.push(Item::Info(text)),
             UiEvent::Error(text) => self.items.push(Item::Error(text)),
             UiEvent::AssistantDelta(delta) => {
@@ -341,8 +408,18 @@ impl App {
                 } else if !self.input.text.is_empty() {
                     self.input.clear();
                     Action::None
+                } else if !self.images.is_empty() {
+                    self.images.clear();
+                    Action::None
                 } else {
                     Action::Quit
+                }
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') if ctrl => {
+                if self.busy {
+                    Action::None
+                } else {
+                    Action::PasteImage
                 }
             }
             KeyCode::Char('d') if ctrl => {
@@ -351,6 +428,14 @@ impl App {
                 } else {
                     Action::None
                 }
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') if ctrl => {
+                self.show_thinking = !self.show_thinking;
+                Action::None
+            }
+            KeyCode::Esc if !self.images.is_empty() => {
+                self.images.pop();
+                Action::None
             }
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert(c);
@@ -408,10 +493,13 @@ impl App {
                     return Action::None;
                 }
                 let text = self.input.take();
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && self.images.is_empty() {
                     Action::None
                 } else {
-                    Action::Submit(text)
+                    Action::Submit(Submission {
+                        text,
+                        images: std::mem::take(&mut self.images),
+                    })
                 }
             }
             _ => Action::None,
@@ -502,10 +590,19 @@ impl Input {
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;
         self.history_pos = None;
-        if !text.trim().is_empty() {
+        if !text.trim().is_empty() && self.history.last() != Some(&text) {
             self.history.push(text.clone());
         }
         text
+    }
+
+    /// Replace the in-memory history (oldest first), e.g. with prompts
+    /// persisted from earlier runs. The coding layer owns loading; `tui`
+    /// stays free of I/O.
+    pub fn seed_history(&mut self, entries: Vec<String>) {
+        self.history = entries;
+        self.history_pos = None;
+        self.stash.clear();
     }
 
     fn byte_index(&self, char_index: usize) -> usize {
@@ -639,6 +736,36 @@ mod tests {
     }
 
     #[test]
+    fn seeded_history_is_recalled_with_up_and_down() {
+        let mut input = Input::default();
+        input.seed_history(vec!["older".into(), "newer".into()]);
+        input.insert('x');
+
+        input.history_prev();
+        assert_eq!(input.text, "newer");
+        input.history_prev();
+        assert_eq!(input.text, "older");
+        input.history_next();
+        assert_eq!(input.text, "newer");
+        input.history_next();
+        // Back to the prompt that was being edited before browsing.
+        assert_eq!(input.text, "x");
+    }
+
+    #[test]
+    fn submitting_the_same_prompt_twice_keeps_one_entry() {
+        let mut input = Input::default();
+        for _ in 0..2 {
+            input.insert('a');
+            let _ = input.take();
+        }
+        input.history_prev();
+        assert_eq!(input.text, "a");
+        input.history_prev();
+        assert_eq!(input.text, "a");
+    }
+
+    #[test]
     fn cache_hit_rate_is_rounded_and_handles_empty_usage() {
         let mut status = StatusInfo::default();
         assert_eq!(status.cache_hit_rate(), None);
@@ -691,7 +818,10 @@ mod tests {
         let mut app = App::new(StatusInfo::default());
         app.input.insert('a');
         let _ = app.input.take();
-        app.apply(UiEvent::User("older".into()));
+        app.apply(UiEvent::User {
+            text: "older".into(),
+            images: Vec::new(),
+        });
         app.max_scroll = 5;
         app.scroll = 5;
 
@@ -723,7 +853,10 @@ mod tests {
         }
         assert_eq!(
             app.on_key(key(KeyCode::Enter)),
-            Action::Submit("hello".into())
+            Action::Submit(Submission {
+                text: "hello".into(),
+                images: Vec::new(),
+            })
         );
         assert!(app.input.text.is_empty());
     }
@@ -745,6 +878,17 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ctrl_t_toggles_thinking_visibility() {
+        let mut app = App::new(StatusInfo::default());
+        assert!(!app.show_thinking);
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key(ctrl_t), Action::None);
+        assert!(app.show_thinking);
+        assert_eq!(app.on_key(ctrl_t), Action::None);
+        assert!(!app.show_thinking);
     }
 
     #[test]
@@ -773,11 +917,103 @@ mod tests {
     #[test]
     fn submitted_user_message_becomes_a_transcript_item() {
         let mut app = App::new(StatusInfo::default());
-        app.apply(UiEvent::User("hello".into()));
-        assert!(matches!(&app.items[0], Item::User(text) if text == "hello"));
+        app.apply(UiEvent::User {
+            text: "hello".into(),
+            images: Vec::new(),
+        });
+        assert!(matches!(&app.items[0], Item::User { text, .. } if text == "hello"));
         // A second submission must not be swallowed either.
-        app.apply(UiEvent::User("again".into()));
+        app.apply(UiEvent::User {
+            text: "again".into(),
+            images: vec!["PNG · 1.0 KB".into()],
+        });
         assert_eq!(app.items.len(), 2);
+        assert!(matches!(&app.items[1], Item::User { images, .. } if images.len() == 1));
+    }
+
+    fn attachment() -> ImageAttachment {
+        ImageAttachment {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+            bytes: 1536,
+            width: Some(640),
+            height: Some(480),
+        }
+    }
+
+    #[test]
+    fn ctrl_v_asks_the_app_layer_for_a_clipboard_image() {
+        let mut app = App::new(StatusInfo::default());
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Action::PasteImage
+        );
+
+        // While busy the paste is ignored instead of queueing an image.
+        app.busy = true;
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn images_submit_with_or_without_text_and_are_cleared() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ImageAttached(attachment()));
+        assert_eq!(app.images.len(), 1);
+        assert_eq!(app.images[0].label(), "PNG 640×480 · 1.5 KB");
+
+        // An image-only turn is a valid submission.
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Submit(Submission {
+                text: String::new(),
+                images: vec![attachment()],
+            })
+        );
+        assert!(app.images.is_empty());
+
+        app.apply(UiEvent::ImageAttached(attachment()));
+        app.on_key(key(KeyCode::Char('h')));
+        app.on_key(key(KeyCode::Char('i')));
+        match app.on_key(key(KeyCode::Enter)) {
+            Action::Submit(submission) => {
+                assert_eq!(submission.text, "hi");
+                assert_eq!(submission.images.len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(app.images.is_empty());
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_drop_pending_images() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ImageAttached(attachment()));
+        app.apply(UiEvent::ImageAttached(attachment()));
+        assert_eq!(app.images.len(), 2);
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.images.len(), 1);
+
+        // Ctrl+C clears the input first, then images, then quits.
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+        assert!(app.input.text.is_empty());
+        assert_eq!(app.images.len(), 1);
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+        assert!(app.images.is_empty());
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        );
     }
 
     #[test]

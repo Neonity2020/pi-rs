@@ -16,7 +16,7 @@ pub mod provider;
 
 pub use cancel::Cancel;
 pub use error::Error;
-pub use message::{Message, Role, ToolCall};
+pub use message::{Image, Message, Role, ToolCall};
 pub use model::{Model, ModelCost, Rate, Usage};
 pub use openai::OpenAiCompat;
 pub use provider::{

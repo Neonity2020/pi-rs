@@ -35,6 +35,11 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   record. Do not add a conversion layer.
 - DeepSeek requires assistant `reasoning_content` to be echoed back verbatim
   whenever `tools` is present. Never strip it.
+- Images are base64 `llm::Image` values on user messages (session format).
+  Clipboard capture lives in `coding::clipboard` and shells out to the OS
+  (osascript / wl-paste / xclip / powershell) — no image crate, no new
+  dependency. The provider expands `images` into OpenAI `content` parts;
+  text-only messages keep the plain string form.
 - No new dependencies without a strong reason (the current list is: tokio,
   reqwest, serde, serde_json, thiserror, tokio-stream, ratatui, crossterm,
   unicode-width, anyhow, dotenvy).

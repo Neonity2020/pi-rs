@@ -5,6 +5,8 @@
 
 mod auth;
 mod cli;
+mod clipboard;
+mod history;
 mod login;
 mod modes;
 mod prompt;

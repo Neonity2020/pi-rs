@@ -59,10 +59,11 @@ done
 [ -n "$PORT" ] || { echo "error: preview server did not start" >&2; cat "$LOG" >&2; exit 1; }
 
 # Chrome sometimes exits nonzero after a successful capture, so trust the file.
+# Its stderr is macOS display/GCM noise; the finished PNG is the real signal.
 "$CHROME" --headless=new --disable-gpu --hide-scrollbars --no-first-run \
   --user-data-dir="$PROFILE" --force-device-scale-factor=2 \
   --window-size=1680,945 --virtual-time-budget=15000 \
-  --screenshot="$SHOT" "http://127.0.0.1:$PORT/" || true
+  --screenshot="$SHOT" "http://127.0.0.1:$PORT/" >/dev/null 2>&1 || true
 
 [ -s "$SHOT" ] || { echo "error: no screenshot produced" >&2; exit 1; }
 mv "$SHOT" "$OUT"

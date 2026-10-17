@@ -37,8 +37,8 @@
 ## 一次 turn 的数据流
 
 1. `coding::main` 解析参数，构造 provider、模型、工具集、系统提示、会话；按模式进入 `modes.rs`。
-2. 模式层先把用户输入写入会话文件（`append_user`），交互模式同时发一个 `UiEvent::User`。
-3. `Agent::run_turn(input, sink, cancel)` 把用户消息追加到内存历史，开始 step 循环。
+2. 模式层先把用户输入写成一条 `Message` 并追加到会话文件（`append_message`），交互模式同时发一个 `UiEvent::User`（只带图片标签，不带字节）。
+3. `Agent::run_turn(message, sink, cancel)` 把用户消息追加到内存历史，开始 step 循环。图片随消息进入历史。
 4. 每个 step：
    - 发 `AgentEvent::Step { step }`；
    - 调 `Provider::stream(ChatRequest, tx, cancel)`；
@@ -75,7 +75,7 @@ pub trait Provider: Send + Sync {
 - `OpenAiCompat` 同时服务 DeepSeek 与任意 OpenAI 兼容端点：`deepseek(...)` 额外携带 `thinking` / `reasoning_effort` 参数，`custom(...)` 不带。
 - SSE 逐行解析 `data:`；`[DONE]` 结束；忽略注释与空行；非法 JSON chunk 变成 `Error::Stream`，HTTP 非 2xx 变成 `Error::Api`（含截断的响应体）。
 - tool call 增量按 `index` 归位；没有 id 的调用在 agent 侧补 `call_{i}`。
-- `Message` 是唯一消息类型：线上格式、agent 历史、会话记录三位一体。`reasoning` 必须随 assistant 消息原样回传（DeepSeek + tools 的硬要求）。
+- `Message` 是唯一消息类型：agent 历史、会话记录、线上格式三位一体。`reasoning` 必须随 assistant 消息原样回传（DeepSeek + tools 的硬要求）。用户消息可带 base64 `Image`；文本消息继续用字符串 `content`，带图消息在发送时展开成 OpenAI 的 `[{type:"text"},…,{type:"image_url"}]` parts，会话文件里仍是同一个 `Message`。
 - `deepseek.rs` 维护模型注册表（上下文窗口、最大输出、峰谷价格）；未知模型照常工作，但成本显示为 `-`。
 - `mock.rs` 的 `ScriptedProvider` 让 agent 测试无需网络。
 
@@ -141,6 +141,10 @@ provider 分键：
 - 损坏的 auth.json 是硬错误（提示修好或删除），避免静默覆盖别的 provider。
 - `pi login` 的 key 来源：`--api-key` > provider 环境变量 > stdin（管道）>
   TTY 隐藏输入。TUI 内的 `/login` 总是要求重新输入。
+
+### 提示词历史
+
+TUI 里 `Up` / `Down` 翻阅历史 prompt：进入历史前先暂存正在编辑的内容，翻回最新一条之后还原。历史跨进程保存于 `$PI_RS_HOME/history/<cwd slug>`，一行一个 JSON 字符串，按工作目录隔离，只保留最近 200 条（加载时截断并重写文件；连续重复与空白 prompt 不入库）。`tui` 只持有内存里的 `Input` 历史；加载与追加在 `coding::history`，读写失败降级为空历史或直接忽略，不影响对话。
 
 ### 三种模式
 
@@ -215,8 +219,9 @@ ToolResult { content: String, is_error: bool }
 
 - 独立线程跑 `crossterm::event::read`，把按键/滚轮/尺寸变化送进 channel。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
-- `Action::Submit` 先看首 token：`/login`、`/logout`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。
-- 未登录时普通提交被拦下并提示 `/login`，不产生模型请求。
+- `Action::Submit` 先看首 token：`/login`、`/logout`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。
+- `Ctrl+V` 在 `tui` 里只产生 `Action::PasteImage`；`coding::clipboard` 读系统剪贴板（macOS `osascript`、Linux `wl-paste`/`xclip`、Windows PowerShell），把图片元数据装进 `UiEvent::ImageAttached`。字节留在 `App` 的待发送附件里，提交时随 `Message` 进会话。
+- 未登录时普通提交被拦下并提示 `/login`，不产生模型请求；已附的图片会退回输入框，避免静默丢失。
 - `/login` 的掩码输入属于 `App`（`Action::Login(key)`）；验证、写盘、换 provider 都在后台任务，结果以 `UiEvent::LoginDone` 回到主循环（关闭输入框、显示成功/失败）。
 - `Action::Submit` 触发 `spawn_turn`：后台拿 agent 锁跑一轮，`TuiSink` 把 `AgentEvent` 翻成 `UiEvent`，主循环消费并更新 `App`。
 - `TerminalGuard` 在 `Drop` 中恢复 raw mode 与主屏幕；即使出错也不把终端留在 alt screen。
@@ -227,7 +232,10 @@ ToolResult { content: String, is_error: bool }
 
 - `App`：消息项、输入框、忙碌态、滚动/跟随、状态栏、spinner、版本号。
 - `UiEvent`：用户消息、assistant 增量/最终文本、工具开始/结束、忙闲、状态刷新。
-- `Action`：`Submit` / `Interrupt` / `Quit` / `None`。
+- `Action`：`Submit(Submission)` / `PasteImage` / `Interrupt` / `Quit` / `None`；`Submission` 带文本和待发送图片，`PasteImage` 只请求应用层读剪贴板（TUI 不做 I/O）。
+- 输入框在有附件时多一行：`[1] PNG 640×480 · 148 B`；`Esc` 删除最后一张，`Ctrl+C` 依次清空文本、附件、退出。
+- `Up` / `Down` 调用 prompt 历史：`coding` 启动时把 `$PI_RS_HOME/history/<cwd slug>` 读进 `Input`，每次提交再追加回该文件；`tui` 不做 I/O。
+- 推理默认折叠成一行 `▸ Thinking · N lines`（流式时是 `⠋ Thinking…`）；`Ctrl+T` 展开/收起全部推理块。展开后逐行显示原始 reasoning，不进入 Markdown 渲染。
 - 渲染：transcript（Markdown）→ 状态栏 → 输入框。渲染时刷新 `viewport` / `max_scroll`；滚轮脱离跟随，回到底部自动恢复跟随。
 - `markdown.rs`：围栏代码（行号 + 语法高亮）、标题、列表、引用、表格、分隔线、行内代码/强调/链接；无法识别的内容按字面输出，**绝不丢字**。
 - `wrap.rs`：按显示宽度换行（CJK 宽字符、tab 展开、长词硬断）。
@@ -235,7 +243,7 @@ ToolResult { content: String, is_error: bool }
 ## 不变量
 
 1. 依赖方向只允许 `coding → agent → llm` 与 `coding → tui`。
-2. 消息只有一种格式，不做 wire/session 转换。
+2. 消息只有一种格式，不做 wire/session 转换；唯一例外是带图消息在发送时由 provider 展开为 OpenAI content parts，会话仍存同一个 `Message`。
 3. assistant 的 `reasoning` 原样保留并回传。
 4. 工具失败是 `ToolResult::is_error`，不是 `Err`，不终止循环。
 5. 工具集合是产品决定：默认且仅四个。
@@ -264,6 +272,9 @@ ToolResult { content: String, is_error: bool }
 | 工具 panic | 捕获为错误结果 | 循环继续 |
 | 用户取消 | `Outcome::Aborted`，保留已产出文本 | 重新提问 |
 | 会话末行损坏 | 跳过该行 | 自动恢复 |
+| 历史 prompt 文件损坏 | 跳过坏行；读不出就是空历史 | 继续使用，新 prompt 照常追加 |
+| 剪贴板没有图片 | 输入框上方提示，不产生消息 | 复制图片后重试 |
+| 剪贴板图片过大/格式不支持 | 错误提示，不进入会话 | 压缩或转成 PNG/JPEG |
 | TUI 出错 | `TerminalGuard::drop` 恢复终端 | 检查 stderr |
 
 ## 扩展点
@@ -284,8 +295,8 @@ ToolResult { content: String, is_error: bool }
 |---|---|---|
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
 | agent 单元 | `crates/agent/src/agent.rs` | 工具回环、并行顺序、中止、空流、panic |
-| coding 单元 | `crates/coding/src/*` | CLI、会话树、提示词合并、工具行为、统计、auth.json 读写与权限、斜杠命令解析 |
-| tui 单元 | `crates/tui/src/*` | 状态机、滚动、换行、Markdown/表格/高亮 |
+| coding 单元 | `crates/coding/src/*` | CLI、会话树、提示词合并、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
+| tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、换行、图片附件、Markdown/表格/高亮 |
 | e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi login`/`logout`、key 优先级、错误路径 |
 | PTY 冒烟 | `scripts/tui_*.py` | 真实终端：启动、输入、流式渲染、干净退出 |
 
@@ -296,6 +307,7 @@ ToolResult { content: String, is_error: bool }
 | 模型返回空 / 流断了 | `llm/openai.rs` 的 SSE 循环 |
 | tool call 丢参数 / 顺序乱 | `agent::Acc`、`execute_tools` |
 | 恢复会话少了消息 | `coding/session.rs` 的 parent 回溯 |
+| Ctrl+V 没有附上图片 | `coding/clipboard.rs` 的平台工具、`tui::Action::PasteImage` 的接线 |
 | 提示词里没有项目规则 | `coding/prompt.rs` 的搜索顺序 |
 | TUI 花屏 / 宽度错 | `tui/render.rs`、`tui/wrap.rs` |
 | 代码块高亮错位 | `tui/markdown.rs` 的 `highlight` / 行号槽 |

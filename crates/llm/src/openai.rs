@@ -333,7 +333,23 @@ fn wire_message(message: &Message) -> Value {
     if let Some(reasoning) = &message.reasoning {
         map.insert("reasoning_content".into(), json!(reasoning));
     }
-    if let Some(content) = &message.content {
+    if !message.images.is_empty() {
+        // OpenAI-style multimodal content. Text-only messages keep the plain
+        // string form so text-only providers (e.g. DeepSeek) are untouched.
+        let mut parts = Vec::with_capacity(message.images.len() + 1);
+        if let Some(text) = &message.content {
+            if !text.is_empty() {
+                parts.push(json!({ "type": "text", "text": text }));
+            }
+        }
+        for image in &message.images {
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": { "url": image.data_url() },
+            }));
+        }
+        map.insert("content".into(), Value::Array(parts));
+    } else if let Some(content) = &message.content {
         map.insert("content".into(), json!(content));
     } else if message.role == Role::Tool {
         map.insert("content".into(), json!(""));
@@ -599,6 +615,31 @@ mod tests {
         assert_eq!(tool["tool_call_id"], "call_1");
         assert_eq!(tool["content"], "file.txt");
         assert!(body.get("thinking").is_some());
+    }
+
+    #[test]
+    fn user_images_become_content_parts() {
+        let mut message = Message::user("what is this?");
+        message.images.push(crate::Image::new("image/png", "AAAA"));
+
+        let wire = wire_message(&message);
+        assert_eq!(wire["content"][0]["type"], "text");
+        assert_eq!(wire["content"][0]["text"], "what is this?");
+        assert_eq!(wire["content"][1]["type"], "image_url");
+        assert_eq!(
+            wire["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+
+        // Image-only: no empty text part.
+        let message = Message::user_with_images("", vec![crate::Image::new("image/png", "BBBB")]);
+        let wire = wire_message(&message);
+        assert_eq!(wire["content"].as_array().unwrap().len(), 1);
+        assert_eq!(wire["content"][0]["type"], "image_url");
+
+        // Text-only stays a plain string (DeepSeek compatibility).
+        let wire = wire_message(&Message::user("hi"));
+        assert_eq!(wire["content"], "hi");
     }
 
     #[test]
