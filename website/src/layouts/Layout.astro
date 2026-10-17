@@ -1,0 +1,90 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#f6eee0" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:locale" content="zh_CN" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=ZCOOL+QingKe+HuangYou&display=swap"
+    />
+  </head>
+
+  <body id="top">
+    <a class="skip" href="#main">跳到内容</a>
+
+    <header class="nav">
+      <div class="wrap nav-inner">
+        <a class="brand" href="#top" aria-label="pi-rs 首页">
+          <svg class="brand-mark" viewBox="0 0 560 560" aria-hidden="true">
+            <path
+              d="M420 280H280V140H0V0H420V280Z"
+              fill="#ffc93c"
+              stroke="#17140f"
+              stroke-width="26"
+              stroke-linejoin="round"></path>
+            <path
+              d="M560 560H420V280H560V560Z"
+              fill="#5fa8ff"
+              stroke="#17140f"
+              stroke-width="26"
+              stroke-linejoin="round"></path>
+            <path
+              d="M140 560H0V140H140V280H280V420H140V560Z"
+              fill="#ff6b57"
+              stroke="#17140f"
+              stroke-width="26"
+              stroke-linejoin="round"></path>
+          </svg>
+          <span class="brand-name">pi-rs</span>
+          <span class="brand-ver">v0.1</span>
+        </a>
+
+        <nav class="nav-links" aria-label="页面导航">
+          <a href="#why">哲学</a>
+          <a href="#tools">工具</a>
+          <a href="#arch">架构</a>
+          <a href="#not-built">没造的东西</a>
+          <a href="#start">上手</a>
+        </nav>
+
+        <a
+          class="btn btn--sm btn--ghost"
+          href="https://github.com/Neonity2020/pi-rs"
+          target="_blank"
+          rel="noreferrer"
+        >
+          GitHub <span aria-hidden="true">↗</span>
+        </a>
+      </div>
+    </header>
+
+    <main id="main">
+      <slot />
+    </main>
+  </body>
+</html>

@@ -16,6 +16,11 @@ Repository: https://github.com/Neonity2020/pi-rs
   feeds it `UiEvent`/keys and returns `Action`.
 - `crates/coding` — the `pi` binary. CLI, session JSONL, system prompt
   assembly, the four tools (read/write/edit/bash), and the three run modes.
+- `website/` — Astro landing page. Built outside Cargo, but it is a complete
+  part of the project: its copy must describe pi-rs as it actually is. Do not
+  invent features, providers, or claims, and do not grow the page with
+  content unrelated to the project. Update it when user-facing behavior
+  changes.
 - `docs/` — maintainer docs: goals, architecture, plan, development. Keep
   `docs/architecture.md` in sync with structural changes.
 
