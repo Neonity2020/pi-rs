@@ -68,6 +68,15 @@ pi -c                       # 继续本目录最近一次会话
 
 **扩展点是 Rust trait。** `llm::Provider` 和 `agent::Tool` 就是全部插件接口。没有动态加载，没有热重载；加一个后端 = 实现一个 trait，加一个工具 = 实现一个 trait。
 
+## 文档
+
+维护者视角的文档在 [`docs/`](docs/README.md)：
+
+- [目标](docs/goals.md) — 要什么、不要什么、成功标准
+- [架构](docs/architecture.md) — 分层、数据流、不变量、失败模型
+- [计划](docs/plan.md) — 里程碑、候选池、开放问题
+- [开发指南](docs/development.md) — 测试、扩展工具/provider、提交检查
+
 ## 会话
 
 每次会话一个 JSONL 文件：`~/.pi-rs/sessions/<cwd 的 slug>/<时间戳>.jsonl`。第一行是 header，之后每行一条消息记录，带 `id` + `parent` —— 文件是棵树而不是日志，目前读取时取活动分支（最后一条回溯到根）。assistant 的 `reasoning` 一并落盘，因为带 `tools` 的 DeepSeek 请求要求把历史 `reasoning_content` 原样带回（否则 API 返回 400），我们的消息格式与线上格式本来就一致，所以不需要任何转换。

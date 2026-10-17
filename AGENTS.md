@@ -14,6 +14,8 @@ be built.
   feeds it `UiEvent`/keys and returns `Action`.
 - `crates/coding` — the `pi` binary. CLI, session JSONL, system prompt
   assembly, the four tools (read/write/edit/bash), and the three run modes.
+- `docs/` — maintainer docs: goals, architecture, plan, development. Keep
+  `docs/architecture.md` in sync with structural changes.
 
 Dependency direction is strictly one-way: `coding -> agent -> llm`.
 `tui` is a leaf used only by `coding`.
