@@ -40,6 +40,19 @@ pub struct StatusInfo {
     pub cost: String,
 }
 
+impl StatusInfo {
+    /// Prompt-cache hit rate as a rounded percentage. `None` until the first
+    /// usage report, so an empty bar does not claim "0%".
+    pub fn cache_hit_rate(&self) -> Option<u64> {
+        if self.input_tokens == 0 {
+            return None;
+        }
+        let cached = u128::from(self.cached_tokens.min(self.input_tokens));
+        let input = u128::from(self.input_tokens);
+        Some(((cached * 100 + input / 2) / input) as u64)
+    }
+}
+
 /// What the key handler asks the app layer to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -518,6 +531,31 @@ mod tests {
         assert_eq!(input.text, "b");
         input.history_next();
         assert_eq!(input.text, "");
+    }
+
+    #[test]
+    fn cache_hit_rate_is_rounded_and_handles_empty_usage() {
+        let mut status = StatusInfo::default();
+        assert_eq!(status.cache_hit_rate(), None);
+
+        status.input_tokens = 1_000;
+        status.cached_tokens = 750;
+        assert_eq!(status.cache_hit_rate(), Some(75));
+
+        status.input_tokens = 3;
+        status.cached_tokens = 1;
+        assert_eq!(status.cache_hit_rate(), Some(33));
+
+        status.input_tokens = 1_000;
+        status.cached_tokens = 1;
+        assert_eq!(status.cache_hit_rate(), Some(0));
+
+        status.cached_tokens = 999;
+        assert_eq!(status.cache_hit_rate(), Some(100));
+
+        // A provider reporting more cached tokens than input must not exceed 100%.
+        status.cached_tokens = 2_000;
+        assert_eq!(status.cache_hit_rate(), Some(100));
     }
 
     #[test]

@@ -197,11 +197,15 @@ fn render_status(app: &App, frame: &mut Frame, rect: Rect) {
         status.model,
         status.dir
     );
+    let cache = match status.cache_hit_rate() {
+        Some(rate) => format!("cache {rate}%"),
+        None => "cache -".to_string(),
+    };
     let right = format!(
-        "↑{} ↓{} · cached {} · {}",
+        "↑{} ↓{} · {} · {}",
         crate::format_tokens(status.input_tokens),
         crate::format_tokens(status.output_tokens),
-        crate::format_tokens(status.cached_tokens),
+        cache,
         status.cost
     );
 
@@ -337,6 +341,38 @@ mod tests {
         let cell = &buffer.content[at];
         assert_eq!(cell.fg, Color::Rgb(229, 192, 123));
         assert_ne!(buffer.content[at - 6].fg, Color::Rgb(229, 192, 123));
+    }
+
+    #[test]
+    fn status_bar_shows_cache_hit_rate() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::StatusInfo;
+
+        let status = StatusInfo {
+            model: "deepseek-flash".into(),
+            dir: "proj".into(),
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cached_tokens: 7_500,
+            cost: "$0.01".into(),
+            ..StatusInfo::default()
+        };
+        let mut app = App::new(status);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("cache 75%"),
+            "status line missing: {screen}"
+        );
     }
 
     #[test]

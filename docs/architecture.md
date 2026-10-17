@@ -179,7 +179,7 @@ ToolResult { content: String, is_error: bool }
 | `ToolEnd` | 会话追加 tool 消息 |
 | `Usage` | 累加 token 与估价 |
 
-之后 print/json/tui sink 再做各自的展示。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按 DeepSeek 峰谷价估算（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日）。
+之后 print/json/tui sink 再做各自的展示。TUI 状态栏的缓存命中率按 `cached_tokens / input_tokens` 四舍五入，尚未收到 usage 或输入为 0 时显示 `cache -`。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按 DeepSeek 峰谷价估算（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日）。
 
 ### UI 接线
 
