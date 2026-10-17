@@ -4,6 +4,8 @@ pi-rs is a Rust workspace that reimplements the pi coding agent philosophy
 (a minimal agent harness). The governing rule: if we don't need it, it won't
 be built.
 
+Repository: https://github.com/Neonity2020/pi-rs
+
 ## Layout
 
 - `crates/llm` — provider layer. `Provider` trait, streaming SSE client,
