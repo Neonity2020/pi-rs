@@ -20,11 +20,20 @@
 ## 快速开始
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...          # https://platform.deepseek.com/api_keys
 cargo install --path crates/coding      # 或：cargo run -p pi-coding
+pi                                      # 打开 TUI，输入 /login
 ```
 
-不想动环境变量的话，把 `DEEPSEEK_API_KEY=sk-...` 写进 `.env` 就行（模板：仓库里的 `.env.example`，`cp .env.example .env` 即可）：启动时会从工作目录或最近上级目录加载，真实环境变量优先。
+`/login` 会提示粘贴 DeepSeek API key（输入不回显），先用 `GET /models` 验证，再把凭据写进 `~/.pi-rs/auth.json`（权限 0600）。验证失败不会保存。终端里也可以直接：
+
+```bash
+pi login                    # 隐藏输入；也接受 --api-key 或管道
+pi logout                   # 删除保存的凭据
+```
+
+凭据优先级：`--api-key` > 环境变量 / `.env` > `auth.json`。所以 CI 仍可注入 `DEEPSEEK_API_KEY`，不需要改用户的 auth 文件。
+
+不想用登录的话，把 `DEEPSEEK_API_KEY=sk-...` 写进 `.env` 同样有效（模板：仓库里的 `.env.example`，`cp .env.example .env`）：启动时会从工作目录或最近上级目录加载，真实环境变量优先。
 
 ```
 pi                          # 交互式 TUI
@@ -44,6 +53,8 @@ pi -c                       # 继续本目录最近一次会话
 --effort <level>      推理强度 low | high | max
 --tools <list>        限制工具集，如 --tools read,bash
 ```
+
+TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
 
 ## 设计决定（对 Pi 的忠实翻译）
 
@@ -88,10 +99,10 @@ pi -c                       # 继续本目录最近一次会话
 ## 测试
 
 ```bash
-cargo test          # 98 个测试，不需要 API key
+cargo test          # 112 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行、Markdown 渲染（表格、代码块行号与语法高亮），以及 8 个端到端测试——起本地 mock SSE 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行、Markdown 渲染（表格、代码块行号与语法高亮），以及 12 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi login` 保存与复用 auth.json、坏 key 不落盘、logout）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

@@ -4,7 +4,7 @@
 
 - Rust stable（edition 2021）。
 - Python 3（仅 PTY 冒烟脚本需要）。
-- 不需要真实 API key 即可跑测试；只有手动运行时需要 `DEEPSEEK_API_KEY`。
+- 不需要真实 API key 即可跑测试；只有手动运行时需要先 `pi login` 或设置 `DEEPSEEK_API_KEY`。
 
 ## 常用命令
 
@@ -27,8 +27,10 @@ python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi
 运行配置：
 
 ```bash
+cargo run -p pi-coding -- login  # 隐藏输入，验证后写入 ~/.pi-rs/auth.json
+# 或者：
 cp .env.example .env            # 填入 DEEPSEEK_API_KEY
-# 真实环境变量优先于 .env；空值视为未设置
+# 优先级：--api-key > 环境变量（含 .env）> auth.json；空值视为未设置
 ```
 
 ## 测试策略
@@ -37,7 +39,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 |---|---|---|
 | 单元 | 各 crate 内的 `#[cfg(test)]` | 纯逻辑，必要时用临时目录 |
 | agent | `llm::mock::ScriptedProvider` + 假工具 | 不碰网络，验证事件顺序 |
-| e2e | 起本地 TCP mock SSE，跑真实 `pi` | 每次用全新临时 cwd，避免开发者 `.env` 泄漏 |
+| e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
 | PTY | Python + 伪终端，跑真实二进制 | 验证 raw mode、流式渲染、干净退出 |
 
 写测试的几条规矩：

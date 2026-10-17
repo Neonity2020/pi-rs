@@ -94,25 +94,87 @@ fn sse(events: &[&str]) -> String {
 }
 
 fn pi() -> Command {
+    pi_in(&test_dir())
+}
+
+/// Isolate a run from the developer's machine: a fresh home for sessions and
+/// auth.json, plus a matching working directory so a stray `.env` cannot leak
+/// into a test. Reuse the same home to test state persisted across runs.
+fn pi_in(home: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-    // Isolate each run from the developer's machine: a fresh home for
-    // sessions plus a fresh working directory, so neither the surrounding
-    // environment nor a stray `.env` can leak into a test.
-    let dir = test_dir();
-    command.env("PI_RS_HOME", &dir);
-    command.current_dir(&dir);
+    command.env("PI_RS_HOME", home);
+    command.current_dir(home);
     command.env_remove("DEEPSEEK_API_KEY");
     command.env_remove("OPENAI_API_KEY");
     command
 }
 
+/// Feed stdin to the binary and collect its output (for `pi login`).
+fn run_with_stdin(mut command: Command, input: &str) -> std::process::Output {
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// One-shot HTTP mock for the `GET /models` key check during login.
+fn start_models_api(status: u16, body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            // Drain through the header terminator before answering; closing
+            // with unread bytes would send a TCP RST and can race the client.
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while find(&buffer, b"\r\n\r\n").is_none() {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                _ => "Error",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
 fn test_dir() -> std::path::PathBuf {
+    // Parallel tests can hit the same clock tick; the counter keeps their
+    // `PI_RS_HOME` (and therefore auth.json) separate.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let home = std::env::temp_dir().join(format!(
-        "pi-rs-e2e-{}",
+        "pi-rs-e2e-{}-{}-{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&home).unwrap();
     home
@@ -260,6 +322,8 @@ fn missing_api_key_fails_with_a_clear_message() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("DEEPSEEK_API_KEY"), "stderr: {stderr}");
+    // The fix should be discoverable, not just the env var name.
+    assert!(stderr.contains("pi login"), "stderr: {stderr}");
 }
 
 #[test]
@@ -343,4 +407,119 @@ fn help_and_version() {
     let version = pi().arg("--version").output().unwrap();
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains("pi"));
+}
+
+#[test]
+fn login_saves_auth_json_and_later_runs_use_it() {
+    let home = test_dir();
+    let models = start_models_api(200, r#"{"object":"list","data":[]}"#);
+
+    // The key arrives on stdin; no environment variable is set.
+    let output = run_with_stdin(
+        {
+            let mut command = pi_in(&home);
+            command.args(["login", "--base-url", &models]);
+            command
+        },
+        "sk-from-stdin\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let auth_path = home.join("auth.json");
+    let auth: Value = serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+    assert_eq!(auth["deepseek"]["type"], "api_key");
+    assert_eq!(auth["deepseek"]["key"], "sk-from-stdin");
+    assert_eq!(auth["deepseek"]["base_url"], models);
+
+    // The next run finds the key in auth.json and sends it to the API.
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"from auth"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+    let output = pi_in(&home)
+        .args(["-p", "hi", "--base-url", &base_url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("from auth"));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].header("authorization"), "bearer sk-from-stdin");
+}
+
+#[test]
+fn login_rejects_a_bad_key_without_writing_auth_json() {
+    let home = test_dir();
+    let models = start_models_api(401, r#"{"error":{"message":"invalid key"}}"#);
+
+    let output = pi_in(&home)
+        .args(["login", "--api-key", "sk-bad", "--base-url", &models])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rejected"), "stderr: {stderr}");
+    assert!(!home.join("auth.json").exists(), "auth.json must not exist");
+}
+
+#[test]
+fn env_key_beats_auth_json() {
+    let home = test_dir();
+    let models = start_models_api(200, r#"{"object":"list","data":[]}"#);
+    let output = pi_in(&home)
+        .args(["login", "--api-key", "sk-saved", "--base-url", &models])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+    let output = pi_in(&home)
+        .env("DEEPSEEK_API_KEY", "sk-from-env")
+        .args(["-p", "hi", "--base-url", &base_url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].header("authorization"), "bearer sk-from-env");
+}
+
+#[test]
+fn logout_removes_the_saved_credential() {
+    let home = test_dir();
+    let models = start_models_api(200, r#"{"object":"list","data":[]}"#);
+    let output = pi_in(&home)
+        .args(["login", "--api-key", "sk-saved", "--base-url", &models])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = pi_in(&home).args(["logout"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let auth: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+    assert!(auth.get("deepseek").is_none(), "auth.json: {auth}");
 }

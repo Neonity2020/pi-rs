@@ -3,7 +3,9 @@
 //!
 //! Layer rule: `coding` (this crate) -> `agent` -> `llm`.
 
+mod auth;
 mod cli;
+mod login;
 mod modes;
 mod prompt;
 mod session;
@@ -20,6 +22,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use llm::{deepseek, Effort, Model, OpenAiCompat, Provider, Thinking};
+
+const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,8 +53,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    match args.command {
+        Some(cli::Command::Login) => return login::run(&args).await,
+        Some(cli::Command::Logout) => return logout(&args),
+        None => {}
+    }
+
     let cwd = std::env::current_dir().context("get working directory")?;
-    let (provider, model) = build_provider(&args)?;
+    let model = model_for(&args)?;
+    let interactive = args.mode() == cli::Mode::Interactive;
+    let (provider, logged_in) = match resolve_api_key(&args)? {
+        Some(key) => (build_provider(&args, &key)?, true),
+        None if interactive => (no_credentials_provider(), false),
+        None => bail!(missing_key_message(&args)),
+    };
     let tool_list = match &args.tools {
         Some(names) => tools::specified(names).map_err(anyhow::Error::msg)?,
         None => tools::all(),
@@ -75,22 +91,25 @@ async fn main() -> Result<()> {
         (session::Session::create(&cwd, &model.id)?, Vec::new(), None)
     };
     let shared = sinks::Shared::new(session, model.clone());
+    let turn = modes::Turn {
+        provider,
+        model,
+        system,
+        tools: tool_list,
+        shared,
+        messages,
+    };
 
     match args.mode() {
         cli::Mode::Print => {
             let prompt = resolve_prompt(&args)?;
-            modes::run_print(provider, model, system, tool_list, shared, messages, prompt).await
+            modes::run_print(turn, prompt).await
         }
         cli::Mode::Json => {
             let prompt = resolve_prompt(&args)?;
-            modes::run_json(provider, model, system, tool_list, shared, messages, prompt).await
+            modes::run_json(turn, prompt).await
         }
-        cli::Mode::Interactive => {
-            modes::run_interactive(
-                provider, model, system, tool_list, shared, messages, resumed,
-            )
-            .await
-        }
+        cli::Mode::Interactive => modes::run_interactive(turn, resumed, logged_in, args).await,
     }
 }
 
@@ -110,60 +129,146 @@ fn resolve_prompt(args: &cli::Args) -> Result<String> {
     Ok(buffer.trim_end().to_string())
 }
 
-fn build_provider(args: &cli::Args) -> Result<(Arc<dyn Provider>, Model)> {
-    match args.provider.as_deref().unwrap_or("deepseek") {
+fn model_for(args: &cli::Args) -> Result<Model> {
+    match provider_name(args) {
+        "deepseek" => Ok(deepseek::model_or_unknown(
+            args.model.as_deref().unwrap_or(deepseek::DEFAULT_MODEL),
+        )),
+        "openai" => {
+            let id = args
+                .model
+                .as_deref()
+                .context("--model is required with --provider openai")?;
+            Ok(Model::unknown("openai", id))
+        }
+        other => bail!("unknown provider: {other}"),
+    }
+}
+
+pub(crate) fn provider_name(args: &cli::Args) -> &str {
+    args.provider.as_deref().unwrap_or("deepseek")
+}
+
+fn env_key_name(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "OPENAI_API_KEY",
+        _ => deepseek::API_KEY_ENV,
+    }
+}
+
+/// The provider's environment key, ignoring auth.json.
+pub(crate) fn env_api_key(provider: &str) -> Option<String> {
+    std::env::var(env_key_name(provider))
+        .ok()
+        // Treat blank values (e.g. an untouched .env template) as absent.
+        .filter(|key| !key.trim().is_empty())
+}
+
+pub(crate) fn default_base_url(provider: &str) -> &'static str {
+    match provider {
+        "openai" => OPENAI_BASE_URL,
+        _ => deepseek::BASE_URL,
+    }
+}
+
+/// `--base-url` > auth.json > provider default.
+pub(crate) fn base_url_for(args: &cli::Args) -> Result<String> {
+    if let Some(url) = &args.base_url {
+        return Ok(url.clone());
+    }
+    if let Some(url) = auth::AuthFile::credential(provider_name(args))?.and_then(|c| c.base_url) {
+        return Ok(url);
+    }
+    Ok(default_base_url(provider_name(args)).to_string())
+}
+
+/// `--api-key` > environment (including `.env`) > auth.json.
+pub(crate) fn resolve_api_key(args: &cli::Args) -> Result<Option<String>> {
+    let provider = provider_name(args);
+    if let Some(key) = args.api_key.clone().filter(|key| !key.trim().is_empty()) {
+        return Ok(Some(key));
+    }
+    if let Some(key) = env_api_key(provider) {
+        return Ok(Some(key));
+    }
+    Ok(auth::AuthFile::credential(provider)?
+        .map(|credential| credential.key)
+        .filter(|key| !key.trim().is_empty()))
+}
+
+pub(crate) fn build_provider(args: &cli::Args, api_key: &str) -> Result<Arc<dyn Provider>> {
+    let base_url = base_url_for(args)?;
+    match provider_name(args) {
         "deepseek" => {
-            let api_key = args
-                .api_key
-                .clone()
-                .or_else(|| std::env::var(deepseek::API_KEY_ENV).ok())
-                // Treat blank values (e.g. an untouched .env template) as absent.
-                .filter(|key| !key.trim().is_empty())
-                .with_context(|| {
-                    format!(
-                        "missing API key: set {}, add it to .env, or pass --api-key",
-                        deepseek::API_KEY_ENV
-                    )
-                })?;
             let thinking = if args.no_thinking {
                 Thinking::Disabled
             } else {
                 Thinking::Enabled
             };
             let effort = Some(args.effort.unwrap_or(Effort::High));
-            let mut compat = OpenAiCompat::deepseek(api_key, thinking, effort);
-            if let Some(base_url) = &args.base_url {
-                compat = compat.with_base_url(base_url.clone());
-            }
-            let model_id = args
-                .model
-                .clone()
-                .unwrap_or_else(|| deepseek::DEFAULT_MODEL.to_string());
-            Ok((Arc::new(compat), deepseek::model_or_unknown(&model_id)))
-        }
-        "openai" => {
-            let api_key = args
-                .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                // Treat blank values (e.g. an untouched .env template) as absent.
-                .filter(|key| !key.trim().is_empty())
-                .context(
-                    "missing API key: set OPENAI_API_KEY, add it to .env, or pass --api-key",
-                )?;
-            let base_url = args
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            let model_id = args
-                .model
-                .clone()
-                .context("--model is required with --provider openai")?;
-            Ok((
-                Arc::new(OpenAiCompat::custom("openai", base_url, api_key)),
-                Model::unknown("openai", &model_id),
+            Ok(Arc::new(
+                OpenAiCompat::deepseek(api_key, thinking, effort).with_base_url(base_url),
             ))
         }
+        "openai" => Ok(Arc::new(OpenAiCompat::custom("openai", base_url, api_key))),
         other => bail!("unknown provider: {other}"),
     }
+}
+
+fn missing_key_message(args: &cli::Args) -> String {
+    let provider = provider_name(args);
+    let login = if provider == "openai" {
+        "pi login --provider openai"
+    } else {
+        "pi login"
+    };
+    format!(
+        "missing API key: run `{login}`, set {}, add it to .env, or pass --api-key",
+        env_key_name(provider)
+    )
+}
+
+fn logout(args: &cli::Args) -> Result<()> {
+    let provider = provider_name(args);
+    if auth::AuthFile::remove(provider)? {
+        println!("removed saved credentials for {provider}");
+    } else {
+        println!("no saved credentials for {provider}");
+    }
+    if env_api_key(provider).is_some() {
+        println!(
+            "note: {} is still set and will keep being used",
+            env_key_name(provider)
+        );
+    } else if args
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        println!("note: --api-key still supplies a key for this run");
+    }
+    Ok(())
+}
+
+/// Placeholder provider for an interactive start without credentials. The
+/// TUI blocks normal prompts until `/login`, so this is only a safety net.
+pub(crate) fn no_credentials_provider() -> Arc<dyn Provider> {
+    struct NoCredentials;
+
+    impl Provider for NoCredentials {
+        fn name(&self) -> &'static str {
+            "none"
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _request: llm::ChatRequest<'a>,
+            _sink: tokio::sync::mpsc::UnboundedSender<llm::StreamEvent>,
+            _cancel: llm::Cancel,
+        ) -> llm::BoxFuture<'a, std::result::Result<(), llm::Error>> {
+            Box::pin(async { Err(llm::Error::Stream("not logged in — type /login".into())) })
+        }
+    }
+
+    Arc::new(NoCredentials)
 }

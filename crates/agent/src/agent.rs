@@ -57,6 +57,11 @@ impl Agent {
         &self.model
     }
 
+    /// Swap the provider without losing history (used after `/login`).
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }

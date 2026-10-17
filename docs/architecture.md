@@ -105,12 +105,42 @@ Step · Text · Reasoning · Assistant · ToolStart · ToolEnd · Usage
 ### 启动顺序
 
 1. 加载 `.env`（工作目录或最近上级；真实环境变量优先；坏文件只警告）。
-2. 解析参数（手写，不引 clap）。`--json` 必须有 prompt。
-3. 取得 cwd，构造 provider 与模型（缺 key 时给出可操作的错误）。
+2. 解析参数（手写，不引 clap）。`--json` 必须有 prompt；`login` / `logout` 是子命令。
+3. 取得 cwd，解析模型，再按 `--api-key` > 环境变量 > `auth.json` 取 key，构造 provider。
+   交互模式允许没有 key：用占位 provider 启动，输入框提示 `/login`；print/json
+   模式直接给出可操作的错误。`logout` 删除 auth.json 里的条目后退出。
 4. 选择工具集：默认四个，`--tools read,bash` 取子集，未知名字直接失败。
 5. 组装系统提示。
 6. 新建会话，或 `-c` 载入最近会话的活动分支。
-7. 进入模式；三种模式共用 `Shared`（会话 + 统计 + 模型）。
+7. 进入模式；三种模式共用 `Shared`（会话 + 统计 + 模型）与 `modes::Turn`。
+
+### 认证（auth.json）
+
+凭据是 `$PI_RS_HOME/auth.json`（默认 `~/.pi-rs`），格式与 Pi 一致——顶层按
+provider 分键：
+
+```json
+{
+  "deepseek": {
+    "type": "api_key",
+    "key": "sk-...",
+    "base_url": "https://api.deepseek.com",
+    "updated_at": "2026-10-17T22:10:00Z"
+  }
+}
+```
+
+- 写入只发生在 `pi login` / TUI `/login`：先 `GET {base_url}/models` 验证 key，
+  成功后才落盘（临时文件 + rename，文件 0600，目录 0700）。401/403 直接报错，
+  不会留下坏凭据。
+- 读取优先级：`--api-key` > 环境变量（含 `.env`）> `auth.json`。`base_url`
+  优先级：`--base-url` > auth.json > provider 默认值。
+- 交互模式的 `/login` 把输入框换成掩码输入；验证与保存跑在后台任务里，成功后
+  通过 `Agent::set_provider` 换掉 provider，会话历史不丢。`/logout` 只删除
+  auth.json 条目；如果环境变量里还有 key，会继续可用。
+- 损坏的 auth.json 是硬错误（提示修好或删除），避免静默覆盖别的 provider。
+- `pi login` 的 key 来源：`--api-key` > provider 环境变量 > stdin（管道）>
+  TTY 隐藏输入。TUI 内的 `/login` 总是要求重新输入。
 
 ### 三种模式
 
@@ -185,6 +215,9 @@ ToolResult { content: String, is_error: bool }
 
 - 独立线程跑 `crossterm::event::read`，把按键/滚轮/尺寸变化送进 channel。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
+- `Action::Submit` 先看首 token：`/login`、`/logout`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。
+- 未登录时普通提交被拦下并提示 `/login`，不产生模型请求。
+- `/login` 的掩码输入属于 `App`（`Action::Login(key)`）；验证、写盘、换 provider 都在后台任务，结果以 `UiEvent::LoginDone` 回到主循环（关闭输入框、显示成功/失败）。
 - `Action::Submit` 触发 `spawn_turn`：后台拿 agent 锁跑一轮，`TuiSink` 把 `AgentEvent` 翻成 `UiEvent`，主循环消费并更新 `App`。
 - `TerminalGuard` 在 `Drop` 中恢复 raw mode 与主屏幕；即使出错也不把终端留在 alt screen。
 
@@ -220,7 +253,10 @@ ToolResult { content: String, is_error: bool }
 
 | 故障 | 表现 | 恢复方式 |
 |---|---|---|
-| 缺 API key | 启动即失败，提示环境变量 / `.env` / `--api-key` | 配置后重试 |
+| 缺 API key（print/json） | 启动即失败，提示 `pi login` / 环境变量 / `.env` / `--api-key` | 登录或配置后重试 |
+| 缺 API key（TUI） | 正常启动，输入框提示未登录；普通提问被拦下 | `/login` |
+| 登录 key 被拒 | 不写 auth.json，登录框关闭并显示错误 | 重新 `/login` |
+| auth.json 损坏 | 启动报错并给出文件路径 | 修复或删除该文件 |
 | HTTP 非 2xx | `llm::Error::Api { status, body }` | 修正 key/端点/模型 |
 | 网络中断 | `llm::Error::Http` | 重试 |
 | SSE chunk 坏 / 空流 | `Error::Stream` | 重试；持续则查 provider |
@@ -248,9 +284,9 @@ ToolResult { content: String, is_error: bool }
 |---|---|---|
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
 | agent 单元 | `crates/agent/src/agent.rs` | 工具回环、并行顺序、中止、空流、panic |
-| coding 单元 | `crates/coding/src/*` | CLI、会话树、提示词合并、工具行为、统计 |
+| coding 单元 | `crates/coding/src/*` | CLI、会话树、提示词合并、工具行为、统计、auth.json 读写与权限、斜杠命令解析 |
 | tui 单元 | `crates/tui/src/*` | 状态机、滚动、换行、Markdown/表格/高亮 |
-| e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE：三种模式、`.env`、错误路径 |
+| e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi login`/`logout`、key 优先级、错误路径 |
 | PTY 冒烟 | `scripts/tui_*.py` | 真实终端：启动、输入、流式渲染、干净退出 |
 
 ## 改代码前的定位表

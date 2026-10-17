@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Item, ToolStatus};
+use crate::app::{App, Item, LoginPrompt, ToolStatus};
 use crate::wrap::{display_width, wrap};
 
 const INPUT_HEIGHT: u16 = 3;
@@ -225,8 +225,14 @@ fn render_status(app: &App, frame: &mut Frame, rect: Rect) {
 }
 
 fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
+    if let Some(login) = &app.login {
+        render_login_input(login, frame, rect);
+        return;
+    }
     let hint = if app.busy {
         " running — Ctrl+C to interrupt "
+    } else if !app.logged_in {
+        " Not logged in · type /login for DeepSeek · Ctrl+C to quit "
     } else if app.input.text.is_empty() {
         " Enter to send · Ctrl+C to quit · wheel/PgUp/PgDn to scroll "
     } else {
@@ -268,6 +274,44 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
     ]);
     frame.render_widget(Paragraph::new(line), inner);
     frame.set_cursor_position((inner.x + 2 + (cursor_col - h_scroll) as u16, inner.y));
+}
+
+/// Masked key entry: the key itself never reaches the framebuffer.
+fn render_login_input(login: &LoginPrompt, frame: &mut Frame, rect: Rect) {
+    let hint = if login.busy {
+        " verifying key… "
+    } else {
+        " paste API key · Enter to save · Esc to cancel "
+    };
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(Line::from(Span::styled(
+            format!(" {} login ", login.provider),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )))
+        .title_bottom(Line::from(Span::styled(
+            hint,
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width < 4 {
+        return;
+    }
+
+    let chars = login.input.text.chars().count();
+    let available = (inner.width - 2) as usize;
+    let start = chars.saturating_sub(available);
+    let visible = "•".repeat(chars - start);
+    let line = Line::from(vec![
+        Span::styled(
+            "❯ ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(visible),
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
+    frame.set_cursor_position((inner.x + 2 + (chars - start) as u16, inner.y));
 }
 
 /// Take `max_cols` display columns from `s`, starting at column `start`.
@@ -373,6 +417,35 @@ mod tests {
             screen.contains("cache 75%"),
             "status line missing: {screen}"
         );
+    }
+
+    #[test]
+    fn login_prompt_masks_the_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.begin_login("DeepSeek");
+        app.apply(UiEvent::Info("sign in".into()));
+        for c in "sk-secret".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!screen.contains("sk-secret"), "key leaked: {screen}");
+        assert!(screen.contains("DeepSeek login"), "missing title: {screen}");
+        assert!(screen.contains("••••"), "missing mask: {screen}");
     }
 
     #[test]

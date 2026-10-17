@@ -36,6 +36,9 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
 - `pi` loads `.env` at startup (dotenvy: the working directory or the nearest
   parent; real environment variables win). e2e runs the binary in a fresh
   temp CWD so a developer's `.env` cannot leak into tests.
+- API keys resolve as `--api-key` > env (incl. `.env`) > `$PI_RS_HOME/auth.json`.
+  Only `pi login` / `/login` writes auth.json (verify with `GET /models` first,
+  then atomic write, mode 0600). Tests must isolate `PI_RS_HOME`.
 - Keep the base system prompt under ~400 tokens.
 
 ## Commands

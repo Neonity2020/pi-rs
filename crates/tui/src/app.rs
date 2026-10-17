@@ -27,6 +27,12 @@ pub enum UiEvent {
     },
     Busy(bool),
     Status(StatusInfo),
+    /// A `/login` attempt finished: close the prompt, report, and (on
+    /// success) mark the session as authenticated.
+    LoginDone {
+        ok: bool,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,8 +64,18 @@ impl StatusInfo {
 pub enum Action {
     None,
     Submit(String),
+    /// The user pressed Enter in the login prompt with a non-empty key.
+    Login(String),
     Interrupt,
     Quit,
+}
+
+/// Masked API-key input shown in place of the normal prompt.
+#[derive(Debug, Clone)]
+pub struct LoginPrompt {
+    pub provider: String,
+    pub input: Input,
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +110,10 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub struct App {
     pub items: Vec<Item>,
     pub input: Input,
+    /// Present while the mask takes over the input box.
+    pub login: Option<LoginPrompt>,
+    /// Whether an API key is available. Drives the input-box hint.
+    pub logged_in: bool,
     pub busy: bool,
     pub status: StatusInfo,
     pub scroll: usize,
@@ -112,6 +132,8 @@ impl App {
         Self {
             items: Vec::new(),
             input: Input::default(),
+            login: None,
+            logged_in: true,
             busy: false,
             status,
             scroll: 0,
@@ -206,7 +228,26 @@ impl App {
             }
             UiEvent::Busy(busy) => self.busy = busy,
             UiEvent::Status(status) => self.status = status,
+            UiEvent::LoginDone { ok, message } => {
+                self.login = None;
+                if ok {
+                    self.logged_in = true;
+                    self.items.push(Item::Info(message));
+                } else {
+                    self.items.push(Item::Error(message));
+                }
+            }
         }
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Replace the input box with a masked key prompt.
+    pub fn begin_login(&mut self, provider: impl Into<String>) {
+        self.login = Some(LoginPrompt {
+            provider: provider.into(),
+            input: Input::default(),
+            busy: false,
+        });
         self.version = self.version.wrapping_add(1);
     }
 
@@ -289,6 +330,9 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if self.login.is_some() {
+            return self.on_login_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => {
@@ -373,10 +417,71 @@ impl App {
             _ => Action::None,
         }
     }
+
+    /// Keys while the masked login prompt is open. The prompt owns every
+    /// printable key; Esc cancels, Enter submits (unless a check is running).
+    fn on_login_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let busy = self.login.as_ref().is_some_and(|login| login.busy);
+        let cancel =
+            matches!(key.code, KeyCode::Esc) || (matches!(key.code, KeyCode::Char('c')) && ctrl);
+        if cancel {
+            if !busy {
+                self.login = None;
+                self.version = self.version.wrapping_add(1);
+            }
+            return Action::None;
+        }
+        if busy {
+            return Action::None;
+        }
+        let Some(login) = self.login.as_mut() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Char(c) if !ctrl => {
+                login.input.insert(c);
+                Action::None
+            }
+            KeyCode::Backspace => {
+                login.input.backspace();
+                Action::None
+            }
+            KeyCode::Delete => {
+                login.input.delete();
+                Action::None
+            }
+            KeyCode::Left => {
+                login.input.left();
+                Action::None
+            }
+            KeyCode::Right => {
+                login.input.right();
+                Action::None
+            }
+            KeyCode::Home => {
+                login.input.home();
+                Action::None
+            }
+            KeyCode::End => {
+                login.input.end();
+                Action::None
+            }
+            KeyCode::Enter => {
+                let text = login.input.text.trim().to_string();
+                if text.is_empty() {
+                    Action::None
+                } else {
+                    Action::Login(text)
+                }
+            }
+            _ => Action::None,
+        }
+    }
 }
 
 /// A single-line editor with history.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Input {
     pub text: String,
     /// Cursor position in characters.
@@ -673,5 +778,49 @@ mod tests {
         // A second submission must not be swallowed either.
         app.apply(UiEvent::User("again".into()));
         assert_eq!(app.items.len(), 2);
+    }
+
+    #[test]
+    fn login_prompt_collects_a_key_and_closes_on_result() {
+        let mut app = App::new(StatusInfo::default());
+        app.begin_login("DeepSeek");
+        for c in "sk-test".chars() {
+            assert_eq!(app.on_key(key(KeyCode::Char(c))), Action::None);
+        }
+        // Normal prompt keeps its own (empty) input.
+        assert!(app.input.text.is_empty());
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Login("sk-test".into())
+        );
+
+        // While the key is being checked, Enter does nothing.
+        app.login.as_mut().unwrap().busy = true;
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+
+        app.apply(UiEvent::LoginDone {
+            ok: true,
+            message: "logged in".into(),
+        });
+        assert!(app.login.is_none());
+        assert!(app.logged_in);
+        assert!(matches!(app.items.last(), Some(Item::Info(text)) if text == "logged in"));
+    }
+
+    #[test]
+    fn esc_cancels_login_and_a_failure_keeps_you_logged_out() {
+        let mut app = App::new(StatusInfo::default());
+        app.logged_in = false;
+        app.begin_login("DeepSeek");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.login.is_none());
+
+        app.begin_login("DeepSeek");
+        app.apply(UiEvent::LoginDone {
+            ok: false,
+            message: "rejected".into(),
+        });
+        assert!(!app.logged_in);
+        assert!(matches!(app.items.last(), Some(Item::Error(text)) if text == "rejected"));
     }
 }

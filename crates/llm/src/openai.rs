@@ -70,6 +70,32 @@ fn default_client() -> reqwest::Client {
         .expect("failed to build http client")
 }
 
+/// Check an API key against an OpenAI-compatible `GET /models` endpoint.
+///
+/// Login saves a key only after this succeeds, so a typo fails right away
+/// instead of on the first prompt. `/models` is free on DeepSeek and OpenAI.
+pub async fn verify_api_key(base_url: &str, api_key: &str) -> Result<(), Error> {
+    let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .user_agent(concat!("pi-rs/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(&endpoint)
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(Error::Api {
+        status: status.as_u16(),
+        body: truncate(&body, 2000),
+    })
+}
+
 impl Provider for OpenAiCompat {
     fn name(&self) -> &'static str {
         self.name

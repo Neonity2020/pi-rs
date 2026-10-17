@@ -5,6 +5,8 @@ use llm::Effort;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Args {
+    /// A subcommand (`login` / `logout`) instead of an agent turn.
+    pub command: Option<Command>,
     pub prompt: Option<String>,
     pub print: bool,
     pub json: bool,
@@ -37,6 +39,12 @@ pub enum Mode {
     Interactive,
     Print,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Login,
+    Logout,
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
@@ -93,8 +101,34 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unknown option: {other}"));
             }
-            _ => positionals.push(arg),
+            _ => {
+                // The first positional may be a subcommand, never a prompt.
+                if args.command.is_none() && positionals.is_empty() {
+                    match arg.as_str() {
+                        "login" => {
+                            args.command = Some(Command::Login);
+                            continue;
+                        }
+                        "logout" => {
+                            args.command = Some(Command::Logout);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                positionals.push(arg);
+            }
         }
+    }
+
+    if args.command.is_some() {
+        if !positionals.is_empty() {
+            return Err("login/logout take no prompt".into());
+        }
+        if args.json || args.print {
+            return Err("login/logout cannot be combined with --json or -p".into());
+        }
+        return Ok(args);
     }
 
     if !positionals.is_empty() {
@@ -111,6 +145,13 @@ pi-rs — a minimal coding agent (DeepSeek by default)
 
 USAGE:
     pi [OPTIONS] [PROMPT]
+    pi login [--api-key <key>] [--provider <name>] [--base-url <url>]
+    pi logout
+
+COMMANDS:
+    login                    verify an API key and save it to auth.json
+                             (reads $DEEPSEEK_API_KEY, stdin, or a hidden prompt)
+    logout                   remove the saved API key
 
 MODES:
     (no prompt)              interactive terminal UI
@@ -132,7 +173,12 @@ OPTIONS:
 
 ENV:
     DEEPSEEK_API_KEY         API key for the default provider
+    OPENAI_API_KEY           API key for --provider openai
     PI_RS_HOME               data directory (default: ~/.pi-rs)
+
+AUTH:
+    ~/.pi-rs/auth.json       written by `pi login` / `/login` (mode 0600);
+                             --api-key and environment variables win over it
 ";
 
 #[cfg(test)]
@@ -191,5 +237,25 @@ mod tests {
         assert!(parse_err(&["--model"]).contains("--model"));
         assert!(parse_err(&["--effort", "turbo"]).contains("effort"));
         assert!(parse_err(&["--provider", "gemini"]).contains("provider"));
+    }
+
+    #[test]
+    fn login_and_logout_are_commands() {
+        let login = parse_ok(&["login", "--api-key", "sk-x"]);
+        assert_eq!(login.command, Some(Command::Login));
+        assert_eq!(login.api_key.as_deref(), Some("sk-x"));
+        assert_eq!(login.prompt, None);
+
+        let logout = parse_ok(&["logout", "--provider", "openai"]);
+        assert_eq!(logout.command, Some(Command::Logout));
+        assert_eq!(logout.provider.as_deref(), Some("openai"));
+
+        // Anything after the command is a prompt, which login does not take.
+        assert!(parse_err(&["login", "now"]).contains("no prompt"));
+        assert!(parse_err(&["logout", "-p"]).contains("cannot be combined"));
+        // A later "login" is just part of the prompt.
+        let prompt = parse_ok(&["please", "login"]);
+        assert_eq!(prompt.command, None);
+        assert_eq!(prompt.prompt.as_deref(), Some("please login"));
     }
 }
