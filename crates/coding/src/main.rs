@@ -1,4 +1,4 @@
-//! pi — a minimal coding agent. Read / write / edit / bash, DeepSeek by
+//! pi-rs — a minimal coding agent. Read / write / edit / bash, DeepSeek by
 //! default, sessions on disk, no hidden magic.
 //!
 //! Layer rule: `coding` (this crate) -> `agent` -> `llm`.
@@ -8,6 +8,7 @@ mod cli;
 mod clipboard;
 mod history;
 mod login;
+mod memory;
 mod modes;
 mod prompt;
 mod session;
@@ -51,7 +52,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if args.version {
-        println!("pi {} (pi-rs)", env!("CARGO_PKG_VERSION"));
+        println!("pi-rs {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -102,6 +103,7 @@ async fn main() -> Result<()> {
         shared,
         messages,
         summary,
+        cwd,
     };
 
     match args.mode() {
@@ -117,7 +119,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// A prompt from the argument, or from stdin for `pi -p` in a pipeline.
+/// A prompt from the argument, or from stdin for `pi-rs -p` in a pipeline.
 fn resolve_prompt(args: &cli::Args) -> Result<String> {
     if let Some(prompt) = &args.prompt {
         return Ok(prompt.clone());
@@ -222,9 +224,9 @@ pub(crate) fn build_provider(args: &cli::Args, api_key: &str) -> Result<Arc<dyn 
 fn missing_key_message(args: &cli::Args) -> String {
     let provider = provider_name(args);
     let login = if provider == "openai" {
-        "pi login --provider openai"
+        "pi-rs login --provider openai"
     } else {
-        "pi login"
+        "pi-rs login"
     };
     format!(
         "missing API key: run `{login}`, set {}, add it to .env, or pass --api-key",

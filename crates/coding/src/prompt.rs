@@ -1,22 +1,26 @@
 //! System prompt assembly.
 //!
-//! Same discipline as pi: a short base prompt, plus `SYSTEM.md` (which
+//! Same discipline as Pi: a short base prompt, plus `SYSTEM.md` (which
 //! replaces the base entirely if present) plus `AGENTS.md` files merged
-//! root-down, deepest last. No hidden context.
+//! root-down, deepest last, plus a bounded long-term memory section.
+//! No hidden context.
 
 use std::path::{Path, PathBuf};
 
-use crate::util;
+use crate::{memory, util};
 
 /// Build the system prompt for a working directory.
 pub fn build(cwd: &Path) -> String {
-    let home = util::home_dir();
-    let mut prompt = match find_system_md(cwd, &home) {
+    build_with(cwd, &util::home_dir())
+}
+
+fn build_with(cwd: &Path, home: &Path) -> String {
+    let mut prompt = match find_system_md(cwd, home) {
         Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
         None => default_prompt(cwd),
     };
 
-    for (path, content) in agents_files(cwd, &home) {
+    for (path, content) in agents_files(cwd, home) {
         let content = content.trim();
         if content.is_empty() {
             continue;
@@ -26,6 +30,11 @@ pub fn build(cwd: &Path) -> String {
             path.display()
         ));
     }
+
+    // Memory goes last: it is context, not instructions, and keeping it at the
+    // end leaves the base + AGENTS prefix stable for provider prompt caching.
+    prompt.push_str("\n\n");
+    prompt.push_str(&memory::render_section(home, cwd));
     prompt
 }
 
@@ -68,7 +77,7 @@ fn agents_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, String)> {
 
 fn default_prompt(cwd: &Path) -> String {
     format!(
-        "You are pi, a coding agent working in the user's terminal.
+        "You are pi-rs, a coding agent working in the user's terminal.
 
 You have four tools:
 - read: read a file's contents (line-numbered).
@@ -142,21 +151,29 @@ mod tests {
         let prompt = build_with(&cwd, &home);
         assert!(prompt.starts_with("CUSTOM PROMPT"));
         assert!(prompt.contains("extra rules"));
-        assert!(!prompt.contains("You are pi, a coding agent"));
+        assert!(prompt.contains("# Long-term memory"));
+        assert!(!prompt.contains("You are pi-rs, a coding agent"));
     }
 
-    fn build_with(cwd: &Path, home: &Path) -> String {
-        let mut prompt = match find_system_md(cwd, home) {
-            Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
-            None => default_prompt(cwd),
-        };
-        for (path, content) in agents_files(cwd, home) {
-            prompt.push_str(&format!(
-                "\n\n# Instructions from {}\n\n{}",
-                path.display(),
-                content.trim()
-            ));
-        }
-        prompt
+    #[test]
+    fn memory_follows_agents_instructions() {
+        let home = temp_dir("home3");
+        let cwd = temp_dir("proj3");
+        std::fs::write(cwd.join("AGENTS.md"), "project rules").unwrap();
+        std::fs::write(home.join("MEMORY.md"), "- (2026-10-17) global note\n").unwrap();
+        std::fs::create_dir_all(home.join("memory")).unwrap();
+        std::fs::write(
+            memory::project_path(&home, &cwd),
+            "- (2026-10-16) project note\n",
+        )
+        .unwrap();
+
+        let prompt = build_with(&cwd, &home);
+        let agents = prompt.find("project rules").unwrap();
+        let memory = prompt.find("# Long-term memory").unwrap();
+        assert!(agents < memory, "memory should come after AGENTS.md");
+        assert!(prompt.contains("global note"));
+        assert!(prompt.contains("project note"));
+        assert!(prompt.contains(&home.join("MEMORY.md").display().to_string()));
     }
 }

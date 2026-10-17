@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Item, LoginPrompt, ToolStatus};
+use crate::app::{App, Item, LoginPrompt, ThinkingHit, ToolEntry, ToolStatus};
 use crate::wrap::{display_width, wrap};
 
 const INPUT_HEIGHT: u16 = 3;
@@ -14,6 +14,8 @@ const TOOL_PREVIEW_LINES: usize = 6;
 /// Draw the whole UI. Also keeps viewport/scroll bookkeeping in sync.
 pub fn render(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
+    app.thinking_hits.clear();
+    app.transcript_top = area.y;
     let input_height = INPUT_HEIGHT + u16::from(!app.images.is_empty());
     if area.width < 8 || area.height < STATUS_HEIGHT + input_height + 1 {
         return;
@@ -45,7 +47,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 }
 
 fn render_transcript(app: &mut App, frame: &mut Frame, rect: Rect) {
-    let lines = transcript_lines(app, rect.width as usize);
+    let (lines, hits) = transcript_lines(app, rect.width as usize);
+    app.thinking_hits = hits;
+    app.transcript_top = rect.y;
     let max_scroll = lines.len().saturating_sub(rect.height as usize);
     let scroll = if app.follow {
         max_scroll
@@ -61,51 +65,103 @@ fn render_transcript(app: &mut App, frame: &mut Frame, rect: Rect) {
     frame.render_widget(paragraph, rect);
 }
 
-/// Render an assistant's reasoning either as a one-line collapsed summary or
-/// as the full transcript. Collapsed streaming blocks animate with the spinner.
-fn thinking_lines(
-    reasoning: &str,
+fn thinking_header(
     streaming: bool,
     expanded: bool,
-    width: usize,
+    reasoning: &str,
+    tools: &[ToolEntry],
     spinner: &str,
-) -> Vec<Line<'static>> {
-    if reasoning.is_empty() {
-        return Vec::new();
-    }
+) -> Line<'static> {
     let style = Style::new()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::ITALIC);
-    let mut lines = Vec::new();
-    if expanded {
-        let title = if streaming {
-            "▾ Thinking…"
-        } else {
-            "▾ Thinking"
-        };
-        lines.push(Line::from(Span::styled(title, style)));
-        for segment in wrap(reasoning, width.saturating_sub(2)) {
-            lines.push(Line::from(Span::styled(format!("  {segment}"), style)));
-        }
-    } else if streaming {
-        lines.push(Line::from(Span::styled(
-            format!("{spinner} Thinking…"),
-            style,
-        )));
+    let mut title = if streaming {
+        format!("{spinner} 正在思考…")
+    } else if expanded {
+        "▾ 正在思考".to_string()
     } else {
-        let count = reasoning.lines().count().max(1);
-        let unit = if count == 1 { "line" } else { "lines" };
-        lines.push(Line::from(Span::styled(
-            format!("▸ Thinking · {count} {unit}"),
-            style,
-        )));
+        "▸ 正在思考".to_string()
+    };
+    let mut details = Vec::new();
+    let reasoning_lines = reasoning.lines().count();
+    if reasoning_lines > 0 {
+        details.push(format!("{reasoning_lines} 行推理"));
+    }
+    if !tools.is_empty() {
+        details.push(format!("{} 个工具", tools.len()));
+    }
+    let failed = tools
+        .iter()
+        .filter(|tool| tool.status == ToolStatus::Failed)
+        .count();
+    if failed > 0 {
+        details.push(format!("{failed} 失败"));
+    }
+    if !details.is_empty() {
+        title.push_str(" · ");
+        title.push_str(&details.join(" · "));
+    }
+    if !expanded {
+        title.push_str(" · 点击展开");
+    }
+    Line::from(Span::styled(title, style))
+}
+
+fn tool_lines(tool: &ToolEntry, width: usize, spinner: &str) -> Vec<Line<'static>> {
+    let (mark, mark_style, timing) = match tool.status {
+        ToolStatus::Running => (
+            spinner.to_string(),
+            Style::new().fg(Color::Yellow),
+            String::new(),
+        ),
+        ToolStatus::Ok => (
+            "✓".to_string(),
+            Style::new().fg(Color::Green),
+            format!(" {}ms", tool.duration_ms),
+        ),
+        ToolStatus::Failed => (
+            "✗".to_string(),
+            Style::new().fg(Color::Red),
+            format!(" {}ms", tool.duration_ms),
+        ),
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  ⏺ ", Style::new().fg(Color::Magenta)),
+        Span::raw(format!("{}({})", tool.name, tool.summary)),
+        Span::raw(" "),
+        Span::styled(format!("{mark}{timing}"), mark_style),
+    ])];
+
+    if !tool.output.is_empty() && tool.status != ToolStatus::Running {
+        let preview_style = match tool.status {
+            ToolStatus::Failed => Style::new().fg(Color::Red).add_modifier(Modifier::DIM),
+            _ => Style::new().fg(Color::DarkGray),
+        };
+        let all: Vec<&str> = tool.output.lines().collect();
+        let shown = all.len().min(TOOL_PREVIEW_LINES);
+        for segment in all[..shown]
+            .iter()
+            .flat_map(|line| wrap(line, width.saturating_sub(4).max(1)))
+        {
+            lines.push(Line::from(Span::styled(
+                format!("    {segment}"),
+                preview_style,
+            )));
+        }
+        if all.len() > shown {
+            lines.push(Line::from(Span::styled(
+                format!("    … +{} lines", all.len() - shown),
+                Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            )));
+        }
     }
     lines
 }
 
-fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<ThinkingHit>) {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hits: Vec<ThinkingHit> = Vec::new();
 
     for item in &app.items {
         match item {
@@ -142,18 +198,45 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 }
                 lines.push(Line::default());
             }
-            Item::Assistant {
-                text,
+            Item::Thinking {
+                id,
                 reasoning,
+                tools,
                 streaming,
             } => {
-                let mut thinking = thinking_lines(
-                    reasoning,
+                let expanded = app.thinking_expanded(*id);
+                hits.push(ThinkingHit {
+                    line: lines.len(),
+                    id: *id,
+                });
+                lines.push(thinking_header(
                     *streaming,
-                    app.show_thinking,
-                    width,
+                    expanded,
+                    reasoning,
+                    tools,
                     app.spinner_char(),
-                );
+                ));
+                if expanded {
+                    let reasoning_style = Style::new()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    if !reasoning.is_empty() {
+                        for segment in wrap(reasoning, width.saturating_sub(2)) {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {segment}"),
+                                reasoning_style,
+                            )));
+                        }
+                    }
+                    for tool in tools {
+                        lines.extend(tool_lines(tool, width, app.spinner_char()));
+                    }
+                }
+                if !*streaming {
+                    lines.push(Line::default());
+                }
+            }
+            Item::Assistant { text, streaming } => {
                 let mut rendered = crate::markdown::lines(text, width);
                 if rendered.is_empty() && !text.is_empty() {
                     rendered.push(Line::default());
@@ -162,74 +245,12 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     let cursor = Span::styled("▌", Style::new().fg(Color::DarkGray));
                     if let Some(last) = rendered.last_mut() {
                         last.spans.push(cursor);
-                    } else if let Some(last) = thinking.last_mut() {
-                        last.spans.push(cursor);
                     } else {
                         rendered.push(Line::from(cursor));
                     }
                 }
-                lines.extend(thinking);
                 lines.extend(rendered);
-                if !*streaming && (!text.is_empty() || !reasoning.is_empty()) {
-                    lines.push(Line::default());
-                }
-            }
-            Item::Tool {
-                name,
-                summary,
-                status,
-                output,
-                duration_ms,
-                ..
-            } => {
-                let (mark, mark_style, timing) = match status {
-                    ToolStatus::Running => (
-                        app.spinner_char().to_string(),
-                        Style::new().fg(Color::Yellow),
-                        String::new(),
-                    ),
-                    ToolStatus::Ok => (
-                        "✓".to_string(),
-                        Style::new().fg(Color::Green),
-                        format!(" {duration_ms}ms"),
-                    ),
-                    ToolStatus::Failed => (
-                        "✗".to_string(),
-                        Style::new().fg(Color::Red),
-                        format!(" {duration_ms}ms"),
-                    ),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("⏺ ", Style::new().fg(Color::Magenta)),
-                    Span::raw(format!("{name}({summary})")),
-                    Span::raw(" "),
-                    Span::styled(format!("{mark}{timing}"), mark_style),
-                ]));
-
-                if !output.is_empty() && *status != ToolStatus::Running {
-                    let preview_style = match status {
-                        ToolStatus::Failed => {
-                            Style::new().fg(Color::Red).add_modifier(Modifier::DIM)
-                        }
-                        _ => Style::new().fg(Color::DarkGray),
-                    };
-                    let all: Vec<&str> = output.lines().collect();
-                    let shown = all.len().min(TOOL_PREVIEW_LINES);
-                    for segment in all[..shown]
-                        .iter()
-                        .flat_map(|l| wrap(l, width.saturating_sub(2)))
-                    {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {segment}"),
-                            preview_style,
-                        )));
-                    }
-                    if all.len() > shown {
-                        lines.push(Line::from(Span::styled(
-                            format!("  … +{} lines", all.len() - shown),
-                            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-                        )));
-                    }
+                if !*streaming && !text.is_empty() {
                     lines.push(Line::default());
                 }
             }
@@ -251,7 +272,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    lines
+    (lines, hits)
 }
 
 fn render_status(app: &App, frame: &mut Frame, rect: Rect) {
@@ -313,7 +334,7 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
         .title(Line::from(Span::styled(
-            " pi ",
+            " pi-rs ",
             Style::new().fg(Color::DarkGray),
         )))
         .title_bottom(Line::from(Span::styled(
@@ -507,8 +528,9 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
+        let flat = screen.replace(' ', "");
         assert!(
-            screen.contains("▸ Thinking · 2 lines"),
+            flat.contains("▸正在思考·2行推理·点击展开"),
             "missing header: {screen}"
         );
         assert!(screen.contains("answer"));
@@ -526,8 +548,9 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
+        let flat = screen.replace(' ', "");
         assert!(
-            screen.contains("▾ Thinking"),
+            flat.contains("▾正在思考"),
             "missing expanded header: {screen}"
         );
         assert!(
@@ -555,13 +578,92 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(
-            screen.contains("Thinking…"),
-            "missing live header: {screen}"
-        );
+        let flat = screen.replace(' ', "");
+        assert!(flat.contains("正在思考…"), "missing live header: {screen}");
         assert!(
             !screen.contains("still thinking"),
             "reasoning leaked: {screen}"
+        );
+    }
+
+    #[test]
+    fn tool_calls_are_folded_and_click_expands_the_block() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("secret plan".into()));
+        app.apply(UiEvent::ToolStart {
+            id: "c1".into(),
+            name: "read".into(),
+            summary: "src/lib.rs".into(),
+        });
+        app.apply(UiEvent::ToolDone {
+            id: "c1".into(),
+            ok: true,
+            output: "file body".into(),
+            duration_ms: 4,
+        });
+        app.apply(UiEvent::AssistantDone {
+            text: "answer".into(),
+        });
+
+        let width = 60;
+        let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        let flat = screen.replace(' ', "");
+        assert!(flat.contains("正在思考·1行推理·1个工具"), "{screen}");
+        assert!(screen.contains("answer"));
+        assert!(
+            !screen.contains("secret plan"),
+            "reasoning leaked: {screen}"
+        );
+        assert!(
+            !screen.contains("read(src/lib.rs)"),
+            "tool leaked: {screen}"
+        );
+
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let header = rows
+            .iter()
+            .position(|row| row.contains("思"))
+            .expect("thinking header visible");
+        assert!(app.on_click(0, header as u16));
+
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("secret plan"),
+            "reasoning not expanded: {screen}"
+        );
+        assert!(
+            screen.contains("read(src/lib.rs)"),
+            "tool not expanded: {screen}"
+        );
+        assert!(
+            screen.contains("file body"),
+            "tool output missing: {screen}"
         );
     }
 

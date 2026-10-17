@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PTY smoke test for the pi TUI: start it, wait, send Ctrl+C, expect a clean exit."""
+"""PTY smoke test for the pi-rs TUI: start it, wait, send Ctrl+C, expect a clean exit."""
 import os
 import pty
 import select

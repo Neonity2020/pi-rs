@@ -2,6 +2,7 @@
 //! All of them drive the same `Agent` with the same tools, prompt and
 //! session; only the event sink and the loop differ.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -16,8 +17,8 @@ use tokio::sync::Mutex;
 use crate::sinks::{JsonSink, PrintSink, Shared};
 use crate::stats::format_tokens;
 use crate::ui::{self, Action, App, ImageAttachment, Submission, UiEvent};
-use crate::{auth, cli, history, login};
-use ui::crossterm::event::MouseEventKind;
+use crate::{auth, cli, history, login, memory, util};
+use ui::crossterm::event::{MouseButton, MouseEventKind};
 
 type Tools = Vec<Arc<dyn Tool>>;
 
@@ -33,6 +34,8 @@ pub struct Turn {
     /// Summary from the latest compaction, so the agent updates it instead of
     /// re-summarizing the whole prefix.
     pub summary: Option<String>,
+    /// Working directory, for scoping long-term memory commands.
+    pub cwd: PathBuf,
 }
 
 /// Cancel on Ctrl+C; a second Ctrl+C exits immediately.
@@ -81,6 +84,7 @@ pub async fn run_print(turn: Turn, prompt: String) -> anyhow::Result<()> {
         shared,
         messages,
         summary,
+        cwd: _,
     } = turn;
     let message = Message::user(prompt);
     let mut agent = build_agent(provider, &model, system, tools, messages, summary);
@@ -123,6 +127,7 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
         shared,
         messages,
         summary,
+        cwd: _,
     } = turn;
     let message = Message::user(prompt);
     let mut agent = build_agent(provider, &model, system, tools, messages, summary);
@@ -179,6 +184,7 @@ pub async fn run_interactive(
         shared,
         messages,
         summary,
+        cwd,
     } = turn;
     let agent = Arc::new(Mutex::new(build_agent(
         provider, &model, system, tools, messages, summary,
@@ -193,12 +199,16 @@ pub async fn run_interactive(
                 }
             }
             Ok(ui::crossterm::event::Event::Mouse(mouse)) => {
-                let delta = match mouse.kind {
-                    MouseEventKind::ScrollUp => -1,
-                    MouseEventKind::ScrollDown => 1,
+                let message = match mouse.kind {
+                    MouseEventKind::ScrollUp => InputMsg::Scroll(-1),
+                    MouseEventKind::ScrollDown => InputMsg::Scroll(1),
+                    MouseEventKind::Down(MouseButton::Left) => InputMsg::Click {
+                        column: mouse.column,
+                        row: mouse.row,
+                    },
                     _ => continue,
                 };
-                if key_tx.send(InputMsg::Scroll(delta)).is_err() {
+                if key_tx.send(message).is_err() {
                     break;
                 }
             }
@@ -235,6 +245,11 @@ pub async fn run_interactive(
                         app.on_scroll(delta);
                         dirty = true;
                     }
+                    InputMsg::Click { column, row } => {
+                        if app.on_click(column, row) {
+                            dirty = true;
+                        }
+                    }
                     InputMsg::Key(key) => match app.on_key(key) {
                         Action::Submit(mut submission) => {
                             // Persist the prompt even if it is a slash command:
@@ -255,6 +270,18 @@ pub async fn run_interactive(
                                 }
                                 Some(Slash::Help) => {
                                     let _ = ui_tx.send(UiEvent::Info(HELP.into()));
+                                }
+                                Some(Slash::Remember { scope, text }) => {
+                                    remember_memory(&cwd, scope, &text, &ui_tx);
+                                }
+                                Some(Slash::Forget { scope, text }) => {
+                                    forget_memory(&cwd, scope, &text, &ui_tx);
+                                }
+                                Some(Slash::Memory) => {
+                                    let _ = ui_tx.send(UiEvent::Info(memory::describe(
+                                        &util::home_dir(),
+                                        &cwd,
+                                    )));
                                 }
                                 Some(Slash::Compact) => {
                                     if app.busy {
@@ -307,7 +334,7 @@ pub async fn run_interactive(
                                 }
                                 Some(Slash::Unknown(name)) => {
                                     let _ = ui_tx.send(UiEvent::Error(format!(
-                                        "unknown command: {name} — try /login, /logout, /compact, /help"
+                                        "unknown command: {name} — try /login, /logout, /compact, /remember, /forget, /memory, /help"
                                     )));
                                 }
                                 None if !app.logged_in => {
@@ -317,7 +344,7 @@ pub async fn run_interactive(
                                         let _ = ui_tx.send(UiEvent::ImageAttached(image));
                                     }
                                     let _ = ui_tx.send(UiEvent::Info(
-                                        "not logged in — type /login to sign in with DeepSeek, or run `pi login`"
+                                        "not logged in — type /login to sign in with DeepSeek, or run `pi-rs login`"
                                             .into(),
                                     ));
                                 }
@@ -378,30 +405,127 @@ pub async fn run_interactive(
     Ok(())
 }
 
-const HELP: &str = "/login    sign in and save your API key to auth.json\n/logout   remove the saved API key\n/compact  summarize older messages to free context\n/help     show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
+const HELP: &str = "/login            sign in and save your API key to auth.json\n/logout           remove the saved API key\n/compact          summarize older messages to free context\n/remember <text>  add a note to this project's long-term memory\n/remember global  add a note for all projects\n/forget <text>    remove matching notes from this project's memory\n/memory           show memory file paths and counts\n/help             show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Slash {
     Login,
     Logout,
     Compact,
+    Remember { scope: memory::Scope, text: String },
+    Forget { scope: memory::Scope, text: String },
+    Memory,
     Help,
     Unknown(String),
 }
 
 /// `/login` etc. only count when they are the whole first token.
 fn slash_command(text: &str) -> Option<Slash> {
-    let command = text.split_whitespace().next()?;
-    if !command.starts_with('/') {
+    let text = text.trim();
+    if !text.starts_with('/') {
         return None;
     }
+    let (command, rest) = text
+        .split_once(|c: char| c.is_whitespace())
+        .unwrap_or((text, ""));
+    let rest = rest.trim_start();
     Some(match command {
         "/login" => Slash::Login,
         "/logout" => Slash::Logout,
         "/compact" => Slash::Compact,
+        "/remember" => {
+            let (scope, text) = split_scope(rest);
+            Slash::Remember {
+                scope,
+                text: text.to_string(),
+            }
+        }
+        "/forget" => {
+            let (scope, text) = split_scope(rest);
+            Slash::Forget {
+                scope,
+                text: text.to_string(),
+            }
+        }
+        "/memory" => Slash::Memory,
         "/help" => Slash::Help,
         other => Slash::Unknown(other.to_string()),
     })
+}
+
+/// `/remember global ...` writes to the global file; everything else is
+/// project-scoped. Only a standalone `global` first word counts.
+fn split_scope(rest: &str) -> (memory::Scope, &str) {
+    if rest == "global" {
+        return (memory::Scope::Global, "");
+    }
+    if let Some(after) = rest.strip_prefix("global") {
+        if after.chars().next().is_some_and(char::is_whitespace) {
+            return (memory::Scope::Global, after.trim_start());
+        }
+    }
+    (memory::Scope::Project, rest)
+}
+
+fn remember_memory(
+    cwd: &std::path::Path,
+    scope: memory::Scope,
+    text: &str,
+    ui: &UnboundedSender<UiEvent>,
+) {
+    let home = util::home_dir();
+    match memory::remember(&home, cwd, scope, text) {
+        Ok(memory::RememberOutcome::Added) => {
+            let path = memory::path(&home, cwd, scope);
+            let _ = ui.send(UiEvent::Info(format!("remembered in {}", path.display())));
+        }
+        Ok(memory::RememberOutcome::Duplicate) => {
+            let _ = ui.send(UiEvent::Info("already remembered".into()));
+        }
+        Err(error) => {
+            let _ = ui.send(UiEvent::Error(format!("remember failed: {error}")));
+        }
+    }
+}
+
+fn forget_memory(
+    cwd: &std::path::Path,
+    scope: memory::Scope,
+    text: &str,
+    ui: &UnboundedSender<UiEvent>,
+) {
+    let home = util::home_dir();
+    match memory::forget(&home, cwd, scope, text) {
+        Ok(removed) if removed.is_empty() => {
+            let path = memory::path(&home, cwd, scope);
+            let _ = ui.send(UiEvent::Info(format!(
+                "no matching memory in {}",
+                path.display()
+            )));
+        }
+        Ok(removed) => {
+            let mut message = format!(
+                "removed {} {} from {}",
+                removed.len(),
+                if removed.len() == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                memory::path(&home, cwd, scope).display()
+            );
+            for text in removed.iter().take(3) {
+                message.push_str(&format!("\n- {text}"));
+            }
+            if removed.len() > 3 {
+                message.push_str("\n…");
+            }
+            let _ = ui.send(UiEvent::Info(message));
+        }
+        Err(error) => {
+            let _ = ui.send(UiEvent::Error(format!("forget failed: {error}")));
+        }
+    }
 }
 
 fn begin_login(app: &mut App, args: &cli::Args, ui: &UnboundedSender<UiEvent>) {
@@ -575,6 +699,7 @@ fn paste_image(ui: &UnboundedSender<UiEvent>) {
 enum InputMsg {
     Key(ui::crossterm::event::KeyEvent),
     Scroll(i32),
+    Click { column: u16, row: u16 },
     Resize,
 }
 
@@ -621,6 +746,35 @@ mod tests {
         assert_eq!(slash_command("  /logout  "), Some(Slash::Logout));
         assert_eq!(slash_command("/help me"), Some(Slash::Help));
         assert_eq!(slash_command("/compact"), Some(Slash::Compact));
+        assert_eq!(slash_command("/memory"), Some(Slash::Memory));
+        assert_eq!(
+            slash_command("/remember  a note  "),
+            Some(Slash::Remember {
+                scope: memory::Scope::Project,
+                text: "a note".into()
+            })
+        );
+        assert_eq!(
+            slash_command("/remember global cross-project"),
+            Some(Slash::Remember {
+                scope: memory::Scope::Global,
+                text: "cross-project".into()
+            })
+        );
+        assert_eq!(
+            slash_command("/forget global old"),
+            Some(Slash::Forget {
+                scope: memory::Scope::Global,
+                text: "old".into()
+            })
+        );
+        assert_eq!(
+            slash_command("/remember global"),
+            Some(Slash::Remember {
+                scope: memory::Scope::Global,
+                text: "".into()
+            })
+        );
         assert_eq!(
             slash_command("/nope"),
             Some(Slash::Unknown("/nope".to_string()))

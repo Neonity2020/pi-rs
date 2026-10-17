@@ -1,6 +1,6 @@
 //! Saved credentials: `$PI_RS_HOME/auth.json`.
 //!
-//! One JSON object keyed by provider, mirroring pi's auth file:
+//! One JSON object keyed by provider, mirroring Pi's auth file:
 //!
 //! ```json
 //! {
@@ -12,7 +12,7 @@
 //! }
 //! ```
 //!
-//! `pi login` / `/login` is the only writer. At runtime `--api-key` and the
+//! `pi-rs login` / `/login` is the only writer. At runtime `--api-key` and the
 //! environment still win, so CI can inject a key without touching the file.
 
 use std::collections::BTreeMap;

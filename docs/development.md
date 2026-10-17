@@ -4,7 +4,7 @@
 
 - Rust stable（edition 2021）。
 - Python 3（仅 PTY 冒烟脚本需要）。
-- 不需要真实 API key 即可跑测试；只有手动运行时需要先 `pi login` 或设置 `DEEPSEEK_API_KEY`。
+- 不需要真实 API key 即可跑测试；只有手动运行时需要先 `pi-rs login` 或设置 `DEEPSEEK_API_KEY`。
 
 ## 常用命令
 
@@ -20,8 +20,8 @@ PTY 冒烟（先 `cargo build`）：
 
 ```bash
 mkdir -p /tmp/pi-smoke
-python3 scripts/tui_smoke.py /tmp/pi-smoke target/debug/pi
-python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi
+python3 scripts/tui_smoke.py /tmp/pi-smoke target/debug/pi-rs
+python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi-rs
 ```
 
 运行配置：
@@ -39,10 +39,11 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 |---|---|---|
 | 单元 | 各 crate 内的 `#[cfg(test)]` | 纯逻辑，必要时用临时目录 |
 | agent | `llm::mock::ScriptedProvider` + 假工具 | 不碰网络，验证事件顺序 |
-| e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
+| e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi-rs` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
 | PTY | Python + 伪终端，跑真实二进制 | 验证 raw mode、流式渲染、干净退出 |
 | 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
 | 压缩 | `ScriptedProvider` 按“摘要 → 最终回答”排脚本；会话测试覆盖 compaction 重放 | 不需要真实窗口；断言摘要请求、保留尾部与 session 记录 |
+| 长期记忆 | 临时 `home` + 临时 cwd；解析、去重、预算、写入、删除各有单元测试；e2e 断言 system message 含记忆 | 绝不读开发者真实 `~/.pi-rs`；不依赖文件系统权限的偶然行为 |
 
 写测试的几条规矩：
 
@@ -58,6 +59,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 - 消息只有 `llm::Message` 一种；不要加 wire/session 转换层。图片是用户消息上的 base64 字段，由 provider 在发送时展开成 content parts。
 - 压缩摘要是一条普通 user 消息（`agent::summary_message`），会话里对应 `type:"compaction"` 记录；不要把摘要做成新的 message role。
 - 切点只能是 user/assistant，永远不能把 assistant 的 tool_calls 和后面的 tool 结果分开；保留的消息不要改 reasoning。
+- 长期记忆是 `coding::memory` 的两个 Markdown 文件，不进 `agent` / `tui`；`llm::Message` 与会话格式不变。召回只读文件，`/remember` 只追加，`/forget` 原子重写。
 - DeepSeek 的 `reasoning` 必须原样回传，任何清理都是 bug。
 - 每个模块顶部用一句话说明职责；说不清就说明边界错了。
 - 新增依赖前先看根 `AGENTS.md` 的依赖清单和 `docs/goals.md` 的预算原则。
@@ -124,18 +126,21 @@ impl Tool for MyTool {
 - 渲染宽度以 `wrap::display_width` 为准（CJK 宽字符、tab）。
 - Markdown 无法识别的语法按字面输出；宁可少样式，不可丢字。
 - 改动渲染逻辑后跑单元测试 + 两个 PTY 冒烟脚本。
+- thinking 的点击命中依赖渲染时记录的行号（`thinking_hits` / `transcript_top`）；新增可点击区域时同步 `on_click` 与测试。
 
 ## 调试
 
 | 想确认 | 手段 |
 |---|---|
-| 模型实际收到/返回什么 | `pi --json -p "..."` 看事件；会话 JSONL 看历史 |
+| 模型实际收到/返回什么 | `pi-rs --json -p "..."` 看事件；会话 JSONL 看历史 |
 | agent 循环顺序 | 单元测试里用 `ScriptedProvider`，检查事件序列 |
 | 提示词内容 | 读 `crates/coding/src/prompt.rs` 的测试；临时打印 `build()` |
 | TUI 是否干净退出 | `scripts/tui_smoke.py` |
 | 图片是否随请求发出 | 会话 JSONL 的 `images` 字段；或临时 mock 服务器打印请求体 |
 | 是否触发了压缩 | `--json` 事件里的 `compaction`；TUI 的 `context compacted` 提示；会话 JSONL 的 `type:"compaction"` |
 | 压缩后保留了什么 | 恢复会话看消息；或读 `agent/compaction.rs` 的切点/序列化测试 |
+| 记忆是否被召回 | 看 mock 请求的 system message；或读 `coding/memory.rs` 的渲染/预算测试 |
+| 记忆写到了哪里 | TUI `/memory`；或直接看 `$PI_RS_HOME/MEMORY.md` 与 `$PI_RS_HOME/memory/<slug>.md` |
 | 流式解析边界 | `llm/openai.rs` 的 SSE 单元测试；构造分块输入 |
 
 ## 提交前检查清单
@@ -145,8 +150,8 @@ cargo fmt
 cargo test
 cargo clippy --all-targets
 cargo build
-python3 scripts/tui_smoke.py /tmp/pi-smoke target/debug/pi
-python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi
+python3 scripts/tui_smoke.py /tmp/pi-smoke target/debug/pi-rs
+python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi-rs
 ```
 
 - 文档是否仍与行为一致？（尤其 `architecture.md`、`plan.md`）

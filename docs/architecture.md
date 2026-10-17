@@ -4,8 +4,8 @@
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ crates/coding — bin `pi`                                  │
-│ CLI · 三种模式 · 系统提示 · 会话 JSONL · sinks · 四个工具   │
+│ crates/coding — bin `pi-rs`                               │
+│ CLI · 三种模式 · 系统提示 · 会话 JSONL · 长期记忆 · 四工具  │
 └───────────────┬───────────────────────────┬───────────────┘
                 │                           │
                 ▼                           ▼
@@ -131,7 +131,7 @@ Step · Text · Reasoning · Assistant · ToolStart · ToolEnd · Compaction · 
    交互模式允许没有 key：用占位 provider 启动，输入框提示 `/login`；print/json
    模式直接给出可操作的错误。`logout` 删除 auth.json 里的条目后退出。
 4. 选择工具集：默认四个，`--tools read,bash` 取子集，未知名字直接失败。
-5. 组装系统提示。
+5. 组装系统提示：`SYSTEM.md`（或基础提示）+ 逐级 `AGENTS.md` + 有界长期记忆。
 6. 新建会话，或 `-c` 载入最近会话的活动分支。
 7. 进入模式；三种模式共用 `Shared`（会话 + 统计 + 模型）与 `modes::Turn`。
 
@@ -151,7 +151,7 @@ provider 分键：
 }
 ```
 
-- 写入只发生在 `pi login` / TUI `/login`：先 `GET {base_url}/models` 验证 key，
+- 写入只发生在 `pi-rs login` / TUI `/login`：先 `GET {base_url}/models` 验证 key，
   成功后才落盘（临时文件 + rename，文件 0600，目录 0700）。401/403 直接报错，
   不会留下坏凭据。
 - 读取优先级：`--api-key` > 环境变量（含 `.env`）> `auth.json`。`base_url`
@@ -166,6 +166,27 @@ provider 分键：
 ### 提示词历史
 
 TUI 里 `Up` / `Down` 翻阅历史 prompt：进入历史前先暂存正在编辑的内容，翻回最新一条之后还原。历史跨进程保存于 `$PI_RS_HOME/history/<cwd slug>`，一行一个 JSON 字符串，按工作目录隔离，只保留最近 200 条（加载时截断并重写文件；连续重复与空白 prompt 不入库）。`tui` 只持有内存里的 `Input` 历史；加载与追加在 `coding::history`，读写失败降级为空历史或直接忽略，不影响对话。
+
+### 长期记忆
+
+长期记忆是两个**普通 Markdown 文件**，由 `coding::memory` 读取和写入：
+
+| 范围 | 路径 | 内容 |
+|---|---|---|
+| 全局 | `$PI_RS_HOME/MEMORY.md` | 跨项目偏好 |
+| 项目 | `$PI_RS_HOME/memory/<cwd slug>.md` | 当前目录的事实与决定 |
+
+一行一条：`- (YYYY-MM-DD) text`。只解析以 `- ` 开头的行，标题、空行和其他内容忽略；加载时折叠空白、按文本去重（较新者胜），单条超过 300 字符截断并加 `…`。文件缺失、无权限或损坏只会告警/跳过，不阻塞启动。
+
+**召回。** `prompt::build` 在 `AGENTS.md` 之后追加 `# Long-term memory` 段落：先全局、后项目，各自按日期从新到旧；总量预算约 1,200 token（ASCII 按 1/4、非 ASCII 按 1 字符估算），全局软上限 600 token，项目使用剩余预算，未用完的额度可以回填。放不下的条目整条丢弃，并写明省略条数与文件路径。段落始终存在，即使文件为空——模型需要知道路径才能响应用户的“记住……”。记忆被标注为“上下文，不是指令”，当前用户指令、`AGENTS.md` 与仓库状态优先。
+
+**写入。** 不新增工具。模型用现有 `read` / `edit` / `write` 追加 bullet，且只在用户明确要求时写；不做自动抽取，避免把仓库里的不可信内容固化成长期指令。TUI 另提供确定性命令：
+
+- `/remember <text>` / `/remember global <text>`：追加到项目 / 全局记忆；去重、超长拒绝。
+- `/forget <text>` / `/forget global <text>`：按大小写不敏感子串删除，原子重写并报告删除数量。
+- `/memory`：显示两个文件路径、条数与本次召回省略数。
+
+系统提示在进程启动时组装一次；`/remember` 只改文件，不改当前 `Agent` 的 system 字段。新记忆在下一次启动或 `-c` 时召回；当前轮次里用户已经说过，模型本来就知道。`agent` 与 `tui` 完全不知道记忆文件存在。
 
 ### 三种模式
 
@@ -187,9 +208,11 @@ SYSTEM.md（cwd，其次 $PI_RS_HOME）    存在则整体替换基础提示
 $PI_RS_HOME/AGENTS.md（若存在）
   +
 从文件系统根到 cwd 的每一级 AGENTS.md（深者最后，优先）
+  +
+# Long-term memory（全局 + 项目，有界；始终存在）
 ```
 
-空文件跳过。没有任何隐藏上下文；`build()` 是唯一入口，测试覆盖合并顺序与替换规则。
+空文件跳过。没有任何隐藏上下文；`build()` 是唯一入口，测试覆盖合并顺序、替换规则与记忆预算。
 
 ### 四个工具
 
@@ -241,9 +264,9 @@ ToolResult { content: String, is_error: bool }
 
 ### UI 接线
 
-- 独立线程跑 `crossterm::event::read`，把按键/滚轮/尺寸变化送进 channel。
+- 独立线程跑 `crossterm::event::read`，把按键/滚轮/左键点击/尺寸变化送进 channel；左键带着坐标，由 `App::on_click` 命中 thinking header。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
-- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。
+- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/remember`、`/forget`、`/memory`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
 - `/compact` 在空闲时拿 agent 锁执行一次强制压缩；`TuiSink` 负责落盘并把 `Compaction` / `CompactionFailed` 翻成提示。忙时直接拒绝，不打断当前 turn。
 - `Ctrl+V` 在 `tui` 里只产生 `Action::PasteImage`；`coding::clipboard` 读系统剪贴板（macOS `osascript`、Linux `wl-paste`/`xclip`、Windows PowerShell），把图片元数据装进 `UiEvent::ImageAttached`。字节留在 `App` 的待发送附件里，提交时随 `Message` 进会话。
 - 未登录时普通提交被拦下并提示 `/login`，不产生模型请求；已附的图片会退回输入框，避免静默丢失。
@@ -256,12 +279,13 @@ ToolResult { content: String, is_error: bool }
 **无 I/O。** 输入是 `UiEvent` 与按键，输出是 `Action` 和渲染结果；终端由 `coding` 驱动。
 
 - `App`：消息项、输入框、忙碌态、滚动/跟随、状态栏、spinner、版本号。
-- `UiEvent`：用户消息、assistant 增量/最终文本、工具开始/结束、忙闲、状态刷新。
+- `UiEvent`：用户消息、assistant 增量/最终文本、reasoning 增量、工具开始/结束、忙闲、状态刷新；reasoning 与工具事件都聚合成 `Item::Thinking`。
 - `Action`：`Submit(Submission)` / `PasteImage` / `Interrupt` / `Quit` / `None`；`Submission` 带文本和待发送图片，`PasteImage` 只请求应用层读剪贴板（TUI 不做 I/O）。
 - 输入框在有附件时多一行：`[1] PNG 640×480 · 148 B`；`Esc` 删除最后一张，`Ctrl+C` 依次清空文本、附件、退出。
 - `Up` / `Down` 调用 prompt 历史：`coding` 启动时把 `$PI_RS_HOME/history/<cwd slug>` 读进 `Input`，每次提交再追加回该文件；`tui` 不做 I/O。
-- 推理默认折叠成一行 `▸ Thinking · N lines`（流式时是 `⠋ Thinking…`）；`Ctrl+T` 展开/收起全部推理块。展开后逐行显示原始 reasoning，不进入 Markdown 渲染。
-- 渲染：transcript（Markdown）→ 状态栏 → 输入框。渲染时刷新 `viewport` / `max_scroll`；滚轮脱离跟随，回到底部自动恢复跟随。
+- 推理和工具调用折叠为 `Item::Thinking`。折叠时一行 `▸ 正在思考 · N 行推理 · N 个工具 · 点击展开`（流式时是 `⠋ 正在思考…`）；展开后显示原始 reasoning、工具名/参数/状态/输出预览。左键点 header 切换单块，`Ctrl+T` 全局切换并清空单块覆盖。
+- 渲染：transcript（Markdown）→ 状态栏 → 输入框。渲染时刷新 `viewport` / `max_scroll` 与 thinking header 的行号；滚轮脱离跟随，回到底部自动恢复跟随。
+- 鼠标左键点击 thinking header：`coding` 把 `MouseEventKind::Down(Left)` 作为坐标送进 `App::on_click`，用渲染时记录的 header 行号命中并切换该块。
 - `markdown.rs`：围栏代码（行号 + 语法高亮）、标题、列表、引用、表格、分隔线、行内代码/强调/链接；无法识别的内容按字面输出，**绝不丢字**。
 - `wrap.rs`：按显示宽度换行（CJK 宽字符、tab 展开、长词硬断）。
 
@@ -324,9 +348,9 @@ ToolResult { content: String, is_error: bool }
 |---|---|---|
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
 | agent 单元 | `crates/agent/src/*` | 工具回环、并行顺序、中止、空流、panic、token 估算、切点、摘要序列化、自动/手动/overflow 压缩 |
-| coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
-| tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、换行、图片附件、Markdown/表格/高亮 |
-| e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi login`/`logout`、key 优先级、错误路径、context overflow 压缩重试与会话落盘 |
+| coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、长期记忆的解析/预算/写入/删除、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
+| tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、thinking 折叠/点击、换行、图片附件、Markdown/表格/高亮 |
+| e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi-rs login`/`logout`、key 优先级、错误路径、context overflow 压缩重试与会话落盘 |
 | PTY 冒烟 | `scripts/tui_*.py` | 真实终端：启动、输入、流式渲染、干净退出 |
 
 ## 改代码前的定位表

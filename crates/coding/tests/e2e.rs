@@ -1,4 +1,4 @@
-//! End-to-end tests: run the real `pi` binary against a local mock of the
+//! End-to-end tests: run the real `pi-rs` binary against a local mock of the
 //! DeepSeek chat completions API (SSE).
 
 use std::io::{Read, Write};
@@ -105,7 +105,7 @@ fn sse(events: &[&str]) -> String {
     out
 }
 
-fn pi() -> Command {
+fn pi_rs() -> Command {
     pi_in(&test_dir())
 }
 
@@ -113,7 +113,7 @@ fn pi() -> Command {
 /// auth.json, plus a matching working directory so a stray `.env` cannot leak
 /// into a test. Reuse the same home to test state persisted across runs.
 fn pi_in(home: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi-rs"));
     command.env("PI_RS_HOME", home);
     command.current_dir(home);
     command.env_remove("DEEPSEEK_API_KEY");
@@ -121,7 +121,7 @@ fn pi_in(home: &std::path::Path) -> Command {
     command
 }
 
-/// Feed stdin to the binary and collect its output (for `pi login`).
+/// Feed stdin to the binary and collect its output (for `pi-rs login`).
 fn run_with_stdin(mut command: Command, input: &str) -> std::process::Output {
     use std::process::Stdio;
     let mut child = command
@@ -202,7 +202,7 @@ fn print_mode_streams_text() {
         r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"prompt_cache_hit_tokens":4}}"#,
     ])]);
 
-    let output = pi()
+    let output = pi_rs()
         .args([
             "-p",
             "say hi",
@@ -239,6 +239,55 @@ fn print_mode_streams_text() {
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(tool_names, vec!["read", "write", "edit", "bash"]);
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("# Long-term memory"));
+    assert!(system.contains("(0 notes)"));
+}
+
+#[test]
+fn memory_is_recalled_in_the_system_prompt() {
+    let home = test_dir();
+    std::fs::write(
+        home.join("MEMORY.md"),
+        "# Long-term memory\n\n- (2026-10-17) prefers short answers\n",
+    )
+    .unwrap();
+    let cwd = home.canonicalize().unwrap();
+    let slug = cwd
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-");
+    std::fs::create_dir_all(home.join("memory")).unwrap();
+    std::fs::write(
+        home.join("memory").join(format!("{slug}.md")),
+        "- (2026-10-16) project uses cargo test\n",
+    )
+    .unwrap();
+
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+
+    let output = pi_in(&home)
+        .args(["-p", "hi", "--base-url", &base_url, "--api-key", "test-key"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = requests.lock().unwrap();
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("# Long-term memory"), "system: {system}");
+    assert!(system.contains("prefers short answers"), "system: {system}");
+    assert!(
+        system.contains("project uses cargo test"),
+        "system: {system}"
+    );
+    assert!(system.contains("MEMORY.md"), "system: {system}");
 }
 
 #[test]
@@ -254,7 +303,7 @@ fn tool_call_loop_executes_and_feeds_back() {
         ]),
     ]);
 
-    let output = pi()
+    let output = pi_rs()
         .args([
             "-p",
             "run echo",
@@ -300,7 +349,7 @@ fn json_mode_emits_jsonl() {
         r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
     ])]);
 
-    let output = pi()
+    let output = pi_rs()
         .args([
             "--json",
             "-p",
@@ -330,12 +379,12 @@ fn json_mode_emits_jsonl() {
 
 #[test]
 fn missing_api_key_fails_with_a_clear_message() {
-    let output = pi().args(["-p", "hi"]).output().unwrap();
+    let output = pi_rs().args(["-p", "hi"]).output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("DEEPSEEK_API_KEY"), "stderr: {stderr}");
     // The fix should be discoverable, not just the env var name.
-    assert!(stderr.contains("pi login"), "stderr: {stderr}");
+    assert!(stderr.contains("pi-rs login"), "stderr: {stderr}");
 }
 
 #[test]
@@ -344,7 +393,7 @@ fn blank_env_key_is_treated_as_missing() {
     // must read as "missing", not as an empty key sent to the API.
     let workdir = test_dir();
     std::fs::write(workdir.join(".env"), "DEEPSEEK_API_KEY=\n").unwrap();
-    let output = pi()
+    let output = pi_rs()
         .current_dir(&workdir)
         // A dead port keeps a regression fast instead of dialing the real API.
         .args(["-p", "hi", "--base-url", "http://127.0.0.1:1"])
@@ -365,7 +414,7 @@ fn dotenv_file_supplies_the_api_key() {
     // No --api-key and no environment variable: the key must come from .env.
     let workdir = test_dir();
     std::fs::write(workdir.join(".env"), "DEEPSEEK_API_KEY=key-from-dotenv\n").unwrap();
-    let output = pi()
+    let output = pi_rs()
         .current_dir(&workdir)
         .args(["-p", "hi", "--base-url", &base_url])
         .output()
@@ -393,7 +442,7 @@ fn real_env_beats_the_dotenv_file() {
 
     let workdir = test_dir();
     std::fs::write(workdir.join(".env"), "DEEPSEEK_API_KEY=key-from-dotenv\n").unwrap();
-    let output = pi()
+    let output = pi_rs()
         .current_dir(&workdir)
         .env("DEEPSEEK_API_KEY", "key-from-env")
         .args(["-p", "hi", "--base-url", &base_url])
@@ -412,13 +461,13 @@ fn real_env_beats_the_dotenv_file() {
 
 #[test]
 fn help_and_version() {
-    let help = pi().arg("--help").output().unwrap();
+    let help = pi_rs().arg("--help").output().unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("USAGE"));
 
-    let version = pi().arg("--version").output().unwrap();
+    let version = pi_rs().arg("--version").output().unwrap();
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).contains("pi"));
+    assert!(String::from_utf8_lossy(&version.stdout).contains("pi-rs"));
 }
 
 #[test]

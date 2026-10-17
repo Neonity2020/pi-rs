@@ -8,7 +8,9 @@ mod markdown;
 mod render;
 mod wrap;
 
-pub use app::{Action, App, ImageAttachment, Item, StatusInfo, Submission, ToolStatus, UiEvent};
+pub use app::{
+    Action, App, ImageAttachment, Item, StatusInfo, Submission, ToolEntry, ToolStatus, UiEvent,
+};
 pub use render::render;
 
 pub use crossterm;

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::BoxFuture;
 
 /// What a tool produced. Tool failures are results, not errors: they go back
-/// to the model as text and never abort the loop (pi philosophy).
+/// to the model as text and never abort the loop (Pi philosophy).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub content: String,

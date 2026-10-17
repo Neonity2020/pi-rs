@@ -9,7 +9,7 @@ const whyCards = [
     icon: "≈",
     kicker: "PROMPT",
     title: "约 300 token，把注意力留给代码。",
-    body: "模型早就知道 coding agent 是什么。基础系统提示只有几百 token，个性化交给 <code>AGENTS.md</code>：全局一份，仓库里再逐级合并，深者优先。",
+    body: "模型早就知道 coding agent 是什么。基础系统提示只有几百 token，个性化交给 <code>AGENTS.md</code>：全局一份，仓库里再逐级合并，深者优先。长期记忆也是两个可 grep 的 Markdown 文件，按预算注入，不把历史硬塞回去。",
   },
   {
     color: "blue",
@@ -30,7 +30,7 @@ const whyCards = [
     icon: "!",
     kicker: "SAFETY",
     title: "默认 YOLO。",
-    body: "没有权限弹窗。能写代码就能跑代码，确认框只是安全剧场。真正的安全边界是容器：<code>docker run --rm -it … pi</code>。想安全就上沙箱。",
+    body: "没有权限弹窗。能写代码就能跑代码，确认框只是安全剧场。真正的安全边界是容器：<code>docker run --rm -it … pi-rs</code>。想安全就上沙箱。",
   },
 ];
 
@@ -78,6 +78,7 @@ const refusals = [
   "配置地狱",
   "权限弹窗",
   "插件热加载",
+  "自动记忆抽取",
 ];
 
 // 8x8 pi glyph. null = empty cell; the mosaic keeps the empty cells by
@@ -161,7 +162,7 @@ mosaicPattern.forEach((row, r) => {
         <span class="float-brick fb-b" aria-hidden="true">bash $</span>
 
         <div class="mosaic-wrap">
-          <button class="mosaic" type="button" data-mosaic aria-label="pi 积木标志，点一下打乱颜色">
+          <button class="mosaic" type="button" data-mosaic aria-label="pi-rs 积木标志，点一下打乱颜色">
             {
               mosaic.map((tile) => (
                 <span
@@ -183,10 +184,10 @@ mosaicPattern.forEach((row, r) => {
   <div class="tape" aria-hidden="true">
     <div class="tape-track">
       <div class="tape-group">
-        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span><span>上下文会自动压缩</span><span class="star">✦</span>
+        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span><span>长期记忆是文件</span><span class="star">✦</span><span>上下文会自动压缩</span><span class="star">✦</span>
       </div>
       <div class="tape-group">
-        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span><span>上下文会自动压缩</span><span class="star">✦</span>
+        <span>READ</span><span class="star">✦</span><span>WRITE</span><span class="star">✦</span><span>EDIT</span><span class="star">✦</span><span>BASH</span><span class="star">✦</span><span>没有 MCP</span><span class="star">✦</span><span>没有子代理</span><span class="star">✦</span><span>没有 plan mode</span><span class="star">✦</span><span>文件即状态</span><span class="star">✦</span><span>长期记忆是文件</span><span class="star">✦</span><span>上下文会自动压缩</span><span class="star">✦</span>
       </div>
     </div>
   </div>
@@ -197,7 +198,7 @@ mosaicPattern.forEach((row, r) => {
       <div class="stat stat--blue"><b>3</b><span>种运行模式</span></div>
       <div class="stat stat--yellow"><b>1</b><span>个 agent 循环</span></div>
       <div class="stat stat--mint"><b>~300</b><span>token 系统提示</span></div>
-      <div class="stat stat--violet"><b>160</b><span>个测试，零 API key</span></div>
+      <div class="stat stat--violet"><b>177</b><span>个测试，零 API key</span></div>
     </div>
   </section>
 
@@ -294,16 +295,16 @@ mosaicPattern.forEach((row, r) => {
       </header>
 
       <div class="reveal">
-        <div class="terminal" data-term aria-label="pi TUI 示例会话">
+        <div class="terminal" data-term aria-label="pi-rs TUI 示例会话">
           <div class="term-bar">
             <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span class="term-title">pi — zsh — 80×24</span>
+            <span class="term-title">pi-rs — zsh — 80×24</span>
             <button class="replay" type="button" data-replay aria-label="重放示例会话">↻ 重放</button>
           </div>
 
           <div class="term-body">
-            <div class="line"><span class="t-prompt">$</span> <span class="t-cmd">pi "给 auth.json 的写入加个重试"</span></div>
-            <div class="line t-think" data-delay="520">▸ Thinking · 12 lines</div>
+            <div class="line"><span class="t-prompt">$</span> <span class="t-cmd">pi-rs "给 auth.json 的写入加个重试"</span></div>
+            <div class="line t-think" data-delay="520">▸ 正在思考 · 12 行推理 · 3 个工具</div>
             <div class="line">
               <span class="t-bullet">●</span> <span class="t-tool">read</span>{" "}
               <span class="t-arg">crates/coding/src/auth.rs</span>
@@ -317,7 +318,7 @@ mosaicPattern.forEach((row, r) => {
               <span class="t-bullet">●</span> <span class="t-tool">bash</span>{" "}
               <span class="t-arg">cargo test</span>
             </div>
-            <div class="line t-out">  160 passed; 0 failed</div>
+            <div class="line t-out">  177 passed; 0 failed</div>
             <div class="line t-ok">✓ 改好了：验证失败时重试两次，再报错。</div>
             <div class="line t-out">  auth.json 仍然只在验证通过后写入，坏 key 不落盘。</div>
             <div class="line t-dim">  <span class="t-violet">~</span> 继续调用工具，或者停下来回答你。<span class="cursor" aria-hidden="true"></span></div>
@@ -334,7 +335,7 @@ mosaicPattern.forEach((row, r) => {
           <span>▸ 示意会话，不是录屏</span>
           <span>▸ 流式 Markdown：表格、带行号和高亮的代码块</span>
           <span>▸ DeepSeek 高峰 / 低谷价自动切换</span>
-          <span>▸ Ctrl+T 展开推理 · Ctrl+V 贴图 · Ctrl+C 贯穿请求和子进程</span>
+          <span>▸ 点击「正在思考」展开推理与工具 · Ctrl+T 全部展开 · Ctrl+V 贴图 · Ctrl+C 贯穿请求和子进程</span>
           <span>▸ 上下文将满时自动总结旧消息，/compact 可手动触发</span>
         </div>
       </div>
@@ -361,9 +362,9 @@ mosaicPattern.forEach((row, r) => {
           <div class="arch-body">
             <span class="arch-crate">crates/coding</span>
             <h3>coding</h3>
-            <p>CLI、TUI、会话 JSONL、系统提示、四把工具。唯一碰终端和文件格式的层。</p>
+            <p>CLI、TUI、会话 JSONL、系统提示、长期记忆、四把工具。唯一碰终端和文件格式的层。</p>
             <div class="arch-tags">
-              <span class="arch-tag">pi</span>
+              <span class="arch-tag">pi-rs</span>
               <span class="arch-tag">TUI</span>
               <span class="arch-tag">/login</span>
               <span class="arch-tag">modes</span>
@@ -453,22 +454,22 @@ mosaicPattern.forEach((row, r) => {
         <article class="mode-card mode-card--violet reveal">
           <span class="mode-tag">TUI</span>
           <h3>交互式</h3>
-          <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理默认折叠成一行 Thinking，Ctrl+T 展开。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。上下文接近窗口上限时自动把旧消息总结成 checkpoint，保留最近一段原文；/compact 可手动触发，摘要写进会话可恢复。没有 key 也能启动，先提示你 /login。</p>
-          <code class="mode-cmd">pi</code>
+          <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理和工具调用折叠成一行「正在思考」，点它展开；Ctrl+T 全局展开/收起。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。上下文接近窗口上限时自动把旧消息总结成 checkpoint，保留最近一段原文；/compact 可手动触发，摘要写进会话可恢复。长期记忆存在 ~/.pi-rs 的两个 Markdown 文件里，启动时有界注入；/remember、/forget、/memory 管理，删掉文件即关闭。没有 key 也能启动，先提示你 /login。</p>
+          <code class="mode-cmd">pi-rs</code>
         </article>
 
         <article class="mode-card mode-card--yellow reveal">
           <span class="mode-tag">PRINT</span>
           <h3>单次执行</h3>
           <p>回答直接进 stdout。也可以从管道读 prompt，适合塞进 shell 和 CI。</p>
-          <code class="mode-cmd">pi "解释这个仓库" · pi -p &lt; prompt.txt</code>
+          <code class="mode-cmd">pi-rs "解释这个仓库" · pi-rs -p &lt; prompt.txt</code>
         </article>
 
         <article class="mode-card mode-card--blue reveal">
           <span class="mode-tag">JSON</span>
           <h3>事件流</h3>
           <p>每个事件一行 JSONL，适合脚本、CI 和你自己的小工具。</p>
-          <code class="mode-cmd">pi --json -p "..."</code>
+          <code class="mode-cmd">pi-rs --json -p "..."</code>
         </article>
       </div>
     </div>
@@ -498,7 +499,7 @@ mosaicPattern.forEach((row, r) => {
         </ul>
 
         <p>
-          计划写 <code>PLAN.md</code>，任务写 <code>TODO.md</code>——文件能被 git、被 grep、跨会话存活；隐藏状态不行。需要子代理就再开一个 <code>pi</code>。扩展点只有两个 Rust trait：加一个后端 = 实现 <code>Provider</code>，加一个工具 = 实现 <code>Tool</code>。没有动态加载，没有热重载。
+          计划写 <code>PLAN.md</code>，任务写 <code>TODO.md</code>——文件能被 git、被 grep、跨会话存活；隐藏状态不行。需要子代理就再开一个 <code>pi-rs</code>。扩展点只有两个 Rust trait：加一个后端 = 实现 <code>Provider</code>，加一个工具 = 实现 <code>Tool</code>。没有动态加载，没有热重载。
         </p>
         <p class="refusal-punch">所以，<em>剩下的每一行都值得读。</em></p>
       </div>
@@ -545,8 +546,8 @@ mosaicPattern.forEach((row, r) => {
           <p>隐藏输入；先用 <code>GET /models</code> 验证，再把凭据写进 auth.json（0600）。TUI 里还有 <code>/login</code>、<code>/logout</code>、<code>/help</code>。</p>
           <div class="cmd-box">
             <span class="dollar" aria-hidden="true">$</span>
-            <code>pi login</code>
-            <button class="mini-copy" type="button" data-copy="pi login" aria-label="复制登录命令"><span class="copy-label">COPY</span></button>
+            <code>pi-rs login</code>
+            <button class="mini-copy" type="button" data-copy="pi-rs login" aria-label="复制登录命令"><span class="copy-label">COPY</span></button>
           </div>
         </article>
 
@@ -555,11 +556,11 @@ mosaicPattern.forEach((row, r) => {
             <span class="step-num" aria-hidden="true">3</span>
             <h3>开工</h3>
           </div>
-          <p>进 TUI 聊，或者单次执行：<code>pi "解释这个仓库的结构"</code>。</p>
+          <p>进 TUI 聊，或者单次执行：<code>pi-rs "解释这个仓库的结构"</code>。</p>
           <div class="cmd-box">
             <span class="dollar" aria-hidden="true">$</span>
-            <code>pi</code>
-            <button class="mini-copy" type="button" data-copy="pi" aria-label="复制启动命令"><span class="copy-label">COPY</span></button>
+            <code>pi-rs</code>
+            <button class="mini-copy" type="button" data-copy="pi-rs" aria-label="复制启动命令"><span class="copy-label">COPY</span></button>
           </div>
         </article>
       </div>
@@ -576,7 +577,7 @@ mosaicPattern.forEach((row, r) => {
         <a class="btn" href={`${GITHUB}/tree/main/docs`} target="_blank" rel="noreferrer">
           读维护者文档 <span aria-hidden="true">→</span>
         </a>
-        <span class="test-note">cargo test · 160 个测试 · 0 个真 API 调用</span>
+        <span class="test-note">cargo test · 177 个测试 · 0 个真 API 调用</span>
       </div>
     </div>
   </section>

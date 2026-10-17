@@ -128,7 +128,7 @@ def main():
     if "hithere" not in flat:
         print("FAIL: user message never rendered")
         ok = False
-    if "Thinking" not in flat:
+    if "正在思考" not in flat:
         print("FAIL: collapsed thinking header missing")
         ok = False
     if "secret" in flat:
@@ -138,9 +138,9 @@ def main():
         print("FAIL: session line missing on exit")
         ok = False
     if not ok:
-        with open("/tmp/pi-tui-chat-dump.txt", "wb") as f:
+        with open("/tmp/pi-rs-tui-chat-dump.txt", "wb") as f:
             f.write(output)
-        print("full output dumped to /tmp/pi-tui-chat-dump.txt")
+        print("full output dumped to /tmp/pi-rs-tui-chat-dump.txt")
         sys.exit(1)
     print("TUI chat smoke test ok")
 

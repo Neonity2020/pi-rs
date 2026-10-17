@@ -14,7 +14,7 @@ pub fn home_dir() -> PathBuf {
 }
 
 /// Sessions and prompt history live under a slug of the working directory,
-/// mirroring pi: `/Users/andi/ws/oc/pi-rs` → `Users-andi-ws-oc-pi-rs`.
+/// mirroring Pi: `/Users/andi/ws/oc/pi-rs` → `Users-andi-ws-oc-pi-rs`.
 pub fn cwd_slug(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .trim_start_matches('/')

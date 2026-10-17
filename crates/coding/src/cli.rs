@@ -135,7 +135,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         args.prompt = Some(positionals.join(" "));
     }
     if args.json && !args.print && args.prompt.is_none() {
-        return Err("--json needs a prompt: pi --json -p \"...\"".into());
+        return Err("--json needs a prompt: pi-rs --json -p \"...\"".into());
     }
     Ok(args)
 }
@@ -144,9 +144,9 @@ pub const USAGE: &str = "\
 pi-rs — a minimal coding agent (DeepSeek by default)
 
 USAGE:
-    pi [OPTIONS] [PROMPT]
-    pi login [--api-key <key>] [--provider <name>] [--base-url <url>]
-    pi logout
+    pi-rs [OPTIONS] [PROMPT]
+    pi-rs login [--api-key <key>] [--provider <name>] [--base-url <url>]
+    pi-rs logout
 
 COMMANDS:
     login                    verify an API key and save it to auth.json
@@ -177,7 +177,7 @@ ENV:
     PI_RS_HOME               data directory (default: ~/.pi-rs)
 
 AUTH:
-    ~/.pi-rs/auth.json       written by `pi login` / `/login` (mode 0600);
+    ~/.pi-rs/auth.json       written by `pi-rs login` / `/login` (mode 0600);
                              --api-key and environment variables win over it
 ";
 

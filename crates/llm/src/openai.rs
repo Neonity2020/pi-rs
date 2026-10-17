@@ -566,7 +566,7 @@ mod tests {
         }];
         let req = ChatRequest {
             model: "deepseek-flash",
-            system: Some("you are pi"),
+            system: Some("you are pi-rs"),
             messages: &messages,
             tools: &tools,
             max_tokens: None,
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["messages"][0]["role"], "system");
-        assert_eq!(body["messages"][0]["content"], "you are pi");
+        assert_eq!(body["messages"][0]["content"], "you are pi-rs");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
     }
 

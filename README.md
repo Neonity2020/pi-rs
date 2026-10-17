@@ -21,14 +21,14 @@
 
 ```bash
 cargo install --path crates/coding      # 或：cargo run -p pi-coding
-pi                                      # 打开 TUI，输入 /login
+pi-rs                                   # 打开 TUI，输入 /login
 ```
 
 `/login` 会提示粘贴 DeepSeek API key（输入不回显），先用 `GET /models` 验证，再把凭据写进 `~/.pi-rs/auth.json`（权限 0600）。验证失败不会保存。终端里也可以直接：
 
 ```bash
-pi login                    # 隐藏输入；也接受 --api-key 或管道
-pi logout                   # 删除保存的凭据
+pi-rs login                 # 隐藏输入；也接受 --api-key 或管道
+pi-rs logout                # 删除保存的凭据
 ```
 
 凭据优先级：`--api-key` > 环境变量 / `.env` > `auth.json`。所以 CI 仍可注入 `DEEPSEEK_API_KEY`，不需要改用户的 auth 文件。
@@ -36,11 +36,11 @@ pi logout                   # 删除保存的凭据
 不想用登录的话，把 `DEEPSEEK_API_KEY=sk-...` 写进 `.env` 同样有效（模板：仓库里的 `.env.example`，`cp .env.example .env`）：启动时会从工作目录或最近上级目录加载，真实环境变量优先。
 
 ```
-pi                          # 交互式 TUI
-pi "解释这个仓库的结构"        # 单次执行，流式输出到 stdout
-pi -p < prompt.txt          # 从 stdin 读 prompt
-pi --json -p "..."          # 事件流以 JSONL 输出，可脚本化
-pi -c                       # 继续本目录最近一次会话
+pi-rs                       # 交互式 TUI
+pi-rs "解释这个仓库的结构"     # 单次执行，流式输出到 stdout
+pi-rs -p < prompt.txt       # 从 stdin 读 prompt
+pi-rs --json -p "..."       # 事件流以 JSONL 输出，可脚本化
+pi-rs -c                    # 继续本目录最近一次会话
 ```
 
 常用参数：
@@ -54,13 +54,13 @@ pi -c                       # 继续本目录最近一次会话
 --tools <list>        限制工具集，如 --tools read,bash
 ```
 
-TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
+TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/remember <text>` 记住一条项目事实、`/remember global <text>` 记住跨项目偏好、`/forget <text>` 删除匹配的记忆、`/memory` 查看记忆文件、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
 
 `Up` / `Down` 在输入框里翻阅历史 prompt（跨会话，按工作目录保存于 `~/.pi-rs/history/<cwd 的 slug>`）；正在编辑的内容会先暂存，翻回最新一条后还原。
 
 `Ctrl+V` 从剪贴板读一张图（macOS 用系统 `osascript`，Linux 用 `wl-paste` / `xclip`），显示在输入框下方；`Enter` 连同文字一起发送，`Esc` 删除最后一张。图片以 base64 存进会话，发送时按 OpenAI 多模态 `content` parts 展开，所以需要模型/端点支持图片输入；超过 10 MB 会被拒绝。
 
-模型的推理过程默认折叠成一行 `Thinking`；`Ctrl+T` 展开或收起全部推理内容。
+模型的推理和工具调用一起折叠成一行「正在思考」；鼠标左键点这一行展开/收起，`Ctrl+T` 全局展开/收起。展开后能看到原始 reasoning、工具调用与输出预览。
 
 接近模型上下文窗口时，pi-rs 会先压缩再发请求：把较早的对话交给当前模型总结成结构化 checkpoint，保留最近一段原文（默认约 20k token 的尾部），摘要作为一条 `compaction` 记录写进会话。压缩只发生在完整消息边界，不会拆开 tool call 与它的结果，也不会改写仍在上下文里的 `reasoning_content`。每次请求前检查；如果服务端先报了 context overflow，会压缩并重试一次。`/compact` 随时手动触发；未知窗口的 OpenAI 兼容端点不会自动压缩，但 `/compact` 和 overflow 恢复仍会尝试；窗口太小导致摘要本身放不下时，只能开新会话。
 
@@ -83,9 +83,11 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 **上下文是预算，不是终止条件。** 接近窗口上限时，旧消息被总结成结构化 checkpoint，最近一段保持原文；摘要作为 `compaction` 记录留在会话里，`-c` 能从这里继续。只丢完整的旧前缀，不拆 tool call 与结果，也不改写仍在上下文里的 reasoning——压缩是为了继续工作，不是悄悄改变历史。
 
+**长期记忆也是文件。** 全局 `~/.pi-rs/MEMORY.md`、项目 `~/.pi-rs/memory/<cwd 的 slug>.md`，一行一条 Markdown bullet，启动时有界注入。没有向量库、没有后台抽取；模型只在用户明确要求时用现有四工具写入。
+
 **YOLO 默认。** 没有权限弹窗。如果 agent 能写代码就能跑代码，确认对话框只是安全剧场。真正的安全边界是容器/沙箱，属于你的环境，不属于 harness。
 
-**有意不做的事：** plan mode、sub-agent、MCP、内置 todo、后台 bash。计划写 `PLAN.md`，任务写 `TODO.md`——文件可以被 git、被 grep、跨会话存活；隐藏状态不行。需要子代理就开第二个 `pi`。这些"拒绝"不是缺口，是产品决定：核心越小，你能看懂的部分越多。
+**有意不做的事：** plan mode、sub-agent、MCP、内置 todo、后台 bash。计划写 `PLAN.md`，任务写 `TODO.md`——文件可以被 git、被 grep、跨会话存活；隐藏状态不行。需要子代理就开第二个 `pi-rs`。这些"拒绝"不是缺口，是产品决定：核心越小，你能看懂的部分越多。
 
 **扩展点是 Rust trait。** `llm::Provider` 和 `agent::Tool` 就是全部插件接口。没有动态加载，没有热重载；加一个后端 = 实现一个 trait，加一个工具 = 实现一个 trait。
 
@@ -104,6 +106,17 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 压缩不会删掉旧消息：文件里追加一条 `{"type":"compaction"}` 记录，保存摘要、`first_kept_id` 与压缩前后的 token 估算。恢复时从这条记录重建上下文：一条合成的 summary 用户消息 + 从 `first_kept_id` 开始的消息。旧消息仍在文件里，只是不再发给模型。
 
+## 长期记忆
+
+跨会话的记忆是两个普通 Markdown 文件，放在数据目录而不是仓库里：
+
+- `~/.pi-rs/MEMORY.md` —— 全局偏好（回答语言、风格、跨项目习惯）；
+- `~/.pi-rs/memory/<cwd 的 slug>.md` —— 当前目录的事实与决定（构建命令、项目约定）。
+
+一行一条，例如 `- (2026-10-17) 这个仓库用 cargo test 验证`。可以直接编辑、grep、删除；没有数据库，也没有隐藏状态。启动时两个文件会被追加到系统提示末尾，总量限制在约 1,200 token（中文按字估算），超出时只放较新的条目并明确提示省略数量。
+
+TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全局记忆，`/forget <text>` 按子串删除，`/memory` 查看路径和条数。在普通 prompt 里说“记住……”也可以，模型会用现有的 `read` / `edit` 工具完成。pi-rs **不会**自动从对话或仓库内容里抽取记忆；删除这两个文件就等于关闭该功能。
+
 ## 成本
 
 状态栏会显示输入/输出 token、缓存命中率与估算成本；`-p` 结尾显示 token 数与成本。DeepSeek 的定价分高峰/低谷（工作日 01:00–04:00 与 06:00–10:00 UTC），估算按 UTC 时间自动选择，但不考虑中国法定节假日，所以看成量级即可。`--provider openai` 或未知模型时不估成本，显示 `-`。
@@ -111,16 +124,16 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 ## 测试
 
 ```bash
-cargo test          # 160 个测试，不需要 API key
+cargo test          # 177 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、TUI 状态机、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 13 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除、TUI 状态机、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 14 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 
 ```bash
-python3 scripts/tui_smoke.py <数据目录> target/debug/pi        # 启动 / Ctrl+C 干净退出 / 恢复终端
-python3 scripts/tui_chat_smoke.py <数据目录> target/debug/pi   # 本地 mock API：输入 → 流式渲染 → 退出
+python3 scripts/tui_smoke.py <数据目录> target/debug/pi-rs     # 启动 / Ctrl+C 干净退出 / 恢复终端
+python3 scripts/tui_chat_smoke.py <数据目录> target/debug/pi-rs   # 本地 mock API：输入 → 流式渲染 → 退出
 ```
 
 ## 安全
@@ -128,5 +141,5 @@ python3 scripts/tui_chat_smoke.py <数据目录> target/debug/pi   # 本地 mock
 `bash` 工具以你的用户身份、无沙箱执行。和 Pi 一样：想要安全就用容器。
 
 ```bash
-docker run --rm -it -e DEEPSEEK_API_KEY -v "$PWD:/work" -w /work your-image pi
+docker run --rm -it -e DEEPSEEK_API_KEY -v "$PWD:/work" -w /work your-image pi-rs
 ```

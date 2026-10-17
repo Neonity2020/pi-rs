@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::wrap::display_width;
@@ -142,27 +144,45 @@ pub enum ToolStatus {
     Failed,
 }
 
+/// One tool call inside a collapsed thinking block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolEntry {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub status: ToolStatus,
+    pub output: String,
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     User {
         text: String,
         images: Vec<String>,
     },
-    Assistant {
-        text: String,
+    /// Reasoning and tool calls from one stretch of agent work. Collapsed by
+    /// default; a click on the header (or Ctrl+T) expands it.
+    Thinking {
+        id: u64,
         reasoning: String,
+        tools: Vec<ToolEntry>,
         streaming: bool,
     },
-    Tool {
-        id: String,
-        name: String,
-        summary: String,
-        status: ToolStatus,
-        output: String,
-        duration_ms: u64,
+    Assistant {
+        text: String,
+        streaming: bool,
     },
     Info(String),
     Error(String),
+}
+
+/// A rendered thinking header, used for mouse hit-testing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThinkingHit {
+    /// Line index in the full transcript (before scrolling).
+    pub line: usize,
+    pub id: u64,
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -177,7 +197,8 @@ pub struct App {
     /// Whether an API key is available. Drives the input-box hint.
     pub logged_in: bool,
     pub busy: bool,
-    /// Whether the agent's reasoning blocks are expanded. Collapsed by default.
+    /// Global default for thinking blocks. Collapsed by default; Ctrl+T
+    /// toggles this and clears per-block overrides.
     pub show_thinking: bool,
     pub status: StatusInfo,
     pub scroll: usize,
@@ -189,6 +210,12 @@ pub struct App {
     pub spinner: usize,
     /// Bumped whenever the rendered transcript may be stale.
     pub version: u64,
+    /// Per-block expansion override, keyed by `Item::Thinking::id`.
+    thinking_overrides: HashMap<u64, bool>,
+    next_thinking_id: u64,
+    /// Filled by the renderer for mouse hit-testing.
+    pub(crate) thinking_hits: Vec<ThinkingHit>,
+    pub(crate) transcript_top: u16,
 }
 
 impl App {
@@ -208,6 +235,10 @@ impl App {
             max_scroll: 0,
             spinner: 0,
             version: 0,
+            thinking_overrides: HashMap::new(),
+            next_thinking_id: 1,
+            thinking_hits: Vec::new(),
+            transcript_top: 0,
         }
     }
 
@@ -215,55 +246,66 @@ impl App {
         match event {
             UiEvent::User { text, images } => {
                 self.finish_streaming();
+                self.prune_empty_assistant();
                 self.items.push(Item::User { text, images });
             }
             UiEvent::ImageAttached(image) => self.images.push(image),
             UiEvent::Info(text) => self.items.push(Item::Info(text)),
             UiEvent::Error(text) => self.items.push(Item::Error(text)),
             UiEvent::AssistantDelta(delta) => {
-                let (text, _) = self.streaming_fields();
-                text.push_str(&delta);
+                let item = self.ensure_assistant();
+                if let Item::Assistant { text, .. } = item {
+                    text.push_str(&delta);
+                }
             }
             UiEvent::ReasoningDelta(delta) => {
-                let (_, reasoning) = self.streaming_fields();
-                reasoning.push_str(&delta);
+                if !delta.is_empty() {
+                    let item = self.ensure_thinking();
+                    if let Item::Thinking { reasoning, .. } = item {
+                        reasoning.push_str(&delta);
+                    }
+                }
             }
             UiEvent::AssistantDone { text } => {
+                let mut committed = false;
                 if let Some(Item::Assistant {
                     text: current,
                     streaming,
-                    ..
                 }) = self.items.last_mut()
                 {
                     if *streaming {
-                        *current = text;
+                        *current = text.clone();
                         *streaming = false;
-                    } else if !text.is_empty() {
-                        self.items.push(Item::Assistant {
-                            text,
-                            reasoning: String::new(),
-                            streaming: false,
-                        });
+                        committed = true;
                     }
-                } else if !text.is_empty() {
+                }
+                if !committed && !text.is_empty() {
                     self.items.push(Item::Assistant {
                         text,
-                        reasoning: String::new(),
                         streaming: false,
                     });
                 }
-                self.prune_empty_streaming();
+                self.finish_streaming();
+                self.prune_empty_assistant();
             }
             UiEvent::ToolStart { id, name, summary } => {
-                self.finish_streaming();
-                self.items.push(Item::Tool {
-                    id,
-                    name,
-                    summary,
-                    status: ToolStatus::Running,
-                    output: String::new(),
-                    duration_ms: 0,
-                });
+                // Text and tool calls can arrive in the same assistant
+                // message; close the text segment and start/continue thinking.
+                if matches!(self.items.last(), Some(Item::Assistant { .. })) {
+                    self.finish_streaming();
+                    self.prune_empty_assistant();
+                }
+                let item = self.ensure_thinking();
+                if let Item::Thinking { tools, .. } = item {
+                    tools.push(ToolEntry {
+                        id,
+                        name,
+                        summary,
+                        status: ToolStatus::Running,
+                        output: String::new(),
+                        duration_ms: 0,
+                    });
+                }
             }
             UiEvent::ToolDone {
                 id,
@@ -271,29 +313,30 @@ impl App {
                 output,
                 duration_ms,
             } => {
-                for item in self.items.iter_mut().rev() {
-                    if let Item::Tool {
-                        id: tool_id,
-                        status,
-                        output: tool_output,
-                        duration_ms: tool_ms,
-                        ..
-                    } = item
-                    {
-                        if *tool_id == id {
-                            *status = if ok {
-                                ToolStatus::Ok
-                            } else {
-                                ToolStatus::Failed
-                            };
-                            *tool_output = output;
-                            *tool_ms = duration_ms;
-                            break;
+                'outer: for item in self.items.iter_mut().rev() {
+                    if let Item::Thinking { tools, .. } = item {
+                        for tool in tools.iter_mut().rev() {
+                            if tool.id == id {
+                                tool.status = if ok {
+                                    ToolStatus::Ok
+                                } else {
+                                    ToolStatus::Failed
+                                };
+                                tool.output = output;
+                                tool.duration_ms = duration_ms;
+                                break 'outer;
+                            }
                         }
                     }
                 }
             }
-            UiEvent::Busy(busy) => self.busy = busy,
+            UiEvent::Busy(busy) => {
+                if !busy {
+                    self.finish_streaming();
+                    self.prune_empty_assistant();
+                }
+                self.busy = busy;
+            }
             UiEvent::Status(status) => self.status = status,
             UiEvent::LoginDone { ok, message } => {
                 self.login = None;
@@ -318,48 +361,105 @@ impl App {
         self.version = self.version.wrapping_add(1);
     }
 
-    fn streaming_fields(&mut self) -> (&mut String, &mut String) {
-        let needs_new = !matches!(
+    fn ensure_thinking(&mut self) -> &mut Item {
+        if !matches!(self.items.last(), Some(Item::Thinking { .. })) {
+            let id = self.next_thinking_id;
+            self.next_thinking_id = self.next_thinking_id.wrapping_add(1);
+            self.items.push(Item::Thinking {
+                id,
+                reasoning: String::new(),
+                tools: Vec::new(),
+                streaming: true,
+            });
+        }
+        match self.items.last_mut() {
+            Some(item @ Item::Thinking { .. }) => {
+                if let Item::Thinking { streaming, .. } = item {
+                    *streaming = true;
+                }
+                item
+            }
+            _ => unreachable!("thinking item present"),
+        }
+    }
+
+    fn ensure_assistant(&mut self) -> &mut Item {
+        if !matches!(
             self.items.last(),
             Some(Item::Assistant {
                 streaming: true,
                 ..
             })
-        );
-        if needs_new {
+        ) {
             self.items.push(Item::Assistant {
                 text: String::new(),
-                reasoning: String::new(),
                 streaming: true,
             });
         }
         match self.items.last_mut() {
-            Some(Item::Assistant {
-                text, reasoning, ..
-            }) => (text, reasoning),
-            _ => unreachable!("streaming item present"),
+            Some(item @ Item::Assistant { .. }) => item,
+            _ => unreachable!("assistant item present"),
         }
     }
 
-    /// Close an in-progress streaming item (e.g. before a new user message).
+    /// Close every in-progress thinking/text block (e.g. before a new user
+    /// message or after the turn finishes). Historical blocks are already
+    /// closed, so a full scan is cheap and safe.
     fn finish_streaming(&mut self) {
-        if let Some(Item::Assistant { streaming, .. }) = self.items.last_mut() {
-            *streaming = false;
-        }
-        self.prune_empty_streaming();
-    }
-
-    fn prune_empty_streaming(&mut self) {
-        if let Some(Item::Assistant {
-            text,
-            reasoning,
-            streaming: false,
-        }) = self.items.last()
-        {
-            if text.is_empty() && reasoning.is_empty() {
-                self.items.pop();
+        for item in &mut self.items {
+            match item {
+                Item::Thinking { streaming, .. } | Item::Assistant { streaming, .. } => {
+                    *streaming = false;
+                }
+                _ => {}
             }
         }
+    }
+
+    fn prune_empty_assistant(&mut self) {
+        self.items.retain(|item| {
+            !matches!(
+                item,
+                Item::Assistant {
+                    text,
+                    streaming: false
+                } if text.is_empty()
+            )
+        });
+    }
+
+    /// Current expansion state for one thinking block. Per-block clicks win
+    /// over the global Ctrl+T default.
+    pub(crate) fn thinking_expanded(&self, id: u64) -> bool {
+        self.thinking_overrides
+            .get(&id)
+            .copied()
+            .unwrap_or(self.show_thinking)
+    }
+
+    /// A left click on a rendered thinking header toggles that block.
+    /// Returns true when the click hit a header (and the caller should redraw).
+    pub fn on_click(&mut self, _column: u16, row: u16) -> bool {
+        if row < self.transcript_top {
+            return false;
+        }
+        let relative = (row as usize).saturating_sub(self.transcript_top as usize);
+        if relative >= self.viewport as usize {
+            return false;
+        }
+        let line = self.scroll.saturating_add(relative);
+        let Some(hit) = self
+            .thinking_hits
+            .iter()
+            .find(|hit| hit.line == line)
+            .copied()
+        else {
+            return false;
+        };
+        let expanded = self.thinking_expanded(hit.id);
+        self.thinking_overrides.insert(hit.id, !expanded);
+        self.version = self.version.wrapping_add(1);
+        true
     }
 
     pub fn tick(&mut self) {
@@ -431,6 +531,7 @@ impl App {
             }
             KeyCode::Char('t') | KeyCode::Char('T') if ctrl => {
                 self.show_thinking = !self.show_thinking;
+                self.thinking_overrides.clear();
                 Action::None
             }
             KeyCode::Esc if !self.images.is_empty() => {
@@ -906,12 +1007,82 @@ mod tests {
             duration_ms: 5,
         });
         match &app.items[0] {
-            Item::Tool { status, output, .. } => {
-                assert_eq!(*status, ToolStatus::Failed);
-                assert_eq!(output, "boom");
+            Item::Thinking { tools, .. } => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].status, ToolStatus::Failed);
+                assert_eq!(tools[0].output, "boom");
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reasoning_and_tools_share_one_thinking_item() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("first plan".into()));
+        app.apply(UiEvent::ToolStart {
+            id: "c1".into(),
+            name: "read".into(),
+            summary: "src/lib.rs".into(),
+        });
+        app.apply(UiEvent::ToolDone {
+            id: "c1".into(),
+            ok: true,
+            output: "file".into(),
+            duration_ms: 3,
+        });
+        app.apply(UiEvent::ReasoningDelta("\nsecond plan".into()));
+        app.apply(UiEvent::AssistantDone {
+            text: "answer".into(),
+        });
+
+        assert_eq!(app.items.len(), 2, "one thinking block plus the answer");
+        match &app.items[0] {
+            Item::Thinking {
+                reasoning,
+                tools,
+                streaming,
+                ..
+            } => {
+                assert_eq!(reasoning, "first plan\nsecond plan");
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].status, ToolStatus::Ok);
+                assert!(!streaming);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            &app.items[1],
+            Item::Assistant { text, .. } if text == "answer"
+        ));
+    }
+
+    #[test]
+    fn clicking_a_thinking_header_toggles_only_that_block() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("one".into()));
+        let first = match &app.items[0] {
+            Item::Thinking { id, .. } => *id,
+            other => panic!("unexpected: {other:?}"),
+        };
+        app.apply(UiEvent::AssistantDone {
+            text: "answer".into(),
+        });
+        app.apply(UiEvent::ReasoningDelta("two".into()));
+        let second = match &app.items[2] {
+            Item::Thinking { id, .. } => *id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        app.transcript_top = 0;
+        app.viewport = 10;
+        app.thinking_hits = vec![ThinkingHit { line: 0, id: first }];
+        assert!(app.on_click(0, 0));
+        assert!(app.thinking_expanded(first));
+        assert!(!app.thinking_expanded(second));
+
+        assert!(app.on_click(0, 0));
+        assert!(!app.thinking_expanded(first));
     }
 
     #[test]

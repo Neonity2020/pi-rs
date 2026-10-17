@@ -6,7 +6,7 @@ license.workspace = true
 description = "pi-rs: a minimal coding agent"
 
 [[bin]]
-name = "pi"
+name = "pi-rs"
 path = "src/main.rs"
 
 [dependencies]

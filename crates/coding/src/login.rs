@@ -1,4 +1,4 @@
-//! `pi login` / `/login`: take an API key, verify it, save `auth.json`.
+//! `pi-rs login` / `/login`: take an API key, verify it, save `auth.json`.
 //!
 //! The verification request goes through the provider layer
 //! (`llm::openai::verify_api_key`); everything terminal-related stays here.
