@@ -263,6 +263,23 @@ fn missing_api_key_fails_with_a_clear_message() {
 }
 
 #[test]
+fn blank_env_key_is_treated_as_missing() {
+    // An untouched .env.example copy leaves DEEPSEEK_API_KEY= blank; that
+    // must read as "missing", not as an empty key sent to the API.
+    let workdir = test_dir();
+    std::fs::write(workdir.join(".env"), "DEEPSEEK_API_KEY=\n").unwrap();
+    let output = pi()
+        .current_dir(&workdir)
+        // A dead port keeps a regression fast instead of dialing the real API.
+        .args(["-p", "hi", "--base-url", "http://127.0.0.1:1"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DEEPSEEK_API_KEY"), "stderr: {stderr}");
+}
+
+#[test]
 fn dotenv_file_supplies_the_api_key() {
     let (base_url, requests) = start_mock_api(vec![sse(&[
         r#"{"choices":[{"delta":{"content":"from dotenv"}}]}"#,

@@ -117,6 +117,8 @@ fn build_provider(args: &cli::Args) -> Result<(Arc<dyn Provider>, Model)> {
                 .api_key
                 .clone()
                 .or_else(|| std::env::var(deepseek::API_KEY_ENV).ok())
+                // Treat blank values (e.g. an untouched .env template) as absent.
+                .filter(|key| !key.trim().is_empty())
                 .with_context(|| {
                     format!(
                         "missing API key: set {}, add it to .env, or pass --api-key",
@@ -144,6 +146,8 @@ fn build_provider(args: &cli::Args) -> Result<(Arc<dyn Provider>, Model)> {
                 .api_key
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                // Treat blank values (e.g. an untouched .env template) as absent.
+                .filter(|key| !key.trim().is_empty())
                 .context(
                     "missing API key: set OPENAI_API_KEY, add it to .env, or pass --api-key",
                 )?;
