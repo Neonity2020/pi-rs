@@ -4,6 +4,8 @@ Static Astro site for pi-rs. It builds independently of Cargo and never
 imports from `crates/`, but it is still part of the project: every claim on
 the page must match what the CLI actually does.
 
+![pi-rs landing page](./screenshot.png)
+
 ## Develop
 
 Requires Node 20+.
