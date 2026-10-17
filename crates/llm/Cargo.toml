@@ -1,0 +1,17 @@
+[package]
+name = "pi-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Provider layer for pi-rs: streaming chat with DeepSeek and any OpenAI-compatible endpoint"
+
+[lib]
+name = "llm"
+
+[dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt", "sync", "time", "macros"] }
+tokio-stream = "0.1.19"

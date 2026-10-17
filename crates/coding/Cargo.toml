@@ -1,0 +1,21 @@
+[package]
+name = "pi-coding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pi-rs: a minimal coding agent"
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+pi-agent = { version = "0.1.0", path = "../agent" }
+pi-llm = { version = "0.1.0", path = "../llm" }
+pi-tui = { version = "0.1.0", path = "../tui" }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["full"] }
