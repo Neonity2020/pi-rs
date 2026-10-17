@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
+dotenvy = "0.15.7"
 pi-agent = { version = "0.1.0", path = "../agent" }
 pi-llm = { version = "0.1.0", path = "../llm" }
 pi-tui = { version = "0.1.0", path = "../tui" }

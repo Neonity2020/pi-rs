@@ -8,9 +8,26 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+/// One request as seen by the mock API: lowercased raw headers and JSON body.
+struct RecordedRequest {
+    headers: String,
+    body: Value,
+}
+
+impl RecordedRequest {
+    /// `name` must be lowercase, e.g. `"authorization"`.
+    fn header(&self, name: &str) -> &str {
+        self.headers
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+            .map(str::trim)
+            .unwrap_or("")
+    }
+}
+
 /// A minimal HTTP/1.1 server that answers each request with one canned SSE
-/// body and records each request body.
-fn start_mock_api(sse_bodies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+/// body and records each request (headers + body).
+fn start_mock_api(sse_bodies: Vec<String>) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -19,9 +36,8 @@ fn start_mock_api(sse_bodies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
     std::thread::spawn(move || {
         for body in sse_bodies {
             let (mut stream, _) = listener.accept().unwrap();
-            let request = read_request(&mut stream);
-            if let Some(json) = request {
-                recorded.lock().unwrap().push(json);
+            if let Some(request) = read_request(&mut stream) {
+                recorded.lock().unwrap().push(request);
             }
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -36,7 +52,7 @@ fn start_mock_api(sse_bodies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<Value> {
+fn read_request(stream: &mut std::net::TcpStream) -> Option<RecordedRequest> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -56,7 +72,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Value> {
             .unwrap_or(0);
         let body_start = header_end + 4;
         if buffer.len() >= body_start + length {
-            return serde_json::from_slice(&buffer[body_start..body_start + length]).ok();
+            let body = serde_json::from_slice(&buffer[body_start..body_start + length]).ok()?;
+            return Some(RecordedRequest { headers, body });
         }
     }
 }
@@ -78,14 +95,18 @@ fn sse(events: &[&str]) -> String {
 
 fn pi() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-    // Isolate sessions and keys from the developer's environment.
-    command.env("PI_RS_HOME", test_home());
+    // Isolate each run from the developer's machine: a fresh home for
+    // sessions plus a fresh working directory, so neither the surrounding
+    // environment nor a stray `.env` can leak into a test.
+    let dir = test_dir();
+    command.env("PI_RS_HOME", &dir);
+    command.current_dir(&dir);
     command.env_remove("DEEPSEEK_API_KEY");
     command.env_remove("OPENAI_API_KEY");
     command
 }
 
-fn test_home() -> std::path::PathBuf {
+fn test_dir() -> std::path::PathBuf {
     let home = std::env::temp_dir().join(format!(
         "pi-rs-e2e-{}",
         std::time::SystemTime::now()
@@ -129,7 +150,7 @@ fn print_mode_streams_text() {
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    let body = &requests[0];
+    let body = &requests[0].body;
     assert_eq!(body["model"], "deepseek-flash");
     assert_eq!(body["stream"], true);
     assert_eq!(body["thinking"]["type"], "enabled");
@@ -182,7 +203,7 @@ fn tool_call_loop_executes_and_feeds_back() {
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    let second = &requests[1];
+    let second = &requests[1].body;
     let messages = second["messages"].as_array().unwrap();
     // system, user, assistant(tool_calls), tool
     assert_eq!(messages.len(), 4);
@@ -239,6 +260,61 @@ fn missing_api_key_fails_with_a_clear_message() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("DEEPSEEK_API_KEY"), "stderr: {stderr}");
+}
+
+#[test]
+fn dotenv_file_supplies_the_api_key() {
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"from dotenv"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+
+    // No --api-key and no environment variable: the key must come from .env.
+    let workdir = test_dir();
+    std::fs::write(workdir.join(".env"), "DEEPSEEK_API_KEY=key-from-dotenv\n").unwrap();
+    let output = pi()
+        .current_dir(&workdir)
+        .args(["-p", "hi", "--base-url", &base_url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = requests.lock().unwrap();
+    // Headers are recorded lowercased, hence the lowercase "bearer".
+    assert_eq!(
+        requests[0].header("authorization"),
+        "bearer key-from-dotenv"
+    );
+}
+
+#[test]
+fn real_env_beats_the_dotenv_file() {
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+
+    let workdir = test_dir();
+    std::fs::write(workdir.join(".env"), "DEEPSEEK_API_KEY=key-from-dotenv\n").unwrap();
+    let output = pi()
+        .current_dir(&workdir)
+        .env("DEEPSEEK_API_KEY", "key-from-env")
+        .args(["-p", "hi", "--base-url", &base_url])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Headers are recorded lowercased, hence the lowercase "bearer".
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].header("authorization"), "bearer key-from-env");
 }
 
 #[test]

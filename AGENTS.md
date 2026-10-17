@@ -28,7 +28,10 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   whenever `tools` is present. Never strip it.
 - No new dependencies without a strong reason (the current list is: tokio,
   reqwest, serde, serde_json, thiserror, tokio-stream, ratatui, crossterm,
-  unicode-width, anyhow).
+  unicode-width, anyhow, dotenvy).
+- `pi` loads `.env` at startup (dotenvy: the working directory or the nearest
+  parent; real environment variables win). e2e runs the binary in a fresh
+  temp CWD so a developer's `.env` cannot leak into tests.
 - Keep the base system prompt under ~400 tokens.
 
 ## Commands

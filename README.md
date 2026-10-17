@@ -24,6 +24,8 @@ export DEEPSEEK_API_KEY=sk-...          # https://platform.deepseek.com/api_keys
 cargo install --path crates/coding      # 或：cargo run -p pi-coding
 ```
 
+不想动环境变量的话，把 `DEEPSEEK_API_KEY=sk-...` 写进工作目录或最近上级目录的 `.env`，启动时会自动加载（真实环境变量优先）。
+
 ```
 pi                          # 交互式 TUI
 pi "解释这个仓库的结构"        # 单次执行，流式输出到 stdout
@@ -68,10 +70,10 @@ pi -c                       # 继续本目录最近一次会话
 ## 测试
 
 ```bash
-cargo test          # 65 个测试，不需要 API key
+cargo test          # 67 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行，以及 5 个端到端测试——起本地 mock SSE 服务器，跑真实 `pi` 二进制验证完整链路。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行，以及 7 个端到端测试——起本地 mock SSE 服务器，跑真实 `pi` 二进制验证完整链路（含 `.env` 自动加载与真实环境变量优先）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

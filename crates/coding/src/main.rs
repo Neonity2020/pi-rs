@@ -23,6 +23,15 @@ use llm::{deepseek, Effort, Model, OpenAiCompat, Provider, Thinking};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load `.env` from the working directory or the nearest parent (dotenvy
+    // walks upward). Variables already present in the real environment win.
+    // No file is fine; a broken file is worth a warning.
+    if let Err(err) = dotenvy::dotenv() {
+        if !err.not_found() {
+            eprintln!("warning: failed to load .env: {err}");
+        }
+    }
+
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(message) => {
@@ -110,7 +119,7 @@ fn build_provider(args: &cli::Args) -> Result<(Arc<dyn Provider>, Model)> {
                 .or_else(|| std::env::var(deepseek::API_KEY_ENV).ok())
                 .with_context(|| {
                     format!(
-                        "missing API key: set {} or pass --api-key",
+                        "missing API key: set {}, add it to .env, or pass --api-key",
                         deepseek::API_KEY_ENV
                     )
                 })?;
@@ -135,7 +144,9 @@ fn build_provider(args: &cli::Args) -> Result<(Arc<dyn Provider>, Model)> {
                 .api_key
                 .clone()
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .context("missing API key: set OPENAI_API_KEY or pass --api-key")?;
+                .context(
+                    "missing API key: set OPENAI_API_KEY, add it to .env, or pass --api-key",
+                )?;
             let base_url = args
                 .base_url
                 .clone()
