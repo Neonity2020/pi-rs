@@ -68,10 +68,17 @@ pi -c                       # 继续本目录最近一次会话
 ## 测试
 
 ```bash
-cargo test
+cargo test          # 65 个测试，不需要 API key
 ```
 
-64 个测试：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行，以及 5 个端到端测试——起本地 mock SSE 服务器，跑真实 `pi` 二进制验证完整链路。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 DeepSeek 的 `reasoning_content` 回传要求）、agent 循环（工具回环、并行批次顺序、中止、空流）、四个工具的真实文件/进程行为、会话读写与分支回溯、arg 解析、TUI 状态机与换行，以及 5 个端到端测试——起本地 mock SSE 服务器，跑真实 `pi` 二进制验证完整链路。
+
+另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
+
+```bash
+python3 scripts/tui_smoke.py <数据目录> target/debug/pi        # 启动 / Ctrl+C 干净退出 / 恢复终端
+python3 scripts/tui_chat_smoke.py <数据目录> target/debug/pi   # 本地 mock API：输入 → 流式渲染 → 退出
+```
 
 ## 安全
 

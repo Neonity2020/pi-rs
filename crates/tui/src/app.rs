@@ -109,8 +109,9 @@ impl App {
 
     pub fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::User(_text) => {
+            UiEvent::User(text) => {
                 self.finish_streaming();
+                self.items.push(Item::User(text));
             }
             UiEvent::Info(text) => self.items.push(Item::Info(text)),
             UiEvent::Error(text) => self.items.push(Item::Error(text)),
@@ -563,5 +564,15 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn submitted_user_message_becomes_a_transcript_item() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::User("hello".into()));
+        assert!(matches!(&app.items[0], Item::User(text) if text == "hello"));
+        // A second submission must not be swallowed either.
+        app.apply(UiEvent::User("again".into()));
+        assert_eq!(app.items.len(), 2);
     }
 }

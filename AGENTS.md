@@ -37,4 +37,6 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   and runs the real binary; no API key needed)
 - `cargo clippy --all-targets` — must stay clean
 - `cargo fmt`
+- PTY smoke tests for the TUI: `python3 scripts/tui_smoke.py <home> target/debug/pi`
+  and `python3 scripts/tui_chat_smoke.py <home> target/debug/pi`
 - Run: `cargo run -p pi-coding -- -p "prompt"` (needs `DEEPSEEK_API_KEY`)
