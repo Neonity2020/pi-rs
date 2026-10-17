@@ -8,12 +8,12 @@
 
 ## 层次
 
-```
-crates/coding    ← 应用层：CLI、TUI、会话、系统提示、四个内建工具
-crates/agent     ← agent 循环：模型请求 → 工具执行 → 事件流（不知道终端和文件格式）
-crates/llm       ← provider 层：流式聊天、SSE 解析、DeepSeek/OpenAI 兼容
-crates/tui       ← 终端 UI 状态与渲染（不碰 I/O）
-```
+| 层级 | Crate | 职责 | 依赖 |
+|---|---|---|---|
+| 应用层 | `crates/coding` | CLI、TUI、会话 JSONL、系统提示、四个内建工具 | `agent`、`tui`、`llm` |
+| 循环层 | `crates/agent` | 模型请求 → 工具执行 → 事件流（不知道终端和文件格式） | `llm` |
+| 提供层 | `crates/llm` | 流式聊天、SSE 解析、DeepSeek / OpenAI 兼容、模型与价格 | — |
+| 渲染层 | `crates/tui` | 终端 UI 状态与渲染（不碰 I/O） | — |
 
 依赖方向严格单向：`coding → agent → llm`，`tui` 是叶子。每层可以单独使用——`llm` 是完整的流式客户端，`agent` 是完整的 agent 循环。
 
@@ -49,7 +49,16 @@ pi -c                       # 继续本目录最近一次会话
 
 **极短系统提示。** 基础提示约 300 token：模型已经知道什么是 coding agent，长篇说明只会在注意力里和你的代码竞争。个性化全部走 `AGENTS.md`（全局 `~/.pi-rs/AGENTS.md`，然后从文件系统根目录逐级合并到 cwd，深者优先），或用 `SYSTEM.md` 整体替换基础提示。
 
-**只有四个工具。** `read` / `write` / `edit` / `bash`。搜索、构建、测试、git 全部走 `bash`。工具失败不是异常，而是 fed back 给模型的结果文本（`is_error: true`）；参数 JSON 解析失败、未知工具名、panic 也一样——循环永不为工具而中断。
+**只有四个工具。** 搜索、构建、测试、git 全部走 `bash`。
+
+| 工具 | 作用 | 失败语义 |
+|---|---|---|
+| `read` | 读取文件（带行号） | `ToolResult::is_error`，不回滚循环 |
+| `write` | 创建或覆盖文件 | `ToolResult::is_error`，不回滚循环 |
+| `edit` | 精确字符串替换 | `ToolResult::is_error`，不回滚循环 |
+| `bash` | 执行 shell 命令 | `ToolResult::is_error`，不回滚循环 |
+
+工具失败不是异常，而是 fed back 给模型的结果文本（`is_error: true`）；参数 JSON 解析失败、未知工具名、panic 也一样——循环永不为工具而中断。
 
 **没有 max steps。** 循环到模型不再调用工具为止，或者被 `Ctrl+C`（取消令牌贯穿 HTTP 请求与工具进程）、或者失败。没有"步数上限"这种旋钮，因为从没用过。
 
