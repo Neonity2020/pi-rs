@@ -78,25 +78,18 @@ pub fn lines(text: &str, width: usize) -> Vec<Line<'static>> {
         .map(|line| line.trim_end_matches('\r'))
         .collect();
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
     let mut i = 0;
 
     while i < src.len() {
         let line = src[i];
         let start = line.trim_start();
 
-        if let Some((ch, n)) = fence {
-            i += 1;
-            if closes_fence(start, ch, n) {
-                fence = None;
-            } else {
-                push_code_block(&mut out, line, width);
-            }
-            continue;
-        }
-        if let Some((ch, n)) = open_fence(start) {
-            fence = Some((ch, n));
-            i += 1;
+        if let Some(fence) = open_fence(start) {
+            let end = (i + 1..src.len())
+                .find(|&j| closes_fence(src[j].trim_start(), fence.ch, fence.n))
+                .unwrap_or(src.len());
+            render_code_block(&mut out, &src[i + 1..end], fence.lang.as_deref(), width);
+            i = if end < src.len() { end + 1 } else { end };
             continue;
         }
         if let Some(table) = table_at(&src, i) {
@@ -159,14 +152,331 @@ pub fn lines(text: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn push_code_block(out: &mut Vec<Line<'static>>, line: &str, width: usize) {
-    let indent = "  ";
-    for segment in wrap(line, width.saturating_sub(indent.len())) {
-        out.push(Line::from(Span::styled(
-            format!("{indent}{segment}"),
-            block_code(),
-        )));
+/// Numbered, syntax-highlighted fenced code.
+fn render_code_block(
+    out: &mut Vec<Line<'static>>,
+    code: &[&str],
+    info: Option<&str>,
+    width: usize,
+) {
+    let lang = lang_of(info);
+    let digits = code.len().max(1).to_string().len().max(2);
+    let gutter = digits + 3; // "{n} │ "
+    let numbered = width > gutter + 1;
+    let avail = if numbered {
+        width - gutter
+    } else {
+        width.saturating_sub(2)
     }
+    .max(1);
+    let mut state = CodeState::default();
+
+    for (index, line) in code.iter().enumerate() {
+        for (part, segment) in wrap(line, avail).into_iter().enumerate() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let prefix = if numbered && part == 0 {
+                Span::styled(format!("{:>digits$} │ ", index + 1), dim())
+            } else if numbered {
+                Span::raw(" ".repeat(gutter))
+            } else {
+                Span::raw("  ")
+            };
+            spans.push(prefix);
+            if lang == Lang::Plain {
+                spans.push(Span::styled(segment, block_code()));
+            } else {
+                spans.extend(highlight(&segment, lang, &mut state));
+            }
+            out.push(Line::from(spans));
+        }
+        // Single-line quotes never outlive their source line; backticks may.
+        if state.quote.is_some_and(|quote| quote != '`') {
+            state.quote = None;
+        }
+    }
+}
+
+fn string_style() -> Style {
+    Style::new().fg(Color::Rgb(152, 195, 121)) // green
+}
+
+fn number_style() -> Style {
+    Style::new().fg(Color::Rgb(209, 154, 102)) // orange
+}
+
+fn keyword_style() -> Style {
+    Style::new()
+        .fg(Color::Rgb(198, 120, 221)) // purple
+        .add_modifier(Modifier::BOLD)
+}
+
+fn type_style() -> Style {
+    Style::new().fg(Color::Rgb(86, 182, 194)) // teal
+}
+
+fn comment_style() -> Style {
+    Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Plain,
+    Rust,
+    CLike,
+    Python,
+    Shell,
+    Config,
+    Json,
+}
+
+fn lang_of(info: Option<&str>) -> Lang {
+    let Some(info) = info else {
+        return Lang::Plain;
+    };
+    let name = info
+        .split([' ', ',', '{'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "rust" | "rs" => Lang::Rust,
+        "c" | "h" | "cc" | "cpp" | "c++" | "cxx" | "hpp" | "hxx" | "js" | "jsx" | "javascript"
+        | "ts" | "tsx" | "typescript" | "go" | "golang" | "java" | "kt" | "kotlin" | "swift"
+        | "cs" | "csharp" | "scala" | "m" | "mm" => Lang::CLike,
+        "py" | "python" | "rb" | "ruby" => Lang::Python,
+        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" | "dockerfile" | "make"
+        | "makefile" => Lang::Shell,
+        "yaml" | "yml" | "toml" | "ini" | "conf" | "cfg" => Lang::Config,
+        "json" => Lang::Json,
+        _ => Lang::Plain,
+    }
+}
+
+fn line_comment(lang: Lang) -> Option<&'static str> {
+    match lang {
+        Lang::Rust | Lang::CLike => Some("//"),
+        Lang::Python | Lang::Shell | Lang::Config => Some("#"),
+        Lang::Plain | Lang::Json => None,
+    }
+}
+
+fn has_block_comment(lang: Lang) -> bool {
+    matches!(lang, Lang::Rust | Lang::CLike)
+}
+
+fn is_keyword(lang: Lang, word: &str) -> bool {
+    let keywords = match lang {
+        Lang::Rust => {
+            "as async await break const continue crate dyn else enum extern false fn for if \
+             impl in let loop match mod move mut pub ref return self Self static struct super \
+             trait true type unsafe use where while"
+        }
+        Lang::CLike => {
+            "auto await async break case catch class const constexpr continue default defer \
+             delete do else enum export extends extern false final finally fn for friend func \
+             function go goto if implements import in inline instanceof interface let match \
+             namespace new nil null nullptr operator package private protected public range \
+             return select sizeof static struct switch template this throw true try type \
+             typedef typename typeof union use using var virtual volatile while yield"
+        }
+        Lang::Python => {
+            "and as assert async await break case class cls continue def del elif else except \
+             finally for from global if import in is lambda match nonlocal not or pass raise \
+             return self try while with yield"
+        }
+        Lang::Shell => {
+            "alias break case cd continue declare do done elif else esac eval exec exit export \
+             fi for function if in local readonly return select set shift source then time \
+             trap typeset unset until wait while"
+        }
+        Lang::Json => "true false null",
+        Lang::Plain | Lang::Config => return false,
+    };
+    contains_word(keywords, word)
+}
+
+fn is_type(lang: Lang, word: &str) -> bool {
+    let types = match lang {
+        Lang::Rust => {
+            "bool char str String i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 \
+             f64 Vec Option Result Box Arc Rc Self"
+        }
+        Lang::CLike => {
+            "int char float double void bool long short unsigned signed size_t string String \
+             number boolean object unknown never"
+        }
+        Lang::Python => "int str float bool list dict set tuple bytes",
+        Lang::Shell | Lang::Config | Lang::Json | Lang::Plain => return false,
+    };
+    contains_word(types, word)
+}
+
+fn contains_word(list: &str, word: &str) -> bool {
+    list.split_whitespace().any(|entry| entry == word)
+}
+
+#[derive(Default)]
+struct CodeState {
+    block_comment: bool,
+    quote: Option<char>,
+}
+
+fn highlight(line: &str, lang: Lang, state: &mut CodeState) -> Vec<Span<'static>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if state.block_comment {
+            let mut j = i;
+            while j + 1 < chars.len() && !(chars[j] == '*' && chars[j + 1] == '/') {
+                j += 1;
+            }
+            let closes = j + 1 < chars.len();
+            let end = if closes { j + 2 } else { chars.len() };
+            plain.extend(&chars[i..end]);
+            push_styled(&mut out, comment_style(), &mut plain);
+            i = end;
+            state.block_comment = !closes;
+            continue;
+        }
+        if let Some(quote) = state.quote {
+            let mut j = i;
+            let mut closed = false;
+            while j < chars.len() {
+                if chars[j] == '\\' && j + 1 < chars.len() && quote != '`' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == quote {
+                    j += 1;
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            let end = j.min(chars.len());
+            plain.extend(&chars[i..end]);
+            push_styled(&mut out, string_style(), &mut plain);
+            i = end;
+            if closed {
+                state.quote = None;
+            }
+            continue;
+        }
+
+        let c = chars[i];
+        if line_comment(lang).is_some_and(|prefix| starts_with(&chars, i, prefix)) {
+            flush_plain(&mut out, &mut plain);
+            plain.extend(&chars[i..]);
+            push_styled(&mut out, comment_style(), &mut plain);
+            break;
+        }
+        if has_block_comment(lang) && starts_with(&chars, i, "/*") {
+            flush_plain(&mut out, &mut plain);
+            state.block_comment = true;
+            plain.push_str("/*");
+            push_styled(&mut out, comment_style(), &mut plain);
+            i += 2;
+            continue;
+        }
+        if is_quote_start(&chars, i, lang) {
+            flush_plain(&mut out, &mut plain);
+            state.quote = Some(c);
+            plain.push(c);
+            push_styled(&mut out, string_style(), &mut plain);
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut j = i + 1;
+            while j < chars.len()
+                && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '_' | '.'))
+            {
+                j += 1;
+            }
+            flush_plain(&mut out, &mut plain);
+            plain.extend(&chars[i..j]);
+            push_styled(&mut out, number_style(), &mut plain);
+            i = j;
+            continue;
+        }
+        if is_word_char(c) {
+            let mut j = i + 1;
+            while j < chars.len() && is_word_char(chars[j]) {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            let style = if is_keyword(lang, &word) {
+                keyword_style()
+            } else if is_type(lang, &word) {
+                type_style()
+            } else {
+                block_code()
+            };
+            flush_plain(&mut out, &mut plain);
+            push_text(&mut out, style, &word);
+            i = j;
+            continue;
+        }
+        plain.push(c);
+        i += 1;
+    }
+    push_styled(&mut out, block_code(), &mut plain);
+    out
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_quote_start(chars: &[char], i: usize, lang: Lang) -> bool {
+    match chars[i] {
+        '"' => true,
+        '`' => matches!(lang, Lang::CLike | Lang::Shell),
+        '\'' => {
+            if lang == Lang::Rust {
+                // `'a` is a lifetime; `'a'` and `'\n'` are char literals.
+                let next = chars.get(i + 1).copied();
+                if next.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    return chars.get(i + 2) == Some(&'\'');
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn starts_with(chars: &[char], at: usize, pat: &str) -> bool {
+    pat.chars()
+        .enumerate()
+        .all(|(offset, c)| chars.get(at + offset) == Some(&c))
+}
+
+fn flush_plain(out: &mut Vec<Span<'static>>, plain: &mut String) {
+    push_styled(out, block_code(), plain);
+}
+
+fn push_styled(out: &mut Vec<Span<'static>>, style: Style, buf: &mut String) {
+    if buf.is_empty() {
+        return;
+    }
+    let text = std::mem::take(buf);
+    push_text(out, style, &text);
+}
+
+fn push_text(out: &mut Vec<Span<'static>>, style: Style, text: &str) {
+    if let Some(last) = out.last_mut() {
+        if last.style == style {
+            last.content.to_mut().push_str(text);
+            return;
+        }
+    }
+    out.push(Span::styled(text.to_string(), style));
 }
 
 /// First line gets `first`, continuation lines get `pad`; `base` styles text.
@@ -468,13 +778,24 @@ fn cell_width(cell: &str) -> usize {
         .sum()
 }
 
-fn open_fence(line: &str) -> Option<(char, usize)> {
+struct Fence {
+    ch: char,
+    n: usize,
+    lang: Option<String>,
+}
+
+fn open_fence(line: &str) -> Option<Fence> {
     let ch = line.chars().next()?;
     if ch != '`' && ch != '~' {
         return None;
     }
     let n = line.chars().take_while(|c| *c == ch).count();
-    (n >= 3).then_some((ch, n))
+    if n < 3 {
+        return None;
+    }
+    let info = line[n * ch.len_utf8()..].trim();
+    let lang = info.split_whitespace().next().map(str::to_string);
+    Some(Fence { ch, n, lang })
 }
 
 fn closes_fence(line: &str, ch: char, n: usize) -> bool {
@@ -862,24 +1183,76 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_is_not_inline_parsed() {
+    fn fenced_code_is_numbered_and_not_inline_parsed() {
         let text = "before\n```rust\nlet x = **1**;\n```\nafter";
         let rendered = lines(text, 80);
         let body = rendered
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content.contains("let x")))
+            .find(|l| line_text(l).contains("let x"))
             .unwrap();
-        assert!(body.spans.iter().all(|s| s.style == block_code()));
-        assert_eq!(
-            body.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>(),
-            "  let x = **1**;"
-        );
+        assert_eq!(line_text(body), " 1 │ let x = **1**;");
         assert!(!rendered
             .iter()
             .any(|l| l.spans.iter().any(|s| s.style == bold())));
+    }
+
+    #[test]
+    fn code_is_highlighted_by_language() {
+        let md = "```rust\n// note\nlet s = \"hi\";\nconst N: u32 = 42;\n```";
+        let rendered = lines(md, 80);
+        assert_eq!(line_text(&rendered[0]), " 1 │ // note");
+        assert_eq!(line_text(&rendered[1]), " 2 │ let s = \"hi\";");
+        assert_eq!(line_text(&rendered[2]), " 3 │ const N: u32 = 42;");
+        assert_eq!(span_style(&rendered[0], "// note"), comment_style());
+        assert_eq!(span_style(&rendered[1], "let"), keyword_style());
+        assert_eq!(span_style(&rendered[1], "\"hi\""), string_style());
+        assert_eq!(span_style(&rendered[2], "const"), keyword_style());
+        assert_eq!(span_style(&rendered[2], "u32"), type_style());
+        assert_eq!(span_style(&rendered[2], "42"), number_style());
+    }
+
+    #[test]
+    fn unlabelled_and_unknown_code_stays_plain() {
+        assert_eq!(
+            text_lines("```\nfoo\nbar\n```", 40),
+            vec![" 1 │ foo", " 2 │ bar"]
+        );
+        let rendered = lines("```text\nlet x = 1;\n```", 40);
+        assert!(rendered[0]
+            .spans
+            .iter()
+            .all(|s| s.style == block_code() || s.style == dim()));
+    }
+
+    #[test]
+    fn block_comments_continue_across_code_lines() {
+        let md = "```c\n/* start\n   end */ int x;\n```";
+        let rendered = lines(md, 80);
+        assert_eq!(line_text(&rendered[0]), " 1 │ /* start");
+        assert_eq!(line_text(&rendered[1]), " 2 │    end */ int x;");
+        assert_eq!(span_style(&rendered[0], "/* start"), comment_style());
+        assert_eq!(span_style(&rendered[1], "   end */"), comment_style());
+        assert_eq!(span_style(&rendered[1], "int"), type_style());
+    }
+
+    #[test]
+    fn unclosed_string_does_not_leak_into_the_next_line() {
+        let md = "```rust\nlet s = \"oops\nlet t = 1;\n```";
+        let rendered = lines(md, 80);
+        assert_eq!(line_text(&rendered[1]), " 2 │ let t = 1;");
+        assert_eq!(span_style(&rendered[1], "let"), keyword_style());
+        assert_eq!(span_style(&rendered[1], "1"), number_style());
+    }
+
+    #[test]
+    fn wrapped_code_lines_get_blank_gutters() {
+        let md = "```\nabcdefghij\n```";
+        assert_eq!(text_lines(md, 12), vec![" 1 │ abcdefg", "     hij"]);
+    }
+
+    #[test]
+    fn narrow_code_falls_back_without_numbers() {
+        assert_eq!(text_lines("```\nabcd\n```", 4), vec!["  ab", "  cd"]);
     }
 
     #[test]
@@ -954,6 +1327,29 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn span_style(line: &Line<'static>, content: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|s| s.content.as_ref() == content)
+            .unwrap_or_else(|| {
+                panic!(
+                    "span {content:?} not in {:?}",
+                    line.spans
+                        .iter()
+                        .map(|s| (s.content.as_ref(), s.style))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .style
     }
 
     #[test]
@@ -1045,9 +1441,6 @@ mod tests {
     #[test]
     fn tables_inside_fences_stay_code() {
         let md = "```\n| a | b |\n|---|---|\n```";
-        let rendered = lines(md, 40);
-        assert!(rendered
-            .iter()
-            .all(|l| l.spans.iter().all(|s| s.style == block_code())));
+        assert_eq!(text_lines(md, 40), vec![" 1 │ | a | b |", " 2 │ |---|---|"]);
     }
 }
