@@ -54,4 +54,6 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
 - `cargo fmt`
 - PTY smoke tests for the TUI: `python3 scripts/tui_smoke.py <home> target/debug/pi`
   and `python3 scripts/tui_chat_smoke.py <home> target/debug/pi`
+- Website screenshot: `scripts/shot_website.sh` rebuilds `website/dist` and
+  regenerates `website/screenshot.png` (needs Node + Chrome)
 - Run: `cargo run -p pi-coding -- -p "prompt"` (needs `DEEPSEEK_API_KEY`)

@@ -32,3 +32,6 @@ npm run preview
 - The content is hand-written so the page has a voice of its own, but it is
   not independent: keep it in sync with the README and the actual CLI. Do not
   add features or sections the project does not have.
+- `screenshot.png` is generated, don't hand-edit it: run
+  `scripts/shot_website.sh` from the repo root after visual changes (needs
+  Node and Chrome), then commit the regenerated image.
