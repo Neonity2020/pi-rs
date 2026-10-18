@@ -1,8 +1,8 @@
 # AGENTS.md
 
 pi-rs is a Rust workspace that reimplements the Pi coding agent philosophy
-(a minimal agent harness). The governing rule: if we don't need it, it won't
-be built.
+(a minimal agent harness). The governing rule is Occam's razor: entities are
+not to be multiplied beyond necessity. If we don't need it, it won't be built.
 
 Repository: https://github.com/Neonity2020/pi-rs
 
