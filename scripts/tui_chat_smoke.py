@@ -129,7 +129,10 @@ def main():
         print("FAIL: user message never rendered")
         ok = False
     if "正在思考" not in flat:
-        print("FAIL: collapsed thinking header missing")
+        print("FAIL: live thinking header missing")
+        ok = False
+    if "思考结果" not in flat:
+        print("FAIL: finished thinking header missing")
         ok = False
     if "secret" in flat:
         print("FAIL: reasoning was not collapsed")

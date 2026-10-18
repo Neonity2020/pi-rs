@@ -253,6 +253,9 @@ impl App {
             UiEvent::Info(text) => self.items.push(Item::Info(text)),
             UiEvent::Error(text) => self.items.push(Item::Error(text)),
             UiEvent::AssistantDelta(delta) => {
+                // The first answer token means reasoning for this stretch is
+                // over, even though the assistant message is still streaming.
+                self.finish_thinking();
                 let item = self.ensure_assistant();
                 if let Item::Assistant { text, .. } = item {
                     text.push_str(&delta);
@@ -260,7 +263,7 @@ impl App {
             }
             UiEvent::ReasoningDelta(delta) => {
                 if !delta.is_empty() {
-                    let item = self.ensure_thinking();
+                    let item = self.ensure_thinking(true);
                     if let Item::Thinking { reasoning, .. } = item {
                         reasoning.push_str(&delta);
                     }
@@ -290,12 +293,14 @@ impl App {
             }
             UiEvent::ToolStart { id, name, summary } => {
                 // Text and tool calls can arrive in the same assistant
-                // message; close the text segment and start/continue thinking.
+                // message; close the text segment and fold the call into the
+                // current thinking block. Running a tool is not "thinking":
+                // only a live reasoning delta marks the block as streaming.
                 if matches!(self.items.last(), Some(Item::Assistant { .. })) {
                     self.finish_streaming();
                     self.prune_empty_assistant();
                 }
-                let item = self.ensure_thinking();
+                let item = self.ensure_thinking(false);
                 if let Item::Thinking { tools, .. } = item {
                     tools.push(ToolEntry {
                         id,
@@ -361,7 +366,7 @@ impl App {
         self.version = self.version.wrapping_add(1);
     }
 
-    fn ensure_thinking(&mut self) -> &mut Item {
+    fn ensure_thinking(&mut self, streaming: bool) -> &mut Item {
         if !matches!(self.items.last(), Some(Item::Thinking { .. })) {
             let id = self.next_thinking_id;
             self.next_thinking_id = self.next_thinking_id.wrapping_add(1);
@@ -369,13 +374,16 @@ impl App {
                 id,
                 reasoning: String::new(),
                 tools: Vec::new(),
-                streaming: true,
+                streaming,
             });
         }
         match self.items.last_mut() {
             Some(item @ Item::Thinking { .. }) => {
-                if let Item::Thinking { streaming, .. } = item {
-                    *streaming = true;
+                if let Item::Thinking {
+                    streaming: active, ..
+                } = item
+                {
+                    *active = streaming;
                 }
                 item
             }
@@ -399,6 +407,14 @@ impl App {
         match self.items.last_mut() {
             Some(item @ Item::Assistant { .. }) => item,
             _ => unreachable!("assistant item present"),
+        }
+    }
+
+    /// Close the most recent thinking block once its reasoning has stopped
+    /// (the first answer token, a tool call, or the end of the turn).
+    fn finish_thinking(&mut self) {
+        if let Some(Item::Thinking { streaming, .. }) = self.items.last_mut() {
+            *streaming = false;
         }
     }
 
@@ -1054,6 +1070,63 @@ mod tests {
         assert!(matches!(
             &app.items[1],
             Item::Assistant { text, .. } if text == "answer"
+        ));
+    }
+
+    #[test]
+    fn assistant_delta_ends_the_live_thinking_block() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("plan".into()));
+        assert!(matches!(
+            &app.items[0],
+            Item::Thinking {
+                streaming: true,
+                ..
+            }
+        ));
+
+        app.apply(UiEvent::AssistantDelta("answer".into()));
+        assert!(matches!(
+            &app.items[0],
+            Item::Thinking {
+                streaming: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &app.items[1],
+            Item::Assistant {
+                text,
+                streaming: true,
+            } if text == "answer"
+        ));
+    }
+
+    #[test]
+    fn running_a_tool_does_not_reopen_thinking() {
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("plan".into()));
+        app.apply(UiEvent::ToolStart {
+            id: "c1".into(),
+            name: "read".into(),
+            summary: "src/lib.rs".into(),
+        });
+        assert!(matches!(
+            &app.items[0],
+            Item::Thinking {
+                streaming: false,
+                ..
+            }
+        ));
+
+        // A later reasoning stretch in the same turn makes it live again.
+        app.apply(UiEvent::ReasoningDelta("more".into()));
+        assert!(matches!(
+            &app.items[0],
+            Item::Thinking {
+                streaming: true,
+                ..
+            }
         ));
     }
 

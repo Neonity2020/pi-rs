@@ -283,7 +283,7 @@ ToolResult { content: String, is_error: bool }
 - `Action`：`Submit(Submission)` / `PasteImage` / `Interrupt` / `Quit` / `None`；`Submission` 带文本和待发送图片，`PasteImage` 只请求应用层读剪贴板（TUI 不做 I/O）。
 - 输入框在有附件时多一行：`[1] PNG 640×480 · 148 B`；`Esc` 删除最后一张，`Ctrl+C` 依次清空文本、附件、退出。
 - `Up` / `Down` 调用 prompt 历史：`coding` 启动时把 `$PI_RS_HOME/history/<cwd slug>` 读进 `Input`，每次提交再追加回该文件；`tui` 不做 I/O。
-- 推理和工具调用折叠为 `Item::Thinking`。折叠时一行 `▸ 正在思考 · N 行推理 · N 个工具 · 点击展开`（流式时是 `⠋ 正在思考…`）；展开后显示原始 reasoning、工具名/参数/状态/输出预览。左键点 header 切换单块，`Ctrl+T` 全局切换并清空单块覆盖。
+- 推理和工具调用折叠为 `Item::Thinking`。折叠时一行 `▸ 思考结果 · N 行推理 · N 个工具 · 点击展开`（reasoning 还在流式时是 `⠋ 正在思考…`；首个 answer token 或工具调用到达即结束该状态）；展开后显示原始 reasoning、工具名/参数/状态/输出预览。左键点 header 切换单块，`Ctrl+T` 全局切换并清空单块覆盖。
 - 渲染：transcript（Markdown）→ 状态栏 → 输入框。渲染时刷新 `viewport` / `max_scroll` 与 thinking header 的行号；滚轮脱离跟随，回到底部自动恢复跟随。
 - 鼠标左键点击 thinking header：`coding` 把 `MouseEventKind::Down(Left)` 作为坐标送进 `App::on_click`，用渲染时记录的 header 行号命中并切换该块。
 - `markdown.rs`：围栏代码（行号 + 语法高亮）、标题、列表、引用、表格、分隔线、行内代码/强调/链接；无法识别的内容按字面输出，**绝不丢字**。

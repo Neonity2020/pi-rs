@@ -78,9 +78,9 @@ fn thinking_header(
     let mut title = if streaming {
         format!("{spinner} 正在思考…")
     } else if expanded {
-        "▾ 正在思考".to_string()
+        "▾ 思考结果".to_string()
     } else {
-        "▸ 正在思考".to_string()
+        "▸ 思考结果".to_string()
     };
     let mut details = Vec::new();
     let reasoning_lines = reasoning.lines().count();
@@ -530,7 +530,7 @@ mod tests {
             .collect();
         let flat = screen.replace(' ', "");
         assert!(
-            flat.contains("▸正在思考·2行推理·点击展开"),
+            flat.contains("▸思考结果·2行推理·点击展开"),
             "missing header: {screen}"
         );
         assert!(screen.contains("answer"));
@@ -550,7 +550,7 @@ mod tests {
             .collect();
         let flat = screen.replace(' ', "");
         assert!(
-            flat.contains("▾正在思考"),
+            flat.contains("▾思考结果"),
             "missing expanded header: {screen}"
         );
         assert!(
@@ -584,6 +584,38 @@ mod tests {
             !screen.contains("still thinking"),
             "reasoning leaked: {screen}"
         );
+    }
+
+    #[test]
+    fn finished_thinking_is_labeled_as_a_result() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::{StatusInfo, UiEvent};
+
+        let mut app = App::new(StatusInfo::default());
+        app.apply(UiEvent::ReasoningDelta("secret plan".into()));
+        app.apply(UiEvent::AssistantDelta("answer".into()));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        let flat = screen.replace(' ', "");
+        assert!(
+            flat.contains("▸思考结果·1行推理·点击展开"),
+            "missing finished header: {screen}"
+        );
+        assert!(
+            !flat.contains("正在思考"),
+            "live label outlived reasoning: {screen}"
+        );
+        assert!(screen.contains("answer"));
     }
 
     #[test]
@@ -621,7 +653,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         let flat = screen.replace(' ', "");
-        assert!(flat.contains("正在思考·1行推理·1个工具"), "{screen}");
+        assert!(flat.contains("思考结果·1行推理·1个工具"), "{screen}");
         assert!(screen.contains("answer"));
         assert!(
             !screen.contains("secret plan"),
