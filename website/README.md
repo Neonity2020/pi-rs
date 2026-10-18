@@ -25,8 +25,9 @@ npm run preview
 
 ## Notes
 
-- One page (`src/pages/index.astro`), one stylesheet
-  (`src/styles/global.css`), one tiny vanilla script in the page.
+- One page (`src/pages/index.astro`) assembled from section components
+  (`src/components/`); a single shared stylesheet (`src/styles/global.css`);
+  small vanilla scripts sit beside the components they drive.
 - Fonts are loaded from Google Fonts (Fredoka + ZCOOL QingKe HuangYou for
   display, JetBrains Mono for text). Everything else is local.
 - The content is hand-written so the page has a voice of its own, but it is

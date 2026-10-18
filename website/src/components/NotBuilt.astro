@@ -1,0 +1,38 @@
+---
+import SectionHead from "./SectionHead.astro";
+
+const refusals = [
+  "plan mode",
+  "子代理",
+  "MCP",
+  "内置 todo",
+  "后台 bash",
+  "配置地狱",
+  "权限弹窗",
+  "插件热加载",
+  "自动记忆抽取",
+];
+---
+
+<section class="section" id="not-built">
+  <div class="wrap">
+    <SectionHead num="06" kicker="NOT BUILT" tone="coral" title="我们没造的东西。">
+      不是缺口清单，是产品决定。剩下的每一行，都值得读。
+    </SectionHead>
+
+    <div class="refusal reveal">
+      <span class="stamp" aria-hidden="true">NOT BUILT</span>
+
+      <ul class="nope-grid">
+        {refusals.map((item) => (
+          <li><span class="x" aria-hidden="true">✗</span><s>{item}</s></li>
+        ))}
+      </ul>
+
+      <p>
+        计划写 <code>PLAN.md</code>，任务写 <code>TODO.md</code>——文件能被 git、被 grep、跨会话存活；隐藏状态不行。需要子代理就再开一个 <code>pi-rs</code>。扩展点只有两个 Rust trait：加一个后端 = 实现 <code>Provider</code>，加一个工具 = 实现 <code>Tool</code>。没有动态加载，没有热重载。
+      </p>
+      <p class="refusal-punch">所以，<em>剩下的每一行都值得读。</em></p>
+    </div>
+  </div>
+</section>

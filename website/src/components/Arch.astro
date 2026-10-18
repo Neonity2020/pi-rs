@@ -1,0 +1,89 @@
+---
+import SectionHead from "./SectionHead.astro";
+---
+
+<section class="section" id="arch">
+  <div class="wrap">
+    <SectionHead num="04" kicker="ARCHITECTURE" tone="violet" title="单向依赖，没有回头路。">
+      每一层都能单独拿走：llm 是完整的流式客户端，agent 是完整的循环。
+    </SectionHead>
+
+    <div class="arch-flow">
+      <article class="arch-block arch--coding reveal">
+        <div class="arch-strip" aria-hidden="true"></div>
+        <div class="arch-body">
+          <span class="arch-crate">crates/coding</span>
+          <h3>coding</h3>
+          <p>CLI、TUI、会话 JSONL、系统提示、长期记忆、四把工具。唯一碰终端和文件格式的层。</p>
+          <div class="arch-tags">
+            <span class="arch-tag">pi-rs</span>
+            <span class="arch-tag">TUI</span>
+            <span class="arch-tag">/login</span>
+            <span class="arch-tag">modes</span>
+          </div>
+          <span class="arch-tui">↳ tui：只存状态与画面，不碰 I/O</span>
+        </div>
+      </article>
+
+      <div class="arch-arrow" aria-hidden="true">→<small>depends on</small></div>
+
+      <article class="arch-block arch--agent reveal">
+        <div class="arch-strip" aria-hidden="true"></div>
+        <div class="arch-body">
+          <span class="arch-crate">crates/agent</span>
+          <h3>agent</h3>
+          <p>请求 → 工具执行 → AgentEvent 流。不知道终端、会话、提示词长什么样。</p>
+          <div class="arch-tags">
+            <span class="arch-tag">AgentEvent</span>
+            <span class="arch-tag">Tool</span>
+            <span class="arch-tag">Cancel</span>
+          </div>
+        </div>
+      </article>
+
+      <div class="arch-arrow" aria-hidden="true">→<small>depends on</small></div>
+
+      <article class="arch-block arch--llm reveal">
+        <div class="arch-strip" aria-hidden="true"></div>
+        <div class="arch-body">
+          <span class="arch-crate">crates/llm</span>
+          <h3>llm</h3>
+          <p>流式聊天、SSE 分块、DeepSeek 与 OpenAI 兼容端点、模型注册表和价格。</p>
+          <div class="arch-tags">
+            <span class="arch-tag">Provider</span>
+            <span class="arch-tag">Message</span>
+            <span class="arch-tag">Usage</span>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <div class="arch-notes">
+      <div class="note-panel reveal">
+        <h3>不变量</h3>
+        <ul class="invariants">
+          <li>依赖方向严格单向，<code>tui</code> 只被 <code>coding</code> 使用。</li>
+          <li>工具失败是 <code>ToolResult::is_error</code>，不是 <code>Err</code>；循环继续。</li>
+          <li><code>llm::Message</code> 同时是线上格式和会话记录，没有转换层。</li>
+          <li>DeepSeek 的 <code>reasoning_content</code> 原样回传，永不剥离。</li>
+        </ul>
+      </div>
+
+      <div class="note-panel note-panel--tinted reveal">
+        <h3>一次请求的旅程</h3>
+        <div class="flow-line" aria-hidden="true">
+          <span class="flow-step">prompt</span>
+          <span class="flow-arrow">→</span>
+          <span class="flow-step">SSE</span>
+          <span class="flow-arrow">→</span>
+          <span class="flow-step">tool_calls</span>
+          <span class="flow-arrow">→</span>
+          <span class="flow-step">tools</span>
+          <span class="flow-arrow">→</span>
+          <span class="flow-step">loop</span>
+        </div>
+        <p>没有 max steps：模型不再要工具，循环才停。中止令牌同时取消 HTTP 请求和正在跑的命令。</p>
+      </div>
+    </div>
+  </div>
+</section>

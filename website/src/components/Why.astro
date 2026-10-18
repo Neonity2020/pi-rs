@@ -1,0 +1,56 @@
+---
+import SectionHead from "./SectionHead.astro";
+
+const whyCards = [
+  {
+    color: "yellow",
+    icon: "≈",
+    kicker: "PROMPT",
+    title: "约 300 token，把注意力留给代码。",
+    body: "模型早就知道 coding agent 是什么。基础系统提示只有几百 token，个性化交给 <code>AGENTS.md</code>：全局一份，仓库里再逐级合并，深者优先。长期记忆也是两个可 grep 的 Markdown 文件，按预算注入，不把历史硬塞回去。",
+  },
+  {
+    color: "blue",
+    icon: "4",
+    kicker: "TOOLS",
+    title: "四把工具，别无其他。",
+    body: "搜索、构建、测试、git，全部走 <code>bash</code>。工具越少，模型越不容易选错，你也越容易看懂它刚才干了什么。",
+  },
+  {
+    color: "mint",
+    icon: "∞",
+    kicker: "LOOP",
+    title: "没有 max steps。",
+    body: "循环到模型不再调用工具为止，或者你按 Ctrl+C。取消令牌贯穿 HTTP 请求和工具进程——没有「最多 20 步」这种没人用过的旋钮。",
+  },
+  {
+    color: "coral",
+    icon: "!",
+    kicker: "SAFETY",
+    title: "默认 YOLO。",
+    body: "没有权限弹窗。能写代码就能跑代码，确认框只是安全剧场。真正的安全边界是容器：<code>docker run --rm -it … pi-rs</code>。想安全就上沙箱。",
+  },
+];
+---
+
+<section class="section" id="why">
+  <div class="wrap">
+    <SectionHead num="01" kicker="PHILOSOPHY" tone="coral" title="小，是设计出来的。">
+      奥卡姆剃刀：如无必要，勿增实体。每一条「不做」都有理由——核心越小，你能看懂的部分越多。
+    </SectionHead>
+
+    <div class="why-grid">
+      {
+        whyCards.map((card, i) => (
+          <article class={`why-card why-card--${card.color} reveal`}>
+            <span class="studs" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="why-icon" aria-hidden="true">{card.icon}</span>
+            <p class="why-kicker">{card.kicker}</p>
+            <h3>{card.title}</h3>
+            <p set:html={card.body} />
+          </article>
+        ))
+      }
+    </div>
+  </div>
+</section>

@@ -1,0 +1,78 @@
+---
+import SectionHead from "./SectionHead.astro";
+
+const tools = [
+  {
+    name: "read",
+    letter: "R",
+    color: "coral",
+    desc: "读取文件内容，输出带行号。大文件用 offset / limit 切片；单行过长会截断，免得一行把上下文吃光。",
+    args: ["file_path", "offset", "limit"],
+    foot: "默认最多 2000 行",
+  },
+  {
+    name: "write",
+    letter: "W",
+    color: "yellow",
+    desc: "创建或整份覆盖文件，父目录自动创建。适合新文件，不适合手术式修改。",
+    args: ["file_path", "content"],
+    foot: "父目录自动创建",
+  },
+  {
+    name: "edit",
+    letter: "E",
+    color: "blue",
+    desc: "精确字符串替换。old_string 必须只出现一次，除非 replace_all；改之前先 read，照抄原文。",
+    args: ["file_path", "old_string", "new_string"],
+    foot: "唯一匹配才动手",
+  },
+  {
+    name: "bash",
+    letter: "$",
+    color: "mint",
+    desc: "在当前目录执行 shell，返回 stdout/stderr，默认 120 秒超时。搜索、构建、测试、git 都从这里走。",
+    args: ["command", "timeout"],
+    foot: "超时 120s，可调到 3600s",
+  },
+];
+---
+
+<section class="section" id="tools">
+  <div class="wrap">
+    <SectionHead num="02" kicker="TOOLS" tone="blue" title="整台机器，只有四块积木。">
+      它们不是插件，就是工具集本身。工具失败不会中断循环——结果会带着 is_error 回到模型。
+    </SectionHead>
+
+    <div class="tool-grid">
+      {
+        tools.map((tool) => (
+          <article class={`tool-card tool-card--${tool.color} reveal`}>
+            <div class="tool-head">
+              <h3 class="tool-name">{tool.name}</h3>
+              <span class="tool-letter" aria-hidden="true">{tool.letter}</span>
+            </div>
+            <p class="tool-desc">{tool.desc}</p>
+            <div class="tool-args">
+              <span class="args-label">args</span>
+              {tool.args.map((arg, i) => (
+                <span>
+                  <span class="k">{arg}</span>
+                  {i < tool.args.length - 1 ? " · " : ""}
+                </span>
+              ))}
+            </div>
+            <p class="tool-foot">{tool.foot}</p>
+          </article>
+        ))
+      }
+    </div>
+
+    <div class="callout reveal">
+      <span class="bang" aria-hidden="true">!</span>
+      <p>
+        <strong>工具失败不是异常。</strong>
+        参数错了、文件不存在、命令非零退出——都会变成 <code>is_error: true</code> 的结果文本，继续喂回模型。循环不会因为一块积木掉地上就停下。
+      </p>
+    </div>
+  </div>
+</section>

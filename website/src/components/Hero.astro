@@ -1,0 +1,117 @@
+---
+import { GITHUB } from "../consts";
+
+// 8x8 pi glyph. null = empty cell; the mosaic keeps the empty cells by
+// placing every tile on an explicit grid coordinate.
+const mosaicPattern = [
+  [1, 1, 1, 1, 1, 1, 1, 1],
+  [1, 1, 1, 1, 1, 1, 1, 1],
+  [0, 1, 1, 0, 0, 1, 1, 0],
+  [0, 1, 1, 0, 0, 1, 1, 0],
+  [0, 1, 1, 0, 0, 1, 1, 0],
+  [0, 1, 1, 0, 0, 1, 1, 0],
+  [0, 1, 1, 0, 0, 1, 1, 0],
+  [0, 1, 1, 0, 0, 1, 1, 0],
+];
+
+const mosaic = [];
+let tileIndex = 0;
+mosaicPattern.forEach((row, r) => {
+  row.forEach((on, c) => {
+    if (!on) return;
+    let color = c <= 3 ? "coral" : "blue";
+    if (r < 2) color = "yellow";
+    if (r === 1 && c === 3) color = "mint";
+    if (r === 4 && c === 5) color = "pink";
+    if (r === 6 && c === 2) color = "violet";
+    mosaic.push({ r, c, color, i: tileIndex++ });
+  });
+});
+---
+
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <p class="eyebrow"><span class="dot" aria-hidden="true"></span>A TINY CODING AGENT · WRITTEN IN RUST</p>
+
+      <h1 class="hero-title">
+        四块积木，<br />
+        一个循环，<br />
+        <span class="mark">没有魔法。</span>
+      </h1>
+
+      <p class="hero-lead">
+        pi-rs 是用 Rust 重写的极简 coding agent：<strong>read / write / edit / bash</strong>，四把工具，约 300 token 的系统提示，一条严格单向的依赖链。小到你能在一个下午读完，完整到能真的写代码、跑测试。
+      </p>
+
+      <div class="install">
+        <span class="dollar" aria-hidden="true">$</span>
+        <code>cargo install --path crates/coding</code>
+        <button
+          class="copy-btn"
+          type="button"
+          data-copy="cargo install --path crates/coding"
+          aria-label="复制安装命令"
+        >
+          <span class="copy-label">复制</span>
+        </button>
+      </div>
+
+      <div class="hero-actions">
+        <a class="btn btn--primary" href="#start">五分钟上手 <span aria-hidden="true">→</span></a>
+        <a class="btn" href={GITHUB} target="_blank" rel="noreferrer">
+          看源码 <span aria-hidden="true">↗</span>
+        </a>
+      </div>
+
+      <p class="hero-meta">
+        <span>MIT</span>
+        <span>Rust 2021</span>
+        <span>默认 DeepSeek</span>
+        <span>cargo test 不需要 API key</span>
+      </p>
+    </div>
+
+    <div class="hero-art">
+      <span class="float-brick fb-a" aria-hidden="true">read</span>
+      <span class="float-brick fb-b" aria-hidden="true">bash $</span>
+
+      <div class="mosaic-wrap">
+        <button class="mosaic" type="button" data-mosaic aria-label="pi-rs 积木标志，点一下打乱颜色">
+          {
+            mosaic.map((tile) => (
+              <span
+                class={`tile c-${tile.color}`}
+                style={`grid-row:${tile.r + 1};grid-column:${tile.c + 1};--i:${tile.i}`}
+                aria-hidden="true"
+              />
+            ))
+          }
+        </button>
+        <span class="mosaic-hint" aria-hidden="true">点一下积木 ↺</span>
+      </div>
+
+      <span class="sticker" aria-hidden="true">100% RUST<br />0% MAGIC</span>
+    </div>
+  </div>
+</section>
+
+<script>
+  const mosaic = document.querySelector("[data-mosaic]");
+
+  if (mosaic) {
+    const colors = ["yellow", "coral", "blue", "mint", "violet", "pink"];
+
+    mosaic.addEventListener("click", () => {
+      mosaic.querySelectorAll(".tile").forEach((tile) => {
+        colors.forEach((color) => tile.classList.remove(`c-${color}`));
+        const pick = colors[Math.floor(Math.random() * colors.length)];
+        tile.classList.add(`c-${pick}`);
+      });
+
+      mosaic.classList.remove("shuffled");
+      void mosaic.offsetWidth;
+      mosaic.classList.add("shuffled");
+    });
+  }
+</script>

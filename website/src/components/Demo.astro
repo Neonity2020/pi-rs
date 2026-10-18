@@ -1,0 +1,118 @@
+---
+import SectionHead from "./SectionHead.astro";
+---
+
+<section class="section" id="demo">
+  <div class="wrap">
+    <SectionHead num="03" kicker="IN THE WILD" tone="mint" title="它真的在干活。">
+      TUI 里的一次普通会话：读文件、改代码、跑测试，状态栏顺手把 token 和钱算好。
+    </SectionHead>
+
+    <div class="reveal">
+      <div class="terminal" data-term aria-label="pi-rs TUI 示例会话">
+        <div class="term-bar">
+          <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="term-title">pi-rs — zsh — 80×24</span>
+          <button class="replay" type="button" data-replay aria-label="重放示例会话">↻ 重放</button>
+        </div>
+
+        <div class="term-body">
+          <div class="line"><span class="t-prompt">$</span> <span class="t-cmd">pi-rs "给 auth.json 的写入加个重试"</span></div>
+          <div class="line t-think" data-delay="520">▸ 思考结果 · 12 行推理 · 3 个工具</div>
+          <div class="line">
+            <span class="t-bullet">●</span> <span class="t-tool">read</span>{" "}
+            <span class="t-arg">crates/coding/src/auth.rs</span>
+          </div>
+          <div class="line">
+            <span class="t-bullet">●</span> <span class="t-tool">edit</span>{" "}
+            <span class="t-arg">crates/coding/src/auth.rs</span>{" "}
+            <span class="t-ok">+18</span> <span class="t-coral">−2</span>
+          </div>
+          <div class="line">
+            <span class="t-bullet">●</span> <span class="t-tool">bash</span>{" "}
+            <span class="t-arg">cargo test</span>
+          </div>
+          <div class="line t-out">  177 passed; 0 failed</div>
+          <div class="line t-ok">✓ 改好了：验证失败时重试两次，再报错。</div>
+          <div class="line t-out">  auth.json 仍然只在验证通过后写入，坏 key 不落盘。</div>
+          <div class="line t-dim">  <span class="t-violet">~</span> 继续调用工具，或者停下来回答你。<span class="cursor" aria-hidden="true"></span></div>
+          <div class="line term-status" data-delay="320">
+            <span>tokens <b>12.4k in / 842 out</b></span>
+            <span>cache <b>91%</b></span>
+            <span>cost <b>$0.0021</b></span>
+            <span>deepseek-flash</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="demo-caption">
+        <span>▸ 示意会话，不是录屏</span>
+        <span>▸ 流式 Markdown：表格、带行号和高亮的代码块</span>
+        <span>▸ DeepSeek 高峰 / 低谷价自动切换</span>
+        <span>▸ 点击「思考结果」展开推理与工具 · Ctrl+T 全部展开 · Ctrl+V 贴图 · Ctrl+C 贯穿请求和子进程</span>
+        <span>▸ 上下文将满时自动总结旧消息，/compact 可手动触发</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const terminal = document.querySelector("[data-term]");
+
+  if (terminal) {
+    const lines = Array.from(terminal.querySelectorAll(".line"));
+    const timers = [];
+    let played = false;
+
+    const stopTimers = () => {
+      while (timers.length) clearTimeout(timers.pop());
+    };
+
+    const revealAll = () => {
+      terminal.removeAttribute("data-anim");
+      lines.forEach((line) => line.classList.add("on"));
+    };
+
+    const play = () => {
+      stopTimers();
+      if (reduceMotion.matches) {
+        revealAll();
+        return;
+      }
+
+      played = true;
+      terminal.setAttribute("data-anim", "");
+      lines.forEach((line) => line.classList.remove("on"));
+
+      let at = 150;
+      lines.forEach((line) => {
+        timers.push(setTimeout(() => line.classList.add("on"), at));
+        at += Number(line.dataset.delay || 260);
+      });
+      timers.push(
+        setTimeout(() => terminal.removeAttribute("data-anim"), at + 200),
+      );
+    };
+
+    if (!reduceMotion.matches) terminal.setAttribute("data-anim", "");
+
+    if ("IntersectionObserver" in window) {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          if (!entries.some((entry) => entry.isIntersecting)) return;
+          observer.disconnect();
+          if (!played) play();
+        },
+        { threshold: 0.2 },
+      );
+      observer.observe(terminal);
+    } else {
+      revealAll();
+    }
+
+    document
+      .querySelector("[data-replay]")
+      ?.addEventListener("click", () => play());
+  }
+</script>

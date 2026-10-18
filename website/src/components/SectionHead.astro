@@ -1,0 +1,21 @@
+---
+interface Props {
+  num: string;
+  kicker: string;
+  tone: string;
+  title: string;
+}
+
+const { num, kicker, tone, title } = Astro.props;
+---
+
+<header class="sec-head reveal">
+  <div>
+    <p class="sec-kicker"><span class="sec-num">{num}</span>{kicker}</p>
+    <h2 class="sec-title">
+      <span class="tick" style={`background: var(--${tone})`} aria-hidden="true"></span>
+      {title}
+    </h2>
+  </div>
+  <p class="sec-note"><slot /></p>
+</header>

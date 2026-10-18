@@ -1,0 +1,56 @@
+---
+import { GITHUB } from "../consts";
+---
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <div class="foot-grid">
+      <div>
+        <div class="foot-mark" aria-hidden="true">
+          <i style="--c: var(--yellow)"></i>
+          <i style="--c: var(--coral)"></i>
+          <i style="--c: var(--blue)"></i>
+          <i style="--c: var(--mint)"></i>
+          <i style="--c: var(--violet)"></i>
+        </div>
+        <div class="foot-word">pi-rs</div>
+        <p class="foot-tag">
+          奥卡姆剃刀：如无必要，勿增实体。<br />
+          四块积木，一条单向依赖，没有魔法。
+        </p>
+      </div>
+
+      <div class="foot-cols">
+        <div>
+          <p class="foot-heading">项目</p>
+          <ul>
+            <li><a href={GITHUB} target="_blank" rel="noreferrer">GitHub</a></li>
+            <li><a href={`${GITHUB}/issues`} target="_blank" rel="noreferrer">Issues</a></li>
+            <li><a href="https://pi.dev" target="_blank" rel="noreferrer">灵感：pi.dev</a></li>
+          </ul>
+        </div>
+        <div>
+          <p class="foot-heading">文档</p>
+          <ul>
+            <li><a href={`${GITHUB}/tree/main/docs`} target="_blank" rel="noreferrer">文档索引</a></li>
+            <li><a href={`${GITHUB}/blob/main/docs/architecture.md`} target="_blank" rel="noreferrer">架构</a></li>
+            <li><a href={`${GITHUB}/blob/main/docs/development.md`} target="_blank" rel="noreferrer">开发指南</a></li>
+          </ul>
+        </div>
+        <div>
+          <p class="foot-heading">本页</p>
+          <ul>
+            <li><a href="#why">哲学</a></li>
+            <li><a href="#tools">四块积木</a></li>
+            <li><a href="#not-built">没造的东西</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="foot-bottom">
+      <span>MIT · Rust 2021 · 用 Astro 堆的这页</span>
+      <span>没有魔法，只有积木。© 2026 pi-rs</span>
+    </div>
+  </div>
+</footer>

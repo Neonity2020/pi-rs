@@ -1,0 +1,72 @@
+---
+import { GITHUB } from "../consts";
+import SectionHead from "./SectionHead.astro";
+---
+
+<section class="section" id="start">
+  <div class="wrap">
+    <SectionHead num="07" kicker="GET STARTED" tone="mint" title="五分钟，堆起来。">
+      需要 Rust 工具链。没有 API key 也能跑测试——e2e 会起本地 mock 服务器。
+    </SectionHead>
+
+    <div class="start-grid">
+      <article class="step step--yellow reveal">
+        <div class="step-top">
+          <span class="step-num" aria-hidden="true">1</span>
+          <h3>装好</h3>
+        </div>
+        <p>克隆仓库，从源码安装；或者在仓库里直接运行。</p>
+        <div class="cmd-box">
+          <span class="dollar" aria-hidden="true">$</span>
+          <code>cargo install --path crates/coding</code>
+          <button
+            class="mini-copy"
+            type="button"
+            data-copy="cargo install --path crates/coding"
+            aria-label="复制安装命令"><span class="copy-label">COPY</span></button>
+        </div>
+      </article>
+
+      <article class="step step--blue reveal">
+        <div class="step-top">
+          <span class="step-num" aria-hidden="true">2</span>
+          <h3>登录</h3>
+        </div>
+        <p>隐藏输入；先用 <code>GET /models</code> 验证，再把凭据写进 auth.json（0600）。TUI 里还有 <code>/login</code>、<code>/logout</code>、<code>/help</code>。</p>
+        <div class="cmd-box">
+          <span class="dollar" aria-hidden="true">$</span>
+          <code>pi-rs login</code>
+          <button class="mini-copy" type="button" data-copy="pi-rs login" aria-label="复制登录命令"><span class="copy-label">COPY</span></button>
+        </div>
+      </article>
+
+      <article class="step step--mint reveal">
+        <div class="step-top">
+          <span class="step-num" aria-hidden="true">3</span>
+          <h3>开工</h3>
+        </div>
+        <p>进 TUI 聊，或者单次执行：<code>pi-rs "解释这个仓库的结构"</code>。</p>
+        <div class="cmd-box">
+          <span class="dollar" aria-hidden="true">$</span>
+          <code>pi-rs</code>
+          <button class="mini-copy" type="button" data-copy="pi-rs" aria-label="复制启动命令"><span class="copy-label">COPY</span></button>
+        </div>
+      </article>
+    </div>
+
+    <div class="auth-note reveal">
+      <p><strong>凭据顺序</strong> <code>--api-key</code> &gt; 环境变量 / <code>.env</code> &gt; <code>~/.pi-rs/auth.json</code></p>
+      <p>CI 注入 <code>DEEPSEEK_API_KEY</code> 即可，不用改用户的 auth 文件。</p>
+    </div>
+
+    <div class="cta-row reveal">
+      <a class="btn btn--primary" href={GITHUB} target="_blank" rel="noreferrer">
+        GitHub 上看源码 <span aria-hidden="true">↗</span>
+      </a>
+      <a class="btn" href={`${GITHUB}/tree/main/docs`} target="_blank" rel="noreferrer">
+        读维护者文档 <span aria-hidden="true">→</span>
+      </a>
+      <span class="test-note">cargo test · 177 个测试 · 0 个真 API 调用</span>
+    </div>
+  </div>
+</section>
