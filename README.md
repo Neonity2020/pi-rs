@@ -82,6 +82,10 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 工具失败不是异常，而是 fed back 给模型的结果文本（`is_error: true`）；参数 JSON 解析失败、未知工具名、panic 也一样——循环永不为工具而中断。
 
+同一响应中的工具按调用顺序执行，每项结果保存后才开始下一项，支持先写文件再编辑等依赖操作。取消或结果保存失败后，剩余工具不会启动。Unix 下 bash 取消、超时或其 future 被丢弃时会终止原进程组内的子孙进程；主动脱离该组的进程不在此范围，其他平台目前只清理直接子进程。
+
+SSE 响应需要 `finish_reason` 才算完整；只收到部分正文或 `[DONE]` 就断开会报告错误、保留已生成正文并丢弃工具调用。已收到合法结束原因的兼容端点可以省略 `[DONE]`；带工具调用的响应必须以 `tool_calls` 结束，因长度等原因截断的调用不会执行。
+
 **没有 max steps。** 循环到模型不再调用工具为止，或者被 `Ctrl+C`（取消令牌贯穿 HTTP 请求与工具进程）、或者失败。没有"步数上限"这种旋钮，因为从没用过。
 
 **上下文是预算，不是终止条件。** 接近窗口上限时，旧消息被总结成结构化 checkpoint，最近一段保持原文；摘要作为 `compaction` 记录留在会话里，`-c` 能从这里继续。只丢完整的旧前缀，不拆 tool call 与结果，也不改写仍在上下文里的 reasoning——压缩是为了继续工作，不是悄悄改变历史。
@@ -131,10 +135,10 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 ## 测试
 
 ```bash
-cargo test          # 207 个测试，不需要 API key
+cargo test          # 215 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 16 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 19 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

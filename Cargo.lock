@@ -1388,6 +1388,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dotenvy",
+ "libc",
  "pi-agent",
  "pi-llm",
  "pi-tui",

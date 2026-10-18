@@ -59,7 +59,11 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   text-only messages keep the plain string form.
 - No new dependencies without a strong reason (the current list is: tokio,
   reqwest, serde, serde_json, thiserror, tokio-stream, ratatui, crossterm,
-  unicode-width, anyhow, dotenvy).
+  unicode-width, anyhow, dotenvy, and Unix-only libc). libc provides process-group
+  signals for bash cancellation; std/tokio only expose group creation.
+- Tool calls execute sequentially in model order; report and persist each
+  result before starting the next call. Cancellation skips remaining calls
+  but records matching error results to preserve tool-call/result pairs.
 - `pi-rs` loads `.env` at startup (dotenvy: the working directory or the nearest
   parent; real environment variables win). e2e runs the binary in a fresh
   temp CWD so a developer's `.env` cannot leak into tests.

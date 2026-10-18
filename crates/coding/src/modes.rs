@@ -878,6 +878,7 @@ mod tests {
             }
         }
         let dir = crate::testutil::temp_dir("tui-tool-persistence");
+        let marker = dir.join("must-not-exist");
         let session = crate::session::Session::create_in(&dir, &dir, "m").unwrap();
         let tool = Arc::new(RemoveSession(session.path.clone()));
         let shared = Shared::new(session, Model::unknown("mock", "m"));
@@ -891,13 +892,22 @@ mod tests {
                 index: 0,
                 args: "{}".into(),
             },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "c2".into(),
+                name: "write".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                args: json!({"file_path": marker, "content": "bad"}).to_string(),
+            },
             StreamEvent::Stop(StopReason::ToolCalls),
         ]]));
         let agent = Arc::new(Mutex::new(Agent::new(
             provider.clone(),
             shared.model.clone(),
             String::new(),
-            vec![tool],
+            vec![tool, Arc::new(crate::tools::WriteTool)],
             vec![],
         )));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -928,6 +938,10 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("session persistence failed"));
         assert!(cancel.is_cancelled());
+        assert!(
+            !marker.exists(),
+            "remaining tool ran after result persistence failed"
+        );
         assert_eq!(provider.observed().len(), 1);
         let before = agent.lock().await.messages().len();
 

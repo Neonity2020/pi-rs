@@ -57,45 +57,108 @@ impl Tool for BashTool {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
 
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(error) => return ToolResult::err(format!("Failed to spawn {shell}: {error}")),
             };
+            #[cfg(unix)]
+            let mut group = ProcessGroup(child.id().map(|id| id as libc::pid_t));
             let mut stdout = child.stdout.take().expect("piped stdout");
             let mut stderr = child.stderr.take().expect("piped stderr");
 
-            let collect = async move {
-                let mut out_bytes = Vec::new();
-                let mut err_bytes = Vec::new();
-                let (out_read, err_read) = tokio::join!(
-                    stdout.read_to_end(&mut out_bytes),
-                    stderr.read_to_end(&mut err_bytes),
-                );
-                out_read?;
-                err_read?;
-                let status = child.wait().await?;
-                Ok::<_, std::io::Error>((
-                    String::from_utf8_lossy(&out_bytes).into_owned(),
-                    String::from_utf8_lossy(&err_bytes).into_owned(),
-                    status,
-                ))
+            let result = {
+                let collect = async {
+                    let mut out_bytes = Vec::new();
+                    let mut err_bytes = Vec::new();
+                    let (out_read, err_read) = tokio::join!(
+                        stdout.read_to_end(&mut out_bytes),
+                        stderr.read_to_end(&mut err_bytes),
+                    );
+                    out_read?;
+                    err_read?;
+                    let status = child.wait().await?;
+                    Ok::<_, std::io::Error>((
+                        String::from_utf8_lossy(&out_bytes).into_owned(),
+                        String::from_utf8_lossy(&err_bytes).into_owned(),
+                        status,
+                    ))
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(ToolResult::err("Cancelled.")),
+                    result = tokio::time::timeout(Duration::from_secs(timeout_secs), collect) => {
+                        match result {
+                            Err(_elapsed) => Err(ToolResult::err(format!(
+                                "Timed out after {timeout_secs}s."
+                            ))),
+                            Ok(Err(error)) => Err(ToolResult::err(format!("Failed to run command: {error}"))),
+                            Ok(Ok(output)) => Ok(output),
+                        }
+                    }
+                }
             };
 
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => ToolResult::err("Cancelled."),
-                result = tokio::time::timeout(Duration::from_secs(timeout_secs), collect) => {
-                    match result {
-                        Err(_elapsed) => ToolResult::err(format!(
-                            "Timed out after {timeout_secs}s and killed the command."
-                        )),
-                        Ok(Err(error)) => ToolResult::err(format!("Failed to run command: {error}")),
-                        Ok(Ok((stdout, stderr, status))) => format_result(stdout, stderr, status),
+            match result {
+                Ok((stdout, stderr, status)) => {
+                    #[cfg(unix)]
+                    {
+                        group.0 = None;
                     }
+                    format_result(stdout, stderr, status)
+                }
+                Err(mut result) => {
+                    #[cfg(unix)]
+                    if let Err(error) = group.terminate() {
+                        result
+                            .content
+                            .push_str(&format!(" Failed to kill process group: {error}."));
+                    }
+                    // Reap the direct child before reporting cancellation or
+                    // timeout. The group guard also covers a dropped future.
+                    let _ = child.start_kill();
+                    if let Err(error) = child.wait().await {
+                        result
+                            .content
+                            .push_str(&format!(" Failed to reap command: {error}."));
+                    }
+                    result
                 }
             }
         })
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroup(Option<libc::pid_t>);
+
+#[cfg(unix)]
+impl ProcessGroup {
+    fn terminate(&mut self) -> std::io::Result<()> {
+        let Some(id) = self.0.take() else {
+            return Ok(());
+        };
+        // SAFETY: process_group(0) made the spawned child its group leader.
+        // Its positive PID is owned here; killpg never targets our own group.
+        if unsafe { libc::killpg(id, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        self.0 = Some(id);
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let _ = self.terminate();
     }
 }
 
@@ -174,5 +237,81 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_timeout_and_dropped_future_stop_descendants() {
+        for mode in ["cancel", "timeout", "drop"] {
+            let dir = crate::testutil::temp_dir(mode);
+            let ready = dir.join("ready");
+            let marker = dir.join("survived");
+            let leader = dir.join("leader-pid");
+            let grandchild = dir.join("grandchild.sh");
+            let child = dir.join("child.sh");
+            std::fs::write(
+                &grandchild,
+                format!(
+                    "printf ready > '{}'; sleep 2; printf survived > '{}'",
+                    ready.display(),
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::write(&child, format!("sh '{}' & wait", grandchild.display())).unwrap();
+            let cancel = Cancel::new();
+            let handle = tokio::spawn({
+                let cancel = cancel.clone();
+                let command = format!(
+                    "printf '%s' $$ > '{}'; sh '{}' & wait",
+                    leader.display(),
+                    child.display()
+                );
+                async move {
+                    BashTool.run(&json!({"command": command, "timeout": if mode == "timeout" { 1 } else { 30 }}), &cancel).await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("grandchild should start");
+            match mode {
+                "cancel" => cancel.cancel(),
+                "drop" => handle.abort(),
+                _ => {}
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap();
+            if mode == "drop" {
+                assert!(result.unwrap_err().is_cancelled());
+            } else {
+                assert!(result.unwrap().is_error);
+            }
+            let pid: libc::pid_t = std::fs::read_to_string(&leader).unwrap().parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    // SAFETY: signal 0 only probes this test's child PID.
+                    if unsafe { libc::kill(pid, 0) } == -1 {
+                        assert_eq!(
+                            std::io::Error::last_os_error().raw_os_error(),
+                            Some(libc::ESRCH)
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the direct child must be reaped");
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            assert!(
+                !marker.exists(),
+                "{mode}: a descendant wrote after the tool stopped"
+            );
+        }
     }
 }

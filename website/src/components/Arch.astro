@@ -82,7 +82,7 @@ import SectionHead from "./SectionHead.astro";
           <span class="flow-arrow">→</span>
           <span class="flow-step">loop</span>
         </div>
-        <p>没有 max steps：模型不再要工具，循环才停。中止令牌同时取消 HTTP 请求和正在跑的命令。</p>
+        <p>没有 max steps：模型不再要工具，循环才停。工具按模型调用顺序执行，上一项完成后再运行下一项；中止令牌同时取消 HTTP 请求和正在跑的命令。</p>
       </div>
     </div>
   </div>

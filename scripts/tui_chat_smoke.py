@@ -89,7 +89,7 @@ def main():
             output += chunk
 
         now = time.time()
-        if not sent_input and now - start > 2:
+        if not sent_input and b"\x1b[?1049h" in output:
             os.write(fd, b"hi there\r")
             sent_input = True
 
@@ -110,10 +110,17 @@ def main():
             status = st
             break
 
+    # Closing the pty may precede the child's exit by a few milliseconds.
+    reap_deadline = min(deadline, time.time() + 1)
+    while status is None and time.time() < reap_deadline:
+        done, st = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = st
+        else:
+            time.sleep(0.01)
     if status is None:
         os.kill(pid, signal.SIGKILL)
-        os.waitpid(pid, 0)
-        status = 1
+        _, status = os.waitpid(pid, 0)
 
     code = os.waitstatus_to_exitcode(status)
     text = strip_ansi(output).decode(errors="replace")

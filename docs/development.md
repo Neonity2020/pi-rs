@@ -39,8 +39,11 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 |---|---|---|
 | 单元 | 各 crate 内的 `#[cfg(test)]` | 纯逻辑，必要时用临时目录 |
 | agent | `llm::mock::ScriptedProvider` + 假工具 | 不碰网络，验证事件顺序 |
+| 工具调度 | 有延迟的假工具 + 调用日志；取消发生在第一项 ToolEnd 时 | 断言执行与结果报告交替出现，剩余调用未启动；panic 不影响下一项，非协作工具取消后已销毁 |
+| bash 进程清理（Unix） | 临时 shell 脚本启动子孙进程，ready 文件确认启动；取消、超时、丢弃 future 后检查延迟写入未发生 | 不只断言工具返回快；清理仍在原进程组内的后代 |
 | e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi-rs` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
-| PTY | Python + 伪终端，跑真实二进制 | 验证 raw mode、流式渲染、干净退出 |
+| SSE 完整性 | 本地 HTTP mock：提前 EOF、只有 DONE、工具以 length 截断、合法 finish 后无 DONE、逐字节 chunked 中文及参数 | 错误时保留文本、不执行工具、不报告成功；正常时保留末尾 usage，依赖工具按序生效 |
+| PTY | Python + 伪终端，跑真实二进制 | 等到进入 alternate screen 再发送输入；验证 raw mode、流式渲染、干净退出，超时必须清理子进程 |
 | 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
 | 压缩 | `ScriptedProvider` 按“摘要 → 最终回答”排脚本；会话测试覆盖 compaction 重放 | 不需要真实窗口；断言摘要请求、保留尾部与 session 记录 |
 | 长期记忆 | 临时 `home` + 临时 cwd；解析、去重、预算、写入、删除、计数各有单元测试；e2e 断言 system message 含记忆 | 绝不读开发者真实 `~/.pi-rs`；不依赖文件系统权限的偶然行为 |

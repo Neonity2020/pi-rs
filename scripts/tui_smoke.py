@@ -27,7 +27,7 @@ while time.time() < deadline:
         if not chunk:
             break
         output += chunk
-    if not sent and time.time() > deadline - 13:
+    if not sent and b"\x1b[?1049h" in output:
         os.write(fd, b"\x03")  # Ctrl+C -> quit (idle, empty input)
         sent = True
     done, st = os.waitpid(pid, os.WNOHANG)
@@ -36,11 +36,15 @@ while time.time() < deadline:
         break
 
 if status is None:
-    # The pty hit EOF (child exited and closed it): collect the status.
-    try:
-        _, status = os.waitpid(pid, 0)
-    except ChildProcessError:
-        status = None
+    # EOF can arrive just before process exit. Reap with a bounded grace
+    # period; a blocking wait here would defeat the test deadline.
+    reap_deadline = min(deadline, time.time() + 1)
+    while status is None and time.time() < reap_deadline:
+        done, st = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = st
+        else:
+            time.sleep(0.01)
 
 if status is None:
     os.kill(pid, signal.SIGKILL)
@@ -60,5 +64,8 @@ if code != 0:
 if "session:" not in text:
     print("MISSING session line on exit")
     print(text[-800:])
+    sys.exit(1)
+if b"\x1b[?1049h" not in output or b"\x1b[?1049l" not in output:
+    print("MISSING alternate-screen enter/leave on exit")
     sys.exit(1)
 print("TUI smoke test ok")

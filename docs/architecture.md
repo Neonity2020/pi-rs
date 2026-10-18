@@ -46,7 +46,7 @@
    - 事件经 `UnboundedSender<StreamEvent>` 回到 agent，边收边发 `AgentEvent::{Text, Reasoning, Usage}` 给 sink，同时累积成一条 assistant `Message`；
    - 流结束后提交 `AgentEvent::Assistant`，把消息追加到历史。
 5. 没有 tool calls → `Outcome::Completed`，turn 结束。
-6. 有 tool calls → 先为每个调用发 `ToolStart`，并行执行（`JoinSet`），结果按调用顺序发 `ToolEnd`，再以 `Message::tool` 追加到历史，回到第 4 步。
+6. 有 tool calls → 按模型调用顺序逐个执行：发 `ToolStart`，执行当前工具，发 `ToolEnd` 并以 `Message::tool` 追加历史，再处理下一项。每个结果先交给 sink 落盘，因此落盘失败的取消可以阻止同批后续工具；被跳过的调用仍补匹配的取消结果，保持 tool 对完整。完成后回到第 4 步。
 7. `Ctrl+C` 触发 `Cancel`：HTTP 流中断，未完成的 tool calls 被丢弃（参数可能不完整），已产生的文本保留；返回 `Outcome::Aborted`。
 
 没有步数上限。循环只由三件事终止：模型不再调工具、取消、错误。
@@ -74,7 +74,7 @@ pub trait Provider: Send + Sync {
 ### 实现
 
 - `OpenAiCompat` 同时服务 DeepSeek 与任意 OpenAI 兼容端点：`deepseek(...)` 额外携带 `thinking` / `reasoning_effort` 参数，`custom(...)` 不带。
-- SSE 逐行解析 `data:`；`[DONE]` 结束；忽略注释与空行；非法 JSON chunk 变成 `Error::Stream`，HTTP 非 2xx 变成 `Error::Api`（含截断的响应体）。
+- SSE 按字节缓存再逐行解析 `data:`，支持跨分块的 UTF-8 和无末尾换行的记录；忽略注释与空行。必须收到 `finish_reason` 才算完整；`[DONE]` 或 EOF 前缺少该字段会报 `Error::Stream`。兼容已收到 `finish_reason` 但省略 `[DONE]` 的端点，且继续收集末尾 usage。带 tool call 的响应必须以 `tool_calls` 结束，`length` 等其他原因视为不完整工具响应。非法 JSON 或 UTF-8 也会报错；agent 保留已有正文，丢弃该响应的工具调用。HTTP 非 2xx 变成 `Error::Api`（含截断的响应体）。
 - tool call 增量按 `index` 归位；没有 id 的调用在 agent 侧补 `call_{i}`。
 - `Message` 是唯一消息类型：agent 历史、会话记录、线上格式三位一体。`reasoning` 必须随 assistant 消息原样回传（DeepSeek + tools 的硬要求）。用户消息可带 base64 `Image`；文本消息继续用字符串 `content`，带图消息在发送时展开成 OpenAI 的 `[{type:"text"},…,{type:"image_url"}]` parts，会话文件里仍是同一个 `Message`。
 - `deepseek.rs` 维护模型注册表（上下文窗口、最大输出、峰谷价格）；未知模型照常工作，但成本显示为 `-`。
@@ -88,9 +88,9 @@ pub trait Provider: Send + Sync {
 |---|---|
 | 取消 | `tokio::select!` 以 cancel 为最高优先级；不完整 tool calls 丢弃，保留文本 |
 | 空流 | provider 一个事件都没发 → `Error::Stream("provider returned an empty stream")` |
-| 工具批 | 相互独立的调用并行执行；结果按调用顺序返回 |
+| 工具批 | 按模型顺序执行；每项结果报告并写入历史后才执行下一项，避免依赖操作与同文件修改竞态 |
 | 失败 | 未知工具、参数 JSON 坏、panic、取消 → `ToolResult::err`，继续循环 |
-| panic 隔离 | 每个工具再套一层 `tokio::spawn`，panic 变成错误结果 |
+| panic 隔离 | 每个工具由一个受 `JoinSet` 管理的任务运行，panic 变成错误结果；取消时中止并等待任务销毁，丢弃 agent future 也不会留下脱离管理的内层任务 |
 | 历史 | assistant 消息与 tool 结果都进入 `Agent::messages`，下一 step 原样回传 |
 | 压缩 | 超阈值时总结旧前缀，替换为 summary + 最近尾部；只丢完整前缀，不拆 tool 对 |
 | overflow | provider 报 context 超限时压缩并重试一次；仍失败才返回错误 |
@@ -227,6 +227,8 @@ $PI_RS_HOME/AGENTS.md（若存在）
 | `edit` | 精确字符串替换 | 要求唯一匹配，或显式 `replace_all` |
 | `bash` | 执行 shell 命令 | 前台进程、可取消；默认 120s 超时；输出头尾截断 |
 
+Unix 下 `bash` 以独立进程组启动。取消、超时或读取输出失败时，向该组发送 SIGKILL 并等待直接子进程回收；future 被丢弃时，由 guard 发出同样的组信号，直接子进程仍由 tokio 的 `kill_on_drop` 清理。覆盖仍处于该组的子孙进程；主动脱离进程组的进程不在这一机制范围内。非 Unix 平台保留直接子进程终止与回收，不宣称进程树清理。为此 `coding` 在 Unix 上直接声明已有依赖树中的 `libc`，使用系统提供的 `killpg` 和信号常量，避免外部命令和手写平台常量。
+
 注册点只有一处：`tools::NAMES`、`tools::all()`、`tools::specified()`。**第五个工具是产品变更**，先改 `docs/goals.md`。
 
 工具失败不是 `Err`，而是：
@@ -267,7 +269,7 @@ ToolResult { content: String, is_error: bool }
 
 之后 print/json/tui sink 再做各自的展示。TUI 状态栏的缓存命中率按 `cached_tokens / input_tokens` 四舍五入，尚未收到 usage 或输入为 0 时显示 `cache -`。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按 DeepSeek 峰谷价估算（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日）。
 
-任一消息或 compaction 写入失败，`Shared` 保留首个错误并同步取消当前回合，停止后续会话写入、模型请求和新工具批次。assistant 消息未落盘时，其工具不会执行；已经执行的工具不回滚。print 模式在 stderr 报错并以非零状态退出；JSON 最终输出 `outcome:"error"` 并非零退出；TUI 显示错误并结束忙碌态，拒绝继续提问、`/compact` 和 `/dream`，退出时返回失败。即使之后路径恢复可写，也必须修复文件并重启，避免继续使用与磁盘不一致的内存历史。这里复用现有取消机制，`agent` 无需知道文件或会话语义。
+任一消息或 compaction 写入失败，`Shared` 保留首个错误并同步取消当前回合，停止后续会话写入、模型请求和剩余工具调用。assistant 消息未落盘时，其工具不会执行；已经执行的工具不回滚。print 模式在 stderr 报错并以非零状态退出；JSON 最终输出 `outcome:"error"` 并非零退出；TUI 显示错误并结束忙碌态，拒绝继续提问、`/compact` 和 `/dream`，退出时返回失败。即使之后路径恢复可写，也必须修复文件并重启，避免继续使用与磁盘不一致的内存历史。这里复用现有取消机制，`agent` 无需知道文件或会话语义。
 
 ### UI 接线
 
@@ -310,7 +312,7 @@ ToolResult { content: String, is_error: bool }
 8. 会话文件正常运行时只追加；每条记录有 `id` 与 `parent`。唯一截断例外是恢复时已完整备份的损坏尾部，不重写保留的记录。
 9. `tui` 不碰 I/O；终端生命周期属于 `coding`。
 10. provider 不知道会话、提示词文件或终端。
-11. 取消是协作式的，贯穿 HTTP 请求与工具子进程。
+11. 取消令牌贯穿 HTTP 请求与工具；工具任务在取消时中止并等待销毁，Unix bash 的组信号由清理 guard 保证。
 12. 预览/渲染失败不能吞掉内容。
 13. 压缩只丢完整的旧前缀；切点不落在 tool 结果上，不拆 tool call/result，不改写仍在上下文里的 reasoning。摘要是一条普通 user 消息，不新增消息类型。
 
@@ -327,6 +329,7 @@ ToolResult { content: String, is_error: bool }
 | HTTP 非 2xx | `llm::Error::Api { status, body }` | 修正 key/端点/模型 |
 | 网络中断 | `llm::Error::Http` | 重试 |
 | SSE chunk 坏 / 空流 | `Error::Stream` | 重试；持续则查 provider |
+| SSE 缺少 finish_reason / 工具调用以 length 等原因截断 | `Error::Stream`，保留已有正文，丢弃工具调用；JSON 最终为 error | 检查端点协议或重新提问 |
 | 工具参数不是 JSON | `ToolResult::err`，回给模型 | 模型自我修正 |
 | 工具 panic | 捕获为错误结果 | 循环继续 |
 | 用户取消 | `Outcome::Aborted`，保留已产出文本 | 重新提问 |
@@ -360,7 +363,7 @@ ToolResult { content: String, is_error: bool }
 | 层 | 位置 | 保护什么 |
 |---|---|---|
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
-| agent 单元 | `crates/agent/src/*` | 工具回环、并行顺序、中止、空流、panic、token 估算、切点、摘要序列化、自动/手动/overflow 压缩 |
+| agent 单元 | `crates/agent/src/*` | 工具回环、顺序执行与逐项结果报告、取消后跳过剩余调用、非协作工具销毁、空流、panic、token 估算、切点、摘要序列化、自动/手动/overflow 压缩 |
 | coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
 | tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、斜杠命令列表/补全、thinking 折叠/点击、换行、图片附件、Markdown/表格/高亮 |
 | e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi-rs login`/`logout`、key 优先级、错误路径、context overflow 压缩重试与会话落盘 |

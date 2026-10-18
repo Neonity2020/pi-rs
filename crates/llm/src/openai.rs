@@ -133,6 +133,8 @@ impl Provider for OpenAiCompat {
 
             let mut stream = response.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
+            let mut finish_reason = None;
+            let mut saw_tools = false;
             loop {
                 let chunk = tokio::select! {
                     biased;
@@ -147,24 +149,34 @@ impl Provider for OpenAiCompat {
                 buf.extend_from_slice(&bytes);
                 while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                     let raw: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&raw[..raw.len() - 1]);
+                    let line = std::str::from_utf8(&raw[..raw.len() - 1])
+                        .map_err(|e| Error::Stream(format!("invalid UTF-8 in SSE: {e}")))?;
                     match classify_line(line.trim_end_matches('\r')) {
                         Line::Ignore => {}
-                        Line::Done => return Ok(()),
-                        Line::Data(data) => emit_chunk(data, &sink)?,
+                        Line::Done => return check_completion(finish_reason, saw_tools),
+                        Line::Data(data) => {
+                            let (reason, tools) = emit_chunk(data, &sink)?;
+                            finish_reason = reason.or(finish_reason);
+                            saw_tools |= tools;
+                        }
                     }
                 }
             }
             // Flush a trailing line that had no newline terminator.
             if !buf.is_empty() {
-                let line = String::from_utf8_lossy(&buf).into_owned();
+                let line = std::str::from_utf8(&buf)
+                    .map_err(|e| Error::Stream(format!("invalid UTF-8 in SSE: {e}")))?;
                 match classify_line(line.trim_end_matches('\r')) {
                     Line::Ignore => {}
                     Line::Done => {}
-                    Line::Data(data) => emit_chunk(data, &sink)?,
+                    Line::Data(data) => {
+                        let (reason, tools) = emit_chunk(data, &sink)?;
+                        finish_reason = reason.or(finish_reason);
+                        saw_tools |= tools;
+                    }
                 }
             }
-            Ok(())
+            check_completion(finish_reason, saw_tools)
         })
     }
 }
@@ -190,7 +202,26 @@ fn classify_line(line: &str) -> Line<'_> {
     }
 }
 
-fn emit_chunk(data: &str, sink: &UnboundedSender<StreamEvent>) -> Result<(), Error> {
+/// `finish_reason` confirms the model response finished. Some compatible
+/// endpoints omit [DONE], but [DONE] alone cannot certify tool completeness.
+fn check_completion(reason: Option<StopReason>, saw_tools: bool) -> Result<(), Error> {
+    let Some(reason) = reason else {
+        return Err(Error::Stream(
+            "stream ended before finish_reason; response is incomplete".into(),
+        ));
+    };
+    if saw_tools && reason != StopReason::ToolCalls {
+        return Err(Error::Stream(format!(
+            "incomplete tool calls: finish_reason was {reason:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn emit_chunk(
+    data: &str,
+    sink: &UnboundedSender<StreamEvent>,
+) -> Result<(Option<StopReason>, bool), Error> {
     let chunk: WireChunk = serde_json::from_str(data)
         .map_err(|e| Error::Stream(format!("bad chunk ({e}): {}", truncate(data, 500))))?;
 
@@ -204,6 +235,8 @@ fn emit_chunk(data: &str, sink: &UnboundedSender<StreamEvent>) -> Result<(), Err
     let send =
         |ev: StreamEvent| -> Result<(), Error> { sink.send(ev).map_err(|_| Error::Cancelled) };
 
+    let mut finish_reason = None;
+    let mut saw_tools = false;
     for choice in chunk.choices {
         if let Some(text) = choice.delta.content {
             if !text.is_empty() {
@@ -215,6 +248,7 @@ fn emit_chunk(data: &str, sink: &UnboundedSender<StreamEvent>) -> Result<(), Err
                 send(StreamEvent::Reasoning(reasoning))?;
             }
         }
+        saw_tools |= !choice.delta.tool_calls.is_empty();
         for call in choice.delta.tool_calls {
             let index = call.index.unwrap_or(0);
             if call.id.is_some() || call.function.name.is_some() {
@@ -231,14 +265,16 @@ fn emit_chunk(data: &str, sink: &UnboundedSender<StreamEvent>) -> Result<(), Err
             }
         }
         if let Some(reason) = choice.finish_reason {
-            send(StreamEvent::Stop(map_stop(&reason)))?;
+            let reason = map_stop(&reason);
+            finish_reason = Some(reason);
+            send(StreamEvent::Stop(reason))?;
         }
     }
 
     if let Some(usage) = chunk.usage {
         send(StreamEvent::Usage(usage.into()))?;
     }
-    Ok(())
+    Ok((finish_reason, saw_tools))
 }
 
 fn map_stop(reason: &str) -> StopReason {

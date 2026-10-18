@@ -30,7 +30,7 @@ const tools = [
     name: "bash",
     letter: "$",
     color: "mint",
-    desc: "在当前目录执行 shell，返回 stdout/stderr，默认 120 秒超时。搜索、构建、测试、git 都从这里走。",
+    desc: "在当前目录执行 shell，返回 stdout/stderr，默认 120 秒超时。Unix 下取消或超时会终止命令进程组中的子孙进程。搜索、构建、测试、git 都从这里走。",
     args: ["command", "timeout"],
     foot: "超时 120s，可调到 3600s",
   },

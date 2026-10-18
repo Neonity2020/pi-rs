@@ -248,19 +248,7 @@ impl Agent {
             }
 
             let calls = message.tool_calls.clone();
-            for call in &calls {
-                sink.on(AgentEvent::ToolStart { call: call.clone() });
-            }
-            let results = self.execute_tools(&calls, &cancel).await;
-            for (call, (result, duration_ms)) in calls.iter().zip(results) {
-                sink.on(AgentEvent::ToolEnd {
-                    call: call.clone(),
-                    result: result.clone(),
-                    duration_ms,
-                });
-                self.messages
-                    .push(Message::tool(call.id.clone(), result.content));
-            }
+            self.execute_tools(&calls, sink, &cancel).await;
 
             if cancel.is_cancelled() {
                 return Ok(Outcome::Aborted);
@@ -533,53 +521,55 @@ impl Agent {
         (acc, aborted, failure)
     }
 
-    /// Execute one tool-call batch. Independent calls run in parallel;
-    /// results are returned in call order. Every failure mode (unknown tool,
-    /// bad JSON, panic, cancellation) becomes an error result.
-    async fn execute_tools(&self, calls: &[ToolCall], cancel: &Cancel) -> Vec<(ToolResult, u64)> {
-        let mut slots: Vec<Option<(ToolResult, u64)>> = (0..calls.len()).map(|_| None).collect();
-        let mut set = JoinSet::new();
-
-        for (i, call) in calls.iter().enumerate() {
-            if cancel.is_cancelled() {
-                slots[i] = Some((ToolResult::err("Cancelled."), 0));
-                continue;
+    /// Execute in model order: tools may depend on earlier filesystem changes.
+    /// Report each result before dispatching the next call so a sink can cancel
+    /// on persistence failure. Skipped calls still get results for replay.
+    async fn execute_tools(&mut self, calls: &[ToolCall], sink: &mut dyn Sink, cancel: &Cancel) {
+        for call in calls {
+            if !cancel.is_cancelled() {
+                sink.on(AgentEvent::ToolStart { call: call.clone() });
             }
-            let Some(tool) = self.tools.iter().find(|t| t.name() == call.name).cloned() else {
-                slots[i] = Some((ToolResult::err(format!("No such tool: {}", call.name)), 0));
-                continue;
-            };
-            let args = match parse_args(&call.arguments) {
-                Ok(args) => args,
-                Err(result) => {
-                    slots[i] = Some((result, 0));
-                    continue;
-                }
-            };
-            let cancel = cancel.clone();
-            set.spawn(async move {
-                let started = Instant::now();
-                // Inner spawn isolates panics so the outer task always
-                // reports its call index.
-                let inner = tokio::spawn(async move { tool.run(&args, &cancel).await });
-                let result = match inner.await {
-                    Ok(result) => result,
-                    Err(join_error) => ToolResult::err(format!("tool panicked: {join_error}")),
-                };
-                (i, result, started.elapsed().as_millis() as u64)
+            let started = Instant::now();
+            let result = self.execute_tool(call, cancel).await;
+            sink.on(AgentEvent::ToolEnd {
+                call: call.clone(),
+                result: result.clone(),
+                duration_ms: started.elapsed().as_millis() as u64,
             });
+            self.messages
+                .push(Message::tool(call.id.clone(), result.content));
         }
+    }
 
-        while let Some(joined) = set.join_next().await {
-            if let Ok((i, result, duration_ms)) = joined {
-                slots[i] = Some((result, duration_ms));
+    async fn execute_tool(&self, call: &ToolCall, cancel: &Cancel) -> ToolResult {
+        if cancel.is_cancelled() {
+            return ToolResult::err("Cancelled.");
+        }
+        let Some(tool) = self.tools.iter().find(|t| t.name() == call.name).cloned() else {
+            return ToolResult::err(format!("No such tool: {}", call.name));
+        };
+        let args = match parse_args(&call.arguments) {
+            Ok(args) => args,
+            Err(result) => return result,
+        };
+        let tool_cancel = cancel.clone();
+        // A single owned task isolates panics and is aborted on drop. No
+        // detached inner task may keep mutating files after the turn ends.
+        let mut task = JoinSet::new();
+        task.spawn(async move { tool.run(&args, &tool_cancel).await });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                task.abort_all();
+                let _ = task.join_next().await;
+                ToolResult::err("Cancelled.")
+            }
+            joined = task.join_next() => match joined {
+                Some(Ok(result)) => result,
+                Some(Err(error)) => ToolResult::err(format!("tool panicked: {error}")),
+                None => ToolResult::err("Tool did not run."),
             }
         }
-
-        slots
-            .into_iter()
-            .map(|slot| slot.unwrap_or_else(|| (ToolResult::err("Tool did not run."), 0)))
-            .collect()
     }
 }
 
@@ -842,7 +832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_batch_preserves_call_order() {
+    async fn batch_results_preserve_call_order() {
         let first = vec![
             StreamEvent::ToolCallStart {
                 index: 0,
@@ -875,6 +865,239 @@ mod tests {
         assert_eq!(messages[2].text(), "a");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(messages[3].text(), "b");
+    }
+
+    #[tokio::test]
+    async fn tools_finish_and_report_before_the_next_call_starts() {
+        struct Ordered(Arc<StdMutex<Vec<String>>>);
+        impl Tool for Ordered {
+            fn name(&self) -> &str {
+                "ordered"
+            }
+            fn description(&self) -> &str {
+                "test execution order"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run<'a>(
+                &'a self,
+                args: &'a serde_json::Value,
+                _: &'a Cancel,
+            ) -> crate::BoxFuture<'a, ToolResult> {
+                Box::pin(async move {
+                    let name = args["name"].as_str().unwrap();
+                    self.0.lock().unwrap().push(format!("start {name}"));
+                    if name == "first" {
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    }
+                    self.0.lock().unwrap().push(format!("end {name}"));
+                    ToolResult::ok(name)
+                })
+            }
+        }
+        struct Reporting(Arc<StdMutex<Vec<String>>>);
+        impl Sink for Reporting {
+            fn on(&mut self, event: AgentEvent) {
+                if let AgentEvent::ToolEnd { call, .. } = event {
+                    self.0.lock().unwrap().push(format!("report {}", call.id));
+                }
+            }
+        }
+        let log = Arc::new(StdMutex::new(vec![]));
+        let mut calls = tool_call("first", "ordered", r#"{"name":"first"}"#);
+        calls.pop();
+        calls.extend([
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "second".into(),
+                name: "ordered".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                args: r#"{"name":"second"}"#.into(),
+            },
+            StreamEvent::Stop(StopReason::ToolCalls),
+        ]);
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            calls,
+            vec![StreamEvent::Text("done".into())],
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            Model::unknown("mock", "m"),
+            String::new(),
+            vec![Arc::new(Ordered(log.clone()))],
+            vec![],
+        );
+        agent
+            .run_turn(
+                Message::user("test"),
+                &mut Reporting(log.clone()),
+                Cancel::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "start first",
+                "end first",
+                "report first",
+                "start second",
+                "end second",
+                "report second"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_a_result_prevents_remaining_tools() {
+        struct CancelAfterResult(Cancel);
+        impl Sink for CancelAfterResult {
+            fn on(&mut self, event: AgentEvent) {
+                if matches!(event, AgentEvent::ToolEnd { .. }) {
+                    self.0.cancel();
+                }
+            }
+        }
+        // An unknown second tool is deliberately distinguishable from a
+        // skipped call: cancellation must be checked before dispatch.
+        let mut calls = tool_call("first", "echo", r#"{"text":"one"}"#);
+        calls.pop();
+        calls.extend([
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "second".into(),
+                name: "unknown".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                args: "{}".into(),
+            },
+            StreamEvent::Stop(StopReason::ToolCalls),
+        ]);
+        let (mut agent, provider) = agent(vec![calls]);
+        let cancel = Cancel::new();
+        let outcome = agent
+            .run_turn(
+                Message::user("test"),
+                &mut CancelAfterResult(cancel.clone()),
+                cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Aborted);
+        assert_eq!(agent.messages()[2].text(), "one");
+        assert_eq!(agent.messages()[3].text(), "Cancelled.");
+        assert_eq!(provider.observed().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn panicking_tool_is_an_error_and_the_next_call_still_runs() {
+        struct Panics;
+        impl Tool for Panics {
+            fn name(&self) -> &str {
+                "panics"
+            }
+            fn description(&self) -> &str {
+                "test panic isolation"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run<'a>(
+                &'a self,
+                _: &'a serde_json::Value,
+                _: &'a Cancel,
+            ) -> crate::BoxFuture<'a, ToolResult> {
+                Box::pin(async {
+                    panic!("test panic");
+                })
+            }
+        }
+        let mut calls = tool_call("first", "panics", "{}");
+        calls.pop();
+        calls.extend([
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "second".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                args: r#"{"text":"still runs"}"#.into(),
+            },
+            StreamEvent::Stop(StopReason::ToolCalls),
+        ]);
+        let (mut agent, _) = agent(vec![calls, vec![StreamEvent::Text("done".into())]]);
+        agent.tools.push(Arc::new(Panics));
+        agent
+            .run_turn(Message::user("test"), &mut (), Cancel::new())
+            .await
+            .unwrap();
+        assert!(agent.messages()[2].text().contains("tool panicked"));
+        assert_eq!(agent.messages()[3].text(), "still runs");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_uncooperative_tool_drops_it_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Waiting {
+            started: Arc<tokio::sync::Notify>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Tool for Waiting {
+            fn name(&self) -> &str {
+                "waiting"
+            }
+            fn description(&self) -> &str {
+                "ignores cancellation"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run<'a>(
+                &'a self,
+                _: &'a serde_json::Value,
+                _: &'a Cancel,
+            ) -> crate::BoxFuture<'a, ToolResult> {
+                Box::pin(async move {
+                    let _guard = Flag(self.dropped.clone());
+                    self.started.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (mut agent, _) = agent(vec![tool_call("c1", "waiting", "{}")]);
+        agent.tools.push(Arc::new(Waiting {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }));
+        let cancel = Cancel::new();
+        let handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { agent.run_turn(Message::user("test"), &mut (), cancel).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Outcome::Aborted);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

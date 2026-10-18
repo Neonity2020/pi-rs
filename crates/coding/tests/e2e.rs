@@ -215,6 +215,147 @@ fn session_path(home: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn interrupted_streams_preserve_text_report_error_and_never_run_tools() {
+    let text = "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n";
+    let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"file_path\\\":\\\"must-not-exist\\\",\\\"content\\\":\\\"bad\\\"}\"}}]}}]}\n\n";
+    for suffix in [
+        String::new(),
+        tool.to_string(),
+        format!("{tool}data: [DONE]\n\n"),
+        format!("{tool}data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: [DONE]\n\n"),
+        "data: {\"choices\":".into(),
+    ] {
+        for json_mode in [false, true] {
+            let home = test_dir();
+            let (url, requests) = start_mock_api(vec![format!("{text}{suffix}")]);
+            let mut command = pi_in(&home);
+            command.args(["-p", "test", "--base-url", &url, "--api-key", "fake"]);
+            if json_mode { command.arg("--json"); }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!output.status.success(), "truncated stream succeeded: {stdout}");
+            assert!(stdout.contains("partial answer"));
+            if json_mode {
+                let result: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+                assert_eq!(result["outcome"], "error", "{stdout}");
+            } else {
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("— done"));
+            }
+            assert!(!home.join("must-not-exist").exists());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            let saved = std::fs::read_to_string(session_path(&home)).unwrap();
+            let entries: Vec<Value> = saved.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let message = &entries.last().unwrap()["message"];
+            assert_eq!(message["content"], "partial answer");
+            assert!(message.get("tool_calls").is_none());
+        }
+    }
+}
+
+#[test]
+fn finish_reason_without_done_preserves_trailing_usage() {
+    let home = test_dir();
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"完成\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}";
+    let (url, _) = start_mock_api(vec![body.into()]);
+    let output = pi_in(&home)
+        .args([
+            "--json",
+            "-p",
+            "test",
+            "--base-url",
+            &url,
+            "--api-key",
+            "fake",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(result["outcome"], "completed");
+    assert_eq!(result["usage"]["input_tokens"], 7);
+    assert!(stdout.contains("完成"));
+}
+
+#[test]
+fn byte_chunked_sse_reassembles_utf8_and_executes_dependent_tools_in_order() {
+    use serde_json::json;
+    let home = test_dir();
+    let events = [
+        json!({"choices":[{"delta":{"content":"正在处理", "tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":"{\"file_path\":\"ordered.txt\",\"content\":"}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"原始\"}"}},{"index":1,"id":"c2","function":{"name":"edit","arguments":json!({"file_path":"ordered.txt","old_string":"原始","new_string":"完成"}).to_string()}}]},"finish_reason":"tool_calls"}]}),
+    ];
+    let first = events
+        .iter()
+        .map(|event| format!("data: {event}\r\n\r\n"))
+        .collect::<String>()
+        + "data: [DONE]\r\n\r\n";
+    let second = sse(&[r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut requests = vec![];
+        for body in [first, second] {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream).unwrap());
+            let mut response = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec();
+            // Split even UTF-8 code points and SSE field names across chunks.
+            for byte in body.bytes() {
+                response.extend_from_slice(b"1\r\n");
+                response.push(byte);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            stream.write_all(&response).unwrap();
+        }
+        requests
+    });
+    let output = pi_in(&home)
+        .args([
+            "--json",
+            "-p",
+            "test",
+            "--base-url",
+            &url,
+            "--api-key",
+            "fake",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("ordered.txt")).unwrap(),
+        "完成"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("正在处理"));
+    let events: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_end")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results
+        .iter()
+        .all(|event| event["result"]["is_error"] == false));
+    let requests = server.join().unwrap();
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(messages[3]["tool_call_id"], "c1");
+    assert_eq!(messages[4]["tool_call_id"], "c2");
+}
+
+#[test]
 fn persistence_failure_is_reported_and_prevents_tool_execution() {
     for (json_mode, tool_call) in [(false, false), (false, true), (true, false), (true, true)] {
         let home = test_dir();
