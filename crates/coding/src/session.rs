@@ -8,6 +8,7 @@
 //! place (the old messages stay in the file), and loading replays the latest
 //! one: a synthetic summary message followed by the kept tail.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -120,11 +121,11 @@ impl Session {
             compaction,
         };
         let mut file = OpenOptions::new()
-            .create(true)
             .append(true)
             .open(&self.path)
             .with_context(|| format!("open {}", self.path.display()))?;
-        writeln!(file, "{}", serde_json::to_string(&entry)?)?;
+        writeln!(file, "{}", serde_json::to_string(&entry)?)
+            .with_context(|| format!("append {}", self.path.display()))?;
         self.last = Some(id.clone());
         Ok(id)
     }
@@ -206,11 +207,17 @@ impl Session {
     }
 
     fn load_file(path: &Path) -> Result<(Self, Vec<Message>)> {
-        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-
-        let header_line = lines.next().context("empty session file")?;
-        let header: Header = serde_json::from_str(header_line).context("parse session header")?;
+        // Read bytes: a crash can tear a UTF-8 character in the final record.
+        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<_> = bytes.split_inclusive(|b| *b == b'\n').collect();
+        let nonempty = |line: &&[u8]| !line.iter().all(u8::is_ascii_whitespace);
+        let first = lines
+            .iter()
+            .position(nonempty)
+            .context("empty session file")?;
+        let last_line = lines.iter().rposition(nonempty).unwrap();
+        let header: Header =
+            serde_json::from_slice(lines[first]).context("parse session header")?;
         if header.kind != "session" {
             bail!("{} is not a session file", path.display());
         }
@@ -223,23 +230,65 @@ impl Session {
         }
 
         let mut entries: Vec<Entry> = Vec::new();
-        for line in lines {
-            match serde_json::from_str::<Entry>(line) {
+        let mut offset = 0;
+        let mut torn_at = None;
+        for (number, line) in lines.iter().enumerate() {
+            let start = offset;
+            offset += line.len();
+            if number <= first || !nonempty(line) {
+                continue;
+            }
+            match serde_json::from_slice::<Entry>(line) {
                 Ok(entry) => entries.push(entry),
-                // A torn final line (crash mid-write) should not kill resume.
-                Err(_) => continue,
+                Err(_) if number == last_line => torn_at = Some(start),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("corrupt session {} at line {}", path.display(), number + 1)
+                    })
+                }
             }
         }
 
+        let mut by_id = HashMap::new();
+        for entry in &entries {
+            if by_id.insert(entry.id.as_str(), entry).is_some() {
+                bail!(
+                    "duplicate session entry id {} in {}",
+                    entry.id,
+                    path.display()
+                );
+            }
+        }
+        // Validate every branch before repairing anything. A visited set also
+        // bounds traversal when an edited/damaged file contains a parent cycle.
+        let mut checked = HashSet::new();
+        for entry in &entries {
+            let mut visiting = HashSet::new();
+            let mut cursor = Some(entry.id.as_str());
+            while let Some(id) = cursor {
+                if checked.contains(id) {
+                    break;
+                }
+                if !visiting.insert(id) {
+                    bail!("session parent cycle at {id} in {}", path.display());
+                }
+                let entry = by_id.get(id).with_context(|| {
+                    format!("missing session parent {id} in {}", path.display())
+                })?;
+                cursor = entry.parent.as_deref();
+            }
+            checked.extend(visiting);
+        }
+
+        repair_tail(path, &bytes, torn_at)?;
+
         // Walk the active branch: from the last entry back to the root.
         let mut branch: Vec<&Entry> = Vec::new();
-        let mut cursor = entries.last().map(|e| e.id.clone());
+        let mut cursor = entries.last().map(|e| e.id.as_str());
         while let Some(id) = cursor {
-            let Some(entry) = entries.iter().find(|e| e.id == id) else {
-                break;
-            };
+            let entry = by_id[id];
             branch.push(entry);
-            cursor = entry.parent.clone();
+            cursor = entry.parent.as_deref();
         }
         branch.reverse();
 
@@ -292,6 +341,47 @@ impl Session {
             messages,
         ))
     }
+}
+
+/// The only truncation allowed for append-only sessions is a damaged tail.
+/// Keep the original bytes before removing it; retained records are untouched.
+fn repair_tail(path: &Path, bytes: &[u8], torn_at: Option<usize>) -> Result<()> {
+    let kept = &bytes[..torn_at.unwrap_or(bytes.len())];
+    if torn_at.is_none() && kept.ends_with(b"\n") {
+        return Ok(());
+    }
+    if torn_at.is_some() {
+        let backup = path.with_extension(format!("jsonl.{}.bak", util::short_id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&backup)
+            .with_context(|| format!("create session backup {}", backup.display()))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .with_context(|| format!("save session backup {}", backup.display()))?;
+        eprintln!(
+            "warning: repairing damaged session tail; original saved to {}",
+            backup.display()
+        );
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("repair session {}", path.display()))?;
+    if torn_at.is_some() {
+        file.set_len(kept.len() as u64)?;
+    }
+    if !kept.ends_with(b"\n") {
+        file.write_all(b"\n")?;
+    }
+    file.sync_all()
+        .with_context(|| format!("repair session {}", path.display()))
 }
 
 #[cfg(test)]
@@ -466,5 +556,117 @@ mod tests {
     fn empty_dir_has_no_session() {
         let dir = temp_dir("empty");
         assert!(Session::load_latest_in(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn torn_tail_can_resume_append_and_resume_again() {
+        for tail in [b"{\"id\":\"torn".as_slice(), b"{\"id\":\"\xff", b"broken\n"] {
+            let dir = temp_dir("torn-tail");
+            let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+            session.append_message(&Message::user("one")).unwrap();
+            let path = session.path.clone();
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(tail)
+                .unwrap();
+            let original = fs::read(&path).unwrap();
+
+            let (mut resumed, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+            assert_eq!(messages[0].text(), "one");
+            resumed.append_message(&Message::user("two")).unwrap();
+            let (mut resumed, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+            assert_eq!(
+                messages.iter().map(Message::text).collect::<Vec<_>>(),
+                ["one", "two"]
+            );
+            resumed.append_message(&Message::user("three")).unwrap();
+            let (_, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+            assert_eq!(messages.len(), 3);
+            let backups: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|e| e == "bak"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(fs::read(&backups[0]).unwrap(), original);
+            for line in fs::read_to_string(path).unwrap().lines() {
+                serde_json::from_str::<serde_json::Value>(line).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn valid_unterminated_message_is_preserved_before_appending() {
+        let dir = temp_dir("no-newline");
+        let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+        session.append_message(&Message::user("one")).unwrap();
+        let text = fs::read_to_string(&session.path).unwrap();
+        fs::write(&session.path, text.trim_end()).unwrap();
+        let (mut resumed, _) = Session::load_latest_in(&dir).unwrap().unwrap();
+        resumed.append_message(&Message::user("two")).unwrap();
+        let (_, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn legacy_v1_session_can_resume_and_append() {
+        let dir = temp_dir("legacy-v1");
+        let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+        session.append_message(&Message::user("one")).unwrap();
+        let text = fs::read_to_string(&session.path)
+            .unwrap()
+            .replacen("\"v\":2", "\"v\":1", 1);
+        fs::write(&session.path, text).unwrap();
+        let (mut resumed, _) = Session::load_latest_in(&dir).unwrap().unwrap();
+        resumed.append_message(&Message::user("two")).unwrap();
+        let (_, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
+        assert_eq!(
+            messages.iter().map(Message::text).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn interior_corruption_is_rejected_without_changing_the_file() {
+        let dir = temp_dir("bad-middle");
+        let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+        session.append_message(&Message::user("one")).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&session.path)
+            .unwrap()
+            .write_all(b"broken\n")
+            .unwrap();
+        session.append_message(&Message::user("two")).unwrap();
+        let original = fs::read(&session.path).unwrap();
+        assert!(Session::load_latest_in(&dir).is_err());
+        assert_eq!(fs::read(&session.path).unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_parent_links_are_rejected_without_changing_the_file() {
+        for defect in ["duplicate", "missing", "cycle"] {
+            let dir = temp_dir(defect);
+            let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+            session.append_message(&Message::user("one")).unwrap();
+            session.append_message(&Message::user("two")).unwrap();
+            let text = fs::read_to_string(&session.path).unwrap();
+            let mut lines: Vec<serde_json::Value> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            match defect {
+                "duplicate" => lines[2]["id"] = lines[1]["id"].clone(),
+                "missing" => lines[2]["parent"] = "absent".into(),
+                "cycle" => lines[1]["parent"] = lines[2]["id"].clone(),
+                _ => unreachable!(),
+            }
+            let damaged = lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+            fs::write(&session.path, &damaged).unwrap();
+            assert!(Session::load_latest_in(&dir).is_err(), "accepted {defect}");
+            assert_eq!(fs::read_to_string(&session.path).unwrap(), damaged);
+        }
     }
 }

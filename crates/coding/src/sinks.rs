@@ -5,7 +5,8 @@
 use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
-use agent::{AgentEvent, Sink};
+use agent::{AgentEvent, Cancel, Sink};
+use anyhow::{bail, Result};
 use llm::{Message, Model};
 
 use crate::session::Session;
@@ -18,6 +19,8 @@ pub struct Shared {
     pub session: Arc<Mutex<Session>>,
     pub stats: Arc<Mutex<Stats>>,
     pub model: Model,
+    persistence_error: Arc<Mutex<Option<String>>>,
+    active_cancel: Arc<Mutex<Cancel>>,
 }
 
 impl Shared {
@@ -26,39 +29,70 @@ impl Shared {
             session: Arc::new(Mutex::new(session)),
             stats: Arc::new(Mutex::new(Stats::default())),
             model,
+            persistence_error: Arc::new(Mutex::new(None)),
+            active_cancel: Arc::new(Mutex::new(Cancel::new())),
         }
     }
 
+    /// A failed write can leave a partial record, so never retry writes or
+    /// run another turn with this process's now-divergent in-memory history.
+    pub fn persistence_result(&self) -> Result<()> {
+        if let Some(error) = &*self.persistence_error.lock().unwrap() {
+            bail!("{error}");
+        }
+        Ok(())
+    }
+
+    pub fn begin_turn(&self, cancel: Cancel) -> Result<()> {
+        self.persistence_result()?;
+        *self.active_cancel.lock().unwrap() = cancel;
+        Ok(())
+    }
+
+    fn persist(&self, write: impl FnOnce(&mut Session) -> Result<()>) -> Result<()> {
+        let mut failure = self.persistence_error.lock().unwrap();
+        if let Some(error) = &*failure {
+            bail!("{error}");
+        }
+        let mut session = self.session.lock().unwrap();
+        if let Err(error) = write(&mut session) {
+            let message = format!(
+                "session persistence failed ({}): {error:#}; turn stopped. Repair the session and restart before continuing",
+                session.path.display()
+            );
+            *failure = Some(message.clone());
+            // Sink::on is synchronous; cancel before returning to the agent
+            // so it cannot start tools from an unpersisted assistant message.
+            self.active_cancel.lock().unwrap().cancel();
+            bail!("{message}");
+        }
+        Ok(())
+    }
+
+    pub fn append_message(&self, message: &Message) -> Result<()> {
+        self.persist(|session| session.append_message(message))
+    }
+
     /// Persist whatever this event contributes to the session.
-    pub fn record(&self, event: &AgentEvent) {
+    pub fn record(&self, event: &AgentEvent) -> Result<()> {
         match event {
-            AgentEvent::Assistant { message } => {
-                let _ = self.session.lock().unwrap().append_message(message);
-            }
+            AgentEvent::Assistant { message } => self.append_message(message),
             AgentEvent::ToolEnd { call, result, .. } => {
-                let _ = self
-                    .session
-                    .lock()
-                    .unwrap()
-                    .append_message(&Message::tool(call.id.clone(), result.content.clone()));
+                self.append_message(&Message::tool(call.id.clone(), result.content.clone()))
             }
             AgentEvent::Compaction {
                 summary,
                 tokens_before,
                 tokens_after,
                 first_kept_index,
-            } => {
-                let _ = self.session.lock().unwrap().append_compaction(
-                    summary,
-                    *first_kept_index,
-                    *tokens_before,
-                    *tokens_after,
-                );
-            }
+            } => self.persist(|session| {
+                session.append_compaction(summary, *first_kept_index, *tokens_before, *tokens_after)
+            }),
             AgentEvent::Usage { usage } => {
                 self.stats.lock().unwrap().add(*usage, &self.model);
+                Ok(())
             }
-            _ => {}
+            _ => self.persistence_result(),
         }
     }
 
@@ -109,7 +143,9 @@ impl PrintSink {
 
 impl Sink for PrintSink {
     fn on(&mut self, event: AgentEvent) {
-        self.shared.record(&event);
+        if self.shared.record(&event).is_err() {
+            return;
+        }
         let (d, r) = dim();
         match event {
             AgentEvent::Text { delta } => {
@@ -163,7 +199,9 @@ pub struct JsonSink {
 
 impl Sink for JsonSink {
     fn on(&mut self, event: AgentEvent) {
-        self.shared.record(&event);
+        if self.shared.record(&event).is_err() {
+            return;
+        }
         match serde_json::to_string(&event) {
             Ok(line) => println!("{line}"),
             Err(error) => eprintln!("failed to serialize event: {error}"),
@@ -187,15 +225,19 @@ mod tests {
             .unwrap();
         let shared = Shared::new(session, Model::unknown("mock", "m"));
 
-        shared.record(&AgentEvent::Compaction {
-            summary: "summary".into(),
-            tokens_before: 100,
-            tokens_after: 20,
-            first_kept_index: 1,
-        });
-        shared.record(&AgentEvent::Assistant {
-            message: Message::assistant(Some("new".into()), None, vec![]),
-        });
+        shared
+            .record(&AgentEvent::Compaction {
+                summary: "summary".into(),
+                tokens_before: 100,
+                tokens_after: 20,
+                first_kept_index: 1,
+            })
+            .unwrap();
+        shared
+            .record(&AgentEvent::Assistant {
+                message: Message::assistant(Some("new".into()), None, vec![]),
+            })
+            .unwrap();
 
         let (loaded, messages) = Session::load_latest_in(&dir).unwrap().unwrap();
         assert_eq!(loaded.summary(), Some("summary"));
@@ -203,5 +245,60 @@ mod tests {
         assert!(agent::is_summary_message(&messages[0]));
         assert_eq!(messages[1].text(), "old answer");
         assert_eq!(messages[2].text(), "new");
+    }
+
+    #[test]
+    fn every_record_failure_cancels_and_latches_until_restart() {
+        let events = [
+            AgentEvent::Assistant {
+                message: Message::assistant(Some("answer".into()), None, vec![]),
+            },
+            AgentEvent::ToolEnd {
+                call: llm::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+                result: agent::ToolResult::ok("result"),
+                duration_ms: 0,
+            },
+            AgentEvent::Compaction {
+                summary: "summary".into(),
+                first_kept_index: 0,
+                tokens_before: 10,
+                tokens_after: 5,
+            },
+        ];
+        for event in events {
+            let dir = crate::testutil::temp_dir("sink-failure");
+            let mut session = Session::create_in(&dir, Path::new("/tmp/project"), "m").unwrap();
+            session.append_message(&Message::user("one")).unwrap();
+            let path = session.path.clone();
+            let backup = path.with_extension("backup");
+            let shared = Shared::new(session, Model::unknown("mock", "m"));
+            let cancel = Cancel::new();
+            shared.begin_turn(cancel.clone()).unwrap();
+            std::fs::rename(&path, &backup).unwrap();
+            std::fs::create_dir(&path).unwrap();
+
+            let error = shared.record(&event).unwrap_err().to_string();
+            assert!(error.contains("session persistence failed"));
+            assert!(cancel.is_cancelled());
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&backup, &path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            assert_eq!(
+                shared.begin_turn(Cancel::new()).unwrap_err().to_string(),
+                error
+            );
+            assert_eq!(
+                shared
+                    .append_message(&Message::user("two"))
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
     }
 }

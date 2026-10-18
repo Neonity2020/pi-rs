@@ -250,12 +250,13 @@ ToolResult { content: String, is_error: bool }
 - 每行一个 JSON，追加写；`id` + `parent` 使文件在格式上是一棵树。
 - compaction 行只描述“从哪里开始保留 + 摘要”，不复制或删除旧消息；加载时重放最新一条。
 - 恢复时从最后一条沿 `parent` 回溯到根，得到活动分支。
-- 最后一行损坏（写到一半崩溃）会被跳过，不影响恢复。
+- 最后一条非空行损坏（包括 UTF-8 字符写到一半）时，先将原始字节完整备份到同目录 `<session>.jsonl.<id>.bak`，再截掉坏尾部并告警；备份失败则拒绝修复。合法末行没有换行时补上换行，确保后续追加不会拼接到上一条记录。
+- 中间坏行、重复 ID、缺失父节点或父链环路直接报错，保持文件原样；加载时建立 ID 索引，父链校验与分支重建均为线性遍历。
 - 当前没有分支导航 UI；需要分支时再实现，不重写历史格式。
 
 ### Sinks 与统计
 
-`Shared` 持有会话、统计和模型。每个 sink 先 `record(event)`：
+`Shared` 持有会话、统计、模型、当前回合的取消令牌和首个持久化错误。用户输入先经 `Shared::append_message` 落盘；每个 sink 先 `record(event)`：
 
 | 事件 | 落盘/统计 |
 |---|---|
@@ -266,10 +267,13 @@ ToolResult { content: String, is_error: bool }
 
 之后 print/json/tui sink 再做各自的展示。TUI 状态栏的缓存命中率按 `cached_tokens / input_tokens` 四舍五入，尚未收到 usage 或输入为 0 时显示 `cache -`。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按 DeepSeek 峰谷价估算（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日）。
 
+任一消息或 compaction 写入失败，`Shared` 保留首个错误并同步取消当前回合，停止后续会话写入、模型请求和新工具批次。assistant 消息未落盘时，其工具不会执行；已经执行的工具不回滚。print 模式在 stderr 报错并以非零状态退出；JSON 最终输出 `outcome:"error"` 并非零退出；TUI 显示错误并结束忙碌态，拒绝继续提问、`/compact` 和 `/dream`，退出时返回失败。即使之后路径恢复可写，也必须修复文件并重启，避免继续使用与磁盘不一致的内存历史。这里复用现有取消机制，`agent` 无需知道文件或会话语义。
+
 ### UI 接线
 
 - 独立线程跑 `crossterm::event::read`，把按键/滚轮/左键点击/尺寸变化送进 channel；左键带着坐标，由 `App::on_click` 命中 thinking header。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
+- `tui::commands` 是斜杠命令的唯一表格（名字、参数提示、一行说明、是否 lab-only）；`/help` 文本和补全菜单都从它生成，避免两处漂移。输入框内容是一个不以空白结尾的 `/` 前缀时 `App::completion` 打开，`Up` / `Down` 改选、`Tab` 补全、`Esc` 关闭；前缀尚未等于完整命令名时 `Enter` 先补全，不把半截命令发给应用层。补全只改输入框，不产生 `Action`。
 - `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/remember`、`/forget`、`/memory`、`/lab`、`/dream`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
 - `/lab` 只翻转 `App::lab`；`/dream` 在 lab 关闭、忙碌、未登录、记忆为空或工具不足时直接拒绝/提示。满足条件时把 `Cancel` 交给隔离的 dream 任务，`TuiSink::ephemeral` 展示思考与工具活动、累计用量，但不追加会话记录；结束统一发 `Busy(false)`。
 - `/compact` 在空闲时拿 agent 锁执行一次强制压缩；`TuiSink` 负责落盘并把 `Compaction` / `CompactionFailed` 翻成提示。忙时直接拒绝，不打断当前 turn。
@@ -303,7 +307,7 @@ ToolResult { content: String, is_error: bool }
 5. 工具集合是产品决定：默认且仅四个。
 6. 没有 max steps。
 7. 基础系统提示保持在约 400 token 以内。
-8. 会话文件只追加；每条记录有 `id` 与 `parent`。
+8. 会话文件正常运行时只追加；每条记录有 `id` 与 `parent`。唯一截断例外是恢复时已完整备份的损坏尾部，不重写保留的记录。
 9. `tui` 不碰 I/O；终端生命周期属于 `coding`。
 10. provider 不知道会话、提示词文件或终端。
 11. 取消是协作式的，贯穿 HTTP 请求与工具子进程。
@@ -326,8 +330,10 @@ ToolResult { content: String, is_error: bool }
 | 工具参数不是 JSON | `ToolResult::err`，回给模型 | 模型自我修正 |
 | 工具 panic | 捕获为错误结果 | 循环继续 |
 | 用户取消 | `Outcome::Aborted`，保留已产出文本 | 重新提问 |
-| 会话末行损坏 | 跳过该行 | 自动恢复 |
-| compaction 行损坏 / `first_kept_id` 丢失 | 回退到完整历史，不静默丢消息 | 继续对话；必要时重新 `/compact` |
+| 会话末行损坏 | 备份原文件、告警并移除损坏尾部 | 自动恢复；备份失败则报错 |
+| 会话中间坏行 / ID 或父链损坏 | 明确报错，文件保持原样 | 依据错误路径手动修复后重启 |
+| 会话写入失败 | 取消当前回合，保留首个错误，拒绝后续模型操作；三种模式均报告失败 | 修复存储或文件后重启 |
+| `first_kept_id` 丢失 | 回退到完整历史，不静默丢消息 | 继续对话；必要时重新 `/compact` |
 | 上下文超过窗口 | 自动/手动压缩；provider 报 overflow 时压缩并重试一次 | 仍失败则开新会话或减小输入 |
 | 摘要请求失败 / 返回工具调用 / 被长度截断 | 自动/overflow 发 `CompactionFailed`；手动压缩返回错误；历史不变 | 自动压缩继续发原请求；手动压缩重试 |
 | 历史 prompt 文件损坏 | 跳过坏行；读不出就是空历史 | 继续使用，新 prompt 照常追加 |
@@ -356,7 +362,7 @@ ToolResult { content: String, is_error: bool }
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
 | agent 单元 | `crates/agent/src/*` | 工具回环、并行顺序、中止、空流、panic、token 估算、切点、摘要序列化、自动/手动/overflow 压缩 |
 | coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
-| tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、thinking 折叠/点击、换行、图片附件、Markdown/表格/高亮 |
+| tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、斜杠命令列表/补全、thinking 折叠/点击、换行、图片附件、Markdown/表格/高亮 |
 | e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi-rs login`/`logout`、key 优先级、错误路径、context overflow 压缩重试与会话落盘 |
 | PTY 冒烟 | `scripts/tui_*.py` | 真实终端：启动、输入、流式渲染、干净退出 |
 

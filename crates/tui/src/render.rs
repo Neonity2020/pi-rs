@@ -42,6 +42,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     };
 
     render_transcript(app, frame, transcript_rect);
+    render_completion(app, frame, transcript_rect);
     render_status(app, frame, status_rect);
     render_input(app, frame, input_rect);
 }
@@ -310,6 +311,89 @@ fn render_status(app: &App, frame: &mut Frame, rect: Rect) {
         Span::styled(right, Style::new().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(line), rect);
+}
+
+/// Slash-command menu, drawn over the bottom of the transcript so it sits
+/// right above the input box. Opens while the input is a bare `/` prefix.
+fn render_completion(app: &App, frame: &mut Frame, rect: Rect) {
+    let Some(completion) = &app.completion else {
+        return;
+    };
+    const MAX_ROWS: usize = 8;
+    let visible = completion.matches.len().min(MAX_ROWS);
+    let height = (visible + 2) as u16;
+    if visible == 0 || rect.height < height || rect.width < 16 {
+        return;
+    }
+
+    let usage_width = completion
+        .matches
+        .iter()
+        .map(|command| display_width(&command.usage()))
+        .max()
+        .unwrap_or(0);
+    let help_width = completion
+        .matches
+        .iter()
+        .map(|command| display_width(command.help) + if command.lab { 6 } else { 0 })
+        .max()
+        .unwrap_or(0);
+    // marker + usage + gap + help + borders
+    let width = (usage_width + help_width + 6)
+        .min(rect.width as usize)
+        .max(16) as u16;
+    let area = Rect {
+        x: rect.x,
+        y: rect.y + rect.height - height,
+        width,
+        height,
+    };
+
+    let start = completion.selected.saturating_sub(visible - 1);
+    let mut lines = Vec::with_capacity(visible);
+    for (row, command) in completion
+        .matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
+        let selected = row == completion.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let usage = format!("{:<width$}", command.usage(), width = usage_width);
+        let name_style = if selected {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::White)
+        };
+        let mut spans = vec![
+            Span::styled(marker, Style::new().fg(Color::Cyan)),
+            Span::styled(usage, name_style),
+            Span::raw("  "),
+            Span::styled(command.help, Style::new().fg(Color::DarkGray)),
+        ];
+        if command.lab {
+            spans.push(Span::styled(
+                " · lab",
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::DIM),
+            ));
+        }
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.style(Style::new().bg(Color::Rgb(38, 38, 46)));
+        }
+        lines.push(line);
+    }
+
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(Line::from(Span::styled(
+            " commands · Tab complete · ↑↓ select · Esc close ",
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
@@ -831,5 +915,44 @@ mod tests {
         assert_eq!(slice_columns("hello", 0, 3), "hel");
         assert_eq!(slice_columns("hello", 2, 3), "llo");
         assert_eq!(slice_columns("hello", 3, 10), "lo");
+    }
+    #[test]
+    fn command_menu_is_drawn_above_the_input_box() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::StatusInfo;
+
+        let mut app = App::new(StatusInfo::default());
+        for c in "/lo".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(70)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let menu = rows
+            .iter()
+            .position(|row| row.contains("commands"))
+            .expect("menu border title");
+        assert!(
+            rows[menu].contains("Tab complete"),
+            "hint missing: {}",
+            rows[menu]
+        );
+        assert!(rows[menu + 1].contains("▸ /login"), "{}", rows[menu + 1]);
+        assert!(rows[menu + 2].contains("/logout"), "{}", rows[menu + 2]);
+        // The input box stays at the bottom, below the menu.
+        assert!(
+            rows.iter().any(|row| row.contains("pi-rs")),
+            "input title missing"
+        );
     }
 }

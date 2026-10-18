@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::commands::{self, Completion};
 use crate::wrap::display_width;
 
 /// An image waiting in the input box. The bytes stay in the app layer until
@@ -190,6 +191,8 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub struct App {
     pub items: Vec<Item>,
     pub input: Input,
+    /// Slash-command menu, open while the input is a bare `/` prefix.
+    pub completion: Option<Completion>,
     /// Images attached to the prompt being edited.
     pub images: Vec<ImageAttachment>,
     /// Present while the mask takes over the input box.
@@ -225,6 +228,7 @@ impl App {
         Self {
             items: Vec::new(),
             input: Input::default(),
+            completion: None,
             images: Vec::new(),
             login: None,
             logged_in: true,
@@ -361,12 +365,38 @@ impl App {
 
     /// Replace the input box with a masked key prompt.
     pub fn begin_login(&mut self, provider: impl Into<String>) {
+        self.completion = None;
         self.login = Some(LoginPrompt {
             provider: provider.into(),
             input: Input::default(),
             busy: false,
         });
         self.version = self.version.wrapping_add(1);
+    }
+
+    /// Recompute the completion menu from the input token. Called after every
+    /// text edit so typing narrows the list and a space closes it.
+    fn refresh_completion(&mut self) {
+        self.completion = commands::token(&self.input.text).and_then(|prefix| {
+            let matches = commands::matches(prefix);
+            if matches.is_empty() {
+                None
+            } else {
+                Some(Completion {
+                    matches,
+                    selected: 0,
+                })
+            }
+        });
+    }
+
+    /// Tab / partial Enter: replace the input with the highlighted command.
+    fn accept_completion(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        self.input.set_text(completion.selected().insertion());
+        self.refresh_completion();
     }
 
     fn ensure_thinking(&mut self, streaming: bool) -> &mut Item {
@@ -526,6 +556,7 @@ impl App {
                     Action::Interrupt
                 } else if !self.input.text.is_empty() {
                     self.input.clear();
+                    self.completion = None;
                     Action::None
                 } else if !self.images.is_empty() {
                     self.images.clear();
@@ -553,20 +584,31 @@ impl App {
                 self.thinking_overrides.clear();
                 Action::None
             }
+            KeyCode::Esc if self.completion.is_some() => {
+                self.completion = None;
+                Action::None
+            }
             KeyCode::Esc if !self.images.is_empty() => {
                 self.images.pop();
                 Action::None
             }
+            KeyCode::Tab if self.completion.is_some() => {
+                self.accept_completion();
+                Action::None
+            }
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert(c);
+                self.refresh_completion();
                 Action::None
             }
             KeyCode::Backspace => {
                 self.input.backspace();
+                self.refresh_completion();
                 Action::None
             }
             KeyCode::Delete => {
                 self.input.delete();
+                self.refresh_completion();
                 Action::None
             }
             KeyCode::Left => {
@@ -586,11 +628,21 @@ impl App {
                 Action::None
             }
             KeyCode::Up => {
-                self.input.history_prev();
+                if let Some(completion) = &mut self.completion {
+                    completion.prev();
+                } else {
+                    self.input.history_prev();
+                    self.refresh_completion();
+                }
                 Action::None
             }
             KeyCode::Down => {
-                self.input.history_next();
+                if let Some(completion) = &mut self.completion {
+                    completion.next();
+                } else {
+                    self.input.history_next();
+                    self.refresh_completion();
+                }
                 Action::None
             }
             KeyCode::PageUp => {
@@ -612,7 +664,18 @@ impl App {
                 if self.busy {
                     return Action::None;
                 }
+                // Enter on a partial command completes it instead of sending
+                // an unknown slash command to the transcript.
+                if let Some(completion) = &self.completion {
+                    let exact =
+                        commands::token(&self.input.text) == Some(completion.selected().name);
+                    if !exact {
+                        self.accept_completion();
+                        return Action::None;
+                    }
+                }
                 let text = self.input.take();
+                self.completion = None;
                 if text.trim().is_empty() && self.images.is_empty() {
                     Action::None
                 } else {
@@ -704,6 +767,14 @@ impl Input {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+    }
+
+    /// Replace the text and put the cursor at the end (used by completion).
+    /// Browsing history is abandoned: the new text is a fresh edit.
+    pub fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.chars().count();
+        self.history_pos = None;
     }
 
     pub fn take(&mut self) -> String {
@@ -1305,5 +1376,100 @@ mod tests {
         });
         assert!(!app.logged_in);
         assert!(matches!(app.items.last(), Some(Item::Error(text)) if text == "rejected"));
+    }
+
+    #[test]
+    fn typing_a_slash_opens_and_narrows_the_command_menu() {
+        let mut app = App::new(StatusInfo::default());
+        assert_eq!(app.on_key(key(KeyCode::Char('/'))), Action::None);
+        let completion = app.completion.as_ref().expect("menu open");
+        assert_eq!(completion.matches.len(), crate::commands::COMMANDS.len());
+        assert_eq!(completion.selected().name, "/login");
+
+        for c in "lo".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let names: Vec<_> = app
+            .completion
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(names, ["/login", "/logout"]);
+
+        // A space starts the arguments: the menu closes.
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn arrows_select_and_tab_completes_a_command() {
+        let mut app = App::new(StatusInfo::default());
+        for c in "/lo".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.on_key(key(KeyCode::Down)), Action::None);
+        assert_eq!(app.completion.as_ref().unwrap().selected().name, "/logout");
+        assert_eq!(app.on_key(key(KeyCode::Tab)), Action::None);
+        assert_eq!(app.input.text, "/logout");
+        assert_eq!(app.input.cursor, "/logout".chars().count());
+
+        // Commands that take arguments get a trailing space.
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.input.text.is_empty());
+        for c in "/remember".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.text, "/remember global ");
+    }
+
+    #[test]
+    fn enter_completes_a_partial_command_but_submits_an_exact_one() {
+        let mut app = App::new(StatusInfo::default());
+        for c in "/log".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.input.text, "/login");
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Submit(Submission {
+                text: "/login".into(),
+                images: Vec::new(),
+            })
+        );
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn esc_closes_the_menu_without_editing_and_reopens_on_typing() {
+        let mut app = App::new(StatusInfo::default());
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(app.completion.is_some());
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.completion.is_none());
+        assert_eq!(app.input.text, "/");
+
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.completion.is_some());
+        assert_eq!(app.completion.unwrap().selected().name, "/help");
+    }
+
+    #[test]
+    fn complete_command_name_needs_no_arguments_to_submit() {
+        let mut app = App::new(StatusInfo::default());
+        for c in "/help".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.completion.is_some());
+        assert!(matches!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Submit(Submission { text, .. }) if text == "/help"
+        ));
     }
 }

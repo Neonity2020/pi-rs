@@ -39,6 +39,13 @@ fn start_mock_api(sse_bodies: Vec<String>) -> (String, Arc<Mutex<Vec<RecordedReq
 fn start_mock_api_responses(
     responses: Vec<(u16, String, String)>,
 ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+    start_mock_api_with_hook(responses, || {})
+}
+
+fn start_mock_api_with_hook(
+    responses: Vec<(u16, String, String)>,
+    mut before_response: impl FnMut() + Send + 'static,
+) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -50,6 +57,7 @@ fn start_mock_api_responses(
             if let Some(request) = read_request(&mut stream) {
                 recorded.lock().unwrap().push(request);
             }
+            before_response();
             let reason = if status == 200 { "OK" } else { "Bad Request" };
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -190,6 +198,111 @@ fn test_dir() -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&home).unwrap();
     home
+}
+
+fn session_path(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .unwrap()
+}
+
+#[test]
+fn persistence_failure_is_reported_and_prevents_tool_execution() {
+    for (json_mode, tool_call) in [(false, false), (false, true), (true, false), (true, true)] {
+        let home = test_dir();
+        let sabotage_home = home.clone();
+        let body = if tool_call {
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"write","arguments":"{\"file_path\":\"must-not-exist\",\"content\":\"bad\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ])
+        } else {
+            sse(&[r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}"#])
+        };
+        let (base_url, requests) =
+            start_mock_api_with_hook(vec![(200, "text/event-stream".into(), body)], move || {
+                let path = session_path(&sabotage_home);
+                std::fs::rename(&path, path.with_extension("backup")).unwrap();
+                std::fs::create_dir(path).unwrap();
+            });
+        let mut command = pi_in(&home);
+        command.args(["-p", "test", "--base-url", &base_url, "--api-key", "fake"]);
+        if json_mode {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if json_mode {
+            let result: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+            assert_eq!(result["outcome"], "error", "{stdout}");
+            assert!(result["message"]
+                .as_str()
+                .unwrap()
+                .contains("session persistence failed"));
+        } else {
+            assert!(stderr.contains("session persistence failed"), "{stderr}");
+            assert!(!stderr.contains("— done"));
+        }
+        assert!(
+            !home.join("must-not-exist").exists(),
+            "tool ran after failed assistant persistence"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn torn_session_tail_survives_two_binary_resumes() {
+    let home = test_dir();
+    let body = sse(&[r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}"#]);
+    let (base_url, requests) = start_mock_api(vec![body.clone(), body.clone(), body]);
+    let run = |prompt: &str, resume: bool| {
+        let mut command = pi_in(&home);
+        command.args(["-p", prompt, "--base-url", &base_url, "--api-key", "fake"]);
+        if resume {
+            command.arg("-c");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run("one", false);
+    let path = session_path(&home);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"id\":\"torn")
+        .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    run("two", true);
+    run("three", true);
+    let requests = requests.lock().unwrap();
+    let messages = requests[2].body["messages"].as_array().unwrap();
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(users, ["one", "two", "three"]);
+    let backup = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "bak"))
+        .unwrap();
+    assert_eq!(std::fs::read(backup).unwrap(), original);
 }
 
 #[test]

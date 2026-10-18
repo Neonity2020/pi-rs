@@ -12,21 +12,21 @@ import SectionHead from "./SectionHead.astro";
       <article class="mode-card mode-card--violet reveal">
         <span class="mode-tag">TUI</span>
         <h3>交互式</h3>
-        <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理和工具调用折叠成一行思考块，推理时显示「正在思考…」，结束后变成「思考结果」，点它展开；Ctrl+T 全局展开/收起。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。上下文接近窗口上限时自动把旧消息总结成 checkpoint，保留最近一段原文；/compact 可手动触发，摘要写进会话可恢复。长期记忆存在 ~/.pi-rs 的两个 Markdown 文件里，启动时有界注入；/remember、/forget、/memory 管理，删掉文件即关闭。实验模式由 /lab 开启；/dream 用当前模型跑一次隔离的整理回合，合并、保留并遗忘记忆条目。没有 key 也能启动，先提示你 /login。</p>
+        <p>流式回答、Markdown 渲染（表格、代码块行号与高亮）、token / 缓存 / 成本状态栏。推理和工具调用折叠成一行思考块，推理时显示「正在思考…」，结束后变成「思考结果」，点它展开；Ctrl+T 全局展开/收起。Ctrl+V 把剪贴板截图附到下一条消息（Esc 删除最后一张）。上下键翻阅历史 prompt（跨会话，按目录隔离）。上下文接近窗口上限时自动把旧消息总结成 checkpoint，保留最近一段原文；/compact 可手动触发，摘要写进会话可恢复。长期记忆存在 ~/.pi-rs 的两个 Markdown 文件里，启动时有界注入；/remember、/forget、/memory 管理，删掉文件即关闭。输入 / 会弹出命令列表，↑↓ 选择、Tab 补全。实验模式由 /lab 开启；/dream 用当前模型跑一次隔离的整理回合，合并、保留并遗忘记忆条目。没有 key 也能启动，先提示你 /login。</p>
         <code class="mode-cmd">pi-rs</code>
       </article>
 
       <article class="mode-card mode-card--yellow reveal">
         <span class="mode-tag">PRINT</span>
         <h3>单次执行</h3>
-        <p>回答直接进 stdout。也可以从管道读 prompt，适合塞进 shell 和 CI。</p>
+        <p>回答直接进 stdout。也可以从管道读 prompt，适合塞进 shell 和 CI。会话保存失败会中止回合、报告错误并非零退出。</p>
         <code class="mode-cmd">pi-rs "解释这个仓库" · pi-rs -p &lt; prompt.txt</code>
       </article>
 
       <article class="mode-card mode-card--blue reveal">
         <span class="mode-tag">JSON</span>
         <h3>事件流</h3>
-        <p>每个事件一行 JSONL，适合脚本、CI 和你自己的小工具。</p>
+        <p>每个事件一行 JSONL，适合脚本、CI 和你自己的小工具。会话保存失败时最终返回 outcome: error，并非零退出。</p>
         <code class="mode-cmd">pi-rs --json -p "..."</code>
       </article>
     </div>

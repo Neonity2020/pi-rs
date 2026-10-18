@@ -88,33 +88,27 @@ pub async fn run_print(turn: Turn, prompt: String) -> anyhow::Result<()> {
     } = turn;
     let message = Message::user(prompt);
     let mut agent = build_agent(provider, &model, system, tools, messages, summary);
-    shared.session.lock().unwrap().append_message(&message)?;
-
     let cancel = Cancel::new();
+    shared.begin_turn(cancel.clone())?;
+    shared.append_message(&message)?;
     spawn_ctrl_c(cancel.clone());
 
     let mut sink = PrintSink::new(shared.clone());
-    match agent.run_turn(message, &mut sink, cancel).await {
+    let outcome = agent.run_turn(message, &mut sink, cancel).await;
+    if sink.wrote_text {
+        println!();
+    }
+    shared.persistence_result()?;
+    match outcome {
         Ok(Outcome::Completed) => {
-            if sink.wrote_text {
-                println!();
-            }
             eprintln!("{}", summary_line(&shared));
             Ok(())
         }
         Ok(Outcome::Aborted) => {
-            if sink.wrote_text {
-                println!();
-            }
             eprintln!("interrupted");
             std::process::exit(130);
         }
-        Err(error) => {
-            if sink.wrote_text {
-                println!();
-            }
-            Err(anyhow::anyhow!(error))
-        }
+        Err(error) => Err(anyhow::anyhow!(error)),
     }
 }
 
@@ -131,7 +125,6 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
     } = turn;
     let message = Message::user(prompt);
     let mut agent = build_agent(provider, &model, system, tools, messages, summary);
-    shared.session.lock().unwrap().append_message(&message)?;
 
     println!(
         "{}",
@@ -142,15 +135,20 @@ pub async fn run_json(turn: Turn, prompt: String) -> anyhow::Result<()> {
             "model": model.id,
         })
     );
-    println!("{}", json!({ "type": "user", "text": message.text() }));
-
-    let cancel = Cancel::new();
-    spawn_ctrl_c(cancel.clone());
-
-    let mut sink = JsonSink {
-        shared: shared.clone(),
-    };
-    let outcome = agent.run_turn(message, &mut sink, cancel).await;
+    let outcome: anyhow::Result<Outcome> = async {
+        let cancel = Cancel::new();
+        shared.begin_turn(cancel.clone())?;
+        shared.append_message(&message)?;
+        println!("{}", json!({ "type": "user", "text": message.text() }));
+        spawn_ctrl_c(cancel.clone());
+        let mut sink = JsonSink {
+            shared: shared.clone(),
+        };
+        let outcome = agent.run_turn(message, &mut sink, cancel).await;
+        shared.persistence_result()?;
+        Ok(outcome?)
+    }
+    .await;
     let failed = outcome.is_err();
     let stats = shared.stats.lock().unwrap();
     let result = match outcome {
@@ -272,7 +270,7 @@ pub async fn run_interactive(
                                     logout(&mut app, &args, &agent, &ui_tx).await
                                 }
                                 Some(Slash::Help) => {
-                                    let _ = ui_tx.send(UiEvent::Info(HELP.into()));
+                                    let _ = ui_tx.send(UiEvent::Info(ui::help_text()));
                                 }
                                 Some(Slash::Remember { scope, text }) => {
                                     remember_memory(&cwd, scope, &text, &ui_tx);
@@ -293,6 +291,11 @@ pub async fn run_interactive(
                                     } else {
                                         "lab mode off".into()
                                     }));
+                                }
+                                Some(Slash::Dream | Slash::Compact)
+                                    if shared.persistence_result().is_err() => {
+                                    let error = shared.persistence_result().unwrap_err();
+                                    let _ = ui_tx.send(UiEvent::Error(error.to_string()));
                                 }
                                 Some(Slash::Dream) => {
                                     if !app.lab {
@@ -354,19 +357,26 @@ pub async fn run_interactive(
                                         let shared = shared.clone();
                                         let ui = ui_tx.clone();
                                         tokio::spawn(async move {
+                                            if let Err(error) = shared.begin_turn(cancel.clone()) {
+                                                let _ = ui.send(UiEvent::Error(error.to_string()));
+                                                let _ = ui.send(UiEvent::Busy(false));
+                                                return;
+                                            }
                                             let mut sink = ui::TuiSink::persisting(
-                                                shared,
+                                                shared.clone(),
                                                 ui.clone(),
                                             );
                                             let mut agent = agent.lock().await;
-                                            match agent
+                                            let outcome = agent
                                                 .compact(
                                                     CompactionMode::Manual,
                                                     &mut sink,
                                                     cancel,
                                                 )
-                                                .await
-                                            {
+                                                .await;
+                                            let outcome = shared.persistence_result()
+                                                .and_then(|_| outcome.map_err(anyhow::Error::from));
+                                            match outcome {
                                                 Ok(Some(_)) => {}
                                                 Ok(None) => {
                                                     let _ = ui.send(UiEvent::Info(
@@ -374,7 +384,8 @@ pub async fn run_interactive(
                                                             .into(),
                                                     ));
                                                 }
-                                                Err(agent::Error::Cancelled) => {
+                                                Err(error) if error.downcast_ref::<agent::Error>()
+                                                    .is_some_and(|e| matches!(e, agent::Error::Cancelled)) => {
                                                     let _ = ui
                                                         .send(UiEvent::Info("compaction cancelled".into()));
                                                 }
@@ -390,7 +401,7 @@ pub async fn run_interactive(
                                 }
                                 Some(Slash::Unknown(name)) => {
                                     let _ = ui_tx.send(UiEvent::Error(format!(
-                                        "unknown command: {name} — try /login, /logout, /compact, /remember, /forget, /memory, /lab, /dream, /help"
+                                        "unknown command: {name} — type /help to list commands"
                                     )));
                                 }
                                 None if !app.logged_in => {
@@ -458,10 +469,8 @@ pub async fn run_interactive(
 
     drop(terminal);
     eprintln!("session: {}", shared.session.lock().unwrap().path.display());
-    Ok(())
+    shared.persistence_result()
 }
-
-const HELP: &str = "/login            sign in and save your API key to auth.json\n/logout           remove the saved API key\n/compact          summarize older messages to free context\n/remember <text>  add a note to this project's long-term memory\n/remember global  add a note for all projects\n/forget <text>    remove matching notes from this project's memory\n/memory           show memory file paths and counts\n/lab              toggle experimental lab mode\n/dream            consolidate and forget long-term memory (lab only)\n/help             show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Slash {
@@ -701,11 +710,18 @@ fn spawn_turn(
             .collect(),
     );
 
+    if let Err(error) = shared
+        .begin_turn(cancel.clone())
+        .and_then(|_| shared.append_message(&message))
+    {
+        let _ = ui.send(UiEvent::Error(error.to_string()));
+        let _ = ui.send(UiEvent::Busy(false));
+        return;
+    }
     let _ = ui.send(UiEvent::User {
         text: message.text().to_string(),
         images: labels,
     });
-    let _ = shared.session.lock().unwrap().append_message(&message);
     let _ = ui.send(UiEvent::Busy(true));
 
     tokio::spawn(async move {
@@ -714,6 +730,9 @@ fn spawn_turn(
             let mut agent = agent.lock().await;
             agent.run_turn(message, &mut sink, cancel).await
         };
+        let result = shared
+            .persistence_result()
+            .and_then(|_| result.map_err(anyhow::Error::from));
         match result {
             Ok(Outcome::Completed) => {}
             Ok(Outcome::Aborted) => {
@@ -796,6 +815,137 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tui_rejects_a_prompt_that_cannot_be_saved() {
+        let dir = crate::testutil::temp_dir("tui-user-persistence");
+        let session = crate::session::Session::create_in(&dir, &dir, "m").unwrap();
+        std::fs::remove_file(&session.path).unwrap();
+        let shared = Shared::new(session, Model::unknown("mock", "m"));
+        let provider = Arc::new(llm::mock::ScriptedProvider::new(vec![]));
+        let agent = Arc::new(Mutex::new(Agent::new(
+            provider.clone(),
+            shared.model.clone(),
+            String::new(),
+            vec![],
+            vec![],
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_turn(
+            agent.clone(),
+            shared.clone(),
+            tx,
+            Submission {
+                text: "hello".into(),
+                images: vec![],
+            },
+            Cancel::new(),
+        );
+        assert!(
+            matches!(rx.recv().await, Some(UiEvent::Error(message)) if message.contains("session persistence failed"))
+        );
+        assert!(matches!(rx.recv().await, Some(UiEvent::Busy(false))));
+        assert!(provider.observed().is_empty());
+        assert!(agent.lock().await.messages().is_empty());
+        assert!(shared.persistence_result().is_err());
+    }
+
+    #[tokio::test]
+    async fn tui_reports_failed_tool_persistence_and_blocks_the_next_turn() {
+        use agent::{BoxFuture, ToolResult};
+        use llm::{mock::ScriptedProvider, StopReason, StreamEvent};
+
+        struct RemoveSession(PathBuf);
+        impl Tool for RemoveSession {
+            fn name(&self) -> &str {
+                "remove_session"
+            }
+            fn description(&self) -> &str {
+                "test write failure"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({})
+            }
+            fn run<'a>(
+                &'a self,
+                _: &'a serde_json::Value,
+                _: &'a Cancel,
+            ) -> BoxFuture<'a, ToolResult> {
+                Box::pin(async move {
+                    std::fs::remove_file(&self.0).unwrap();
+                    ToolResult::ok("removed")
+                })
+            }
+        }
+        let dir = crate::testutil::temp_dir("tui-tool-persistence");
+        let session = crate::session::Session::create_in(&dir, &dir, "m").unwrap();
+        let tool = Arc::new(RemoveSession(session.path.clone()));
+        let shared = Shared::new(session, Model::unknown("mock", "m"));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "c1".into(),
+                name: "remove_session".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                args: "{}".into(),
+            },
+            StreamEvent::Stop(StopReason::ToolCalls),
+        ]]));
+        let agent = Arc::new(Mutex::new(Agent::new(
+            provider.clone(),
+            shared.model.clone(),
+            String::new(),
+            vec![tool],
+            vec![],
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = Cancel::new();
+        spawn_turn(
+            agent.clone(),
+            shared.clone(),
+            tx.clone(),
+            Submission {
+                text: "hello".into(),
+                images: vec![],
+            },
+            cancel.clone(),
+        );
+        let mut errors = vec![];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    UiEvent::Error(error) => errors.push(error),
+                    UiEvent::Busy(false) => break,
+                    UiEvent::Info(message) => assert_ne!(message, "interrupted"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("session persistence failed"));
+        assert!(cancel.is_cancelled());
+        assert_eq!(provider.observed().len(), 1);
+        let before = agent.lock().await.messages().len();
+
+        spawn_turn(
+            agent.clone(),
+            shared,
+            tx,
+            Submission {
+                text: "again".into(),
+                images: vec![],
+            },
+            Cancel::new(),
+        );
+        assert!(matches!(rx.recv().await, Some(UiEvent::Error(message)) if message == errors[0]));
+        assert!(matches!(rx.recv().await, Some(UiEvent::Busy(false))));
+        assert_eq!(agent.lock().await.messages().len(), before);
+        assert_eq!(provider.observed().len(), 1);
+    }
 
     #[test]
     fn slash_commands_are_the_first_token() {

@@ -68,7 +68,9 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   then atomic write, mode 0600). Tests must isolate `PI_RS_HOME`.
 - Keep the base system prompt under ~400 tokens.
 - TUI click targets are render-recorded line ranges (`thinking_hits`); the
-  `coding` layer forwards mouse coordinates and `tui` still owns no I/O.
+  `coding` layer forwards mouse coordinates and `tui` still owns no I/O. Slash-command
+  metadata lives in `tui::commands`; `/help` and the completion menu are
+  generated from that one table.
 
 ## Commands
 

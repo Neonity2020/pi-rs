@@ -1,5 +1,6 @@
 //! The one place where the TUI crate is wired into the app layer.
 
+pub use tui::help_text;
 pub use tui::render as tui_render;
 pub use tui::{crossterm, ratatui};
 pub use tui::{Action, App, ImageAttachment, StatusInfo, Submission, UiEvent};
@@ -39,11 +40,11 @@ impl TuiSink {
 
 impl Sink for TuiSink {
     fn on(&mut self, event: AgentEvent) {
-        if self.persist {
-            self.shared.record(&event);
-        } else if matches!(&event, AgentEvent::Usage { .. }) {
-            // Ephemeral turns still count toward token/cost stats.
-            self.shared.record(&event);
+        // Ephemeral turns only contribute usage, never session records.
+        if (self.persist || matches!(&event, AgentEvent::Usage { .. }))
+            && self.shared.record(&event).is_err()
+        {
+            return;
         }
         let translated = match event {
             AgentEvent::Step { .. } => None,

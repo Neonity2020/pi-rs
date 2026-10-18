@@ -4,6 +4,7 @@
 //! `Action`s from key presses, and drives the terminal.
 
 mod app;
+mod commands;
 mod markdown;
 mod render;
 mod wrap;
@@ -11,6 +12,7 @@ mod wrap;
 pub use app::{
     Action, App, ImageAttachment, Item, StatusInfo, Submission, ToolEntry, ToolStatus, UiEvent,
 };
+pub use commands::{help_text, Command, Completion, COMMANDS};
 pub use render::render;
 
 pub use crossterm;
