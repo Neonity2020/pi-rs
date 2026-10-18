@@ -127,7 +127,7 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 ## 测试
 
 ```bash
-cargo test          # 177 个测试，不需要 API key
+cargo test          # 180 个测试，不需要 API key
 ```
 
 覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除、TUI 状态机、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 14 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。

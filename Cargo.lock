@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pi-llm",
  "serde",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "pi-llm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossterm",
  "ratatui",
