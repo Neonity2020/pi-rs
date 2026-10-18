@@ -3,6 +3,7 @@
 ## 环境
 
 - Rust stable（edition 2021）。
+- 网站使用 Node 24；CI 依照 `website/package-lock.json` 执行 `npm ci`。
 - Python 3（仅 PTY 冒烟脚本需要）。
 - 不需要真实 API key 即可跑测试；只有手动运行时需要先 `pi-rs login` 或设置 `DEEPSEEK_API_KEY`。
 
@@ -35,14 +36,18 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 
 ## 测试策略
 
+`.github/workflows/ci.yml` 在 push / pull request 触发：Linux 和 macOS 执行格式、`cargo clippy --workspace --all-targets --locked -- -D warnings`、锁定依赖的测试/构建和两个隔离 CWD 的 PTY 冒烟；网站单独执行 Node 24 的 `npm ci` 与构建。固定代码的 CI 任务关闭 Rust 增量缓存以节省临时磁盘。Action 使用固定提交，工作流只需仓库读取权限；配置 CI 不等于已经通过远端运行，首次推送后检查对应结果。
+
 | 层 | 怎么测 | 约束 |
 |---|---|---|
 | 单元 | 各 crate 内的 `#[cfg(test)]` | 纯逻辑，必要时用临时目录 |
 | agent | `llm::mock::ScriptedProvider` + 假工具 | 不碰网络，验证事件顺序 |
 | 工具调度 | 有延迟的假工具 + 调用日志；取消发生在第一项 ToolEnd 时 | 断言执行与结果报告交替出现，剩余调用未启动；panic 不影响下一项，非协作工具取消后已销毁 |
-| bash 进程清理（Unix） | 临时 shell 脚本启动子孙进程，ready 文件确认启动；取消、超时、丢弃 future 后检查延迟写入未发生 | 不只断言工具返回快；清理仍在原进程组内的后代 |
+| bash 进程清理（Unix） | 非登录 `/bin/sh` 启动临时子孙脚本，ready 确认启动；停止后才释放写入信号，断言未写入 | 不依赖开发者登录配置；不只断言返回快，同时确认直接子进程回收与组内后代停止 |
 | e2e | 起本地 TCP mock SSE/HTTP，跑真实 `pi-rs` | 每次用全新临时 cwd + `PI_RS_HOME`，避免开发者 `.env` / auth.json 泄漏 |
 | SSE 完整性 | 本地 HTTP mock：提前 EOF、只有 DONE、工具以 length 截断、合法 finish 后无 DONE、逐字节 chunked 中文及参数 | 错误时保留文本、不执行工具、不报告成功；正常时保留末尾 usage，依赖工具按序生效 |
+| 资源边界 | 多 MiB stdout/stderr、超长 Unicode 行、小范围后接无效 UTF-8；真实二进制检查下一次模型请求 | read/bash 结果不超过 64 KiB，管道排空，继续读取 offset 正确，UTF-8 截断不损坏字符 |
+| 网络边界 | 本地停滞 TLS、响应头/正文、持续有数据的响应、超大 SSE 行与错误正文 | 测试用私有 builder 缩短时间，不等生产超时；空闲超时不误杀正常长流，取消能中断错误正文读取 |
 | PTY | Python + 伪终端，跑真实二进制 | 等到进入 alternate screen 再发送输入；验证 raw mode、流式渲染、干净退出，超时必须清理子进程 |
 | 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
 | 压缩 | `ScriptedProvider` 按“摘要 → 最终回答”排脚本；会话测试覆盖 compaction 重放 | 不需要真实窗口；断言摘要请求、保留尾部与 session 记录 |

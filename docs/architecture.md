@@ -75,6 +75,7 @@ pub trait Provider: Send + Sync {
 
 - `OpenAiCompat` 同时服务 DeepSeek 与任意 OpenAI 兼容端点：`deepseek(...)` 额外携带 `thinking` / `reasoning_effort` 参数，`custom(...)` 不带。
 - SSE 按字节缓存再逐行解析 `data:`，支持跨分块的 UTF-8 和无末尾换行的记录；忽略注释与空行。必须收到 `finish_reason` 才算完整；`[DONE]` 或 EOF 前缺少该字段会报 `Error::Stream`。兼容已收到 `finish_reason` 但省略 `[DONE]` 的端点，且继续收集末尾 usage。带 tool call 的响应必须以 `tool_calls` 结束，`length` 等其他原因视为不完整工具响应。非法 JSON 或 UTF-8 也会报错；agent 保留已有正文，丢弃该响应的工具调用。HTTP 非 2xx 变成 `Error::Api`（含截断的响应体）。
+- 网络与缓冲有固定边界：连接（含 TLS 握手）10 秒，单次读取空闲 120 秒，正常持续输出没有总时长上限；登录验证仍有 15 秒总超时。SSE 逐个行片段检查 1 MiB 上限再追加，不把整个传输 chunk 复制到缓冲。API 错误响应只读取前 2,000 字节并标注限制，达到上限立即放弃剩余正文；错误正文读取同样可取消。
 - tool call 增量按 `index` 归位；没有 id 的调用在 agent 侧补 `call_{i}`。
 - `Message` 是唯一消息类型：agent 历史、会话记录、线上格式三位一体。`reasoning` 必须随 assistant 消息原样回传（DeepSeek + tools 的硬要求）。用户消息可带 base64 `Image`；文本消息继续用字符串 `content`，带图消息在发送时展开成 OpenAI 的 `[{type:"text"},…,{type:"image_url"}]` parts，会话文件里仍是同一个 `Message`。
 - `deepseek.rs` 维护模型注册表（上下文窗口、最大输出、峰谷价格）；未知模型照常工作，但成本显示为 `-`。
@@ -222,10 +223,14 @@ $PI_RS_HOME/AGENTS.md（若存在）
 
 | 工具 | 语义 | 关键约束 |
 |---|---|---|
-| `read` | 读文件，带行号 | 默认 2000 行，支持 `offset`/`limit`；单行超长截断 |
+| `read` | 读文件，带行号 | 默认 2000 行，支持 `offset`/`limit`；单行显示最多 2000 字符，总输出最多 64 KiB，给出继续读取的 offset |
 | `write` | 创建/覆盖 | 自动创建父目录 |
 | `edit` | 精确字符串替换 | 要求唯一匹配，或显式 `replace_all` |
-| `bash` | 执行 shell 命令 | 前台进程、可取消；默认 120s 超时；输出头尾截断 |
+| `bash` | 执行 shell 命令 | 前台进程、可取消；默认 120s 超时；持续排空 stdout/stderr，各保留至多 16 KiB 原始头尾，总结果最多 64 KiB |
+
+`read` 用有界缓冲扫描到请求范围，跳过的行不保留内容，超长行仅保留足够展示的 UTF-8 前缀；不再预读整份文件或构造全部行索引。达到行数上限时仅探测是否还有内容，报告 `more lines` 和下一次 offset，避免为总行数继续扫描。达到字节预算时保留整行并给出第一条未展示行的 offset。只校验显示前缀的 UTF-8，范围外内容不影响已请求的范围。
+
+`bash` 的管道采集不会在预算满后停读，否则子进程会卡在满管道上。采集仅保留每路头尾和省略字节数，之后才做行数与最终 UTF-8 字节预算裁剪；不会先把全部输出放进内存再截断。
 
 Unix 下 `bash` 以独立进程组启动。取消、超时或读取输出失败时，向该组发送 SIGKILL 并等待直接子进程回收；future 被丢弃时，由 guard 发出同样的组信号，直接子进程仍由 tokio 的 `kill_on_drop` 清理。覆盖仍处于该组的子孙进程；主动脱离进程组的进程不在这一机制范围内。非 Unix 平台保留直接子进程终止与回收，不宣称进程树清理。为此 `coding` 在 Unix 上直接声明已有依赖树中的 `libc`，使用系统提供的 `killpg` 和信号常量，避免外部命令和手写平台常量。
 
@@ -329,6 +334,8 @@ ToolResult { content: String, is_error: bool }
 | HTTP 非 2xx | `llm::Error::Api { status, body }` | 修正 key/端点/模型 |
 | 网络中断 | `llm::Error::Http` | 重试 |
 | SSE chunk 坏 / 空流 | `Error::Stream` | 重试；持续则查 provider |
+| 连接或响应读取停滞 | `Error::Http` 超时，保留已有正文，丢弃该响应的工具调用 | 检查网络或端点后重试 |
+| SSE 单行超过 1 MiB | `Error::Stream`，超限行不进入事件流 | 缩小单次响应或修复端点 |
 | SSE 缺少 finish_reason / 工具调用以 length 等原因截断 | `Error::Stream`，保留已有正文，丢弃工具调用；JSON 最终为 error | 检查端点协议或重新提问 |
 | 工具参数不是 JSON | `ToolResult::err`，回给模型 | 模型自我修正 |
 | 工具 panic | 捕获为错误结果 | 循环继续 |

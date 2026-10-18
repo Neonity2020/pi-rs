@@ -64,6 +64,11 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
 - Tool calls execute sequentially in model order; report and persist each
   result before starting the next call. Cancellation skips remaining calls
   but records matching error results to preserve tool-call/result pairs.
+- read/bash previews are bounded to 64 KiB. bash must keep draining both
+  pipes after its capture budget is full; read must not allocate whole files
+  or whole unbounded lines. Provider connections time out after 10 seconds,
+  reads after 120 seconds idle; SSE lines are capped at 1 MiB and API error
+  bodies at a 2,000-byte prefix. Keep these fixed bounds covered by tests.
 - `pi-rs` loads `.env` at startup (dotenvy: the working directory or the nearest
   parent; real environment variables win). e2e runs the binary in a fresh
   temp CWD so a developer's `.env` cannot leak into tests.
@@ -82,6 +87,8 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   and runs the real binary; no API key needed)
 - `cargo clippy --all-targets` — must stay clean
 - `cargo fmt`
+- CI (`.github/workflows/ci.yml`): Linux/macOS run fmt, strict Clippy, locked
+  tests/build and isolated PTY smokes; a Node 24 job runs website npm ci/build.
 - PTY smoke tests for the TUI: `python3 scripts/tui_smoke.py <home> target/debug/pi-rs`
   and `python3 scripts/tui_chat_smoke.py <home> target/debug/pi-rs`
 - Website screenshot: `scripts/shot_website.sh` rebuilds `website/dist` and

@@ -84,7 +84,11 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 同一响应中的工具按调用顺序执行，每项结果保存后才开始下一项，支持先写文件再编辑等依赖操作。取消或结果保存失败后，剩余工具不会启动。Unix 下 bash 取消、超时或其 future 被丢弃时会终止原进程组内的子孙进程；主动脱离该组的进程不在此范围，其他平台目前只清理直接子进程。
 
+`read` / `bash` 的预览最多 64 KiB。`read` 按范围读取，超长行截断，预算满时给出继续读取的 offset；不会为了统计总行数读完整个文件。`bash` 保留 stdout/stderr 头尾并标注省略，仍会持续排空管道，让命令正常结束。
+
 SSE 响应需要 `finish_reason` 才算完整；只收到部分正文或 `[DONE]` 就断开会报告错误、保留已生成正文并丢弃工具调用。已收到合法结束原因的兼容端点可以省略 `[DONE]`；带工具调用的响应必须以 `tool_calls` 结束，因长度等原因截断的调用不会执行。
+
+连接超时为 10 秒，响应读取空闲超时为 120 秒；持续有数据的长流可以继续。SSE 单行超过 1 MiB 会报错，API 错误正文只保留前 2,000 字节。
 
 **没有 max steps。** 循环到模型不再调用工具为止，或者被 `Ctrl+C`（取消令牌贯穿 HTTP 请求与工具进程）、或者失败。没有"步数上限"这种旋钮，因为从没用过。
 
@@ -134,11 +138,13 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 
 ## 测试
 
+GitHub Actions 已配置 Linux/macOS 的格式、Clippy、锁定依赖测试与构建、PTY 冒烟，以及 Node 24 的网站构建；均不需要真实 API key。
+
 ```bash
-cargo test          # 215 个测试，不需要 API key
+cargo test          # 229 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 19 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 20 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

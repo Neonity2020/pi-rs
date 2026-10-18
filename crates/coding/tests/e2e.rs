@@ -126,6 +126,8 @@ fn pi_in(home: &std::path::Path) -> Command {
     command.current_dir(home);
     command.env_remove("DEEPSEEK_API_KEY");
     command.env_remove("OPENAI_API_KEY");
+    #[cfg(unix)]
+    command.env("SHELL", "/bin/sh");
     command
 }
 
@@ -212,6 +214,74 @@ fn session_path(home: &std::path::Path) -> std::path::PathBuf {
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
         .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn large_tool_outputs_stay_bounded_in_events_and_the_next_model_request() {
+    use serde_json::json;
+    let home = test_dir();
+    std::fs::write(
+        home.join("large.txt"),
+        ("中".repeat(2000) + "\n").repeat(40),
+    )
+    .unwrap();
+    let first = json!({"choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"bash1","function":{"name":"bash","arguments":json!({"command":"head -c 2097152 /dev/zero | tr '\\000' x; printf END"}).to_string()}},
+        {"index":1,"id":"read1","function":{"name":"read","arguments":json!({"file_path":"large.txt","limit":u64::MAX}).to_string()}}
+    ]},"finish_reason":"tool_calls"}]}).to_string();
+    let (url, requests) = start_mock_api(vec![
+        sse(&[&first]),
+        sse(&[r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#]),
+    ]);
+    let output = pi_in(&home)
+        .args([
+            "--json",
+            "-p",
+            "test",
+            "--base-url",
+            &url,
+            "--api-key",
+            "fake",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_end")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results
+        .iter()
+        .all(|event| event["result"]["content"].as_str().unwrap().len() <= 64 * 1024));
+    let requests = requests.lock().unwrap();
+    let tools: Vec<_> = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert!(tools[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("bytes omitted"));
+    assert!(tools[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("output limit"));
+    assert!(tools
+        .iter()
+        .all(|message| message["content"].as_str().unwrap().len() <= 64 * 1024));
 }
 
 #[test]
@@ -843,10 +913,10 @@ fn logout_removes_the_saved_credential() {
 fn context_overflow_compacts_the_session_and_retries() {
     let home = test_dir();
 
-    // Seed a session with a large tool result: 100k characters, which the
-    // compaction cut can drop while keeping the rest of the conversation.
+    // Create a real session, then emulate an older, uncapped tool result.
+    // New bash output is bounded and cannot generate this legacy fixture.
     let huge = serde_json::json!({
-        "command": "yes x | head -c 200000 | tr -d '\\n'"
+        "command": "echo seeded result"
     })
     .to_string();
     let tool_call = serde_json::json!({
@@ -887,6 +957,19 @@ fn context_overflow_compacts_the_session_and_retries() {
         "stderr: {}",
         String::from_utf8_lossy(&seed.stderr)
     );
+    let path = session_path(&home);
+    let seeded = std::fs::read_to_string(&path).unwrap();
+    let legacy = seeded
+        .lines()
+        .map(|line| {
+            let mut entry: Value = serde_json::from_str(line).unwrap();
+            if entry["message"]["role"] == "tool" {
+                entry["message"]["content"] = "x".repeat(100000).into();
+            }
+            format!("{entry}\n")
+        })
+        .collect::<String>();
+    std::fs::write(path, legacy).unwrap();
 
     // The next run overflows. The agent should summarize the old prefix, keep
     // the recent tail, retry, and persist a compaction entry.

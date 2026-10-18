@@ -5,11 +5,15 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 
 use crate::provider::{BoxFuture, ChatRequest, Provider, StreamEvent, Thinking};
 use crate::{deepseek, Cancel, Effort, Error, Message, Role, StopReason, Usage};
+
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 2000;
 
 pub struct OpenAiCompat {
     name: &'static str,
@@ -63,9 +67,15 @@ impl OpenAiCompat {
     }
 }
 
-fn default_client() -> reqwest::Client {
+fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(concat!("pi-rs/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(120))
+}
+
+fn default_client() -> reqwest::Client {
+    client_builder()
         .build()
         .expect("failed to build http client")
 }
@@ -76,8 +86,7 @@ fn default_client() -> reqwest::Client {
 /// instead of on the first prompt. `/models` is free on DeepSeek and OpenAI.
 pub async fn verify_api_key(base_url: &str, api_key: &str) -> Result<(), Error> {
     let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
-    let response = reqwest::Client::builder()
-        .user_agent(concat!("pi-rs/", env!("CARGO_PKG_VERSION")))
+    let response = client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?
         .get(&endpoint)
@@ -89,10 +98,10 @@ pub async fn verify_api_key(base_url: &str, api_key: &str) -> Result<(), Error> 
     if status.is_success() {
         return Ok(());
     }
-    let body = response.text().await.unwrap_or_default();
+    let body = error_body(response).await?;
     Err(Error::Api {
         status: status.as_u16(),
-        body: truncate(&body, 2000),
+        body,
     })
 }
 
@@ -124,10 +133,14 @@ impl Provider for OpenAiCompat {
 
             let status = response.status();
             if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
+                let body = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Error::Cancelled),
+                    body = error_body(response) => body?,
+                };
                 return Err(Error::Api {
                     status: status.as_u16(),
-                    body: truncate(&body, 2000),
+                    body,
                 });
             }
 
@@ -146,10 +159,17 @@ impl Provider for OpenAiCompat {
                     Some(Ok(bytes)) => bytes,
                     Some(Err(e)) => return Err(Error::Http(e)),
                 };
-                buf.extend_from_slice(&bytes);
-                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                    let raw: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = std::str::from_utf8(&raw[..raw.len() - 1])
+                // Append one line fragment at a time, never copying an
+                // arbitrarily large transport chunk into the line buffer.
+                for part in bytes.split_inclusive(|b| *b == b'\n') {
+                    if part.len() > MAX_SSE_LINE_BYTES - buf.len() {
+                        return Err(Error::Stream("SSE line limit exceeded (1 MiB)".into()));
+                    }
+                    buf.extend_from_slice(part);
+                    if part.last() != Some(&b'\n') {
+                        continue;
+                    }
+                    let line = std::str::from_utf8(&buf[..buf.len() - 1])
                         .map_err(|e| Error::Stream(format!("invalid UTF-8 in SSE: {e}")))?;
                     match classify_line(line.trim_end_matches('\r')) {
                         Line::Ignore => {}
@@ -160,6 +180,7 @@ impl Provider for OpenAiCompat {
                             saw_tools |= tools;
                         }
                     }
+                    buf.clear();
                 }
             }
             // Flush a trailing line that had no newline terminator.
@@ -179,6 +200,23 @@ impl Provider for OpenAiCompat {
             check_completion(finish_reason, saw_tools)
         })
     }
+}
+
+/// Error responses are diagnostics, not unbounded downloads. Drop the body
+/// as soon as the retained prefix is full, even if the server never closes.
+async fn error_body(mut response: reqwest::Response) -> Result<String, Error> {
+    let mut bytes = Vec::with_capacity(MAX_ERROR_BYTES);
+    while let Some(chunk) = response.chunk().await? {
+        let n = chunk.len().min(MAX_ERROR_BYTES - bytes.len());
+        bytes.extend_from_slice(&chunk[..n]);
+        if bytes.len() == MAX_ERROR_BYTES {
+            return Ok(format!(
+                "{}… [error response limited to {MAX_ERROR_BYTES} bytes]",
+                truncate(&String::from_utf8_lossy(&bytes), MAX_ERROR_BYTES)
+            ));
+        }
+    }
+    Ok(truncate(&String::from_utf8_lossy(&bytes), MAX_ERROR_BYTES))
 }
 
 enum Line<'a> {
@@ -499,6 +537,243 @@ impl From<WireUsage> for Usage {
 mod tests {
     use super::*;
     use crate::message::ToolCall;
+    use std::time::Duration;
+
+    fn mock_response(
+        bytes: Vec<u8>,
+        stall: bool,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            if !drain_request(&mut stream) {
+                return;
+            }
+            let _ = stream.write_all(&bytes);
+            let _ = ready.send(());
+            if stall {
+                let _ = stream.read(&mut [0u8; 1]);
+            }
+        });
+        (url, received, task)
+    }
+
+    fn drain_request(stream: &mut std::net::TcpStream) -> bool {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut buf = [0; 8192];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                return false;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if request.len() >= end + 4 + len {
+                    return true;
+                }
+            }
+        }
+    }
+
+    async fn collect_response(
+        p: OpenAiCompat,
+        cancel: Cancel,
+    ) -> (Result<(), Error>, Vec<StreamEvent>) {
+        let messages = [Message::user("test")];
+        let request = ChatRequest {
+            model: "m",
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = p.stream(request, tx, cancel).await;
+        let mut events = vec![];
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn oversized_sse_lines_fail_before_emitting_their_contents() {
+        let body = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", "x".repeat(1024 * 1024));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, _, server) = mock_response(response.into_bytes(), false);
+        let (result, events) =
+            collect_response(OpenAiCompat::custom("mock", url, "fake"), Cancel::new()).await;
+        assert!(matches!(result, Err(Error::Stream(message)) if message.contains("line limit")));
+        let text: String = events
+            .into_iter()
+            .filter_map(|e| {
+                if let StreamEvent::Text(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "partial");
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn error_responses_stop_reading_at_the_byte_budget() {
+        let response = format!(
+            "HTTP/1.1 500 Error\r\ncontent-length: 10000000\r\nconnection: close\r\n\r\n{}",
+            "中".repeat(2000)
+        );
+        let (url, _, server) = mock_response(response.into_bytes(), true);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_response(OpenAiCompat::custom("mock", url, "fake"), Cancel::new()),
+        )
+        .await
+        .expect("must not read the entire stalled error body")
+        .0;
+        assert!(
+            matches!(result, Err(Error::Api { status: 500, body }) if body.len() < 2200 && body.contains("limited"))
+        );
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_error_body() {
+        let (url, ready, server) = mock_response(
+            b"HTTP/1.1 500 Error\r\nconnection: close\r\n\r\npartial".to_vec(),
+            true,
+        );
+        let cancel = Cancel::new();
+        let task = tokio::spawn(collect_response(
+            OpenAiCompat::custom("mock", url, "fake"),
+            cancel.clone(),
+        ));
+        ready.await.unwrap();
+        // Let the client consume the headers and block inside the body read,
+        // rather than cancelling the already-covered request-header phase.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must interrupt error body reads")
+            .unwrap()
+            .0;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_response_headers_and_body_time_out() {
+        for prefix in ["", "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"] {
+            let (url, _, server) = mock_response(prefix.as_bytes().to_vec(), true);
+            let mut p = OpenAiCompat::custom("mock", url, "fake");
+            p.client = client_builder().read_timeout(Duration::from_millis(100)).build().unwrap();
+            let (result, events) = tokio::time::timeout(Duration::from_secs(1), collect_response(p, Cancel::new())).await.expect("stalled reads must time out");
+            assert!(matches!(result, Err(Error::Http(error)) if error.is_timeout()));
+            if !prefix.is_empty() { assert!(events.iter().any(|e| matches!(e, StreamEvent::Text(text) if text == "partial"))); }
+            tokio::task::spawn_blocking(move || server.join().unwrap()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_tls_handshake_obeys_the_connection_timeout() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0; 8192];
+            // Drain the ClientHello, then wait without completing TLS.
+            while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        let mut p = OpenAiCompat::custom("mock", url, "fake");
+        p.client = client_builder()
+            .connect_timeout(Duration::from_millis(100))
+            .read_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), collect_response(p, Cancel::new()))
+                .await
+                .expect("TLS handshake must obey connect timeout")
+                .0;
+        assert!(matches!(result, Err(Error::Http(error)) if error.is_timeout()));
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_streams_can_outlive_one_read_timeout() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            if !drain_request(&mut stream) {
+                return;
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            for _ in 0..5 {
+                stream
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            stream.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+        });
+        let mut p = OpenAiCompat::custom("mock", url, "fake");
+        p.client = client_builder()
+            .read_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let (result, events) = collect_response(p, Cancel::new()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::Text(_)))
+                .count(),
+            5
+        );
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
 
     fn provider() -> OpenAiCompat {
         OpenAiCompat::deepseek("test-key", Thinking::Enabled, Some(Effort::High))

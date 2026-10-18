@@ -1,7 +1,9 @@
 use agent::{BoxFuture, Cancel, Tool, ToolResult};
 use serde_json::{json, Value};
 
-use crate::util::truncate_chars;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+
+use super::MAX_OUTPUT_BYTES;
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
@@ -14,7 +16,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file's contents. Output is line-numbered as `N<TAB>text`. Use offset/limit for large files."
+        "Read a file's contents. Output is line-numbered as `N<TAB>text`, capped at 64 KiB with long lines truncated. Use offset/limit or the continuation offset for large files."
     }
 
     fn parameters(&self) -> Value {
@@ -38,7 +40,7 @@ impl Tool for ReadTool {
         })
     }
 
-    fn run<'a>(&'a self, args: &'a Value, _cancel: &'a Cancel) -> BoxFuture<'a, ToolResult> {
+    fn run<'a>(&'a self, args: &'a Value, cancel: &'a Cancel) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(path) = args.get("file_path").and_then(Value::as_str) else {
                 return ToolResult::err("Missing required argument: file_path");
@@ -47,47 +49,119 @@ impl Tool for ReadTool {
                 .get("offset")
                 .and_then(Value::as_u64)
                 .unwrap_or(1)
-                .max(1) as usize;
+                .max(1);
             let limit = args
                 .get("limit")
                 .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_LIMIT as u64) as usize;
-
-            let bytes = match tokio::fs::read(path).await {
-                Ok(bytes) => bytes,
-                Err(error) => return ToolResult::err(format!("Failed to read {path}: {error}")),
-            };
-            let size = bytes.len();
-            let Ok(text) = String::from_utf8(bytes) else {
-                return ToolResult::err(format!("{path} is not UTF-8 text ({size} bytes)."));
-            };
-
-            let lines: Vec<&str> = text.lines().collect();
-            let total = lines.len();
-            if total == 0 {
-                return ToolResult::ok(format!("0 lines. {path} is empty."));
+                .unwrap_or(DEFAULT_LIMIT as u64);
+            if limit == 0 {
+                return ToolResult::err("limit must be greater than zero");
             }
-
-            let start = (offset - 1).min(total);
-            let end = start.saturating_add(limit).min(total);
-            let mut out = String::new();
-            for (i, line) in lines[start..end].iter().enumerate() {
-                out.push_str(&format!(
-                    "{}\t{}\n",
-                    start + i + 1,
-                    truncate_chars(line, MAX_LINE_CHARS)
-                ));
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => ToolResult::err("Cancelled."),
+                result = read_range(path, offset, limit) => match result {
+                    Ok(result) => result,
+                    Err(error) => ToolResult::err(format!("Failed to read {path}: {error}")),
+                }
             }
-            if end < total {
-                out.push_str(&format!(
-                    "… file has {total} lines; showing {}-{} (use offset/limit)\n",
-                    start + 1,
-                    end
-                ));
-            }
-            ToolResult::ok(out.trim_end())
         })
     }
+}
+
+/// Keep only the displayed prefix of each line. `fill_buf`/`consume` also
+/// discard huge skipped lines without ever allocating a complete line.
+async fn line_prefix(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    keep: bool,
+) -> std::io::Result<Option<String>> {
+    const PREFIX_BYTES: usize = MAX_LINE_CHARS * 4 + 1;
+    let mut prefix = Vec::new();
+    let mut saw_bytes = false;
+    let mut clipped = false;
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            break;
+        }
+        saw_bytes = true;
+        let newline = bytes.iter().position(|b| *b == b'\n');
+        let n = newline.unwrap_or(bytes.len());
+        if keep {
+            let kept = n.min(PREFIX_BYTES - prefix.len());
+            prefix.extend_from_slice(&bytes[..kept]);
+            clipped |= kept < n;
+        }
+        reader.consume(n + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
+    }
+    if !saw_bytes {
+        return Ok(None);
+    }
+    if !keep {
+        return Ok(Some(String::new()));
+    }
+    if !clipped && prefix.last() == Some(&b'\r') {
+        prefix.pop();
+    }
+    let text = match std::str::from_utf8(&prefix) {
+        Ok(text) => text,
+        Err(error) if clipped && error.error_len().is_none() => {
+            std::str::from_utf8(&prefix[..error.valid_up_to()]).unwrap()
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not UTF-8 text",
+            ))
+        }
+    };
+    let mut out: String = text.chars().take(MAX_LINE_CHARS).collect();
+    if clipped || text.chars().count() > MAX_LINE_CHARS {
+        out.push('…');
+    }
+    Ok(Some(out))
+}
+
+async fn read_range(path: &str, offset: u64, limit: u64) -> std::io::Result<ToolResult> {
+    let mut reader = BufReader::new(tokio::fs::File::open(path).await?);
+    let mut number = 1u64;
+    let mut shown = 0u64;
+    let mut out = String::new();
+    while shown < limit {
+        let keep = number >= offset;
+        let Some(line) = line_prefix(&mut reader, keep).await? else {
+            break;
+        };
+        if keep {
+            let formatted = format!("{number}\t{line}\n");
+            // Leave room for the continuation hint and its line number.
+            if out.len() + formatted.len() + 128 > MAX_OUTPUT_BYTES {
+                out.push_str(&format!(
+                    "… output limit reached; continue with offset {number}\n"
+                ));
+                return Ok(ToolResult::ok(out.trim_end()));
+            }
+            out.push_str(&formatted);
+            shown += 1;
+        }
+        number = number.saturating_add(1);
+    }
+    if !reader.fill_buf().await?.is_empty() {
+        out.push_str(&format!(
+            "… more lines; showing {offset}-{} (use offset {number}/limit)\n",
+            number - 1
+        ));
+    }
+    if number == 1 {
+        return Ok(ToolResult::ok(format!("0 lines. {path} is empty.")));
+    }
+    if out.is_empty() {
+        return Ok(ToolResult::ok(format!("No lines at offset {offset}.")));
+    }
+    Ok(ToolResult::ok(out.trim_end()))
 }
 
 #[cfg(test)]
@@ -120,7 +194,7 @@ mod tests {
             .await;
         assert_eq!(
             result.content,
-            "2\tb\n3\tc\n… file has 5 lines; showing 2-3 (use offset/limit)"
+            "2\tb\n3\tc\n… more lines; showing 2-3 (use offset 4/limit)"
         );
     }
 
@@ -146,5 +220,52 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("not UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn range_reads_do_not_parse_the_rest_of_the_file() {
+        let path = crate::testutil::temp_dir("read-range").join("file");
+        std::fs::write(&path, b"first\n\xff\xff\xff").unwrap();
+        let result = ReadTool
+            .run(&json!({"file_path": path, "limit": 1}), &Cancel::new())
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.starts_with("1\tfirst"));
+        assert!(result.content.contains("offset"));
+    }
+
+    #[tokio::test]
+    async fn huge_requested_ranges_have_a_bounded_result_and_resume_offset() {
+        let path = temp_file("read-budget", &("中".repeat(2000) + "\n").repeat(40));
+        let result = ReadTool
+            .run(
+                &json!({"file_path": path, "limit": u64::MAX}),
+                &Cancel::new(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.len() <= 64 * 1024,
+            "retained {} bytes",
+            result.content.len()
+        );
+        assert!(result.content.contains("output limit"));
+        assert!(result.content.contains("offset 11"));
+    }
+
+    #[tokio::test]
+    async fn a_huge_single_line_is_truncated_without_losing_the_next_line() {
+        let path = temp_file(
+            "read-huge-line",
+            &("x".repeat(4 * 1024 * 1024) + "\nlast\n"),
+        );
+        let result = ReadTool
+            .run(&json!({"file_path": path}), &Cancel::new())
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.starts_with("1\t"));
+        assert!(result.content.contains("…\n2\tlast"));
+        assert!(result.content.len() < 8100);
+        assert!(!result.content.contains('�'));
     }
 }

@@ -102,6 +102,31 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Keep a UTF-8-safe head and tail within a hard byte budget.
+pub fn truncate_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    const MARKER: &str = "\n… [output truncated] …\n";
+    let budget = max.saturating_sub(MARKER.len());
+    let mut head = budget / 2;
+    let mut tail = text.len() - (budget - head);
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    if max < MARKER.len() {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return text[..end].to_string();
+    }
+    format!("{}{MARKER}{}", &text[..head], &text[tail..])
+}
+
 /// Keep at most `head` + `tail` lines, with a marker in between.
 pub fn truncate_lines(text: &str, head: usize, tail: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -129,6 +154,16 @@ pub fn truncate_lines(text: &str, head: usize, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_budget_preserves_unicode_head_and_tail() {
+        let text = "中".repeat(30000) + "END";
+        let out = truncate_bytes(&text, 64 * 1024);
+        assert!(out.len() <= 64 * 1024);
+        assert!(out.starts_with('中') && out.ends_with("END"));
+        assert!(out.contains("output truncated"));
+        assert!(!out.contains('�'));
+    }
 
     #[test]
     fn iso_timestamps() {

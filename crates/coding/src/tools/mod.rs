@@ -13,6 +13,7 @@ pub use write::WriteTool;
 use agent::Tool;
 
 pub const NAMES: [&str; 4] = ["read", "write", "edit", "bash"];
+pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 pub fn all() -> Vec<Arc<dyn Tool>> {
     vec![
