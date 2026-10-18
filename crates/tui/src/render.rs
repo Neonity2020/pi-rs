@@ -277,9 +277,11 @@ fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<Thinkin
 
 fn render_status(app: &App, frame: &mut Frame, rect: Rect) {
     let status = &app.status;
+    let lab = if app.lab { " · LAB" } else { "" };
     let left = format!(
-        "{} pi-rs · {} · {}",
+        "{} pi-rs{} · {} · {}",
         app.spinner_char(),
+        lab,
         status.model,
         status.dir
     );
@@ -728,6 +730,30 @@ mod tests {
         assert!(
             screen.contains("cache 75%"),
             "status line missing: {screen}"
+        );
+    }
+
+    #[test]
+    fn lab_mode_is_visible_in_the_status_bar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        use crate::app::StatusInfo;
+
+        let mut app = App::new(StatusInfo::default());
+        app.lab = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| render(&mut app, frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("pi-rs · LAB"),
+            "missing lab marker: {screen}"
         );
     }
 

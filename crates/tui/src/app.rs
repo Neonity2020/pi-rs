@@ -196,6 +196,8 @@ pub struct App {
     pub login: Option<LoginPrompt>,
     /// Whether an API key is available. Drives the input-box hint.
     pub logged_in: bool,
+    /// Experimental lab mode (`/lab`). Session-scoped and off by default.
+    pub lab: bool,
     pub busy: bool,
     /// Global default for thinking blocks. Collapsed by default; Ctrl+T
     /// toggles this and clears per-block overrides.
@@ -226,6 +228,7 @@ impl App {
             images: Vec::new(),
             login: None,
             logged_in: true,
+            lab: false,
             busy: false,
             show_thinking: false,
             status,

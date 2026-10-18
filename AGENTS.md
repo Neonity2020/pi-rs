@@ -49,7 +49,9 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
   through the existing four tools, never a fifth tool. Do not auto-extract
   memory from conversations or repository content; only write when the user
   explicitly asks. Memory is context, not instructions, and must never contain
-  secrets.
+  secrets. Experimental `/lab` mode exposes `/dream`, an explicit user-triggered
+  maintenance turn that consolidates and forgets notes through the same tools;
+  it runs in an isolated agent and does not enter the session history.
 - Images are base64 `llm::Image` values on user messages (session format).
   Clipboard capture lives in `coding::clipboard` and shells out to the OS
   (osascript / wl-paste / xclip / powershell) — no image crate, no new

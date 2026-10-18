@@ -59,6 +59,18 @@ pub struct Recall {
     pub project_omitted: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub global: usize,
+    pub project: usize,
+}
+
+impl Counts {
+    pub fn total(self) -> usize {
+        self.global + self.project
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RememberOutcome {
     Added,
@@ -79,6 +91,15 @@ pub fn path(home: &Path, cwd: &Path, scope: Scope) -> PathBuf {
     match scope {
         Scope::Global => global_path(home),
         Scope::Project => project_path(home, cwd),
+    }
+}
+
+/// Number of parsed (deduplicated) notes in each file. Used before and after
+/// `/dream` to report what the pass changed.
+pub fn counts(home: &Path, cwd: &Path) -> Counts {
+    Counts {
+        global: load_file(&global_path(home)).len(),
+        project: load_file(&project_path(home, cwd)).len(),
     }
 }
 
@@ -523,6 +544,39 @@ mod tests {
             .sum();
         assert!(total <= RECALL_TOKEN_BUDGET, "total = {total}");
         assert!(recalled.global_lines[0].contains("note number 49"));
+    }
+
+    #[test]
+    fn counts_use_parsed_deduplicated_entries() {
+        let home = home("counts");
+        let cwd = Path::new("/tmp/project");
+        fs::write(
+            global_path(&home),
+            "- global one\n- (2026-10-17) global one\n- global two\n",
+        )
+        .unwrap();
+        fs::create_dir_all(home.join("memory")).unwrap();
+        fs::write(
+            project_path(&home, cwd),
+            "# header\n- project one\n- project two\nnot a note\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            counts(&home, cwd),
+            Counts {
+                global: 2,
+                project: 2
+            }
+        );
+        assert_eq!(counts(&home, cwd).total(), 4);
+        assert_eq!(
+            counts(&home, Path::new("/tmp/other")),
+            Counts {
+                global: 2,
+                project: 0
+            }
+        );
     }
 
     #[test]

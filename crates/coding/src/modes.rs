@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use crate::sinks::{JsonSink, PrintSink, Shared};
 use crate::stats::format_tokens;
 use crate::ui::{self, Action, App, ImageAttachment, Submission, UiEvent};
-use crate::{auth, cli, history, login, memory, util};
+use crate::{auth, cli, dream, history, login, memory, util};
 use ui::crossterm::event::{MouseButton, MouseEventKind};
 
 type Tools = Vec<Arc<dyn Tool>>;
@@ -186,6 +186,9 @@ pub async fn run_interactive(
         summary,
         cwd,
     } = turn;
+    // Keep a snapshot of the file tools for experimental `/dream`. It runs
+    // in an isolated agent so maintenance chatter never enters this history.
+    let dream_tools = dream::tools(&tools);
     let agent = Arc::new(Mutex::new(build_agent(
         provider, &model, system, tools, messages, summary,
     )));
@@ -283,6 +286,59 @@ pub async fn run_interactive(
                                         &cwd,
                                     )));
                                 }
+                                Some(Slash::Lab) => {
+                                    app.lab = !app.lab;
+                                    let _ = ui_tx.send(UiEvent::Info(if app.lab {
+                                        "lab mode on — experimental commands: /dream".into()
+                                    } else {
+                                        "lab mode off".into()
+                                    }));
+                                }
+                                Some(Slash::Dream) => {
+                                    if !app.lab {
+                                        let _ = ui_tx.send(UiEvent::Info(
+                                            "dream is experimental — type /lab to enter lab mode"
+                                                .into(),
+                                        ));
+                                    } else if app.busy {
+                                        let _ = ui_tx.send(UiEvent::Error(
+                                            "wait for the current turn to finish before /dream"
+                                                .into(),
+                                        ));
+                                    } else if !app.logged_in {
+                                        let _ = ui_tx.send(UiEvent::Info(
+                                            "not logged in — /dream needs a model; type /login"
+                                                .into(),
+                                        ));
+                                    } else if !dream::can_run(&dream_tools) {
+                                        let _ = ui_tx.send(UiEvent::Error(
+                                            "/dream needs the read and write tools".into(),
+                                        ));
+                                    } else {
+                                        let home = util::home_dir();
+                                        let before = memory::counts(&home, &cwd);
+                                        if before.total() == 0 {
+                                            let _ = ui_tx.send(UiEvent::Info(
+                                                "long-term memory is empty — nothing to dream about"
+                                                    .into(),
+                                            ));
+                                        } else {
+                                            app.busy = true;
+                                            let _ = ui_tx.send(UiEvent::Busy(true));
+                                            let cancel = Cancel::new();
+                                            *cancel_cell.lock().unwrap() = cancel.clone();
+                                            dream::spawn(
+                                                agent.clone(),
+                                                dream_tools.clone(),
+                                                shared.clone(),
+                                                cwd.clone(),
+                                                ui_tx.clone(),
+                                                cancel,
+                                                before,
+                                            );
+                                        }
+                                    }
+                                }
                                 Some(Slash::Compact) => {
                                     if app.busy {
                                         let _ = ui_tx.send(UiEvent::Error(
@@ -298,10 +354,10 @@ pub async fn run_interactive(
                                         let shared = shared.clone();
                                         let ui = ui_tx.clone();
                                         tokio::spawn(async move {
-                                            let mut sink = ui::TuiSink {
+                                            let mut sink = ui::TuiSink::persisting(
                                                 shared,
-                                                ui: ui.clone(),
-                                            };
+                                                ui.clone(),
+                                            );
                                             let mut agent = agent.lock().await;
                                             match agent
                                                 .compact(
@@ -334,7 +390,7 @@ pub async fn run_interactive(
                                 }
                                 Some(Slash::Unknown(name)) => {
                                     let _ = ui_tx.send(UiEvent::Error(format!(
-                                        "unknown command: {name} — try /login, /logout, /compact, /remember, /forget, /memory, /help"
+                                        "unknown command: {name} — try /login, /logout, /compact, /remember, /forget, /memory, /lab, /dream, /help"
                                     )));
                                 }
                                 None if !app.logged_in => {
@@ -405,7 +461,7 @@ pub async fn run_interactive(
     Ok(())
 }
 
-const HELP: &str = "/login            sign in and save your API key to auth.json\n/logout           remove the saved API key\n/compact          summarize older messages to free context\n/remember <text>  add a note to this project's long-term memory\n/remember global  add a note for all projects\n/forget <text>    remove matching notes from this project's memory\n/memory           show memory file paths and counts\n/help             show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
+const HELP: &str = "/login            sign in and save your API key to auth.json\n/logout           remove the saved API key\n/compact          summarize older messages to free context\n/remember <text>  add a note to this project's long-term memory\n/remember global  add a note for all projects\n/forget <text>    remove matching notes from this project's memory\n/memory           show memory file paths and counts\n/lab              toggle experimental lab mode\n/dream            consolidate and forget long-term memory (lab only)\n/help             show this\n\nCtrl+V   attach an image from the clipboard (Esc removes the last one)\nCtrl+T   expand or collapse the agent's thinking";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Slash {
@@ -415,6 +471,8 @@ enum Slash {
     Remember { scope: memory::Scope, text: String },
     Forget { scope: memory::Scope, text: String },
     Memory,
+    Lab,
+    Dream,
     Help,
     Unknown(String),
 }
@@ -448,6 +506,8 @@ fn slash_command(text: &str) -> Option<Slash> {
             }
         }
         "/memory" => Slash::Memory,
+        "/lab" => Slash::Lab,
+        "/dream" => Slash::Dream,
         "/help" => Slash::Help,
         other => Slash::Unknown(other.to_string()),
     })
@@ -649,10 +709,7 @@ fn spawn_turn(
     let _ = ui.send(UiEvent::Busy(true));
 
     tokio::spawn(async move {
-        let mut sink = ui::TuiSink {
-            shared: shared.clone(),
-            ui: ui.clone(),
-        };
+        let mut sink = ui::TuiSink::persisting(shared.clone(), ui.clone());
         let result = {
             let mut agent = agent.lock().await;
             agent.run_turn(message, &mut sink, cancel).await
@@ -747,6 +804,9 @@ mod tests {
         assert_eq!(slash_command("/help me"), Some(Slash::Help));
         assert_eq!(slash_command("/compact"), Some(Slash::Compact));
         assert_eq!(slash_command("/memory"), Some(Slash::Memory));
+        assert_eq!(slash_command("/lab"), Some(Slash::Lab));
+        assert_eq!(slash_command("/lab on"), Some(Slash::Lab));
+        assert_eq!(slash_command("/dream"), Some(Slash::Dream));
         assert_eq!(
             slash_command("/remember  a note  "),
             Some(Slash::Remember {

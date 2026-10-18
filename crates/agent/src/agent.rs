@@ -95,6 +95,12 @@ impl Agent {
         &self.model
     }
 
+    /// The active provider. Used by experimental modes that run an isolated
+    /// turn without taking over this agent's history.
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.provider)
+    }
+
     /// Swap the provider without losing history (used after `/login`).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;

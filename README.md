@@ -55,7 +55,7 @@ pi-rs -c                    # 继续本目录最近一次会话
 --tools <list>        限制工具集，如 --tools read,bash
 ```
 
-TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/remember <text>` 记住一条项目事实、`/remember global <text>` 记住跨项目偏好、`/forget <text>` 删除匹配的记忆、`/memory` 查看记忆文件、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
+TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/remember <text>` 记住一条项目事实、`/remember global <text>` 记住跨项目偏好、`/forget <text>` 删除匹配的记忆、`/memory` 查看记忆文件、`/lab` 开关实验模式、`/dream` 在实验模式里整理并遗忘长期记忆、`/help` 列出命令。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
 
 `Up` / `Down` 在输入框里翻阅历史 prompt（跨会话，按工作目录保存于 `~/.pi-rs/history/<cwd 的 slug>`）；正在编辑的内容会先暂存，翻回最新一条后还原。
 
@@ -120,6 +120,8 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 
 TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全局记忆，`/forget <text>` 按子串删除，`/memory` 查看路径和条数。在普通 prompt 里说“记住……”也可以，模型会用现有的 `read` / `edit` 工具完成。pi-rs **不会**自动从对话或仓库内容里抽取记忆；删除这两个文件就等于关闭该功能。
 
+实验模式 `/lab` 提供一个 `/dream`：用当前模型跑一次隔离的整理回合，读两个记忆文件，合并重复/近重复、保留耐久事实、遗忘过期或琐碎条目，再按同一 bullet 格式写回。它只带 `read` / `write` / `edit`，不进入主会话，只把 token/成本计入统计；状态栏会显示 `LAB`。这是手动实验功能，不是后台睡眠计算。
+
 ## 成本
 
 状态栏会显示输入/输出 token、缓存命中率与估算成本；`-p` 结尾显示 token 数与成本。DeepSeek 的定价分高峰/低谷（工作日 01:00–04:00 与 06:00–10:00 UTC），估算按 UTC 时间自动选择，但不考虑中国法定节假日，所以看成量级即可。`--provider openai` 或未知模型时不估成本，显示 `-`。
@@ -127,10 +129,10 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 ## 测试
 
 ```bash
-cargo test          # 180 个测试，不需要 API key
+cargo test          # 186 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除、TUI 状态机、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 14 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、并行批次顺序、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 14 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

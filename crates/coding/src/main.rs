@@ -6,6 +6,7 @@
 mod auth;
 mod cli;
 mod clipboard;
+mod dream;
 mod history;
 mod login;
 mod memory;

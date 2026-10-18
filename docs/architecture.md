@@ -188,6 +188,10 @@ TUI 里 `Up` / `Down` 翻阅历史 prompt：进入历史前先暂存正在编辑
 
 系统提示在进程启动时组装一次；`/remember` 只改文件，不改当前 `Agent` 的 system 字段。新记忆在下一次启动或 `-c` 时召回；当前轮次里用户已经说过，模型本来就知道。`agent` 与 `tui` 完全不知道记忆文件存在。
 
+**实验模式 `/lab`。** 只在交互模式存在，是 `App` 上的一个开关，默认关闭，状态栏显示 `LAB`。开启后 `/dream` 才可用；离开实验模式或重启进程即关闭。
+
+**`/dream`。** 用户显式触发的记忆整理回合：读取两个文件，合并重复/近重复条目，保留耐久偏好与项目事实，遗忘过期、琐碎、可从仓库推导或含密钥的条目，再按 `- (YYYY-MM-DD) text` 重写。它使用一个独立 `Agent`：专用 system prompt、只含 `read` / `write` / `edit` 的工具子集、空历史，因此不会把维护过程写进主会话，也不会携带主会话上下文。用量仍计入共享统计。完成后比较前后解析条数并报告 `global X→Y · project A→B · N notes forgotten or merged`。取消、空记忆、未登录、缺少读写工具都只产生提示，不改动历史。它不新增工具、不新增依赖、不做后台抽取。
+
 ### 三种模式
 
 | 模式 | 入口 | 输出去向 | 结束行为 |
@@ -266,7 +270,8 @@ ToolResult { content: String, is_error: bool }
 
 - 独立线程跑 `crossterm::event::read`，把按键/滚轮/左键点击/尺寸变化送进 channel；左键带着坐标，由 `App::on_click` 命中 thinking header。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
-- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/remember`、`/forget`、`/memory`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
+- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/remember`、`/forget`、`/memory`、`/lab`、`/dream`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
+- `/lab` 只翻转 `App::lab`；`/dream` 在 lab 关闭、忙碌、未登录、记忆为空或工具不足时直接拒绝/提示。满足条件时把 `Cancel` 交给隔离的 dream 任务，`TuiSink::ephemeral` 展示思考与工具活动、累计用量，但不追加会话记录；结束统一发 `Busy(false)`。
 - `/compact` 在空闲时拿 agent 锁执行一次强制压缩；`TuiSink` 负责落盘并把 `Compaction` / `CompactionFailed` 翻成提示。忙时直接拒绝，不打断当前 turn。
 - `Ctrl+V` 在 `tui` 里只产生 `Action::PasteImage`；`coding::clipboard` 读系统剪贴板（macOS `osascript`、Linux `wl-paste`/`xclip`、Windows PowerShell），把图片元数据装进 `UiEvent::ImageAttached`。字节留在 `App` 的待发送附件里，提交时随 `Message` 进会话。
 - 未登录时普通提交被拦下并提示 `/login`，不产生模型请求；已附的图片会退回输入框，避免静默丢失。
@@ -329,6 +334,8 @@ ToolResult { content: String, is_error: bool }
 | 剪贴板没有图片 | 输入框上方提示，不产生消息 | 复制图片后重试 |
 | 剪贴板图片过大/格式不支持 | 错误提示，不进入会话 | 压缩或转成 PNG/JPEG |
 | TUI 出错 | `TerminalGuard::drop` 恢复终端 | 检查 stderr |
+| `/dream` 失败 / 取消 | 显示错误或 `dream interrupted`；记忆文件保持不变或保留已写入部分 | 重新 `/dream`；先检查记忆文件 |
+| `/dream` 缺少读写工具 | 启动时按 `--tools` 选择的子集执行；不足则提示 | 用默认四工具重启 |
 
 ## 扩展点
 
@@ -348,7 +355,7 @@ ToolResult { content: String, is_error: bool }
 |---|---|---|
 | llm 单元 | `crates/llm/src/*` | SSE 解析、请求体、reasoning 回传、峰谷价 |
 | agent 单元 | `crates/agent/src/*` | 工具回环、并行顺序、中止、空流、panic、token 估算、切点、摘要序列化、自动/手动/overflow 压缩 |
-| coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、长期记忆的解析/预算/写入/删除、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
+| coding 单元 | `crates/coding/src/*` | CLI、会话树、compaction 重放、提示词合并、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、工具行为、统计、auth.json、提示词历史、剪贴板图片的格式/尺寸/base64、斜杠命令解析 |
 | tui 单元 | `crates/tui/src/*` | 状态机、滚动、历史召回、thinking 折叠/点击、换行、图片附件、Markdown/表格/高亮 |
 | e2e | `crates/coding/tests/e2e.rs` | 真实二进制 + 本地 mock SSE/HTTP：三种模式、`.env`、`pi-rs login`/`logout`、key 优先级、错误路径、context overflow 压缩重试与会话落盘 |
 | PTY 冒烟 | `scripts/tui_*.py` | 真实终端：启动、输入、流式渲染、干净退出 |

@@ -13,11 +13,38 @@ use crate::util;
 pub struct TuiSink {
     pub shared: Shared,
     pub ui: tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    /// Persist assistant/tool/compaction records into the session file.
+    /// Experimental `/dream` runs use `false`: they display the pass but do
+    /// not inject internal maintenance messages into the conversation.
+    pub persist: bool,
+}
+
+impl TuiSink {
+    pub fn persisting(shared: Shared, ui: tokio::sync::mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            shared,
+            ui,
+            persist: true,
+        }
+    }
+
+    pub fn ephemeral(shared: Shared, ui: tokio::sync::mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            shared,
+            ui,
+            persist: false,
+        }
+    }
 }
 
 impl Sink for TuiSink {
     fn on(&mut self, event: AgentEvent) {
-        self.shared.record(&event);
+        if self.persist {
+            self.shared.record(&event);
+        } else if matches!(&event, AgentEvent::Usage { .. }) {
+            // Ephemeral turns still count toward token/cost stats.
+            self.shared.record(&event);
+        }
         let translated = match event {
             AgentEvent::Step { .. } => None,
             AgentEvent::Text { delta } => Some(UiEvent::AssistantDelta(delta)),

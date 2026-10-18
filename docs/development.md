@@ -43,7 +43,8 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 | PTY | Python + 伪终端，跑真实二进制 | 验证 raw mode、流式渲染、干净退出 |
 | 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
 | 压缩 | `ScriptedProvider` 按“摘要 → 最终回答”排脚本；会话测试覆盖 compaction 重放 | 不需要真实窗口；断言摘要请求、保留尾部与 session 记录 |
-| 长期记忆 | 临时 `home` + 临时 cwd；解析、去重、预算、写入、删除各有单元测试；e2e 断言 system message 含记忆 | 绝不读开发者真实 `~/.pi-rs`；不依赖文件系统权限的偶然行为 |
+| 长期记忆 | 临时 `home` + 临时 cwd；解析、去重、预算、写入、删除、计数各有单元测试；e2e 断言 system message 含记忆 | 绝不读开发者真实 `~/.pi-rs`；不依赖文件系统权限的偶然行为 |
+| `/dream` | `ScriptedProvider` 按“写文件工具调用 → 报告”排脚本；断言只暴露文件工具、隔离回合能改写记忆；报告计数有纯函数测试 | 不调用真实模型；不依赖 TUI；取消/空记忆/工具不足走提示路径 |
 
 写测试的几条规矩：
 
@@ -59,7 +60,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 - 消息只有 `llm::Message` 一种；不要加 wire/session 转换层。图片是用户消息上的 base64 字段，由 provider 在发送时展开成 content parts。
 - 压缩摘要是一条普通 user 消息（`agent::summary_message`），会话里对应 `type:"compaction"` 记录；不要把摘要做成新的 message role。
 - 切点只能是 user/assistant，永远不能把 assistant 的 tool_calls 和后面的 tool 结果分开；保留的消息不要改 reasoning。
-- 长期记忆是 `coding::memory` 的两个 Markdown 文件，不进 `agent` / `tui`；`llm::Message` 与会话格式不变。召回只读文件，`/remember` 只追加，`/forget` 原子重写。
+- 长期记忆是 `coding::memory` 的两个 Markdown 文件，不进 `agent` / `tui`；`llm::Message` 与会话格式不变。召回只读文件，`/remember` 只追加，`/forget` 原子重写。实验性的 `/dream` 是 `coding::dream` 里的隔离回合：专用 prompt + 文件工具子集 + 空历史，内部消息不进主会话。
 - DeepSeek 的 `reasoning` 必须原样回传，任何清理都是 bug。
 - 每个模块顶部用一句话说明职责；说不清就说明边界错了。
 - 新增依赖前先看根 `AGENTS.md` 的依赖清单和 `docs/goals.md` 的预算原则。
