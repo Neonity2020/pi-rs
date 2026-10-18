@@ -70,13 +70,27 @@ impl Session {
     /// Create a fresh session for `cwd` inside `dir`.
     pub fn create_in(dir: &Path, cwd: &Path, model: &str) -> Result<Self> {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        let id = util::short_id();
-        let file_name = format!(
-            "{}-{}.jsonl",
-            util::file_timestamp(),
-            &id[..8.min(id.len())]
-        );
-        let path = dir.join(file_name);
+        // The timestamp has second resolution, so the full id is what keeps
+        // two sessions created in the same second apart. Never truncate an
+        // existing file: `create_new` turns a collision into a retry.
+        let (mut file, path, id) = {
+            let mut attempts = 0;
+            loop {
+                let id = util::short_id();
+                let path = dir.join(format!("{}-{id}.jsonl", util::file_timestamp()));
+                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(file) => break (file, path, id),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 =>
+                    {
+                        attempts += 1;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("create {}", path.display()))
+                    }
+                }
+            }
+        };
         let header = Header {
             kind: "session".into(),
             v: 2,
@@ -85,8 +99,6 @@ impl Session {
             model: model.to_string(),
             created: util::iso_now(),
         };
-        let mut file =
-            fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
         writeln!(file, "{}", serde_json::to_string(&header)?)?;
         Ok(Self {
             id,
@@ -425,6 +437,31 @@ mod tests {
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(messages[2].text(), "file.txt");
         assert_eq!(loaded.summary(), None);
+    }
+
+    #[test]
+    fn sessions_created_in_the_same_second_keep_separate_files() {
+        let dir = temp_dir("same-second");
+        let cwd = Path::new("/tmp/project");
+        let mut first = Session::create_in(&dir, cwd, "m").unwrap();
+        first.append_message(&Message::user("first")).unwrap();
+        let first_path = first.path.clone();
+        let original = fs::read(&first_path).unwrap();
+
+        let mut second = Session::create_in(&dir, cwd, "m").unwrap();
+        second.append_message(&Message::user("second")).unwrap();
+
+        // The second-resolution timestamp is not enough on its own; the full
+        // id must be in the file name so same-second sessions cannot collide.
+        assert_ne!(first.path, second.path);
+        assert!(first.path.to_string_lossy().contains(&first.id));
+        assert!(second.path.to_string_lossy().contains(&second.id));
+        // Creating a second session must never truncate the first.
+        assert_eq!(fs::read(&first_path).unwrap(), original);
+        let (_, messages) = Session::load_file(&first_path).unwrap();
+        assert_eq!(messages[0].text(), "first");
+        let (_, messages) = Session::load_file(&second.path).unwrap();
+        assert_eq!(messages[0].text(), "second");
     }
 
     #[test]

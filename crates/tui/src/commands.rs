@@ -77,6 +77,12 @@ pub const COMMANDS: &[Command] = &[
         lab: false,
     },
     Command {
+        name: "/forget global",
+        hint: "<text>",
+        help: "remove matching notes for all projects",
+        lab: false,
+    },
+    Command {
         name: "/memory",
         hint: "",
         help: "show memory file paths and counts",
@@ -200,6 +206,12 @@ mod tests {
             .map(|command| command.usage())
             .collect();
         assert_eq!(remember, ["/remember <text>", "/remember global <text>"]);
+
+        let forget: Vec<_> = matches("/forget")
+            .iter()
+            .map(|command| command.usage())
+            .collect();
+        assert_eq!(forget, ["/forget <text>", "/forget global <text>"]);
 
         assert!(matches("/nope").is_empty());
         assert!(matches("log").is_empty());

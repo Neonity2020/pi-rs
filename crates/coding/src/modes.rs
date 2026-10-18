@@ -962,6 +962,37 @@ mod tests {
     }
 
     #[test]
+    fn slash_commands_and_the_help_table_agree() {
+        // Mirrors every arm of `slash_command`; update both together.
+        let implemented = [
+            "/login",
+            "/logout",
+            "/compact",
+            "/remember",
+            "/remember global",
+            "/forget",
+            "/forget global",
+            "/memory",
+            "/lab",
+            "/dream",
+            "/help",
+        ];
+        for name in implemented {
+            assert!(
+                tui::COMMANDS.iter().any(|command| command.name == name),
+                "{name} is implemented but missing from tui::commands"
+            );
+        }
+        for command in tui::COMMANDS {
+            assert!(
+                !matches!(slash_command(command.name), Some(Slash::Unknown(_))),
+                "{} is advertised but unknown to the parser",
+                command.name
+            );
+        }
+    }
+
+    #[test]
     fn slash_commands_are_the_first_token() {
         assert_eq!(slash_command("/login"), Some(Slash::Login));
         assert_eq!(slash_command("  /logout  "), Some(Slash::Logout));
