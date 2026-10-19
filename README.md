@@ -69,7 +69,7 @@ pi-rs -c                    # 继续本目录最近一次会话
 
 TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/model` 列出可用模型、`/model <id>` 切换模型、`/remember <text>` 记住一条项目事实、`/remember global <text>` 记住跨项目偏好、`/forget <text>` 删除匹配的项目记忆、`/forget global <text>` 删除匹配的全局记忆、`/memory` 查看记忆文件、`/lab` 开关实验模式、`/dream` 在实验模式里整理并遗忘长期记忆、`/help` 列出命令。输入 `/` 会弹出命令列表，`Up` / `Down` 选择、`Tab` 补全、`Esc` 关闭；只输入了命令前缀时按 `Enter` 也会先补全。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
 
-`/model` 列出所有 provider 的已知模型，`*` 标记当前模型。`/model <id>` 切换到指定模型，历史对话保留，状态栏同步更新。id 可以是族名（`MiniMax-M3.1`），会解析成 API 真实接受的 ID（`MiniMax-M3.1-Flash`）。切换到另一个 provider 的模型时需要该 provider 自己的凭据（`MINIMAX_CN_API_KEY` 或 `pi-rs login --provider minimax-cn`）；`--api-key` 和 `--base-url` 只属于启动时的 provider，不跟着走。切换只影响之后的请求，不改写会话文件里已记录的内容。
+`/model` 列出所有 provider 的已知模型，`*` 标记当前模型。`/model <id>` 切换到指定模型，历史对话保留，状态栏同步更新。id 可以是族名（`MiniMax-M3.1`），会解析成 API 真实接受的 ID（`MiniMax-M3.1-Flash`）。切换到另一个 provider 的模型时需要该 provider 自己的凭据（`MINIMAX_CN_API_KEY` 或 `pi-rs login --provider minimax-cn`）；`--api-key` 和 `--base-url` 只属于启动时的 provider，不跟着走。切换只影响之后的请求，不改写会话文件里已记录的内容。 `/login` 和 `/logout` 始终操作当前 provider；切换成功后可直接继续聊天，登录验证期间输入框锁定。
 
 `Up` / `Down` 在输入框里翻阅历史 prompt（跨会话，按工作目录保存于 `~/.pi-rs/history/<cwd 的 slug>`）；正在编辑的内容会先暂存，翻回最新一条后还原。
 
@@ -97,6 +97,8 @@ TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logou
 工具失败不是异常，而是 fed back 给模型的结果文本（`is_error: true`）；参数 JSON 解析失败、未知工具名、panic 也一样——循环永不为工具而中断。
 
 同一响应中的工具按调用顺序执行，每项结果保存后才开始下一项，支持先写文件再编辑等依赖操作。取消或结果保存失败后，剩余工具不会启动。Unix 下 bash 取消、超时或其 future 被丢弃时会终止原进程组内的子孙进程；主动脱离该组的进程不在此范围，其他平台目前只清理直接子进程。
+
+`write` / `edit` 先写同目录临时文件，完整写入后才替换目标；写入失败或提交前取消时保留原文。保留已有文件的权限，跟随有效符号链接；拒绝悬空链接、只读文件和非普通文件。替换一个硬链接路径不会改动它的其他链接。
 
 `read` / `bash` 的预览最多 64 KiB。`read` 按范围读取，超长行截断，预算满时给出继续读取的 offset；不会为了统计总行数读完整个文件。`bash` 保留 stdout/stderr 头尾并标注省略，仍会持续排空管道，让命令正常结束。
 
@@ -155,17 +157,17 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 GitHub Actions 已配置 Linux/macOS 的格式、Clippy、锁定依赖测试与构建、PTY 冒烟，以及 Node 24 的网站构建；均不需要真实 API key。
 
 ```bash
-cargo test          # 245 个测试，不需要 API key
+cargo test          # 250 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、`/model` 的模型路由与切换、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 22 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、MiniMax 族名解析成 API 真实 ID、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、`/model` 的模型路由与切换、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 23 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、MiniMax 族名解析成 API 真实 ID、context overflow 压缩重试与会话落盘）。
 
-另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
+另外有三个真 pty 冒烟脚本（同样不需要真实 key）：
 
 ```bash
 python3 scripts/tui_smoke.py <数据目录> target/debug/pi-rs     # 启动 / Ctrl+C 干净退出 / 恢复终端
 python3 scripts/tui_chat_smoke.py <数据目录> target/debug/pi-rs   # 本地 mock API：输入 → 流式渲染 → 退出
-python3 scripts/tui_model_smoke.py <数据目录> target/debug/pi-rs  # `/model` 列表 → 切换 → 跨 provider 切换
+python3 scripts/tui_model_smoke.py <数据目录> target/debug/pi-rs  # 模型切换后的真实请求、凭据、登录/退出与取消
 ```
 
 ## 安全

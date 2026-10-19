@@ -43,6 +43,15 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/tui_chat_smoke.py" "$pi_smoke_dir/chat-home" "$GITHUB_WORKSPACE/target/debug/pi-rs"
           python3 "$GITHUB_WORKSPACE/scripts/tui_model_smoke.py" "$pi_smoke_dir/model-home" "$GITHUB_WORKSPACE/target/debug/pi-rs"
 
+      - name: Upload PTY failure logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pty-failure-${{ matrix.os }}
+          path: /tmp/pi-rs-tui-*-dump.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
   website:
     name: Website
     runs-on: ubuntu-latest

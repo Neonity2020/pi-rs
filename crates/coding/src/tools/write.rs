@@ -29,7 +29,7 @@ impl Tool for WriteTool {
         })
     }
 
-    fn run<'a>(&'a self, args: &'a Value, _cancel: &'a Cancel) -> BoxFuture<'a, ToolResult> {
+    fn run<'a>(&'a self, args: &'a Value, cancel: &'a Cancel) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(path) = args.get("file_path").and_then(Value::as_str) else {
                 return ToolResult::err("Missing required argument: file_path");
@@ -47,7 +47,7 @@ impl Tool for WriteTool {
                     }
                 }
             }
-            match tokio::fs::write(path, content).await {
+            match super::atomic::write(std::path::Path::new(path), content.as_bytes(), cancel) {
                 Ok(()) => {
                     let lines = content.lines().count();
                     ToolResult::ok(format!("Wrote {lines} lines to {path}."))

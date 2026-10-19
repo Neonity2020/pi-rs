@@ -265,9 +265,9 @@ pub async fn run_interactive(
                                 }
                             }
                             match command {
-                                Some(Slash::Login) => begin_login(&mut app, &args, &ui_tx),
+                                Some(Slash::Login) => begin_login(&mut app, &shared, &ui_tx),
                                 Some(Slash::Logout) => {
-                                    logout(&mut app, &args, &agent, &ui_tx).await
+                                    logout(&mut app, &args, &agent, &shared, &ui_tx).await
                                 }
                                 Some(Slash::Help) => {
                                     let _ = ui_tx.send(UiEvent::Info(ui::help_text()));
@@ -282,7 +282,12 @@ pub async fn run_interactive(
                                                 .into(),
                                         ));
                                     } else {
-                                        switch_model(&args, &agent, &shared, &ui_tx, &id).await;
+                                        let previous = shared.model().provider;
+                                        if switch_model(&args, &agent, &shared, &ui_tx, &id).await
+                                            && shared.model().provider != previous
+                                        {
+                                            app.logged_in = true;
+                                        }
                                     }
                                 }
                                 Some(Slash::Remember { scope, text }) => {
@@ -424,11 +429,12 @@ pub async fn run_interactive(
                                         let _ = ui_tx.send(UiEvent::ImageAttached(image));
                                     }
                                     let _ = ui_tx.send(UiEvent::Info(
-                                        "not logged in — type /login to sign in with DeepSeek, or run `pi-rs login`"
+                                        "not logged in — type /login to sign in to the current provider"
                                             .into(),
                                     ));
                                 }
                                 None => {
+                                    app.busy = true;
                                     let cancel = Cancel::new();
                                     *cancel_cell.lock().unwrap() = cancel.clone();
                                     spawn_turn(
@@ -447,7 +453,7 @@ pub async fn run_interactive(
                             dirty = true;
                         }
                         Action::Login(key) => {
-                            start_login(&mut app, &args, &agent, &ui_tx, key);
+                            start_login(&mut app, &args, &agent, &shared, &ui_tx, key);
                             dirty = true;
                         }
                         Action::Interrupt => {
@@ -663,7 +669,7 @@ async fn switch_model(
     shared: &Shared,
     ui: &UnboundedSender<UiEvent>,
     id: &str,
-) {
+) -> bool {
     let current = shared.model();
     let provider = llm::provider_of_model(id)
         .map(str::to_string)
@@ -678,18 +684,18 @@ async fn switch_model(
                     "no API key for {provider} — run `pi-rs login --provider {provider}` or set {}",
                     crate::env_key_name(&provider)
                 )));
-                return;
+                return false;
             }
             Err(error) => {
                 let _ = ui.send(UiEvent::Error(format!("model switch failed: {error}")));
-                return;
+                return false;
             }
         };
         let next = match crate::build_provider_for(&provider, args, &key) {
             Ok(provider) => provider,
             Err(error) => {
                 let _ = ui.send(UiEvent::Error(format!("model switch failed: {error}")));
-                return;
+                return false;
             }
         };
         let mut agent = agent.lock().await;
@@ -702,10 +708,29 @@ async fn switch_model(
     shared.set_model(model.clone());
     let _ = ui.send(UiEvent::Info(format!("model: {id}")));
     let _ = ui.send(UiEvent::Status(shared.status_info()));
+    true
 }
 
-fn begin_login(app: &mut App, args: &cli::Args, ui: &UnboundedSender<UiEvent>) {
-    let provider = crate::provider_name(args);
+// CLI overrides belong to the startup provider. Login uses the current one.
+fn active_provider_args(args: &cli::Args, provider: &str) -> cli::Args {
+    let mut active = args.clone();
+    if provider != crate::provider_name(args) {
+        active.api_key = None;
+        active.base_url = None;
+    }
+    active.provider = Some(provider.to_string());
+    active
+}
+
+fn begin_login(app: &mut App, shared: &Shared, ui: &UnboundedSender<UiEvent>) {
+    if app.busy {
+        let _ = ui.send(UiEvent::Error(
+            "wait for the current turn to finish before /login".into(),
+        ));
+        return;
+    }
+    let model = shared.model();
+    let provider = model.provider.as_str();
     let _ = ui.send(UiEvent::Info(format!(
         "sign in to {} — get a key at {}",
         login::label(provider),
@@ -720,10 +745,12 @@ fn start_login(
     app: &mut App,
     args: &cli::Args,
     agent: &Arc<Mutex<Agent>>,
+    shared: &Shared,
     ui: &UnboundedSender<UiEvent>,
     key: String,
 ) {
-    let opts = match login::options(args) {
+    let active = active_provider_args(args, &shared.model().provider);
+    let opts = match login::options(&active) {
         Ok(opts) => opts,
         Err(err) => {
             app.login = None;
@@ -734,7 +761,7 @@ fn start_login(
     if let Some(prompt) = app.login.as_mut() {
         prompt.busy = true;
     }
-    let mut next = args.clone();
+    let mut next = active;
     next.api_key = Some(key.clone());
     let agent = agent.clone();
     let ui = ui.clone();
@@ -762,34 +789,42 @@ fn start_login(
 }
 
 /// `/logout` removes the saved key. A key from the environment or
-/// `--api-key` keeps working, so only replace the provider when none is left.
+/// `--api-key` keeps working; rebuild from the remaining credential, or clear it.
 async fn logout(
     app: &mut App,
     args: &cli::Args,
     agent: &Arc<Mutex<Agent>>,
+    shared: &Shared,
     ui: &UnboundedSender<UiEvent>,
 ) {
-    let provider = crate::provider_name(args).to_string();
-    match auth::AuthFile::remove(&provider) {
-        Ok(removed) => {
-            if crate::resolve_api_key(args).ok().flatten().is_some() {
-                app.logged_in = true;
-                let _ = ui.send(UiEvent::Info(format!(
-                    "removed saved credentials for {provider}; a key from the environment or --api-key is still in use"
-                )));
+    if app.busy {
+        let _ = ui.send(UiEvent::Error(
+            "wait for the current turn to finish before /logout".into(),
+        ));
+        return;
+    }
+    let provider = shared.model().provider;
+    let result = (|| {
+        let removed = auth::AuthFile::remove(&provider)?;
+        let remaining = crate::resolve_api_key_for(&provider, args)?;
+        let next = match &remaining {
+            Some(key) => crate::build_provider_for(&provider, args, key)?,
+            None => crate::no_credentials_provider(),
+        };
+        Ok::<_, anyhow::Error>((removed, remaining.is_some(), next))
+    })();
+    match result {
+        Ok((removed, logged_in, next)) => {
+            agent.lock().await.set_provider(next);
+            app.logged_in = logged_in;
+            let message = if logged_in {
+                format!("removed saved credentials for {provider}; a key from the environment or --api-key is still in use")
+            } else if removed {
+                format!("logged out of {provider}")
             } else {
-                agent
-                    .lock()
-                    .await
-                    .set_provider(crate::no_credentials_provider());
-                app.logged_in = false;
-                let message = if removed {
-                    format!("logged out of {provider}")
-                } else {
-                    format!("no saved credentials for {provider}")
-                };
-                let _ = ui.send(UiEvent::Info(message));
-            }
+                format!("no saved credentials for {provider}")
+            };
+            let _ = ui.send(UiEvent::Info(message));
         }
         Err(err) => {
             let _ = ui.send(UiEvent::Error(format!("logout failed: {err}")));
@@ -922,6 +957,36 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_uses_current_provider_without_carrying_startup_overrides() {
+        let args = cli::Args {
+            api_key: Some("startup-key".into()),
+            base_url: Some("http://startup.invalid".into()),
+            ..cli::Args::default()
+        };
+        let same = active_provider_args(&args, "deepseek");
+        assert_eq!(same.api_key, args.api_key);
+        assert_eq!(same.base_url, args.base_url);
+        let switched = active_provider_args(&args, "minimax-cn");
+        assert_eq!(switched.provider.as_deref(), Some("minimax-cn"));
+        assert!(switched.api_key.is_none());
+        assert!(switched.base_url.is_none());
+
+        let dir = crate::testutil::temp_dir("active-login");
+        let session = crate::session::Session::create_in(&dir, &dir, "m").unwrap();
+        let shared = Shared::new(session, llm::minimax_cn::model_or_unknown("MiniMax-M3.1"));
+        let mut app = App::new(shared.status_info());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        begin_login(&mut app, &shared, &tx);
+        assert!(app.login.as_ref().unwrap().provider.contains("MiniMax"));
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::Info(message)) if message.contains("MiniMax")));
+        app.login = None;
+        app.busy = true;
+        begin_login(&mut app, &shared, &tx);
+        assert!(app.login.is_none());
+        assert!(matches!(rx.try_recv(), Ok(UiEvent::Error(message)) if message.contains("wait")));
+    }
 
     #[tokio::test]
     async fn tui_rejects_a_prompt_that_cannot_be_saved() {

@@ -1120,3 +1120,81 @@ fn context_overflow_compacts_the_session_and_retries() {
     assert!(text.contains("\"type\":\"compaction\""), "session: {text}");
     assert!(text.contains("recovered"), "session: {text}");
 }
+
+#[cfg(unix)]
+#[test]
+fn failed_edit_preserves_the_original_file() {
+    use std::os::unix::process::CommandExt;
+
+    let home = test_dir();
+    let path = home.join("original.txt");
+    let original = "a".repeat(3_000);
+    std::fs::write(&path, &original).unwrap();
+    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+        "index":0,"id":"edit1","type":"function","function":{
+            "name":"edit", "arguments":serde_json::json!({
+                "file_path":"original.txt", "old_string":"a",
+                "new_string":"bb", "replace_all":true
+            }).to_string()
+        }
+    }]}}]})
+    .to_string();
+    let (base_url, requests) = start_mock_api(vec![
+        sse(&[
+            &call,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]),
+        sse(&[
+            r#"{"choices":[{"delta":{"content":"write failed safely"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]),
+    ]);
+    let mut command = pi_in(&home);
+    command.args([
+        "--base-url",
+        &base_url,
+        "--api-key",
+        "fake",
+        "-p",
+        "edit the file",
+    ]);
+    // Limit only this child. The small JSONL session fits, but the 6,000-byte
+    // replacement hits EFBIG after a partial write, without filling a disk.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 4_096,
+                rlim_max: 4_096,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert!(!std::fs::read_dir(&home).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".pi-rs-")));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let result = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(result["role"], "tool");
+    assert!(result["content"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to write"));
+}

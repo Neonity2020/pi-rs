@@ -37,7 +37,7 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 
 ## 测试策略
 
-`.github/workflows/ci.yml` 在 push / pull request 触发：Linux 和 macOS 执行格式、`cargo clippy --workspace --all-targets --locked -- -D warnings`、锁定依赖的测试/构建和两个隔离 CWD 的 PTY 冒烟；网站单独执行 Node 24 的 `npm ci` 与构建。固定代码的 CI 任务关闭 Rust 增量缓存以节省临时磁盘。Action 使用固定提交，工作流只需仓库读取权限；配置 CI 不等于已经通过远端运行，首次推送后检查对应结果。
+`.github/workflows/ci.yml` 在 push / pull request 触发：Linux 和 macOS 执行格式、`cargo clippy --workspace --all-targets --locked -- -D warnings`、锁定依赖的测试/构建和三个隔离 CWD 的 PTY 冒烟；网站单独执行 Node 24 的 `npm ci` 与构建。固定代码的 CI 任务关闭 Rust 增量缓存以节省临时磁盘。Action 使用固定提交，工作流只需仓库读取权限；配置 CI 不等于已经通过远端运行，推送后检查对应结果。PTY 失败时上传终端输出 artifact，保留 7 天。
 
 | 层 | 怎么测 | 约束 |
 |---|---|---|
@@ -49,7 +49,8 @@ cp .env.example .env            # 填入 DEEPSEEK_API_KEY
 | SSE 完整性 | 本地 HTTP mock：提前 EOF、只有 DONE、工具以 length 截断、合法 finish 后无 DONE、逐字节 chunked 中文及参数 | 错误时保留文本、不执行工具、不报告成功；正常时保留末尾 usage，依赖工具按序生效 |
 | 资源边界 | 多 MiB stdout/stderr、超长 Unicode 行、小范围后接无效 UTF-8；真实二进制检查下一次模型请求 | read/bash 结果不超过 64 KiB，管道排空，继续读取 offset 正确，UTF-8 截断不损坏字符 |
 | 网络边界 | 本地停滞 TLS、响应头/正文、持续有数据的响应、超大 SSE 行与错误正文 | 测试用私有 builder 缩短时间，不等生产超时；空闲超时不误杀正常长流，取消能中断错误正文读取 |
-| PTY | Python + 伪终端，跑真实二进制 | 等到进入 alternate screen 再发送输入；验证 raw mode、流式渲染、干净退出，超时必须清理子进程 |
+| PTY | Python + 伪终端，跑真实二进制 | 等到进入 alternate screen 再发送输入；进程退出后读到 EOF；模型切换后断言实际端点、模型、认证与历史，覆盖登录/退出和取消；超时清理子进程 |
+| 文件写入 | 部分写入失败/取消注入，以及 Unix 子进程文件大小限制 | 原文不变、无临时残留；符号链接与可执行权限保持，拒绝只读与特殊文件 |
 | 剪贴板 | 手动在 TUI 里 `Ctrl+V` | `cargo test` 不依赖系统剪贴板；单元测试只覆盖格式/尺寸/base64 |
 | 压缩 | `ScriptedProvider` 按“摘要 → 最终回答”排脚本；会话测试覆盖 compaction 重放 | 不需要真实窗口；断言摘要请求、保留尾部与 session 记录 |
 | 长期记忆 | 临时 `home` + 临时 cwd；解析、去重、预算、写入、删除、计数各有单元测试；e2e 断言 system message 含记忆 | 绝不读开发者真实 `~/.pi-rs`；不依赖文件系统权限的偶然行为 |

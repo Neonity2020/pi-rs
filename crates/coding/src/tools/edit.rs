@@ -37,7 +37,7 @@ impl Tool for EditTool {
         })
     }
 
-    fn run<'a>(&'a self, args: &'a Value, _cancel: &'a Cancel) -> BoxFuture<'a, ToolResult> {
+    fn run<'a>(&'a self, args: &'a Value, cancel: &'a Cancel) -> BoxFuture<'a, ToolResult> {
         Box::pin(async move {
             let Some(path) = args.get("file_path").and_then(Value::as_str) else {
                 return ToolResult::err("Missing required argument: file_path");
@@ -80,7 +80,7 @@ impl Tool for EditTool {
             } else {
                 text.replacen(old_string, new_string, 1)
             };
-            match tokio::fs::write(path, new_text).await {
+            match super::atomic::write(std::path::Path::new(path), new_text.as_bytes(), cancel) {
                 Ok(()) => ToolResult::ok(format!(
                     "Edited {path}: replaced {replaced} occurrence{}.",
                     if replaced == 1 { "" } else { "s" }

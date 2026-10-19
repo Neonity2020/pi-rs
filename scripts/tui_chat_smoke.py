@@ -105,10 +105,12 @@ def main():
             quit_attempts += 1
             time.sleep(0.5)
 
-        done, st = os.waitpid(pid, os.WNOHANG)
-        if done:
-            status = st
-            break
+        if status is None:
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                status = st
+        # Process exit and PTY EOF are separate events. Keep reading after
+        # waitpid succeeds: the terminal may still hold the final session line.
 
     # Closing the pty may precede the child's exit by a few milliseconds.
     reap_deadline = min(deadline, time.time() + 1)

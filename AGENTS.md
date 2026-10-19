@@ -64,6 +64,11 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
 - Tool calls execute sequentially in model order; report and persist each
   result before starting the next call. Cancellation skips remaining calls
   but records matching error results to preserve tool-call/result pairs.
+- write/edit replace files through a same-directory temporary file; preserve the
+  original on write failure or cancellation before commit, existing permissions,
+  and valid symlinks. Reject dangling links, read-only and non-regular targets.
+- TUI login/logout operate on the current model provider; startup credential and
+  endpoint overrides never carry across providers. Login verification is modal.
 - read/bash previews are bounded to 64 KiB. bash must keep draining both
   pipes after its capture budget is full; read must not allocate whole files
   or whole unbounded lines. Provider connections time out after 10 seconds,
@@ -89,8 +94,9 @@ Dependency direction is strictly one-way: `coding -> agent -> llm`.
 - `cargo fmt`
 - CI (`.github/workflows/ci.yml`): Linux/macOS run fmt, strict Clippy, locked
   tests/build and isolated PTY smokes; a Node 24 job runs website npm ci/build.
-- PTY smoke tests for the TUI: `python3 scripts/tui_smoke.py <home> target/debug/pi-rs`
-  and `python3 scripts/tui_chat_smoke.py <home> target/debug/pi-rs`
+- PTY smoke tests for the TUI: `python3 scripts/tui_smoke.py <home> target/debug/pi-rs`,
+  `python3 scripts/tui_chat_smoke.py <home> target/debug/pi-rs`, and
+  `python3 scripts/tui_model_smoke.py <home> target/debug/pi-rs`
 - Website screenshot: `scripts/shot_website.sh` rebuilds `website/dist` and
   regenerates `website/screenshot.png` (needs Node + Chrome)
 - Run: `cargo run -p pi-coding -- -p "prompt"` (needs `DEEPSEEK_API_KEY`)

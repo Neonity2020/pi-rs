@@ -160,8 +160,10 @@ provider 分键：
 - 读取优先级：`--api-key` > 环境变量（含 `.env`）> `auth.json`。`base_url`
   优先级：`--base-url` > auth.json > provider 默认值。
 - 交互模式的 `/login` 把输入框换成掩码输入；验证与保存跑在后台任务里，成功后
-  通过 `Agent::set_provider` 换掉 provider，会话历史不丢。`/logout` 只删除
-  auth.json 条目；如果环境变量里还有 key，会继续可用。
+  通过 `Agent::set_provider` 换掉当前模型所属的 provider，会话历史不丢。验证期间
+  掩码输入框屏蔽其他命令，不能被新的模型切换抢先覆盖。`/logout` 只删除当前
+  provider 的 auth.json 条目；如果环境变量或启动参数仍供给它的 key，则重新构建
+  provider 继续使用该 key，否则清除运行时凭据并标记为未登录。
 - 损坏的 auth.json 是硬错误（提示修好或删除），避免静默覆盖别的 provider。
 - `pi login` 的 key 来源：`--api-key` > provider 环境变量 > stdin（管道）>
   TTY 隐藏输入。TUI 内的 `/login` 总是要求重新输入。
@@ -230,6 +232,8 @@ $PI_RS_HOME/AGENTS.md（若存在）
 | `edit` | 精确字符串替换 | 要求唯一匹配，或显式 `replace_all` |
 | `bash` | 执行 shell 命令 | 前台进程、可取消；默认 120s 超时；持续排空 stdout/stderr，各保留至多 16 KiB 原始头尾，总结果最多 64 KiB |
 
+`write` / `edit` 共用 `tools::atomic`：同目录临时文件完整写入并同步后 rename，失败或提交前取消则清理临时文件并保留原文。文件提交使用同步 I/O，在工具任务返回后没有后台写入继续修改目标。保留已有普通文件的权限；有效符号链接解析到目标，保留链接本身；拒绝悬空链接、只读文件、目录和设备等特殊文件。原子替换只更新指定目录项，其他硬链接保留旧内容。不承诺并发外部修改检测或断电后的目录持久性。
+
 `read` 用有界缓冲扫描到请求范围，跳过的行不保留内容，超长行仅保留足够展示的 UTF-8 前缀；不再预读整份文件或构造全部行索引。达到行数上限时仅探测是否还有内容，报告 `more lines` 和下一次 offset，避免为总行数继续扫描。达到字节预算时保留整行并给出第一条未展示行的 offset。只校验显示前缀的 UTF-8，范围外内容不影响已请求的范围。
 
 `bash` 的管道采集不会在预算满后停读，否则子进程会卡在满管道上。采集仅保留每路头尾和省略字节数，之后才做行数与最终 UTF-8 字节预算裁剪；不会先把全部输出放进内存再截断。
@@ -284,7 +288,7 @@ ToolResult { content: String, is_error: bool }
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
 - `tui::commands` 是斜杠命令的唯一表格（名字、参数提示、一行说明、是否 lab-only）；`/help` 文本和补全菜单都从它生成，避免两处漂移。输入框内容是一个不以空白结尾的 `/` 前缀时 `App::completion` 打开，`Up` / `Down` 改选、`Tab` 补全、`Esc` 关闭；前缀尚未等于完整命令名时 `Enter` 先补全，不把半截命令发给应用层。补全只改输入框，不产生 `Action`。
 - `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/model`、`/remember`、`/forget`、`/memory`、`/lab`、`/dream`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
-- `/model` 无参时列出所有 provider 的注册模型（`*` 标记当前）；带 id 时切换模型。模型 id 到 provider 的映射由 `llm::provider_of_model` 给出，族名先经 `llm::provider_model` 解析成 API 真实接受的 ID。同 provider 切换只改模型；跨 provider 切换还要解析那个 provider 自己的凭据并重建 provider（`--api-key` / `--base-url` 只属于启动时的 provider，不跟着走）。切换不中断对话，不改写会话文件里已记录的内容；忙时直接拒绝。
+- `/model` 无参时列出所有 provider 的注册模型（`*` 标记当前）；带 id 时切换模型。模型 id 到 provider 的映射由 `llm::provider_of_model` 给出，族名先经 `llm::provider_model` 解析成 API 真实接受的 ID。同 provider 切换只改模型；跨 provider 切换还要解析那个 provider 自己的凭据并重建 provider（`--api-key` / `--base-url` 只属于启动时的 provider，不跟着走）。切换不中断对话，不改写会话文件里已记录的内容；忙时直接拒绝。跨 provider 切换成功同步更新登录状态，启动时未登录也可切到已有凭据的 provider 后直接聊天。`/login` / `/logout` 读取共享模型的当前 provider；启动时的参数只对启动 provider 有效。
 - `/lab` 只翻转 `App::lab`；`/dream` 在 lab 关闭、忙碌、未登录、记忆为空或工具不足时直接拒绝/提示。满足条件时把 `Cancel` 交给隔离的 dream 任务，`TuiSink::ephemeral` 展示思考与工具活动、累计用量，但不追加会话记录；结束统一发 `Busy(false)`。
 - `/compact` 在空闲时拿 agent 锁执行一次强制压缩；`TuiSink` 负责落盘并把 `Compaction` / `CompactionFailed` 翻成提示。忙时直接拒绝，不打断当前 turn。
 - `Ctrl+V` 在 `tui` 里只产生 `Action::PasteImage`；`coding::clipboard` 读系统剪贴板（macOS `osascript`、Linux `wl-paste`/`xclip`、Windows PowerShell），把图片元数据装进 `UiEvent::ImageAttached`。字节留在 `App` 的待发送附件里，提交时随 `Message` 进会话。

@@ -30,10 +30,11 @@ while time.time() < deadline:
     if not sent and b"\x1b[?1049h" in output:
         os.write(fd, b"\x03")  # Ctrl+C -> quit (idle, empty input)
         sent = True
-    done, st = os.waitpid(pid, os.WNOHANG)
-    if done:
-        status = st
-        break
+    if status is None:
+        done, st = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = st
+    # Reap once, but keep draining until PTY EOF (the session line can lag).
 
 if status is None:
     # EOF can arrive just before process exit. Reap with a bounded grace

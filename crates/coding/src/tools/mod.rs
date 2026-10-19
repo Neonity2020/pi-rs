@@ -1,3 +1,4 @@
+mod atomic;
 mod bash;
 mod edit;
 mod read;
