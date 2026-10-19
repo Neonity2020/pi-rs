@@ -148,6 +148,7 @@ pub fn label(provider: &str) -> &str {
     match provider {
         "deepseek" => "DeepSeek",
         "openai" => "OpenAI",
+        "minimax-cn" => "MiniMax CN",
         other => other,
     }
 }
@@ -155,6 +156,7 @@ pub fn label(provider: &str) -> &str {
 pub fn manage_url(provider: &str) -> &'static str {
     match provider {
         "openai" => "https://platform.openai.com/api-keys",
+        "minimax-cn" => "https://platform.minimax.cn/console/plan",
         _ => "https://platform.deepseek.com/api_keys",
     }
 }

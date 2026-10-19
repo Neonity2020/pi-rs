@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 应用层 | `crates/coding` | CLI、TUI、会话 JSONL、系统提示、四个内建工具 | `agent`、`tui`、`llm` |
 | 循环层 | `crates/agent` | 模型请求 → 工具执行 → 事件流（不知道终端和文件格式） | `llm` |
-| 提供层 | `crates/llm` | 流式聊天、SSE 解析、DeepSeek / OpenAI 兼容、模型与价格 | — |
+| 提供层 | `crates/llm` | 流式聊天、SSE 解析、DeepSeek / OpenAI 兼容 / MiniMax CN、模型与价格 | — |
 | 渲染层 | `crates/tui` | 终端 UI 状态与渲染（不碰 I/O） | — |
 
 依赖方向严格单向：`coding → agent → llm`，`tui` 是叶子。每层可以单独使用——`llm` 是完整的流式客户端，`agent` 是完整的 agent 循环。
@@ -36,6 +36,18 @@ pi-rs logout                # 删除保存的凭据
 
 不想用登录的话，把 `DEEPSEEK_API_KEY=sk-...` 写进 `.env` 同样有效（模板：仓库里的 `.env.example`，`cp .env.example .env`）：启动时会从工作目录或最近上级目录加载，真实环境变量优先。
 
+MiniMax 国内 M Plan 订阅内置为 `minimax-cn`（OpenAI 兼容接口）：
+
+```bash
+export MINIMAX_CN_API_KEY=sk-cp-...     # M Plan 订阅 Key
+pi-rs --provider minimax-cn             # 默认模型 MiniMax-M3.1-Flash
+pi-rs login --provider minimax-cn       # 或先验证并保存到 auth.json
+```
+
+订阅按套餐计费、不按 token 计价，所以成本显示 `-`；模型窗口仍参与自动压缩。`--model MiniMax-M3` 可切换当前另一个 1M 上下文模型。
+
+MiniMax 的 M3.1 代际在 API 里的真实 ID 是 `MiniMax-M3.1-Flash`（直接发 `MiniMax-M3.1` 会被服务端以 `unknown model` 拒掉）。pi-rs 认得族名：`--model MiniMax-M3.1` 会解析成 `MiniMax-M3.1-Flash` 再发出去。
+
 ```
 pi-rs                       # 交互式 TUI
 pi-rs "解释这个仓库的结构"     # 单次执行，流式输出到 stdout
@@ -48,7 +60,7 @@ pi-rs -c                    # 继续本目录最近一次会话
 
 ```
 --model <id>          模型（默认 deepseek-flash，或 deepseek-v4-pro）
---provider <name>     deepseek | openai
+--provider <name>     deepseek | openai | minimax-cn
 --base-url <url>      任意 OpenAI 兼容端点
 --no-thinking         关闭 DeepSeek 思考模式
 --effort <level>      推理强度 low | high | max
@@ -134,17 +146,17 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 
 ## 成本
 
-状态栏会显示输入/输出 token、缓存命中率与估算成本；`-p` 结尾显示 token 数与成本。DeepSeek 的定价分高峰/低谷（工作日 01:00–04:00 与 06:00–10:00 UTC），估算按 UTC 时间自动选择，但不考虑中国法定节假日，所以看成量级即可。`--provider openai` 或未知模型时不估成本，显示 `-`。
+状态栏会显示输入/输出 token、缓存命中率与估算成本；`-p` 结尾显示 token 数与成本。DeepSeek 的定价分高峰/低谷（工作日 01:00–04:00 与 06:00–10:00 UTC），估算按 UTC 时间自动选择，但不考虑中国法定节假日，所以看成量级即可。`--provider openai`、MiniMax CN 订阅（按套餐计费）或未知模型时不估成本，显示 `-`。
 
 ## 测试
 
 GitHub Actions 已配置 Linux/macOS 的格式、Clippy、锁定依赖测试与构建、PTY 冒烟，以及 Node 24 的网站构建；均不需要真实 API key。
 
 ```bash
-cargo test          # 231 个测试，不需要 API key
+cargo test          # 239 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 20 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 21 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、MiniMax 族名解析成 API 真实 ID、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 

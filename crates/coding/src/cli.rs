@@ -67,9 +67,9 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             "--model" => args.model = Some(value(&mut iter, "--model")?),
             "--provider" => {
                 let provider = value(&mut iter, "--provider")?;
-                if provider != "deepseek" && provider != "openai" {
+                if !matches!(provider.as_str(), "deepseek" | "openai" | "minimax-cn") {
                     return Err(format!(
-                        "unknown provider: {provider} (available: deepseek, openai)"
+                        "unknown provider: {provider} (available: deepseek, openai, minimax-cn)"
                     ));
                 }
                 args.provider = Some(provider);
@@ -150,7 +150,7 @@ USAGE:
 
 COMMANDS:
     login                    verify an API key and save it to auth.json
-                             (reads $DEEPSEEK_API_KEY, stdin, or a hidden prompt)
+                             (reads the provider's env var, stdin, or a hidden prompt)
     logout                   remove the saved API key
 
 MODES:
@@ -161,10 +161,10 @@ MODES:
 OPTIONS:
     -p, --print              run one prompt (reads stdin when empty)
     -c, --continue           continue the most recent session here
-        --model <id>         model (default: deepseek-flash)
-        --provider <name>    deepseek (default) | openai
+        --model <id>         model (default: deepseek-flash / MiniMax-M3.1-Flash)
+        --provider <name>    deepseek (default) | openai | minimax-cn
         --base-url <url>     override the API base URL
-        --api-key <key>      API key (default: $DEEPSEEK_API_KEY)
+        --api-key <key>      API key (default: the provider's env var)
         --no-thinking        disable DeepSeek thinking mode
         --effort <level>     reasoning effort: low | high | max
         --tools <list>       restrict tools, e.g. --tools read,bash
@@ -174,6 +174,7 @@ OPTIONS:
 ENV:
     DEEPSEEK_API_KEY         API key for the default provider
     OPENAI_API_KEY           API key for --provider openai
+    MINIMAX_CN_API_KEY       API key for --provider minimax-cn (M Plan)
     PI_RS_HOME               data directory (default: ~/.pi-rs)
 
 AUTH:
@@ -237,6 +238,10 @@ mod tests {
         assert!(parse_err(&["--model"]).contains("--model"));
         assert!(parse_err(&["--effort", "turbo"]).contains("effort"));
         assert!(parse_err(&["--provider", "gemini"]).contains("provider"));
+        assert_eq!(
+            parse_ok(&["--provider", "minimax-cn"]).provider.as_deref(),
+            Some("minimax-cn")
+        );
     }
 
     #[test]

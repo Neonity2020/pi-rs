@@ -25,7 +25,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use llm::{deepseek, Effort, Model, OpenAiCompat, Provider, Thinking};
+use llm::{deepseek, minimax_cn, Effort, Model, OpenAiCompat, Provider, Thinking};
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -148,6 +148,9 @@ fn model_for(args: &cli::Args) -> Result<Model> {
                 .context("--model is required with --provider openai")?;
             Ok(Model::unknown("openai", id))
         }
+        "minimax-cn" => Ok(minimax_cn::model_or_unknown(
+            args.model.as_deref().unwrap_or(minimax_cn::DEFAULT_MODEL),
+        )),
         other => bail!("unknown provider: {other}"),
     }
 }
@@ -159,6 +162,7 @@ pub(crate) fn provider_name(args: &cli::Args) -> &str {
 fn env_key_name(provider: &str) -> &'static str {
     match provider {
         "openai" => "OPENAI_API_KEY",
+        "minimax-cn" => minimax_cn::API_KEY_ENV,
         _ => deepseek::API_KEY_ENV,
     }
 }
@@ -174,6 +178,7 @@ pub(crate) fn env_api_key(provider: &str) -> Option<String> {
 pub(crate) fn default_base_url(provider: &str) -> &'static str {
     match provider {
         "openai" => OPENAI_BASE_URL,
+        "minimax-cn" => minimax_cn::BASE_URL,
         _ => deepseek::BASE_URL,
     }
 }
@@ -218,16 +223,19 @@ pub(crate) fn build_provider(args: &cli::Args, api_key: &str) -> Result<Arc<dyn 
             ))
         }
         "openai" => Ok(Arc::new(OpenAiCompat::custom("openai", base_url, api_key))),
+        "minimax-cn" => Ok(Arc::new(
+            OpenAiCompat::minimax_cn(api_key, args.effort).with_base_url(base_url),
+        )),
         other => bail!("unknown provider: {other}"),
     }
 }
 
 fn missing_key_message(args: &cli::Args) -> String {
     let provider = provider_name(args);
-    let login = if provider == "openai" {
-        "pi-rs login --provider openai"
+    let login = if provider == "deepseek" {
+        "pi-rs login".to_string()
     } else {
-        "pi-rs login"
+        format!("pi-rs login --provider {provider}")
     };
     format!(
         "missing API key: run `{login}`, set {}, add it to .env, or pass --api-key",

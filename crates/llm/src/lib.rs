@@ -9,6 +9,7 @@ pub mod cancel;
 pub mod deepseek;
 pub mod error;
 pub mod message;
+pub mod minimax_cn;
 pub mod mock;
 pub mod model;
 pub mod openai;

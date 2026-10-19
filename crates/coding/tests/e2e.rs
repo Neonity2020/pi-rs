@@ -126,6 +126,7 @@ fn pi_in(home: &std::path::Path) -> Command {
     command.current_dir(home);
     command.env_remove("DEEPSEEK_API_KEY");
     command.env_remove("OPENAI_API_KEY");
+    command.env_remove("MINIMAX_CN_API_KEY");
     #[cfg(unix)]
     command.env("SHELL", "/bin/sh");
     command
@@ -886,6 +887,72 @@ fn env_key_beats_auth_json() {
     );
     let requests = requests.lock().unwrap();
     assert_eq!(requests[0].header("authorization"), "bearer sk-from-env");
+}
+
+#[test]
+fn minimax_cn_uses_the_plan_key_and_default_model() {
+    let home = test_dir();
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"from minimax"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+    let output = pi_in(&home)
+        .env("MINIMAX_CN_API_KEY", "sk-cp-test")
+        .args([
+            "-p",
+            "hi",
+            "--provider",
+            "minimax-cn",
+            "--base-url",
+            &base_url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("from minimax"));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].header("authorization"), "bearer sk-cp-test");
+    assert_eq!(requests[0].body["model"], "MiniMax-M3.1-Flash");
+    assert_eq!(requests[0].body["reasoning_split"], true);
+    assert!(requests[0].body.get("thinking").is_none());
+}
+
+#[test]
+fn the_m3_1_alias_is_sent_as_the_id_the_api_accepts() {
+    let home = test_dir();
+    let (base_url, requests) = start_mock_api(vec![sse(&[
+        r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ])]);
+    let output = pi_in(&home)
+        .env("MINIMAX_CN_API_KEY", "sk-cp-test")
+        .args([
+            "-p",
+            "hi",
+            "--provider",
+            "minimax-cn",
+            "--model",
+            "MiniMax-M3.1",
+            "--base-url",
+            &base_url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = requests.lock().unwrap();
+    // The API rejects `MiniMax-M3.1` with `unknown model`; the alias must
+    // reach the wire as `MiniMax-M3.1-Flash`.
+    assert_eq!(requests[0].body["model"], "MiniMax-M3.1-Flash");
 }
 
 #[test]

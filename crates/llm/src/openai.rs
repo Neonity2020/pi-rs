@@ -1,7 +1,8 @@
 //! OpenAI-compatible chat completions client with SSE streaming.
 //!
-//! DeepSeek speaks this protocol natively (with two extra knobs, `thinking`
-//! and `reasoning_effort`), so one implementation serves both.
+//! DeepSeek and MiniMax CN speak this protocol natively (with a few extra
+//! knobs, `thinking`, `reasoning_effort`, `reasoning_split`), so one
+//! implementation serves all of them.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -10,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::StreamExt;
 
 use crate::provider::{BoxFuture, ChatRequest, Provider, StreamEvent, Thinking};
-use crate::{deepseek, Cancel, Effort, Error, Message, Role, StopReason, Usage};
+use crate::{deepseek, minimax_cn, Cancel, Effort, Error, Message, Role, StopReason, Usage};
 
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 2000;
@@ -22,6 +23,9 @@ pub struct OpenAiCompat {
     /// Present only for DeepSeek-style backends that accept `thinking`.
     thinking: Option<Thinking>,
     effort: Option<Effort>,
+    /// MiniMax: return thinking in `reasoning_content` instead of `<think>`
+    /// tags inside `content`.
+    reasoning_split: bool,
     client: reqwest::Client,
 }
 
@@ -37,6 +41,22 @@ impl OpenAiCompat {
             api_key: api_key.into(),
             thinking: Some(thinking),
             effort,
+            reasoning_split: false,
+            client: default_client(),
+        }
+    }
+
+    /// MiniMax CN's OpenAI-compatible endpoint. Reasoning is requested as a
+    /// separate `reasoning_content` stream so the agent can persist and echo
+    /// it back, as required for interleaved tool calls.
+    pub fn minimax_cn(api_key: impl Into<String>, effort: Option<Effort>) -> Self {
+        Self {
+            name: "minimax-cn",
+            base_url: minimax_cn::BASE_URL.to_string(),
+            api_key: api_key.into(),
+            thinking: None,
+            effort,
+            reasoning_split: true,
             client: default_client(),
         }
     }
@@ -53,6 +73,7 @@ impl OpenAiCompat {
             api_key: api_key.into(),
             thinking: None,
             effort: None,
+            reasoning_split: false,
             client: default_client(),
         }
     }
@@ -388,6 +409,9 @@ fn body_json(provider: &OpenAiCompat, req: &ChatRequest<'_>) -> Value {
     if let Some(effort) = provider.effort {
         map.insert("reasoning_effort".into(), json!(effort.as_str()));
     }
+    if provider.reasoning_split {
+        map.insert("reasoning_split".into(), json!(true));
+    }
     body
 }
 
@@ -504,10 +528,20 @@ struct WireUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    /// DeepSeek's shape.
     #[serde(default)]
     prompt_cache_hit_tokens: u64,
+    /// OpenAI/MiniMax shape.
+    #[serde(default)]
+    prompt_tokens_details: WirePromptDetails,
     #[serde(default)]
     completion_tokens_details: WireCompletionDetails,
+}
+
+#[derive(Deserialize, Default)]
+struct WirePromptDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -527,7 +561,9 @@ impl From<WireUsage> for Usage {
         Usage {
             input_tokens: w.prompt_tokens,
             output_tokens: w.completion_tokens,
-            cached_tokens: w.prompt_cache_hit_tokens,
+            cached_tokens: w
+                .prompt_cache_hit_tokens
+                .max(w.prompt_tokens_details.cached_tokens),
             reasoning_tokens: w.completion_tokens_details.reasoning_tokens,
         }
     }
@@ -861,6 +897,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_openai_style_cached_tokens() {
+        let events = drain(
+            r#"{"choices":[],"usage":{"prompt_tokens":170,"completion_tokens":303,"prompt_tokens_details":{"cached_tokens":157}}}"#,
+        );
+        match &events[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 170);
+                assert_eq!(u.output_tokens, 303);
+                assert_eq!(u.cached_tokens, 157);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn stream_error_becomes_api_error() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let err = emit_chunk(r#"{"error":{"message":"rate limited"}}"#, &tx).unwrap_err();
@@ -954,7 +1005,25 @@ mod tests {
     }
 
     #[test]
-    fn custom_provider_has_no_thinking_fields() {
+    fn minimax_requests_split_reasoning_without_deepseek_thinking() {
+        let p = OpenAiCompat::minimax_cn("test-key", Some(Effort::Max));
+        assert_eq!(p.name(), "minimax-cn");
+        let messages = vec![Message::user("hi")];
+        let req = ChatRequest {
+            model: "MiniMax-M3.1-Flash",
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: None,
+        };
+        let body = body_json(&p, &req);
+        assert_eq!(body["reasoning_split"], true);
+        assert_eq!(body["reasoning_effort"], "max");
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn custom_provider_has_no_thinking_or_reasoning_split_fields() {
         let p = OpenAiCompat::custom("openai", "https://example.com/v1", "k");
         let messages = vec![Message::user("hi")];
         let req = ChatRequest {
@@ -967,6 +1036,7 @@ mod tests {
         let body = body_json(&p, &req);
         assert!(body.get("thinking").is_none());
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning_split").is_none());
         assert_eq!(body["max_tokens"], 100);
     }
 }
