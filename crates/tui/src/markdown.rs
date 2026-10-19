@@ -9,21 +9,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+use crate::theme;
 use crate::wrap::{display_width, wrap};
 
 /// Palette: every accent has its own hue so styles stay distinguishable.
 fn inline_code() -> Style {
-    Style::new().fg(Color::Rgb(229, 192, 123)) // amber
+    Style::new().fg(theme::WARNING)
 }
 
 fn block_code() -> Style {
-    Style::new().fg(Color::Rgb(171, 178, 191)) // light gray
+    Style::new().fg(theme::TEXT)
 }
 
 fn bold() -> Style {
-    Style::new()
-        .fg(Color::Rgb(97, 175, 239)) // blue
-        .add_modifier(Modifier::BOLD)
+    Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD)
 }
 
 fn italic() -> Style {
@@ -32,34 +31,32 @@ fn italic() -> Style {
 
 fn strike() -> Style {
     Style::new()
-        .fg(Color::DarkGray)
+        .fg(theme::MUTED)
         .add_modifier(Modifier::CROSSED_OUT)
 }
 
 fn heading() -> Style {
     Style::new()
-        .fg(Color::Rgb(86, 182, 194)) // teal
+        .fg(theme::SECONDARY)
         .add_modifier(Modifier::BOLD)
 }
 
 fn link() -> Style {
     Style::new()
-        .fg(Color::Rgb(97, 175, 239))
+        .fg(theme::PRIMARY)
         .add_modifier(Modifier::UNDERLINED)
 }
 
 fn bullet() -> Style {
-    Style::new().fg(Color::Rgb(86, 182, 194))
+    Style::new().fg(theme::SECONDARY)
 }
 
 fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().fg(theme::MUTED)
 }
 
 fn quote() -> Style {
-    Style::new()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC)
+    Style::new().fg(theme::MUTED).add_modifier(Modifier::ITALIC)
 }
 
 fn table_header() -> Style {

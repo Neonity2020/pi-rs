@@ -17,7 +17,7 @@ pub fn build(cwd: &Path) -> String {
 fn build_with(cwd: &Path, home: &Path) -> String {
     let mut prompt = match find_system_md(cwd, home) {
         Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
-        None => default_prompt(cwd),
+        None => default_prompt(cwd, home),
     };
 
     for (path, content) in agents_files(cwd, home) {
@@ -75,7 +75,7 @@ fn agents_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, String)> {
     files
 }
 
-fn default_prompt(cwd: &Path) -> String {
+fn default_prompt(cwd: &Path, home: &Path) -> String {
     format!(
         "You are pi-rs, a coding agent working in the user's terminal.
 
@@ -95,11 +95,13 @@ Rules:
 Environment:
 - cwd: {}
 - platform: {} {}
-- date: {}",
+- date: {}
+- global instructions: {}/AGENTS.md (loaded before root-to-cwd AGENTS.md)",
         cwd.display(),
         std::env::consts::OS,
         std::env::consts::ARCH,
         util::iso_now(),
+        home.display(),
     )
 }
 
@@ -116,8 +118,11 @@ mod tests {
     #[test]
     fn default_prompt_mentions_environment() {
         let cwd = Path::new("/tmp/project");
-        let prompt = default_prompt(cwd);
+        let home = Path::new("/tmp/pi-rs-home");
+        let prompt = default_prompt(cwd, home);
         assert!(prompt.contains("cwd: /tmp/project"));
+        assert!(prompt.contains("global instructions: /tmp/pi-rs-home/AGENTS.md"));
+        assert!(prompt.contains("loaded before root-to-cwd AGENTS.md"));
         assert!(prompt.contains("read"));
         assert!(prompt.len() < 2500, "keep the base prompt small");
     }

@@ -1,19 +1,22 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Item, LoginPrompt, ThinkingHit, ToolEntry, ToolStatus};
+use crate::theme;
 use crate::wrap::{display_width, wrap};
 
 const INPUT_HEIGHT: u16 = 3;
 const STATUS_HEIGHT: u16 = 1;
 const TOOL_PREVIEW_LINES: usize = 6;
+const CONTENT_MAX_WIDTH: u16 = 120;
 
 /// Draw the whole UI. Also keeps viewport/scroll bookkeeping in sync.
 pub fn render(app: &mut App, frame: &mut Frame) {
-    let area = frame.area();
+    let area = content_area(frame.area());
     app.thinking_hits.clear();
     app.transcript_top = area.y;
     let input_height = INPUT_HEIGHT + u16::from(!app.images.is_empty());
@@ -47,6 +50,19 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     render_input(app, frame, input_rect);
 }
 
+/// Keep long lines readable on large terminals while leaving compact layouts
+/// untouched. This mirrors the calm, centered conversation column used by
+/// modern coding TUIs without adding another pane or navigation concept.
+fn content_area(area: Rect) -> Rect {
+    let width = area.width.min(CONTENT_MAX_WIDTH);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y,
+        width,
+        height: area.height,
+    }
+}
+
 fn render_transcript(app: &mut App, frame: &mut Frame, rect: Rect) {
     let (lines, hits) = transcript_lines(app, rect.width as usize);
     app.thinking_hits = hits;
@@ -73,9 +89,7 @@ fn thinking_header(
     tools: &[ToolEntry],
     spinner: &str,
 ) -> Line<'static> {
-    let style = Style::new()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::new().fg(theme::MUTED);
     let mut title = if streaming {
         format!("{spinner} 正在思考…")
     } else if expanded {
@@ -112,31 +126,32 @@ fn tool_lines(tool: &ToolEntry, width: usize, spinner: &str) -> Vec<Line<'static
     let (mark, mark_style, timing) = match tool.status {
         ToolStatus::Running => (
             spinner.to_string(),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::WARNING),
             String::new(),
         ),
         ToolStatus::Ok => (
             "✓".to_string(),
-            Style::new().fg(Color::Green),
+            Style::new().fg(theme::SUCCESS),
             format!(" {}ms", tool.duration_ms),
         ),
         ToolStatus::Failed => (
             "✗".to_string(),
-            Style::new().fg(Color::Red),
+            Style::new().fg(theme::ERROR),
             format!(" {}ms", tool.duration_ms),
         ),
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled("  ⏺ ", Style::new().fg(Color::Magenta)),
-        Span::raw(format!("{}({})", tool.name, tool.summary)),
+        Span::styled("  ├─ ", Style::new().fg(theme::BORDER)),
+        Span::styled(tool.name.clone(), Style::new().fg(theme::SECONDARY)),
+        Span::styled(format!("({})", tool.summary), Style::new().fg(theme::MUTED)),
         Span::raw(" "),
         Span::styled(format!("{mark}{timing}"), mark_style),
     ])];
 
     if !tool.output.is_empty() && tool.status != ToolStatus::Running {
         let preview_style = match tool.status {
-            ToolStatus::Failed => Style::new().fg(Color::Red).add_modifier(Modifier::DIM),
-            _ => Style::new().fg(Color::DarkGray),
+            ToolStatus::Failed => Style::new().fg(theme::ERROR).add_modifier(Modifier::DIM),
+            _ => Style::new().fg(theme::MUTED),
         };
         let all: Vec<&str> = tool.output.lines().collect();
         let shown = all.len().min(TOOL_PREVIEW_LINES);
@@ -152,7 +167,7 @@ fn tool_lines(tool: &ToolEntry, width: usize, spinner: &str) -> Vec<Line<'static
         if all.len() > shown {
             lines.push(Line::from(Span::styled(
                 format!("    … +{} lines", all.len() - shown),
-                Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::new().fg(theme::MUTED).add_modifier(Modifier::DIM),
             )));
         }
     }
@@ -171,20 +186,18 @@ fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<Thinkin
                     if !images.is_empty() {
                         lines.push(Line::from(vec![
                             Span::styled(
-                                "❯ ",
-                                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                "┃ ",
+                                Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled("[image]", Style::new().fg(Color::DarkGray)),
+                            Span::styled("[image]", Style::new().fg(theme::MUTED)),
                         ]));
                     }
                 } else {
-                    for (i, segment) in wrap(text, width.saturating_sub(2)).into_iter().enumerate()
-                    {
-                        let prefix = if i == 0 { "❯ " } else { "  " };
+                    for segment in wrap(text, width.saturating_sub(2)) {
                         lines.push(Line::from(vec![
                             Span::styled(
-                                prefix.to_string(),
-                                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                "┃ ",
+                                Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(segment),
                         ]));
@@ -192,9 +205,10 @@ fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<Thinkin
                 }
                 for (i, label) in images.iter().enumerate() {
                     lines.push(Line::from(vec![
-                        Span::styled("  ▣ ", Style::new().fg(Color::Magenta)),
-                        Span::styled(format!("[{}] ", i + 1), Style::new().fg(Color::Cyan)),
-                        Span::styled(label.clone(), Style::new().fg(Color::DarkGray)),
+                        Span::styled("┃ ", Style::new().fg(theme::PRIMARY)),
+                        Span::styled("▣ ", Style::new().fg(theme::PURPLE)),
+                        Span::styled(format!("[{}] ", i + 1), Style::new().fg(theme::PRIMARY)),
+                        Span::styled(label.clone(), Style::new().fg(theme::MUTED)),
                     ]));
                 }
                 lines.push(Line::default());
@@ -218,9 +232,8 @@ fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<Thinkin
                     app.spinner_char(),
                 ));
                 if expanded {
-                    let reasoning_style = Style::new()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
+                    let reasoning_style =
+                        Style::new().fg(theme::MUTED).add_modifier(Modifier::ITALIC);
                     if !reasoning.is_empty() {
                         for segment in wrap(reasoning, width.saturating_sub(2)) {
                             lines.push(Line::from(Span::styled(
@@ -243,7 +256,7 @@ fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<Thinkin
                     rendered.push(Line::default());
                 }
                 if *streaming {
-                    let cursor = Span::styled("▌", Style::new().fg(Color::DarkGray));
+                    let cursor = Span::styled("▌", Style::new().fg(theme::PRIMARY));
                     if let Some(last) = rendered.last_mut() {
                         last.spans.push(cursor);
                     } else {
@@ -256,19 +269,22 @@ fn transcript_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Vec<Thinkin
                 }
             }
             Item::Info(text) => {
-                for segment in wrap(text, width) {
-                    lines.push(Line::from(Span::styled(
-                        segment,
-                        Style::new().fg(Color::DarkGray),
-                    )));
+                for segment in wrap(text, width.saturating_sub(2)) {
+                    lines.push(Line::from(vec![
+                        Span::styled("· ", Style::new().fg(theme::SECONDARY)),
+                        Span::styled(segment, Style::new().fg(theme::MUTED)),
+                    ]));
                 }
             }
             Item::Error(text) => {
-                for segment in wrap(text, width) {
-                    lines.push(Line::from(Span::styled(
-                        segment,
-                        Style::new().fg(Color::Red),
-                    )));
+                for segment in wrap(text, width.saturating_sub(2)) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "× ",
+                            Style::new().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(segment, Style::new().fg(theme::ERROR)),
+                    ]));
                 }
             }
         }
@@ -306,9 +322,9 @@ fn render_status(app: &App, frame: &mut Frame, rect: Rect) {
         .max(1);
 
     let line = Line::from(vec![
-        Span::styled(left, Style::new().fg(Color::DarkGray)),
+        Span::styled(left, Style::new().fg(theme::MUTED)),
         Span::raw(" ".repeat(padding)),
-        Span::styled(right, Style::new().fg(Color::DarkGray)),
+        Span::styled(right, Style::new().fg(theme::MUTED)),
     ]);
     frame.render_widget(Paragraph::new(line), rect);
 }
@@ -362,34 +378,35 @@ fn render_completion(app: &App, frame: &mut Frame, rect: Rect) {
         let marker = if selected { "▸ " } else { "  " };
         let usage = format!("{:<width$}", command.usage(), width = usage_width);
         let name_style = if selected {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(Color::White)
+            Style::new().fg(theme::TEXT)
         };
         let mut spans = vec![
-            Span::styled(marker, Style::new().fg(Color::Cyan)),
+            Span::styled(marker, Style::new().fg(theme::PRIMARY)),
             Span::styled(usage, name_style),
             Span::raw("  "),
-            Span::styled(command.help, Style::new().fg(Color::DarkGray)),
+            Span::styled(command.help, Style::new().fg(theme::MUTED)),
         ];
         if command.lab {
             spans.push(Span::styled(
                 " · lab",
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::DIM),
+                Style::new().fg(theme::PURPLE).add_modifier(Modifier::DIM),
             ));
         }
         let mut line = Line::from(spans);
         if selected {
-            line = line.style(Style::new().bg(Color::Rgb(38, 38, 46)));
+            line = line.style(Style::new().bg(theme::SELECTED));
         }
         lines.push(line);
     }
 
     let block = Block::bordered()
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_set(border::ROUNDED)
+        .border_style(Style::new().fg(theme::PRIMARY))
         .title(Line::from(Span::styled(
             " commands · Tab complete · ↑↓ select · Esc close ",
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::new().fg(theme::MUTED).add_modifier(Modifier::DIM),
         )));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -417,15 +434,23 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
     } else {
         " Enter to send · Ctrl+V image ".to_string()
     };
+    let border_color = if app.busy {
+        theme::WARNING
+    } else if app.logged_in {
+        theme::PRIMARY
+    } else {
+        theme::BORDER
+    };
     let block = Block::bordered()
-        .border_style(Style::new().fg(Color::DarkGray))
+        .border_set(border::ROUNDED)
+        .border_style(Style::new().fg(border_color))
         .title(Line::from(Span::styled(
             " pi-rs ",
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
         )))
         .title_bottom(Line::from(Span::styled(
             hint,
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::new().fg(theme::MUTED).add_modifier(Modifier::DIM),
         )));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -447,7 +472,7 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
     let line = Line::from(vec![
         Span::styled(
             "❯ ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
         ),
         Span::raw(visible),
     ]);
@@ -462,11 +487,11 @@ fn render_input(app: &App, frame: &mut Frame, rect: Rect) {
             }
             spans.push(Span::styled(
                 format!("[{}]", i + 1),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(theme::PRIMARY),
             ));
             spans.push(Span::styled(
                 format!(" {}", image.label()),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(theme::MUTED),
             ));
         }
         let attachments = Rect {
@@ -487,14 +512,15 @@ fn render_login_input(login: &LoginPrompt, frame: &mut Frame, rect: Rect) {
         " paste API key · Enter to save · Esc to cancel "
     };
     let block = Block::bordered()
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_set(border::ROUNDED)
+        .border_style(Style::new().fg(theme::PRIMARY))
         .title(Line::from(Span::styled(
             format!(" {} login ", login.provider),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
         )))
         .title_bottom(Line::from(Span::styled(
             hint,
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::new().fg(theme::MUTED).add_modifier(Modifier::DIM),
         )));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -509,7 +535,7 @@ fn render_login_input(login: &LoginPrompt, frame: &mut Frame, rect: Rect) {
     let line = Line::from(vec![
         Span::styled(
             "❯ ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme::PRIMARY).add_modifier(Modifier::BOLD),
         ),
         Span::raw(visible),
     ]);
@@ -586,8 +612,8 @@ mod tests {
         // Inline code keeps its accent color all the way to the framebuffer.
         let at = screen.find("code").expect("code visible");
         let cell = &buffer.content[at];
-        assert_eq!(cell.fg, Color::Rgb(229, 192, 123));
-        assert_ne!(buffer.content[at - 6].fg, Color::Rgb(229, 192, 123));
+        assert_eq!(cell.fg, theme::WARNING);
+        assert_ne!(buffer.content[at - 6].fg, theme::WARNING);
     }
 
     #[test]
@@ -916,6 +942,19 @@ mod tests {
         assert_eq!(slice_columns("hello", 2, 3), "llo");
         assert_eq!(slice_columns("hello", 3, 10), "lo");
     }
+
+    #[test]
+    fn wide_terminals_center_a_readable_conversation_column() {
+        assert_eq!(
+            content_area(Rect::new(0, 0, 160, 40)),
+            Rect::new(20, 0, CONTENT_MAX_WIDTH, 40)
+        );
+        assert_eq!(
+            content_area(Rect::new(3, 2, 80, 20)),
+            Rect::new(3, 2, 80, 20)
+        );
+    }
+
     #[test]
     fn command_menu_is_drawn_above_the_input_box() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

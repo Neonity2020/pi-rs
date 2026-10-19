@@ -7,6 +7,7 @@ mod app;
 mod commands;
 mod markdown;
 mod render;
+mod theme;
 mod wrap;
 
 pub use app::{
