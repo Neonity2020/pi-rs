@@ -23,6 +23,7 @@ PTY 冒烟（先 `cargo build`）：
 mkdir -p /tmp/pi-smoke
 python3 scripts/tui_smoke.py /tmp/pi-smoke target/debug/pi-rs
 python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi-rs
+python3 scripts/tui_model_smoke.py /tmp/pi-smoke target/debug/pi-rs
 ```
 
 运行配置：
@@ -116,7 +117,7 @@ impl Tool for MyTool {
 
 优先复用 `OpenAiCompat`：大多数端点只是 base URL、key 和少量额外参数不同。
 
-1. 若协议兼容：在 `crates/coding/src/main.rs` 的 `build_provider` 里构造 `OpenAiCompat::custom(...)`，并决定默认模型。
+1. 若协议兼容：在 `crates/llm/` 放 provider 常量与模型注册表，在 `crates/coding/src/main.rs` 的 `build_provider`、`model_for`、`env_key_name`、`default_base_url` 与 CLI 的 provider 白名单接线；只有额外线格式参数才需要新的 `OpenAiCompat` 构造器（参考 `minimax_cn` 的 `reasoning_split`）。
 2. 若协议不兼容：在 `crates/llm/` 新模块实现 `Provider::stream`，把厂商事件翻译成 `StreamEvent`。
 3. 模型与价格：在对应注册表加 `Model`；未知模型必须继续可用，只是不估价。
 4. 测试请求体与 SSE 解析；不要用真实 API 做单元测试。
@@ -136,7 +137,7 @@ impl Tool for MyTool {
 - `crates/tui` 不碰 I/O：需要外部信息时，让 `coding` 通过 `UiEvent` 送进来。剪贴板同理——`Ctrl+V` 只返回 `Action::PasteImage`。
 - 渲染宽度以 `wrap::display_width` 为准（CJK 宽字符、tab）。
 - Markdown 无法识别的语法按字面输出；宁可少样式，不可丢字。
-- 改动渲染逻辑后跑单元测试 + 两个 PTY 冒烟脚本。
+- 改动渲染逻辑后跑单元测试 + PTY 冒烟脚本。
 - thinking 的点击命中依赖渲染时记录的行号（`thinking_hits` / `transcript_top`）；新增可点击区域时同步 `on_click` 与测试。
 
 ## 调试
@@ -163,6 +164,7 @@ cargo clippy --all-targets
 cargo build
 python3 scripts/tui_smoke.py /tmp/pi-smoke target/debug/pi-rs
 python3 scripts/tui_chat_smoke.py /tmp/pi-smoke target/debug/pi-rs
+python3 scripts/tui_model_smoke.py /tmp/pi-smoke target/debug/pi-rs
 ```
 
 - 文档是否仍与行为一致？（尤其 `architecture.md`、`plan.md`）

@@ -73,12 +73,14 @@ pub trait Provider: Send + Sync {
 
 ### 实现
 
-- `OpenAiCompat` 同时服务 DeepSeek 与任意 OpenAI 兼容端点：`deepseek(...)` 额外携带 `thinking` / `reasoning_effort` 参数，`custom(...)` 不带。
+- `OpenAiCompat` 同时服务 DeepSeek、MiniMax CN 与任意 OpenAI 兼容端点：`deepseek(...)` 额外携带 `thinking` / `reasoning_effort` 参数；`minimax_cn(...)` 携带 `reasoning_split: true`，把思考内容拆到 `reasoning_content`，与其它端点一样原样回传；`custom(...)` 两者都不带。
 - SSE 按字节缓存再逐行解析 `data:`，支持跨分块的 UTF-8 和无末尾换行的记录；忽略注释与空行。必须收到 `finish_reason` 才算完整；`[DONE]` 或 EOF 前缺少该字段会报 `Error::Stream`。兼容已收到 `finish_reason` 但省略 `[DONE]` 的端点，且继续收集末尾 usage。带 tool call 的响应必须以 `tool_calls` 结束，`length` 等其他原因视为不完整工具响应。非法 JSON 或 UTF-8 也会报错；agent 保留已有正文，丢弃该响应的工具调用。HTTP 非 2xx 变成 `Error::Api`（含截断的响应体）。
 - 网络与缓冲有固定边界：连接（含 TLS 握手）10 秒，单次读取空闲 120 秒，正常持续输出没有总时长上限；登录验证仍有 15 秒总超时。SSE 逐个行片段检查 1 MiB 上限再追加，不把整个传输 chunk 复制到缓冲。API 错误响应只读取前 2,000 字节并标注限制，达到上限立即放弃剩余正文；错误正文读取同样可取消。
 - tool call 增量按 `index` 归位；没有 id 的调用在 agent 侧补 `call_{i}`。
 - `Message` 是唯一消息类型：agent 历史、会话记录、线上格式三位一体。`reasoning` 必须随 assistant 消息原样回传（DeepSeek + tools 的硬要求）。用户消息可带 base64 `Image`；文本消息继续用字符串 `content`，带图消息在发送时展开成 OpenAI 的 `[{type:"text"},…,{type:"image_url"}]` parts，会话文件里仍是同一个 `Message`。
-- `deepseek.rs` 维护模型注册表（上下文窗口、最大输出、峰谷价格）；未知模型照常工作，但成本显示为 `-`。
+- `deepseek.rs` / `minimax_cn.rs` 维护模型注册表（上下文窗口、最大输出；DeepSeek 另有峰谷价格）。MiniMax M Plan 按套餐计费、不按 token 计价，所以其模型 `cost: None`，成本显示 `-`；未知模型照常工作，但成本同样显示 `-`。
+- `llm::provider_models` / `provider_model` / `provider_of_model` 是注册表的统一入口：前者列模型，第二个把 id 解析成 `Model`（含族名别名），第三个给出该 id 属于哪个 provider。模型 id 在各注册表间不重名，所以它就是 `/model` 的路由表。
+- 厂商的族名不一定等于 API 接受的 ID：MiniMax 的 M3.1 代际实际是 `MiniMax-M3.1-Flash`，直接发 `MiniMax-M3.1` 会被服务端以 `unknown model` 拒掉。`minimax_cn::canonical_id` 负责把族名解析成真实 ID，注册表与 wire 都用解析后的名字。
 - `mock.rs` 的 `ScriptedProvider` 让 agent 测试无需网络。
 
 ## crates/agent
@@ -272,7 +274,7 @@ ToolResult { content: String, is_error: bool }
 | `Compaction` | 追加 compaction 记录，更新会话上下文映射 |
 | `Usage` | 累加 token 与估价（含摘要请求） |
 
-之后 print/json/tui sink 再做各自的展示。TUI 状态栏的缓存命中率按 `cached_tokens / input_tokens` 四舍五入，尚未收到 usage 或输入为 0 时显示 `cache -`。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按 DeepSeek 峰谷价估算（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日）。
+之后 print/json/tui sink 再做各自的展示。TUI 状态栏的缓存命中率按 `cached_tokens / input_tokens` 四舍五入，尚未收到 usage 或输入为 0 时显示 `cache -`。`stats` 只在进程内累计，不落盘；`-c` 恢复历史消息，但 token/成本从 0 重新计。成本按模型注册表估算；DeepSeek 用峰谷价（UTC 工作日 01–04、06–10 点为峰时，不含中国法定节假日），MiniMax M Plan 订阅不估价。
 
 任一消息或 compaction 写入失败，`Shared` 保留首个错误并同步取消当前回合，停止后续会话写入、模型请求和剩余工具调用。assistant 消息未落盘时，其工具不会执行；已经执行的工具不回滚。print 模式在 stderr 报错并以非零状态退出；JSON 最终输出 `outcome:"error"` 并非零退出；TUI 显示错误并结束忙碌态，拒绝继续提问、`/compact` 和 `/dream`，退出时返回失败。即使之后路径恢复可写，也必须修复文件并重启，避免继续使用与磁盘不一致的内存历史。这里复用现有取消机制，`agent` 无需知道文件或会话语义。
 
@@ -281,7 +283,8 @@ ToolResult { content: String, is_error: bool }
 - 独立线程跑 `crossterm::event::read`，把按键/滚轮/左键点击/尺寸变化送进 channel；左键带着坐标，由 `App::on_click` 命中 thinking header。
 - 主循环 `select!` 在输入、`UiEvent`、120ms ticker 之间调度；只有 `dirty` 时重绘。
 - `tui::commands` 是斜杠命令的唯一表格（名字、参数提示、一行说明、是否 lab-only）；`/help` 文本和补全菜单都从它生成，避免两处漂移。输入框内容是一个不以空白结尾的 `/` 前缀时 `App::completion` 打开，`Up` / `Down` 改选、`Tab` 补全、`Esc` 关闭；前缀尚未等于完整命令名时 `Enter` 先补全，不把半截命令发给应用层。补全只改输入框，不产生 `Action`。
-- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/remember`、`/forget`、`/memory`、`/lab`、`/dream`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
+- `Action::Submit` 先看首 token：`/login`、`/logout`、`/compact`、`/model`、`/remember`、`/forget`、`/memory`、`/lab`、`/dream`、`/help` 由应用层处理，其余才触发 `spawn_turn`。未知斜杠命令只报错，不发给模型。斜杠命令是纯文本的：已附图片会退回输入框，留给下一条消息。`/remember` / `/forget` / `/memory` 只读写 `coding::memory` 的文件，不打断当前 turn。
+- `/model` 无参时列出所有 provider 的注册模型（`*` 标记当前）；带 id 时切换模型。模型 id 到 provider 的映射由 `llm::provider_of_model` 给出，族名先经 `llm::provider_model` 解析成 API 真实接受的 ID。同 provider 切换只改模型；跨 provider 切换还要解析那个 provider 自己的凭据并重建 provider（`--api-key` / `--base-url` 只属于启动时的 provider，不跟着走）。切换不中断对话，不改写会话文件里已记录的内容；忙时直接拒绝。
 - `/lab` 只翻转 `App::lab`；`/dream` 在 lab 关闭、忙碌、未登录、记忆为空或工具不足时直接拒绝/提示。满足条件时把 `Cancel` 交给隔离的 dream 任务，`TuiSink::ephemeral` 展示思考与工具活动、累计用量，但不追加会话记录；结束统一发 `Busy(false)`。
 - `/compact` 在空闲时拿 agent 锁执行一次强制压缩；`TuiSink` 负责落盘并把 `Compaction` / `CompactionFailed` 翻成提示。忙时直接拒绝，不打断当前 turn。
 - `Ctrl+V` 在 `tui` 里只产生 `Action::PasteImage`；`coding::clipboard` 读系统剪贴板（macOS `osascript`、Linux `wl-paste`/`xclip`、Windows PowerShell），把图片元数据装进 `UiEvent::ImageAttached`。字节留在 `App` 的待发送附件里，提交时随 `Message` 进会话。
@@ -360,7 +363,7 @@ ToolResult { content: String, is_error: bool }
 | 新 provider | 实现 `llm::Provider`；在 `coding::build_provider` 接线 | 否 |
 | 新工具 | 实现 `agent::Tool`；在 `coding/tools` 注册 | 是（需先改目标） |
 | 新展示方式 | 实现 `agent::Sink` | 否 |
-| 新模型/价格 | `llm/deepseek.rs` 或 provider 自己的注册表 | 否 |
+| 新模型/价格 | `llm/deepseek.rs`、`llm/minimax_cn.rs` 或 provider 自己的注册表 | 否 |
 | 新运行模式 | `coding/modes.rs` + `cli::Mode` | 否 |
 
 步骤与代码骨架见 [development.md](development.md)。
@@ -389,4 +392,4 @@ ToolResult { content: String, is_error: bool }
 | 提示词里没有项目规则 | `coding/prompt.rs` 的搜索顺序 |
 | TUI 花屏 / 宽度错 | `tui/render.rs`、`tui/wrap.rs` |
 | 代码块高亮错位 | `tui/markdown.rs` 的 `highlight` / 行号槽 |
-| 成本不对 | `llm/model.rs`、`llm/deepseek.rs` 的峰谷判断 |
+| 成本不对 | `llm/model.rs`、模型注册表、`llm/deepseek.rs` 的峰谷判断 |

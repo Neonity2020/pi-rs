@@ -183,22 +183,33 @@ pub(crate) fn default_base_url(provider: &str) -> &'static str {
     }
 }
 
-/// `--base-url` > auth.json > provider default.
-pub(crate) fn base_url_for(args: &cli::Args) -> Result<String> {
-    if let Some(url) = &args.base_url {
-        return Ok(url.clone());
+/// `--base-url` > auth.json > provider default, for a provider other than
+/// the one pi-rs started with. `--base-url` and `--api-key` belong to the
+/// startup provider, so they do not carry over when `/model` switches to
+/// another one.
+pub(crate) fn base_url_for_provider(provider: &str, args: &cli::Args) -> Result<String> {
+    if provider == provider_name(args) {
+        if let Some(url) = &args.base_url {
+            return Ok(url.clone());
+        }
     }
-    if let Some(url) = auth::AuthFile::credential(provider_name(args))?.and_then(|c| c.base_url) {
+    if let Some(url) = auth::AuthFile::credential(provider)?.and_then(|c| c.base_url) {
         return Ok(url);
     }
-    Ok(default_base_url(provider_name(args)).to_string())
+    Ok(default_base_url(provider).to_string())
 }
 
 /// `--api-key` > environment (including `.env`) > auth.json.
 pub(crate) fn resolve_api_key(args: &cli::Args) -> Result<Option<String>> {
-    let provider = provider_name(args);
-    if let Some(key) = args.api_key.clone().filter(|key| !key.trim().is_empty()) {
-        return Ok(Some(key));
+    resolve_api_key_for(provider_name(args), args)
+}
+
+/// Same order, for a provider other than the one pi-rs started with.
+pub(crate) fn resolve_api_key_for(provider: &str, args: &cli::Args) -> Result<Option<String>> {
+    if provider == provider_name(args) {
+        if let Some(key) = args.api_key.clone().filter(|key| !key.trim().is_empty()) {
+            return Ok(Some(key));
+        }
     }
     if let Some(key) = env_api_key(provider) {
         return Ok(Some(key));
@@ -209,8 +220,16 @@ pub(crate) fn resolve_api_key(args: &cli::Args) -> Result<Option<String>> {
 }
 
 pub(crate) fn build_provider(args: &cli::Args, api_key: &str) -> Result<Arc<dyn Provider>> {
-    let base_url = base_url_for(args)?;
-    match provider_name(args) {
+    build_provider_for(provider_name(args), args, api_key)
+}
+
+pub(crate) fn build_provider_for(
+    provider: &str,
+    args: &cli::Args,
+    api_key: &str,
+) -> Result<Arc<dyn Provider>> {
+    let base_url = base_url_for_provider(provider, args)?;
+    match provider {
         "deepseek" => {
             let thinking = if args.no_thinking {
                 Thinking::Disabled

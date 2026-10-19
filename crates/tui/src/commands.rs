@@ -59,6 +59,12 @@ pub const COMMANDS: &[Command] = &[
         lab: false,
     },
     Command {
+        name: "/model",
+        hint: "<id>",
+        help: "show the available models, or switch to one",
+        lab: false,
+    },
+    Command {
         name: "/remember",
         hint: "<text>",
         help: "add a note to this project's long-term memory",

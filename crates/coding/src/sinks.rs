@@ -18,7 +18,9 @@ use crate::util;
 pub struct Shared {
     pub session: Arc<Mutex<Session>>,
     pub stats: Arc<Mutex<Stats>>,
-    pub model: Model,
+    /// The active model. Shared behind a lock because `/model` can switch it
+    /// while a turn is running.
+    model: Arc<Mutex<Model>>,
     persistence_error: Arc<Mutex<Option<String>>>,
     active_cancel: Arc<Mutex<Cancel>>,
 }
@@ -28,10 +30,21 @@ impl Shared {
         Self {
             session: Arc::new(Mutex::new(session)),
             stats: Arc::new(Mutex::new(Stats::default())),
-            model,
+            model: Arc::new(Mutex::new(model)),
             persistence_error: Arc::new(Mutex::new(None)),
             active_cancel: Arc::new(Mutex::new(Cancel::new())),
         }
+    }
+
+    /// The active model.
+    pub fn model(&self) -> Model {
+        self.model.lock().unwrap().clone()
+    }
+
+    /// Switch models (`/model`). Cost estimates from now on use the new
+    /// model's pricing; earlier usage keeps the price it was billed at.
+    pub fn set_model(&self, model: Model) {
+        *self.model.lock().unwrap() = model;
     }
 
     /// A failed write can leave a partial record, so never retry writes or
@@ -89,7 +102,8 @@ impl Shared {
                 session.append_compaction(summary, *first_kept_index, *tokens_before, *tokens_after)
             }),
             AgentEvent::Usage { usage } => {
-                self.stats.lock().unwrap().add(*usage, &self.model);
+                let model = self.model();
+                self.stats.lock().unwrap().add(*usage, &model);
                 Ok(())
             }
             _ => self.persistence_result(),
@@ -99,8 +113,9 @@ impl Shared {
     pub fn status_info(&self) -> crate::ui::StatusInfo {
         let stats = self.stats.lock().unwrap();
         let session = self.session.lock().unwrap();
+        let model = self.model();
         crate::ui::StatusInfo {
-            model: self.model.id.clone(),
+            model: model.id.clone(),
             dir: std::env::current_dir()
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -113,7 +128,7 @@ impl Shared {
             input_tokens: stats.usage.input_tokens,
             output_tokens: stats.usage.output_tokens,
             cached_tokens: stats.usage.cached_tokens,
-            cost: stats.cost_display(&self.model),
+            cost: stats.cost_display(&model),
         }
     }
 }

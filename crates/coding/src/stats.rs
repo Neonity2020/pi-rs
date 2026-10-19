@@ -16,7 +16,10 @@ impl Stats {
     }
 
     pub fn cost_display(&self, model: &Model) -> String {
-        if model.cost.is_none() {
+        // A model without a price (a subscription plan) cannot be estimated,
+        // but usage on a priced model still cost money — so only show `-`
+        // when there is nothing to show.
+        if model.cost.is_none() && self.cost_usd <= 0.0 {
             "-".to_string()
         } else {
             format!("${:.4}", self.cost_usd)

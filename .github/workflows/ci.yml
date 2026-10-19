@@ -41,6 +41,7 @@ jobs:
           cd "$pi_smoke_dir"
           python3 "$GITHUB_WORKSPACE/scripts/tui_smoke.py" "$pi_smoke_dir/home" "$GITHUB_WORKSPACE/target/debug/pi-rs"
           python3 "$GITHUB_WORKSPACE/scripts/tui_chat_smoke.py" "$pi_smoke_dir/chat-home" "$GITHUB_WORKSPACE/target/debug/pi-rs"
+          python3 "$GITHUB_WORKSPACE/scripts/tui_model_smoke.py" "$pi_smoke_dir/model-home" "$GITHUB_WORKSPACE/target/debug/pi-rs"
 
   website:
     name: Website

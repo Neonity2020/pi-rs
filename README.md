@@ -67,7 +67,9 @@ pi-rs -c                    # 继续本目录最近一次会话
 --tools <list>        限制工具集，如 --tools read,bash
 ```
 
-TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/remember <text>` 记住一条项目事实、`/remember global <text>` 记住跨项目偏好、`/forget <text>` 删除匹配的项目记忆、`/forget global <text>` 删除匹配的全局记忆、`/memory` 查看记忆文件、`/lab` 开关实验模式、`/dream` 在实验模式里整理并遗忘长期记忆、`/help` 列出命令。输入 `/` 会弹出命令列表，`Up` / `Down` 选择、`Tab` 补全、`Esc` 关闭；只输入了命令前缀时按 `Enter` 也会先补全。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
+TUI 内的斜杠命令：`/login` 登录（输入框切换为掩码）、`/logout` 删除保存的凭据、`/compact` 手动压缩上下文、`/model` 列出可用模型、`/model <id>` 切换模型、`/remember <text>` 记住一条项目事实、`/remember global <text>` 记住跨项目偏好、`/forget <text>` 删除匹配的项目记忆、`/forget global <text>` 删除匹配的全局记忆、`/memory` 查看记忆文件、`/lab` 开关实验模式、`/dream` 在实验模式里整理并遗忘长期记忆、`/help` 列出命令。输入 `/` 会弹出命令列表，`Up` / `Down` 选择、`Tab` 补全、`Esc` 关闭；只输入了命令前缀时按 `Enter` 也会先补全。没有凭据时 TUI 仍会启动，普通提问会被拦下并提示先 `/login`。
+
+`/model` 列出所有 provider 的已知模型，`*` 标记当前模型。`/model <id>` 切换到指定模型，历史对话保留，状态栏同步更新。id 可以是族名（`MiniMax-M3.1`），会解析成 API 真实接受的 ID（`MiniMax-M3.1-Flash`）。切换到另一个 provider 的模型时需要该 provider 自己的凭据（`MINIMAX_CN_API_KEY` 或 `pi-rs login --provider minimax-cn`）；`--api-key` 和 `--base-url` 只属于启动时的 provider，不跟着走。切换只影响之后的请求，不改写会话文件里已记录的内容。
 
 `Up` / `Down` 在输入框里翻阅历史 prompt（跨会话，按工作目录保存于 `~/.pi-rs/history/<cwd 的 slug>`）；正在编辑的内容会先暂存，翻回最新一条后还原。
 
@@ -153,16 +155,17 @@ TUI 里用 `/remember <text>` 写项目记忆，`/remember global <text>` 写全
 GitHub Actions 已配置 Linux/macOS 的格式、Clippy、锁定依赖测试与构建、PTY 冒烟，以及 Node 24 的网站构建；均不需要真实 API key。
 
 ```bash
-cargo test          # 239 个测试，不需要 API key
+cargo test          # 245 个测试，不需要 API key
 ```
 
-覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 21 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、MiniMax 族名解析成 API 真实 ID、context overflow 压缩重试与会话落盘）。
+覆盖：SSE 分块解析、工具 schema 与线格式（含 `reasoning_content` 回传与图片 content parts）、agent 循环（工具回环、顺序执行与逐项结果报告、中止、空流、context overflow 重试）、上下文压缩（token 估算、切点、摘要序列化、自动/手动压缩、摘要续写）、四个工具的真实文件/进程行为、会话读写、分支回溯与 compaction 重放、arg 解析、剪贴板图片的格式识别/尺寸解析/base64、提示词历史、长期记忆的解析/预算/写入/删除/计数、`/dream` 的提示词与工具子集、`/model` 的模型路由与切换、TUI 状态机、斜杠命令列表与补全、thinking 折叠与点击、换行与图片附件、Markdown 渲染（表格、代码块行号与语法高亮），以及 22 个端到端测试——起本地 mock SSE / auth 服务器，跑真实 `pi-rs` 二进制验证完整链路（含 `.env` 自动加载、真实环境变量优先、空值视为未设置、`pi-rs login` 保存与复用 auth.json、坏 key 不落盘、logout、MiniMax 族名解析成 API 真实 ID、context overflow 压缩重试与会话落盘）。
 
 另外有两个真 pty 冒烟脚本（同样不需要真实 key）：
 
 ```bash
 python3 scripts/tui_smoke.py <数据目录> target/debug/pi-rs     # 启动 / Ctrl+C 干净退出 / 恢复终端
 python3 scripts/tui_chat_smoke.py <数据目录> target/debug/pi-rs   # 本地 mock API：输入 → 流式渲染 → 退出
+python3 scripts/tui_model_smoke.py <数据目录> target/debug/pi-rs  # `/model` 列表 → 切换 → 跨 provider 切换
 ```
 
 ## 安全

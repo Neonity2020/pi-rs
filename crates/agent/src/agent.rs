@@ -106,6 +106,12 @@ impl Agent {
         self.provider = provider;
     }
 
+    /// Switch to another model without losing history (used by `/model`).
+    /// The new model's context window drives compaction from now on.
+    pub fn set_model(&mut self, model: Model) {
+        self.model = model;
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }

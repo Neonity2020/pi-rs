@@ -57,7 +57,7 @@ fn summary_line(shared: &Shared) -> String {
         format_tokens(stats.usage.input_tokens),
         format_tokens(stats.usage.output_tokens),
         format_tokens(stats.usage.cached_tokens),
-        stats.cost_display(&shared.model),
+        stats.cost_display(&shared.model()),
         session.path.display()
     )
 }
@@ -272,6 +272,19 @@ pub async fn run_interactive(
                                 Some(Slash::Help) => {
                                     let _ = ui_tx.send(UiEvent::Info(ui::help_text()));
                                 }
+                                Some(Slash::Model { id: None }) => {
+                                    let _ = ui_tx.send(UiEvent::Info(list_models(&args, &shared)));
+                                }
+                                Some(Slash::Model { id: Some(id) }) => {
+                                    if app.busy {
+                                        let _ = ui_tx.send(UiEvent::Error(
+                                            "wait for the current turn to finish before /model"
+                                                .into(),
+                                        ));
+                                    } else {
+                                        switch_model(&args, &agent, &shared, &ui_tx, &id).await;
+                                    }
+                                }
                                 Some(Slash::Remember { scope, text }) => {
                                     remember_memory(&cwd, scope, &text, &ui_tx);
                                 }
@@ -477,8 +490,18 @@ enum Slash {
     Login,
     Logout,
     Compact,
-    Remember { scope: memory::Scope, text: String },
-    Forget { scope: memory::Scope, text: String },
+    /// `/model` lists the available models; `/model <id>` switches to one.
+    Model {
+        id: Option<String>,
+    },
+    Remember {
+        scope: memory::Scope,
+        text: String,
+    },
+    Forget {
+        scope: memory::Scope,
+        text: String,
+    },
     Memory,
     Lab,
     Dream,
@@ -500,6 +523,9 @@ fn slash_command(text: &str) -> Option<Slash> {
         "/login" => Slash::Login,
         "/logout" => Slash::Logout,
         "/compact" => Slash::Compact,
+        "/model" => Slash::Model {
+            id: (!rest.is_empty()).then(|| rest.to_string()),
+        },
         "/remember" => {
             let (scope, text) = split_scope(rest);
             Slash::Remember {
@@ -595,6 +621,87 @@ fn forget_memory(
             let _ = ui.send(UiEvent::Error(format!("forget failed: {error}")));
         }
     }
+}
+
+/// `/model` with no argument: list every model pi-rs knows, marking the
+/// current one. Models whose provider has no credentials are listed too —
+/// they are reachable once the key is there.
+fn list_models(args: &cli::Args, shared: &Shared) -> String {
+    let current = shared.model();
+    let mut text = String::new();
+    for model in llm::all_models() {
+        let marker = if model.id == current.id { '*' } else { ' ' };
+        let window = if model.context_window > 0 {
+            format!("{} ctx", crate::stats::format_tokens(model.context_window))
+        } else {
+            "unknown ctx".to_string()
+        };
+        let current_provider = model.provider == current.provider;
+        let suffix = if current_provider {
+            String::new()
+        } else {
+            match crate::resolve_api_key_for(&model.provider, args) {
+                Ok(Some(_)) => String::new(),
+                _ => " (no key)".to_string(),
+            }
+        };
+        text.push_str(&format!(
+            "{marker} {:<22} {:<12} {window}{suffix}\n",
+            model.id, model.provider
+        ));
+    }
+    text.push_str("switch with /model <id>");
+    text
+}
+
+/// `/model <id>`: switch models. The id may be an alias (`MiniMax-M3.1`) and
+/// may name a different provider than the current one; that needs that
+/// provider's own credentials, so the provider is rebuilt when it changes.
+async fn switch_model(
+    args: &cli::Args,
+    agent: &Arc<Mutex<Agent>>,
+    shared: &Shared,
+    ui: &UnboundedSender<UiEvent>,
+    id: &str,
+) {
+    let current = shared.model();
+    let provider = llm::provider_of_model(id)
+        .map(str::to_string)
+        .unwrap_or_else(|| current.provider.clone());
+    let model = llm::provider_model(&provider, id);
+
+    if provider != current.provider {
+        let key = match crate::resolve_api_key_for(&provider, args) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                let _ = ui.send(UiEvent::Error(format!(
+                    "no API key for {provider} — run `pi-rs login --provider {provider}` or set {}",
+                    crate::env_key_name(&provider)
+                )));
+                return;
+            }
+            Err(error) => {
+                let _ = ui.send(UiEvent::Error(format!("model switch failed: {error}")));
+                return;
+            }
+        };
+        let next = match crate::build_provider_for(&provider, args, &key) {
+            Ok(provider) => provider,
+            Err(error) => {
+                let _ = ui.send(UiEvent::Error(format!("model switch failed: {error}")));
+                return;
+            }
+        };
+        let mut agent = agent.lock().await;
+        agent.set_provider(next);
+        agent.set_model(model.clone());
+    } else {
+        agent.lock().await.set_model(model.clone());
+    }
+
+    shared.set_model(model.clone());
+    let _ = ui.send(UiEvent::Info(format!("model: {id}")));
+    let _ = ui.send(UiEvent::Status(shared.status_info()));
 }
 
 fn begin_login(app: &mut App, args: &cli::Args, ui: &UnboundedSender<UiEvent>) {
@@ -825,7 +932,7 @@ mod tests {
         let provider = Arc::new(llm::mock::ScriptedProvider::new(vec![]));
         let agent = Arc::new(Mutex::new(Agent::new(
             provider.clone(),
-            shared.model.clone(),
+            shared.model(),
             String::new(),
             vec![],
             vec![],
@@ -905,7 +1012,7 @@ mod tests {
         ]]));
         let agent = Arc::new(Mutex::new(Agent::new(
             provider.clone(),
-            shared.model.clone(),
+            shared.model(),
             String::new(),
             vec![tool, Arc::new(crate::tools::WriteTool)],
             vec![],
@@ -968,6 +1075,7 @@ mod tests {
             "/login",
             "/logout",
             "/compact",
+            "/model",
             "/remember",
             "/remember global",
             "/forget",
@@ -998,6 +1106,13 @@ mod tests {
         assert_eq!(slash_command("  /logout  "), Some(Slash::Logout));
         assert_eq!(slash_command("/help me"), Some(Slash::Help));
         assert_eq!(slash_command("/compact"), Some(Slash::Compact));
+        assert_eq!(slash_command("/model"), Some(Slash::Model { id: None }));
+        assert_eq!(
+            slash_command("/model MiniMax-M3.1"),
+            Some(Slash::Model {
+                id: Some("MiniMax-M3.1".into())
+            })
+        );
         assert_eq!(slash_command("/memory"), Some(Slash::Memory));
         assert_eq!(slash_command("/lab"), Some(Slash::Lab));
         assert_eq!(slash_command("/lab on"), Some(Slash::Lab));
@@ -1036,5 +1151,80 @@ mod tests {
         );
         assert_eq!(slash_command("please /login"), None);
         assert_eq!(slash_command("hello"), None);
+    }
+
+    #[tokio::test]
+    async fn model_switch_changes_the_agent_and_the_shared_model() {
+        let dir = crate::testutil::temp_dir("model-switch");
+        let session = crate::session::Session::create_in(&dir, &dir, "deepseek-flash").unwrap();
+        let shared = Shared::new(session, llm::deepseek::model_or_unknown("deepseek-flash"));
+        let provider = Arc::new(llm::mock::ScriptedProvider::new(vec![]));
+        let agent = Arc::new(Mutex::new(Agent::new(
+            provider.clone(),
+            shared.model(),
+            String::new(),
+            vec![],
+            vec![],
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        switch_model(
+            &cli::Args::default(),
+            &agent,
+            &shared,
+            &tx,
+            "deepseek-v4-pro",
+        )
+        .await;
+
+        assert_eq!(agent.lock().await.model().id, "deepseek-v4-pro");
+        assert_eq!(shared.model().id, "deepseek-v4-pro");
+        // The status bar follows the switch.
+        assert!(
+            matches!(rx.recv().await, Some(UiEvent::Info(message)) if message.contains("deepseek-v4-pro"))
+        );
+        let status = match rx.recv().await {
+            Some(UiEvent::Status(status)) => status,
+            other => panic!("expected a status update, got {other:?}"),
+        };
+        assert_eq!(status.model, "deepseek-v4-pro");
+    }
+
+    #[tokio::test]
+    async fn model_switch_to_an_alias_uses_the_id_the_api_accepts() {
+        let dir = crate::testutil::temp_dir("model-alias");
+        let session = crate::session::Session::create_in(&dir, &dir, "deepseek-flash").unwrap();
+        let shared = Shared::new(session, llm::deepseek::model_or_unknown("deepseek-flash"));
+        let provider = Arc::new(llm::mock::ScriptedProvider::new(vec![]));
+        let agent = Arc::new(Mutex::new(Agent::new(
+            provider.clone(),
+            shared.model(),
+            String::new(),
+            vec![],
+            vec![],
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // The alias resolves to the M3.1 model of another provider, which
+        // needs that provider's credentials.
+        switch_model(&cli::Args::default(), &agent, &shared, &tx, "MiniMax-M3.1").await;
+
+        // No key for the other provider, so the switch is refused and the
+        // current model stays.
+        assert_eq!(agent.lock().await.model().id, "deepseek-flash");
+        assert!(
+            matches!(rx.recv().await, Some(UiEvent::Error(message)) if message.contains("no API key"))
+        );
+    }
+
+    #[test]
+    fn the_model_list_marks_the_current_model() {
+        let dir = crate::testutil::temp_dir("model-list");
+        let session = crate::session::Session::create_in(&dir, &dir, "deepseek-flash").unwrap();
+        let shared = Shared::new(session, llm::deepseek::model_or_unknown("deepseek-flash"));
+        let list = list_models(&cli::Args::default(), &shared);
+        assert!(list.contains("* deepseek-flash"), "{list}");
+        assert!(list.contains("MiniMax-M3.1-Flash"), "{list}");
+        assert!(list.contains("switch with /model <id>"), "{list}");
     }
 }
