@@ -1,0 +1,13 @@
+[package]
+name = "pi-tui"
+description = "Terminal UI toolkit on ratatui/crossterm (pi-rs counterpart of packages/tui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }

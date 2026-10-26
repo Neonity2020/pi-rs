@@ -1,0 +1,10 @@
+[package]
+name = "pi-codemode"
+description = "Sandboxed script execution where the only capability is calling injected tools (pi-rs port of packages/codemode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

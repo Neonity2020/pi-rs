@@ -1,0 +1,33 @@
+[package]
+name = "pi-coding-agent"
+description = "The pi coding agent, Rust port (binary: pi-rs) of packages/coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pi-rs"
+path = "src/main.rs"
+
+[dependencies]
+pi-ai = { workspace = true }
+pi-agent = { workspace = true }
+pi-mcp = { workspace = true }
+pi-env = { workspace = true }
+pi-tui = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+unicode-width = { workspace = true }

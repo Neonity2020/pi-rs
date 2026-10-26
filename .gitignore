@@ -1,0 +1,6 @@
+/target
+/pi/
+/t3code/
+/pi-tutorial/
+Cargo.lock.orig
+.DS_Store
