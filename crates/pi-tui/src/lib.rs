@@ -9,10 +9,13 @@
 
 pub mod components;
 pub mod fuzzy;
+pub mod keybindings;
 pub mod keys;
 pub mod terminal;
 pub mod theme;
 
 pub use components::{Component, Editor, ScrollView, Text};
+pub use keybindings::{KeybindingsManager, TUI_KEYBINDINGS};
+pub use keys::{KeyChord, KeyName, ParseKeyError, parse_chord};
 pub use terminal::{TerminalGuard, init_terminal, restore_terminal};
 pub use theme::Theme;

@@ -12,3 +12,5 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 pulldown-cmark = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
