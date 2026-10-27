@@ -41,6 +41,17 @@ impl InMemoryTransport {
 	}
 }
 
+/// Build a transport over existing raw line channels — the seam for embedded
+/// servers and tests whose peer speaks JSON lines (and needs the request
+/// `method`, which the parsed [`crate::transports::TransportEvent`] drops).
+pub fn from_raw(
+	name: &str,
+	inbound: mpsc::UnboundedReceiver<String>,
+	outbound: mpsc::UnboundedSender<String>,
+) -> InMemoryTransport {
+	InMemoryTransport::new(name, inbound, outbound)
+}
+
 #[async_trait]
 impl Transport for InMemoryTransport {
 	async fn send(&mut self, request: &JsonRpcRequest) -> crate::Result<()> {

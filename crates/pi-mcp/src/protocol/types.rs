@@ -9,6 +9,7 @@ use serde_json::Value;
 use super::content::Content;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
 	#[serde(default)]
 	pub protocol_version: String,
@@ -23,6 +24,7 @@ pub struct ServerInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
 	pub protocol_version: String,
 	pub capabilities: Value,
@@ -32,6 +34,7 @@ pub struct InitializeResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolInfo {
 	pub name: String,
 	pub description: Option<String>,
@@ -40,6 +43,7 @@ pub struct ToolInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListToolsResult {
 	pub tools: Vec<ToolInfo>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,6 +58,7 @@ pub struct CallToolParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
 	#[serde(default)]
 	pub content: Vec<Content>,

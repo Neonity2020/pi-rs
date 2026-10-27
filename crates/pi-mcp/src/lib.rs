@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod protocol;
+pub mod tool;
 pub mod transports;
 
 pub use client::{McpClient, McpServerConfig, McpToolInfo};
@@ -13,6 +14,7 @@ pub use protocol::jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use protocol::types::{
 	CallToolParams, CallToolResult, InitializeParams, InitializeResult, ListToolsResult, ServerInfo,
 };
+pub use tool::{McpTool, SharedMcpClient, create_mcp_tool_name};
 pub use transports::{Transport, TransportEvent};
 
 /// Crate error type.
