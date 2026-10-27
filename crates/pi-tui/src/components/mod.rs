@@ -15,7 +15,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 pub use editor::{Editor, EditorEvent};
-pub use markdown::{markdown_lines, Markdown};
+pub use markdown::{Markdown, markdown_lines};
 pub use scroll_view::ScrollView;
 pub use select_list::{SelectAction, SelectItem, SelectList};
 pub use text::Text;

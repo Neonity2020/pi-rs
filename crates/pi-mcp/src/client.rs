@@ -17,8 +17,18 @@ use crate::transports::Transport;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum McpServerConfig {
-	Stdio { command: String, #[serde(default)] args: Vec<String>, #[serde(default)] env: Vec<(String, String)> },
-	Http { url: String, #[serde(default)] headers: Vec<(String, String)> },
+	Stdio {
+		command: String,
+		#[serde(default)]
+		args: Vec<String>,
+		#[serde(default)]
+		env: Vec<(String, String)>,
+	},
+	Http {
+		url: String,
+		#[serde(default)]
+		headers: Vec<(String, String)>,
+	},
 }
 
 /// Tool metadata as surfaced to the model registry.
@@ -41,7 +51,12 @@ pub struct McpClient {
 
 impl McpClient {
 	pub fn new(server_name: impl Into<String>, transport: Box<dyn Transport>) -> Self {
-		Self { server_name: server_name.into(), transport, next_id: 0, server_info: None }
+		Self {
+			server_name: server_name.into(),
+			transport,
+			next_id: 0,
+			server_info: None,
+		}
 	}
 
 	pub fn server_info(&self) -> Option<&InitializeResult> {
@@ -53,10 +68,14 @@ impl McpClient {
 		let params = InitializeParams {
 			protocol_version: "2025-06-18".into(),
 			capabilities: serde_json::json!({}),
-			client_info: ServerInfo { name: "pi-rs".into(), version: client_version.into() },
+			client_info: ServerInfo {
+				name: "pi-rs".into(),
+				version: client_version.into(),
+			},
 		};
-		let result: InitializeResult =
-			self.request("initialize", serde_json::to_value(&params)?).await?;
+		let result: InitializeResult = self
+			.request("initialize", serde_json::to_value(&params)?)
+			.await?;
 		let notification =
 			JsonRpcRequest::notification("notifications/initialized", serde_json::json!({}));
 		self.transport.send(&notification).await?;
@@ -65,8 +84,7 @@ impl McpClient {
 	}
 
 	pub async fn list_tools(&mut self) -> crate::Result<Vec<McpToolInfo>> {
-		let result: ListToolsResult =
-			self.request("tools/list", serde_json::json!({})).await?;
+		let result: ListToolsResult = self.request("tools/list", serde_json::json!({})).await?;
 		Ok(result
 			.tools
 			.into_iter()
@@ -81,7 +99,8 @@ impl McpClient {
 	}
 
 	pub async fn call_tool(&mut self, params: CallToolParams) -> crate::Result<CallToolResult> {
-		self.request("tools/call", serde_json::to_value(&params)?).await
+		self.request("tools/call", serde_json::to_value(&params)?)
+			.await
 	}
 
 	async fn request<T: for<'de> Deserialize<'de>>(
@@ -100,13 +119,17 @@ impl McpClient {
 				Some(crate::TransportEvent::Closed) => return Err(crate::Error::Closed),
 				Some(crate::TransportEvent::Error(e)) => return Err(crate::Error::Transport(e)),
 				Some(crate::TransportEvent::Message(frame)) => {
+					let frame = *frame;
 					if matches!(&frame.id, Some(v) if v.as_u64() == Some(id)) {
 						return match (frame.result, frame.error) {
 							(Some(result), _) => Ok(serde_json::from_value(result)?),
-							(None, Some(error)) => {
-								Err(crate::Error::Protocol(format!("{}: {}", error.code, error.message)))
+							(None, Some(error)) => Err(crate::Error::Protocol(format!(
+								"{}: {}",
+								error.code, error.message
+							))),
+							(None, None) => {
+								Err(crate::Error::Protocol("response without result".into()))
 							}
-							(None, None) => Err(crate::Error::Protocol("response without result".into())),
 						};
 					}
 					// Notifications and unrelated frames are skipped for now.

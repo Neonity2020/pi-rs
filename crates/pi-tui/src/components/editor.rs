@@ -405,7 +405,10 @@ impl Editor {
 	pub fn cursor_screen_pos(&self, area: Rect) -> (u16, u16) {
 		let height = area.height as usize;
 		let (x, y) = self.cursor_xy(height);
-		(self.clamp_x(x, area.width as usize), (y as u16).min(area.height.saturating_sub(1)))
+		(
+			self.clamp_x(x, area.width as usize),
+			(y as u16).min(area.height.saturating_sub(1)),
+		)
 	}
 
 	fn cursor_xy(&self, max_height: usize) -> (usize, usize) {
@@ -433,7 +436,10 @@ impl Editor {
 }
 
 fn char_to_byte_index(s: &str, char_index: usize) -> usize {
-	s.char_indices().nth(char_index).map(|(b, _)| b).unwrap_or(s.len())
+	s.char_indices()
+		.nth(char_index)
+		.map(|(b, _)| b)
+		.unwrap_or(s.len())
 }
 
 impl Component for Editor {
@@ -465,7 +471,9 @@ impl Component for Editor {
 		let height = (area.height as usize).min(lines.len());
 		let skip = lines.len().saturating_sub(height);
 		let visible: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
-		Paragraph::new(ratatui::text::Text::from(visible)).style(self.style).render(area, buf);
+		Paragraph::new(ratatui::text::Text::from(visible))
+			.style(self.style)
+			.render(area, buf);
 	}
 
 	fn preferred_height(&self, _width: u16) -> u16 {
@@ -507,7 +515,10 @@ mod tests {
 		assert!(editor.take_events().is_empty());
 		editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 		assert_eq!(editor.text(), "");
-		assert_eq!(editor.take_events(), vec![EditorEvent::Submit("a\n".into())]);
+		assert_eq!(
+			editor.take_events(),
+			vec![EditorEvent::Submit("a\n".into())]
+		);
 	}
 
 	#[test]
@@ -523,10 +534,7 @@ mod tests {
 	fn alt_backspace_kills_word() {
 		let mut editor = Editor::new("❯ ");
 		editor.set_text("hello world");
-		editor.handle_key(KeyEvent::new(
-			KeyCode::Backspace,
-			KeyModifiers::ALT,
-		));
+		editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
 		assert_eq!(editor.text(), "hello ");
 	}
 

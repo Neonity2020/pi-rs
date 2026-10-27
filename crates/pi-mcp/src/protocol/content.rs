@@ -6,16 +6,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Content {
-	Text {
-		text: String,
-	},
-	Image {
-		data: String,
-		mime_type: String,
-	},
-	Resource {
-		resource: Value,
-	},
+	Text { text: String },
+	Image { data: String, mime_type: String },
+	Resource { resource: Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

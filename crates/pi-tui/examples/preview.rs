@@ -1,8 +1,8 @@
 //! Renders a sample chat viewport (markdown + tool call + select list) into
 //! a TestBackend buffer and prints it — a smoke preview of the TUI pipeline.
 
-use pi_tui::components::{markdown_lines, SelectList, SelectItem};
 use pi_tui::Theme;
+use pi_tui::components::{SelectItem, SelectList, markdown_lines};
 
 fn main() {
 	let theme = Theme::dark();
@@ -17,7 +17,7 @@ fn main() {
 	}
 
 	println!("\n── tool call (collapsed) ───────────────────────────");
-	println!("✓ read {package}", package = "path=\"/tmp/a.txt\" limit=5");
+	println!("✓ read path=\"/tmp/a.txt\" limit=5");
 	println!("    .DS_Store\t6148B");
 	println!("    .env\t456B");
 	println!("  … (8 more lines, ctrl+o to expand)");

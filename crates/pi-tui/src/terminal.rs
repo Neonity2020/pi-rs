@@ -8,8 +8,8 @@ use std::io::{self, Stdout};
 
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags};
 
-use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal as RatatuiTerminal;
+use ratatui::prelude::CrosstermBackend;
 
 pub type DefaultTerminal = RatatuiTerminal<CrosstermBackend<Stdout>>;
 
@@ -22,7 +22,10 @@ pub struct TerminalGuard {
 impl TerminalGuard {
 	pub fn new() -> io::Result<Self> {
 		let terminal = init_terminal()?;
-		Ok(Self { terminal, restored: false })
+		Ok(Self {
+			terminal,
+			restored: false,
+		})
 	}
 
 	pub fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {

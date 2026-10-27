@@ -8,9 +8,7 @@
 //! with aligned continuation lines, links underline and show the URL when it
 //! differs from the label. Word-wrapping is greedy on unicode width.
 
-use pulldown_cmark::{
-	CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -103,9 +101,7 @@ impl<'t> Renderer<'t> {
 	fn current_style(&self) -> Style {
 		let mut style = Style::default();
 		if self.quote_depth > 0 {
-			style = style
-				.fg(self.theme.md_quote)
-				.add_modifier(Modifier::ITALIC);
+			style = style.fg(self.theme.md_quote).add_modifier(Modifier::ITALIC);
 		}
 		for s in &self.style_stack {
 			style = style.patch(*s);
@@ -118,13 +114,14 @@ impl<'t> Renderer<'t> {
 			return;
 		}
 		let style = self.current_style();
-		if let Some(last) = self.runs.last_mut() {
-			if last.style == style {
-				last.text.push_str(text);
-				return;
-			}
+		if let Some(last) = self.runs.last_mut().filter(|last| last.style == style) {
+			last.text.push_str(text);
+			return;
 		}
-		self.runs.push(Run { text: text.to_string(), style });
+		self.runs.push(Run {
+			text: text.to_string(),
+			style,
+		});
 	}
 
 	// -- block emission helpers -----------------------------------------------
@@ -168,7 +165,10 @@ impl<'t> Renderer<'t> {
 		if self.runs.is_empty() && first_prefix.is_empty() {
 			return;
 		}
-		let first_w = first_prefix.iter().map(|s| s.content.width()).sum::<usize>();
+		let first_w = first_prefix
+			.iter()
+			.map(|s| s.content.width())
+			.sum::<usize>();
 		let content_width = self.effective_width().saturating_sub(first_w).max(1);
 		let wrapped = wrap_runs(&self.runs, content_width);
 		self.runs.clear();
@@ -179,7 +179,7 @@ impl<'t> Renderer<'t> {
 			}
 			// Bare marker line (empty list item).
 			let mut line = self.quote_borders();
-			line.extend(first_prefix.drain(..));
+			line.append(&mut first_prefix);
 			self.open_block();
 			self.lines.push(Line::from(line));
 			return;
@@ -193,7 +193,7 @@ impl<'t> Renderer<'t> {
 		for (i, wline) in wrapped.into_iter().enumerate() {
 			let mut line = self.quote_borders();
 			if i == 0 && !used_prefix {
-				line.extend(first_prefix.drain(..));
+				line.append(&mut first_prefix);
 			} else {
 				line.push(Span::styled(cont_prefix.clone(), cont_style));
 			}
@@ -208,7 +208,11 @@ impl<'t> Renderer<'t> {
 	fn flush_block_inline(&mut self) {
 		let in_list = !self.lists.is_empty();
 		let prefix = std::mem::take(&mut self.item_prefix);
-		let cont = if in_list { " ".repeat(self.item_prefix_width) } else { String::new() };
+		let cont = if in_list {
+			" ".repeat(self.item_prefix_width)
+		} else {
+			String::new()
+		};
 		self.flush_inline(prefix, cont);
 	}
 
@@ -227,7 +231,10 @@ impl<'t> Renderer<'t> {
 				Event::Text(text) => self.inline_text(&text),
 				Event::Code(code) => {
 					let style = self.current_style().fg(self.theme.md_code);
-					self.runs.push(Run { text: code.to_string(), style });
+					self.runs.push(Run {
+						text: code.to_string(),
+						style,
+					});
 				}
 				Event::InlineHtml(html) => self.push_run(&html),
 				Event::Html(html) => {
@@ -249,7 +256,10 @@ impl<'t> Renderer<'t> {
 				}
 				Event::TaskListMarker(checked) => {
 					let marker = if checked { "[x] " } else { "[ ] " };
-					self.item_prefix.push(Span::styled(marker.to_string(), Style::new().fg(self.theme.md_list_bullet)));
+					self.item_prefix.push(Span::styled(
+						marker.to_string(),
+						Style::new().fg(self.theme.md_list_bullet),
+					));
 					self.item_prefix_width += 4;
 				}
 				Event::FootnoteReference(_) => {}
@@ -275,7 +285,9 @@ impl<'t> Renderer<'t> {
 			Tag::Heading { level, .. } => {
 				self.flush_block_inline();
 				self.runs.clear();
-				let mut style = Style::new().fg(self.theme.md_heading).add_modifier(Modifier::BOLD);
+				let mut style = Style::new()
+					.fg(self.theme.md_heading)
+					.add_modifier(Modifier::BOLD);
 				if level == HeadingLevel::H1 {
 					style = style.add_modifier(Modifier::UNDERLINED);
 				}
@@ -303,7 +315,11 @@ impl<'t> Renderer<'t> {
 			}
 			Tag::List(start) => {
 				self.flush_block_inline();
-				let indent = self.lists.last().map(|f| format!("{}    ", f.indent)).unwrap_or_default();
+				let indent = self
+					.lists
+					.last()
+					.map(|f| format!("{}    ", f.indent))
+					.unwrap_or_default();
 				self.lists.push(ListFrame {
 					indent,
 					ordered: start.is_some(),
@@ -322,11 +338,20 @@ impl<'t> Renderer<'t> {
 				frame.counter += 1;
 				self.item_started = false;
 				self.item_prefix_width = marker.width();
-				self.item_prefix = vec![Span::styled(marker, Style::new().fg(self.theme.md_list_bullet))];
+				self.item_prefix = vec![Span::styled(
+					marker,
+					Style::new().fg(self.theme.md_list_bullet),
+				)];
 			}
-			Tag::Emphasis => self.style_stack.push(Style::new().add_modifier(Modifier::ITALIC)),
-			Tag::Strong => self.style_stack.push(Style::new().add_modifier(Modifier::BOLD)),
-			Tag::Strikethrough => self.style_stack.push(Style::new().add_modifier(Modifier::CROSSED_OUT)),
+			Tag::Emphasis => self
+				.style_stack
+				.push(Style::new().add_modifier(Modifier::ITALIC)),
+			Tag::Strong => self
+				.style_stack
+				.push(Style::new().add_modifier(Modifier::BOLD)),
+			Tag::Strikethrough => self
+				.style_stack
+				.push(Style::new().add_modifier(Modifier::CROSSED_OUT)),
 			Tag::Link { dest_url, .. } => {
 				let style = Style::new()
 					.fg(self.theme.md_link)
@@ -366,10 +391,13 @@ impl<'t> Renderer<'t> {
 				// H3+ keep their `#` prefix; move it in front of the text runs.
 				if level >= HeadingLevel::H3 {
 					let prefix = std::mem::take(&mut self.item_prefix);
-					self.runs.splice(0..0, prefix.into_iter().map(|s| Run {
-						text: s.content.to_string(),
-						style: s.style,
-					}));
+					self.runs.splice(
+						0..0,
+						prefix.into_iter().map(|s| Run {
+							text: s.content.to_string(),
+							style: s.style,
+						}),
+					);
 					self.item_prefix_width = 0;
 				}
 				self.style_stack.pop();
@@ -409,10 +437,8 @@ impl<'t> Renderer<'t> {
 			}
 			TagEnd::List(_) => {
 				self.flush_block_inline();
-				if let Some(frame) = self.lists.pop() {
-					if frame.loose {
-						self.close_block();
-					}
+				if self.lists.pop().is_some_and(|frame| frame.loose) {
+					self.close_block();
 				}
 				if self.lists.is_empty() {
 					self.close_block();
@@ -436,7 +462,10 @@ impl<'t> Renderer<'t> {
 						.concat();
 					if !text.is_empty() && text != url {
 						let url_style = Style::new().fg(self.theme.md_link_url);
-						self.runs.push(Run { text: format!(" ({url})"), style: url_style });
+						self.runs.push(Run {
+							text: format!(" ({url})"),
+							style: url_style,
+						});
 					}
 				}
 			}
@@ -496,14 +525,20 @@ impl<'t> Renderer<'t> {
 		if t.header.is_empty() && t.rows.is_empty() {
 			return;
 		}
-		let n_cols = t.header.len().max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+		let n_cols = t
+			.header
+			.len()
+			.max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
 		if n_cols == 0 {
 			return;
 		}
 		// Column widths from cell content (single-line projection).
 		let mut widths = vec![0usize; n_cols];
 		let cell_text = |cell: &Vec<Span<'static>>| -> String {
-			cell.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("")
+			cell.iter()
+				.map(|s| s.content.as_ref())
+				.collect::<Vec<_>>()
+				.join("")
 		};
 		for (i, cell) in t.header.iter().enumerate() {
 			widths[i] = widths[i].max(cell_text(cell).width());
@@ -605,7 +640,10 @@ fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Span<'static>>> {
 				' ' | '\t' => {
 					flush(&mut segment, &mut pieces, segment_style);
 					// Collapse whitespace runs.
-					if !matches!(pieces.last(), Some(Piece::Space(_)) | Some(Piece::Break) | None) {
+					if !matches!(
+						pieces.last(),
+						Some(Piece::Space(_)) | Some(Piece::Break) | None
+					) {
 						pieces.push(Piece::Space(run.style));
 					}
 					segment_style = run.style;
@@ -631,11 +669,9 @@ fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Span<'static>>> {
 	let mut pending_space: Option<Style> = None;
 
 	let push_span = |current: &mut Vec<Span<'static>>, text: String, style: Style| {
-		if let Some(last) = current.last_mut() {
-			if last.style == style {
-				last.content.to_mut().push_str(&text);
-				return;
-			}
+		if let Some(last) = current.last_mut().filter(|last| last.style == style) {
+			last.content.to_mut().push_str(&text);
+			return;
 		}
 		current.push(Span::styled(text, style));
 	};
@@ -681,15 +717,17 @@ fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Span<'static>>> {
 					started = true;
 				} else {
 					let space_style = pending_space.take();
-					let extra = if started && space_style.is_some() { 1 } else { 0 };
+					let extra = if started && space_style.is_some() {
+						1
+					} else {
+						0
+					};
 					if started && current_w + extra + w > width {
 						lines.push(std::mem::take(&mut current));
 						current_w = 0;
-					} else if let Some(style) = space_style {
-						if started {
-							push_span(&mut current, " ".to_string(), style);
-							current_w += 1;
-						}
+					} else if started && let Some(style) = space_style {
+						push_span(&mut current, " ".to_string(), style);
+						current_w += 1;
 					}
 					push_span(&mut current, word, style);
 					current_w += w;
@@ -733,11 +771,9 @@ fn flatten_runs(runs: &[Run]) -> Vec<Span<'static>> {
 		if run.text.is_empty() {
 			continue;
 		}
-		if let Some(last) = spans.last_mut() {
-			if last.style == run.style {
-				last.content.to_mut().push_str(&run.text);
-				continue;
-			}
+		if let Some(last) = spans.last_mut().filter(|last| last.style == run.style) {
+			last.content.to_mut().push_str(&run.text);
+			continue;
 		}
 		spans.push(Span::styled(run.text.clone(), run.style));
 	}
@@ -759,7 +795,10 @@ pub struct Markdown {
 
 impl Markdown {
 	pub fn new(source: impl Into<String>, theme: Theme) -> Self {
-		Self { source: source.into(), theme }
+		Self {
+			source: source.into(),
+			theme,
+		}
 	}
 
 	pub fn set_source(&mut self, source: impl Into<String>) {
@@ -793,7 +832,12 @@ mod tests {
 	fn plain(lines: Vec<Line<'static>>) -> Vec<String> {
 		lines
 			.into_iter()
-			.map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+			.map(|l| {
+				l.spans
+					.iter()
+					.map(|s| s.content.as_ref())
+					.collect::<String>()
+			})
 			.collect()
 	}
 
@@ -860,7 +904,11 @@ mod tests {
 		let theme = Theme::dark();
 		let out = plain(markdown_lines("---\n", 20, &theme));
 		assert_eq!(out, vec!["────────────────────"]);
-		let out = plain(markdown_lines("| a | b |\n|---|---|\n| 1 | 2 |\n", 40, &theme));
+		let out = plain(markdown_lines(
+			"| a | b |\n|---|---|\n| 1 | 2 |\n",
+			40,
+			&theme,
+		));
 		assert_eq!(out.iter().filter(|l| l.contains("│")).count(), 3);
 	}
 }

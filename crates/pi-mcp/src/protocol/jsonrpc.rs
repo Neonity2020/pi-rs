@@ -25,7 +25,12 @@ impl JsonRpcRequest {
 	}
 
 	pub fn notification(method: impl Into<String>, params: Value) -> Self {
-		Self { jsonrpc: "2.0".into(), id: None, method: method.into(), params: Some(params) }
+		Self {
+			jsonrpc: "2.0".into(),
+			id: None,
+			method: method.into(),
+			params: Some(params),
+		}
 	}
 }
 

@@ -11,7 +11,7 @@ use crate::protocol::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 /// Events surfaced by a transport to its client.
 #[derive(Debug)]
 pub enum TransportEvent {
-	Message(JsonRpcResponse),
+	Message(Box<JsonRpcResponse>),
 	/// Underlying connection closed.
 	Closed,
 	/// Fatal transport error.

@@ -16,7 +16,10 @@ pub struct StreamableHttpTransport {
 
 impl StreamableHttpTransport {
 	pub fn new(url: impl Into<String>, headers: Vec<(String, String)>) -> Self {
-		Self { url: url.into(), headers }
+		Self {
+			url: url.into(),
+			headers,
+		}
 	}
 }
 

@@ -14,5 +14,5 @@ pub mod terminal;
 pub mod theme;
 
 pub use components::{Component, Editor, ScrollView, Text};
-pub use terminal::{init_terminal, restore_terminal, TerminalGuard};
+pub use terminal::{TerminalGuard, init_terminal, restore_terminal};
 pub use theme::Theme;

@@ -16,18 +16,26 @@ pub struct StdioTransport {
 
 impl StdioTransport {
 	pub fn new(command: impl Into<String>, args: Vec<String>, env: Vec<(String, String)>) -> Self {
-		Self { command: command.into(), args, env }
+		Self {
+			command: command.into(),
+			args,
+			env,
+		}
 	}
 }
 
 #[async_trait]
 impl Transport for StdioTransport {
 	async fn send(&mut self, _request: &JsonRpcRequest) -> crate::Result<()> {
-		Err(crate::Error::Unsupported("stdio transport not implemented yet (pi-rs framework stage)".into()))
+		Err(crate::Error::Unsupported(
+			"stdio transport not implemented yet (pi-rs framework stage)".into(),
+		))
 	}
 
 	async fn recv(&mut self) -> crate::Result<Option<TransportEvent>> {
-		Err(crate::Error::Unsupported("stdio transport not implemented yet (pi-rs framework stage)".into()))
+		Err(crate::Error::Unsupported(
+			"stdio transport not implemented yet (pi-rs framework stage)".into(),
+		))
 	}
 
 	async fn close(&mut self) -> crate::Result<()> {

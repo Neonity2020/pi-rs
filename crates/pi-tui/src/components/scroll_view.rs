@@ -7,7 +7,9 @@ use crossterm::event::{Event, KeyCode, MouseButton, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text as RatatuiText};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
+use ratatui::widgets::{
+	Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+};
 
 use super::Component;
 
@@ -20,7 +22,11 @@ pub struct ScrollView {
 
 impl ScrollView {
 	pub fn new() -> Self {
-		Self { lines: Vec::new(), offset: 0, follow_bottom: true }
+		Self {
+			lines: Vec::new(),
+			offset: 0,
+			follow_bottom: true,
+		}
 	}
 
 	pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -79,17 +85,19 @@ impl Default for ScrollView {
 impl Component for ScrollView {
 	fn handle_event(&mut self, event: &Event) -> bool {
 		match event {
-			Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => match key.code {
-				KeyCode::PageUp => {
-					self.scroll_up(20);
-					true
+			Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+				match key.code {
+					KeyCode::PageUp => {
+						self.scroll_up(20);
+						true
+					}
+					KeyCode::PageDown => {
+						self.scroll_down(20, usize::MAX); // clamped at render
+						true
+					}
+					_ => false,
 				}
-				KeyCode::PageDown => {
-					self.scroll_down(20, usize::MAX); // clamped at render
-					true
-				}
-				_ => false,
-			},
+			}
 			Event::Mouse(mouse) => match mouse.kind {
 				MouseEventKind::ScrollUp => {
 					self.scroll_up(3);
@@ -119,8 +127,13 @@ impl Component for ScrollView {
 		}
 		self.offset = self.offset.min(max);
 
-		let visible: Vec<Line<'static>> =
-			self.lines.iter().skip(self.offset).take(viewport).cloned().collect();
+		let visible: Vec<Line<'static>> = self
+			.lines
+			.iter()
+			.skip(self.offset)
+			.take(viewport)
+			.cloned()
+			.collect();
 		Paragraph::new(RatatuiText::from(visible)).render(area, buf);
 
 		if max > 0 {

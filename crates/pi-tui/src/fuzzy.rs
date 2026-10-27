@@ -40,10 +40,16 @@ fn score_positions(text_lower: &[char], positions: &[usize]) -> f64 {
 
 fn match_query(normalized_query: &[char], text_lower: &[char]) -> FuzzyMatch {
 	if normalized_query.is_empty() {
-		return FuzzyMatch { matches: true, score: 0.0 };
+		return FuzzyMatch {
+			matches: true,
+			score: 0.0,
+		};
 	}
 	if normalized_query.len() > text_lower.len() {
-		return FuzzyMatch { matches: false, score: 0.0 };
+		return FuzzyMatch {
+			matches: false,
+			score: 0.0,
+		};
 	}
 
 	// Greedy alignment: each query character at its first occurrence after the
@@ -52,13 +58,21 @@ fn match_query(normalized_query: &[char], text_lower: &[char]) -> FuzzyMatch {
 	let mut last_match: Option<usize> = None;
 	for &qc in normalized_query {
 		let start = last_match.map_or(0, |l| l + 1);
-		let found = text_lower[start..].iter().position(|&c| c == qc).map(|p| p + start);
+		let found = text_lower[start..]
+			.iter()
+			.position(|&c| c == qc)
+			.map(|p| p + start);
 		match found {
 			Some(i) => {
 				positions.push(i);
 				last_match = Some(i);
 			}
-			None => return FuzzyMatch { matches: false, score: 0.0 },
+			None => {
+				return FuzzyMatch {
+					matches: false,
+					score: 0.0,
+				};
+			}
 		}
 	}
 
@@ -81,7 +95,10 @@ fn match_query(normalized_query: &[char], text_lower: &[char]) -> FuzzyMatch {
 		score -= 100.0;
 	}
 
-	FuzzyMatch { matches: true, score }
+	FuzzyMatch {
+		matches: true,
+		score,
+	}
 }
 
 fn find_subsequence(haystack: &[char], needle: &[char]) -> Option<usize> {
@@ -106,9 +123,15 @@ pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
 
 	// Swap a pure letters+digits query (letters then digits or vice versa) and
 	// retry, since model ids often reorder those segments.
-	let letters: String = query_lower.iter().filter(|c| c.is_ascii_lowercase()).collect();
+	let letters: String = query_lower
+		.iter()
+		.filter(|c| c.is_ascii_lowercase())
+		.collect();
 	let digits: String = query_lower.iter().filter(|c| c.is_ascii_digit()).collect();
-	let swapped = if !letters.is_empty() && !digits.is_empty() && letters.len() + digits.len() == query_lower.len() {
+	let swapped = if !letters.is_empty()
+		&& !digits.is_empty()
+		&& letters.len() + digits.len() == query_lower.len()
+	{
 		format!("{digits}{letters}")
 	} else {
 		String::new()
@@ -120,7 +143,10 @@ pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
 	if !swapped_match.matches {
 		return primary;
 	}
-	FuzzyMatch { matches: true, score: swapped_match.score + 5.0 }
+	FuzzyMatch {
+		matches: true,
+		score: swapped_match.score + 5.0,
+	}
 }
 
 /// Filter items by fuzzy match quality (best matches first). All
@@ -133,7 +159,10 @@ where
 	if query.is_empty() {
 		return items.into_iter().collect();
 	}
-	let tokens: Vec<&str> = query.split(|c: char| c.is_whitespace() || c == '/').filter(|t| !t.is_empty()).collect();
+	let tokens: Vec<&str> = query
+		.split(|c: char| c.is_whitespace() || c == '/')
+		.filter(|t| !t.is_empty())
+		.collect();
 	if tokens.is_empty() {
 		return items.into_iter().collect();
 	}
@@ -184,7 +213,7 @@ mod tests {
 
 	#[test]
 	fn tokenized_filter_requires_all_tokens() {
-		let items = vec!["openai/gpt-5.2", "anthropic/claude-opus"];
+		let items = ["openai/gpt-5.2", "anthropic/claude-opus"];
 		let got = fuzzy_filter(items.iter(), "openai 5", |s| s.to_string());
 		assert_eq!(got.len(), 1);
 		assert_eq!(*got[0], "openai/gpt-5.2");

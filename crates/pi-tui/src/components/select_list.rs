@@ -172,7 +172,8 @@ impl SelectList {
 		}
 
 		let max_visible = self.max_visible;
-		let start = (self.selected.saturating_sub(max_visible / 2)).min(self.filtered.len().saturating_sub(max_visible));
+		let start = (self.selected.saturating_sub(max_visible / 2))
+			.min(self.filtered.len().saturating_sub(max_visible));
 		let end = (start + max_visible).min(self.filtered.len());
 
 		let mut lines = Vec::new();
@@ -198,7 +199,10 @@ impl SelectList {
 			};
 
 			let mut spans = vec![cursor, marker];
-			spans.push(Span::styled(truncate(&item.label, PRIMARY_COLUMN_WIDTH), label_style));
+			spans.push(Span::styled(
+				truncate(&item.label, PRIMARY_COLUMN_WIDTH),
+				label_style,
+			));
 
 			let mut desc_parts: Vec<String> = Vec::new();
 			if let Some(desc) = &item.description {
@@ -210,7 +214,10 @@ impl SelectList {
 				let text = desc_parts.join(" ");
 				if !text.is_empty() {
 					spans.push(Span::raw(" ".repeat(PRIMARY_COLUMN_GAP)));
-					spans.push(Span::styled(truncate(&text, avail), Style::new().fg(theme.muted)));
+					spans.push(Span::styled(
+						truncate(&text, avail),
+						Style::new().fg(theme.muted),
+					));
 				}
 			}
 			lines.push(Line::from(spans));

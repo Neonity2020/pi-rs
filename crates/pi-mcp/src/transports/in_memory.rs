@@ -32,14 +32,21 @@ impl InMemoryTransport {
 		inbound: mpsc::UnboundedReceiver<String>,
 		outbound: mpsc::UnboundedSender<String>,
 	) -> Self {
-		Self { name: name.into(), inbound, outbound, closed: false }
+		Self {
+			name: name.into(),
+			inbound,
+			outbound,
+			closed: false,
+		}
 	}
 }
 
 #[async_trait]
 impl Transport for InMemoryTransport {
 	async fn send(&mut self, request: &JsonRpcRequest) -> crate::Result<()> {
-		self.outbound.send(super::encode_frame(request)).map_err(|_| crate::Error::Closed)
+		self.outbound
+			.send(super::encode_frame(request))
+			.map_err(|_| crate::Error::Closed)
 	}
 
 	async fn recv(&mut self) -> crate::Result<Option<TransportEvent>> {
@@ -48,7 +55,7 @@ impl Transport for InMemoryTransport {
 		}
 		match self.inbound.recv().await {
 			Some(line) => match super::parse_frame(&line) {
-				Ok(frame) => Ok(Some(TransportEvent::Message(frame))),
+				Ok(frame) => Ok(Some(TransportEvent::Message(Box::new(frame)))),
 				Err(e) => Ok(Some(TransportEvent::Error(e.to_string()))),
 			},
 			None => {
@@ -60,7 +67,9 @@ impl Transport for InMemoryTransport {
 
 	async fn close(&mut self) -> crate::Result<()> {
 		self.closed = true;
-		self.outbound.send("{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":null}".into()).ok();
+		self.outbound
+			.send("{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":null}".into())
+			.ok();
 		Ok(())
 	}
 
