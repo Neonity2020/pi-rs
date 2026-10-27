@@ -89,7 +89,7 @@ fn plan_response(model: &Model, context: &TranscriptContext) -> Vec<AssistantMes
 				tool_call_events(message, call)
 			} else {
 				let reply = format!(
-					"[mock provider] You said: {text}\n\nNo HTTP adapter is wired yet — configure a provider in ~/.pi-rs/agent/models.json once the anthropic/openai adapters land.\nTip: ask me to \"list files\" to see a tool call round-trip."
+					"[mock provider] You said: {text}\n\nSet OPENAI_API_KEY and select an OpenAI model for real responses.\nTip: ask me to \"list files\" to see a tool call round-trip."
 				);
 				let usage = fake_usage(reply.len());
 				let mut message = base_message(model, StopReason::Stop, usage);

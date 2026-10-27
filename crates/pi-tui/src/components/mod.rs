@@ -7,6 +7,7 @@
 pub mod editor;
 pub mod markdown;
 pub mod scroll_view;
+pub mod select_list;
 pub mod text;
 
 use crossterm::event::Event;
@@ -14,8 +15,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 pub use editor::{Editor, EditorEvent};
-pub use markdown::Markdown;
+pub use markdown::{markdown_lines, Markdown};
 pub use scroll_view::ScrollView;
+pub use select_list::{SelectAction, SelectItem, SelectList};
 pub use text::Text;
 
 /// Base component contract shared by all pi-tui widgets.

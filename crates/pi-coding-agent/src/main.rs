@@ -71,6 +71,11 @@ fn parse_thinking(value: Option<&str>) -> ThinkingLevel {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	match dotenvy::dotenv() {
+		Ok(_) => {}
+		Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+		Err(error) => return Err(error.into()),
+	}
 	let cli = Cli::parse();
 	let cwd = std::env::current_dir()?;
 
@@ -85,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 		None => registry.default_model(),
 	};
 	registry.set_default(&model);
-	let model_keys: Vec<String> = registry.models().iter().map(|m| m.key()).collect();
+	let models: Vec<pi_ai::Model> = registry.models().to_vec();
 
 	// Tools + agent + system prompt.
 	let tools = create_tools(&cwd);
@@ -125,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 	}
 
 	let theme = if cli.light { Theme::light() } else { Theme::dark() };
-	let mode = modes::interactive::InteractiveMode::new(handle, model_keys, cwd.display().to_string(), theme);
+	let mode = modes::interactive::InteractiveMode::new(handle, models, cwd.display().to_string(), theme);
 	mode.run(initial_prompt).await
 }
 

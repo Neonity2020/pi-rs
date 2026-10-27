@@ -70,10 +70,10 @@ impl ModelRegistry {
 			}
 		}
 
-		// Default selection: settings default > first env-keyed provider > mock.
+		// Explicit settings take priority; otherwise use the MiMo Token Plan.
 		let default_model = settings_default_model
 			.map(|s| s.to_string())
-			.or_else(|| first_env_model(&models));
+			.or_else(|| Some("mimo/mimo-v2.6-pro".to_string()));
 		if let Some(default_key) = default_model {
 			if let Some(model) = models.iter_mut().find(|m| matches_key(m, &default_key)) {
 				model.name = format!("{} (default)", model.name);
@@ -91,12 +91,7 @@ impl ModelRegistry {
 		if let Some(model) = self.models.iter().find(|m| m.name.ends_with("(default)")) {
 			return model.clone();
 		}
-		if let Some(key) = first_env_model(&self.models) {
-			if let Some(model) = self.find(&key) {
-				return model;
-			}
-		}
-		self.models.first().expect("registry always contains the mock model").clone()
+		self.find("mimo/mimo-v2.6-pro").expect("registry always contains the MiMo model")
 	}
 
 	/// Find by exact key (`provider/id`), id, or case-insensitive substring.
@@ -132,17 +127,14 @@ fn matches_key(model: &Model, key: &str) -> bool {
 	model.key() == key || (model.id == key) || format!("{}/{}", model.provider, model.id) == key
 }
 
-fn first_env_model(models: &[Model]) -> Option<String> {
-	if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-		return models.iter().find(|m| m.provider == "anthropic").map(|m| m.key());
-	}
-	if std::env::var_os("OPENAI_API_KEY").is_some() {
-		return models.iter().find(|m| m.provider == "openai").map(|m| m.key());
-	}
-	None
-}
-
 fn builtin_models() -> Vec<Model> {
+	let mimo = Model::new(
+		"mimo-v2.6-pro",
+		"MiMo V2.6 Pro (Token Plan CN)",
+		Api::OPENAI_COMPLETIONS,
+		"mimo",
+		std::env::var("MIMO_BASE_URL").unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string()),
+	);
 	let mut mock = Model::new(
 		"mock-echo",
 		"Mock (built-in)",
@@ -178,5 +170,5 @@ fn builtin_models() -> Vec<Model> {
 	gpt.context_window = 400_000;
 	gpt.max_tokens = 128_000;
 
-	vec![mock, sonnet, gpt]
+	vec![mimo, mock, sonnet, gpt]
 }

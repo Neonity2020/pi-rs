@@ -27,6 +27,31 @@ pub struct Theme {
 	pub accent: Color,
 	/// Dim metadata (timestamps, token counts).
 	pub muted: Color,
+	// Markdown element colors — counterpart of pi's `md*` theme tokens
+	// (system-theme.ts): mdHeading yellow, mdLink blue, mdCode/mdListBullet
+	// violet, mdCodeBlock green, quote/hr/borders dim.
+	/// Markdown headings (`mdHeading`).
+	pub md_heading: Color,
+	/// Markdown link text (`mdLink`).
+	pub md_link: Color,
+	/// Markdown link URL fallback (`mdLinkUrl`).
+	pub md_link_url: Color,
+	/// Markdown inline code (`mdCode`).
+	pub md_code: Color,
+	/// Markdown fenced code content (`mdCodeBlock`).
+	pub md_code_block: Color,
+	/// Markdown code fence lines (`mdCodeBlockBorder`).
+	pub md_code_block_border: Color,
+	/// Markdown blockquote text (`mdQuote`).
+	pub md_quote: Color,
+	/// Markdown blockquote border (`mdQuoteBorder`).
+	pub md_quote_border: Color,
+	/// Markdown horizontal rules (`mdHr`).
+	pub md_hr: Color,
+	/// Markdown list bullets/numbers (`mdListBullet`).
+	pub md_list_bullet: Color,
+	/// Background behind user messages (`userMessageBg`).
+	pub user_bg: Color,
 }
 
 impl Default for Theme {
@@ -49,6 +74,17 @@ impl Theme {
 			border: Color::DarkGray,
 			accent: Color::Cyan,
 			muted: Color::DarkGray,
+			md_heading: Color::Yellow,
+			md_link: Color::Blue,
+			md_link_url: Color::DarkGray,
+			md_code: Color::Magenta,
+			md_code_block: Color::Green,
+			md_code_block_border: Color::DarkGray,
+			md_quote: Color::Gray,
+			md_quote_border: Color::DarkGray,
+			md_hr: Color::DarkGray,
+			md_list_bullet: Color::Magenta,
+			user_bg: Color::Indexed(236),
 		}
 	}
 
@@ -65,6 +101,17 @@ impl Theme {
 			border: Color::Indexed(250),
 			accent: Color::Cyan,
 			muted: Color::Indexed(249),
+			md_heading: Color::Indexed(130),
+			md_link: Color::Blue,
+			md_link_url: Color::Indexed(244),
+			md_code: Color::Indexed(127),
+			md_code_block: Color::Indexed(28),
+			md_code_block_border: Color::Indexed(249),
+			md_quote: Color::Indexed(238),
+			md_quote_border: Color::Indexed(249),
+			md_hr: Color::Indexed(249),
+			md_list_bullet: Color::Indexed(127),
+			user_bg: Color::Indexed(254),
 		}
 	}
 }

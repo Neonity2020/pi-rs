@@ -129,6 +129,7 @@ async fn session_task(
 						let found = registry.lock().unwrap().find(&query);
 						match found {
 							Some(model) => {
+								agent.set_stream_fn(pi_ai::providers::stream_fn_for(&model));
 								agent.set_model(model.clone());
 								registry.lock().unwrap().set_default(&model);
 								let _ = session.append(&SessionEntry::ModelChange { model: model.key() });

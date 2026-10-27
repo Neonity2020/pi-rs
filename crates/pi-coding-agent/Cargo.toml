@@ -31,3 +31,4 @@ walkdir = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 unicode-width = { workspace = true }
+dotenvy = "0.15"

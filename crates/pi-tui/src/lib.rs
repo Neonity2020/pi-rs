@@ -8,6 +8,7 @@
 //! them onto ratatui widgets instead of reimplementing the render loop.
 
 pub mod components;
+pub mod fuzzy;
 pub mod keys;
 pub mod terminal;
 pub mod theme;
