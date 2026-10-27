@@ -11,7 +11,7 @@ use crate::protocol::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use crate::protocol::types::{
 	CallToolResult, InitializeParams, InitializeResult, ListToolsResult, ServerInfo,
 };
-use crate::transports::Transport;
+use crate::transports::{Transport, TransportEvent};
 
 /// Server entry from `mcp.json` or `pi.registerMcpServer()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +88,24 @@ impl McpClient {
 		self.transport.send(&notification).await?;
 		self.server_info = Some(result.clone());
 		Ok(result)
+	}
+
+	/// Close the transport gracefully and wait for the server to exit: the
+	/// stdio transport runs the spec shutdown ladder (stdin close → grace →
+	/// SIGTERM → SIGKILL of the server's process group) and reports `Closed`
+	/// when the child is reaped. Safe to call twice; later calls return
+	/// immediately. Dropping the client without `close()` still kills the
+	/// process group via the transport's orphan guard — just less gently.
+	pub async fn close(&mut self) -> crate::Result<()> {
+		self.transport.close().await?;
+		// Drain trailing frames until the supervisor reports `Closed` (or the
+		// channel ends), so callers can treat the server as fully reaped.
+		loop {
+			match self.transport.recv().await? {
+				None | Some(TransportEvent::Closed) => return Ok(()),
+				Some(TransportEvent::Message(_) | TransportEvent::Error(_)) => continue,
+			}
+		}
 	}
 
 	pub async fn list_tools(&mut self) -> crate::Result<Vec<McpToolInfo>> {
@@ -197,6 +215,43 @@ pub fn response_for(id: u64, result: Value) -> JsonRpcResponse {
 		id: Some(Value::from(id)),
 		result: Some(result),
 		error: None,
+	}
+}
+
+#[cfg(all(test, unix))]
+mod close_lifecycle {
+	use super::*;
+	use std::time::Duration;
+
+	use crate::transports::stdio::StdioTransport;
+
+	/// A server that answers `initialize` and exits on stdin EOF.
+	const INIT_ONLY_SERVER: &str = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1.0"}}}\n' "$id" ;;
+  esac
+done
+"#;
+
+	#[tokio::test]
+	async fn close_reaps_the_server_and_is_idempotent() {
+		let transport =
+			StdioTransport::new("sh", vec!["-c".into(), INIT_ONLY_SERVER.into()], vec![]);
+		let mut client = McpClient::new("fake", Box::new(transport));
+		client.initialize("0.1.0").await.unwrap();
+		// The server exits on stdin EOF inside the grace window, so close
+		// returns well before the SIGTERM/SIGKILL escalation.
+		tokio::time::timeout(Duration::from_secs(10), client.close())
+			.await
+			.expect("close must not hang")
+			.unwrap();
+		// A second close is a no-op.
+		tokio::time::timeout(Duration::from_secs(5), client.close())
+			.await
+			.expect("second close must not hang")
+			.unwrap();
 	}
 }
 
