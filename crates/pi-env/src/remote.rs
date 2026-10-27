@@ -16,7 +16,11 @@ pub struct RemoteEnv {
 
 impl RemoteEnv {
 	pub fn new(host: impl Into<String>) -> Self {
-		Self { host: host.into(), port: 22, user: None }
+		Self {
+			host: host.into(),
+			port: 22,
+			user: None,
+		}
 	}
 }
 

@@ -1,14 +1,14 @@
 //! Local environment — the default connection, executing on this machine.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use walkdir::WalkDir;
 
-use crate::connection::{
-	DirEntryInfo, EnvConnection, ExecOptions, ExecResult, FileType,
-};
+use crate::connection::{DirEntryInfo, EnvConnection, ExecOptions, ExecResult, FileType};
 use crate::errors::{Error, Result};
 
 #[derive(Default, Clone)]
@@ -18,7 +18,11 @@ pub struct LocalEnv {
 
 impl LocalEnv {
 	pub fn new() -> Self {
-		Self { cwd: std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default() }
+		Self {
+			cwd: std::env::current_dir()
+				.map(|p| p.to_string_lossy().into_owned())
+				.unwrap_or_default(),
+		}
 	}
 
 	pub fn with_cwd(cwd: impl Into<String>) -> Self {
@@ -36,6 +40,99 @@ fn file_type(path: &Path) -> FileType {
 	}
 }
 
+// Continue draining after the limit so a noisy child cannot block on a full pipe.
+const MAX_CAPTURE_BYTES: usize = 60_000;
+
+// After the shell exits, a descendant that inherited stdout/stderr keeps the
+// pipes open. Finalize once the streams have been silent for this long after
+// exit (re-armed on every chunk), instead of waiting for EOF forever. Mirrors
+// pi's `waitForChildProcess` (utils/child-process.ts, EXIT_STDIO_GRACE_MS).
+const EXIT_STDIO_GRACE_MS: u64 = 100;
+
+// Shared, per-stream output buffer so output already read survives finalizing
+// while a lingering descendant still holds the pipe.
+struct Capture {
+	buf: Arc<std::sync::Mutex<Vec<u8>>>,
+	truncated: Arc<std::sync::atomic::AtomicBool>,
+	task: tokio::task::JoinHandle<()>,
+}
+
+impl Capture {
+	fn start<R: AsyncRead + Unpin + Send + 'static>(mut reader: R) -> Self {
+		let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let task = {
+			let buf = buf.clone();
+			let truncated = truncated.clone();
+			tokio::spawn(async move {
+				let mut chunk = [0u8; 8192];
+				loop {
+					// Read errors (including our own task abort closing in) end
+					// the stream, matching the TS "destroy the stream" semantics.
+					match reader.read(&mut chunk).await {
+						Ok(0) | Err(_) => break,
+						Ok(n) => {
+							let mut guard = buf.lock().unwrap();
+							let keep = n.min(MAX_CAPTURE_BYTES.saturating_sub(guard.len()));
+							truncated.store(keep < n, std::sync::atomic::Ordering::Relaxed);
+							guard.extend_from_slice(&chunk[..keep]);
+						}
+					}
+				}
+			})
+		};
+		Self {
+			buf,
+			truncated,
+			task,
+		}
+	}
+
+	fn len(&self) -> usize {
+		self.buf.lock().unwrap().len()
+	}
+
+	fn is_finished(&self) -> bool {
+		self.task.is_finished()
+	}
+
+	/// Stop waiting for EOF and return the output gathered so far.
+	fn finish(self) -> String {
+		self.task.abort();
+		let bytes = std::mem::take(&mut *self.buf.lock().unwrap());
+		let mut text = String::from_utf8_lossy(&bytes).into_owned();
+		if self.truncated.load(std::sync::atomic::Ordering::Relaxed) {
+			text.push_str("\n… (output truncated at 60000 bytes)");
+		}
+		text
+	}
+}
+
+// Dropping the exec future (for example on cancellation) must also kill the
+// shell's descendants, not only the shell held by tokio's Child.
+//
+// Scope of the guarantee (pi-rs framework stage):
+// - Unix: the shell runs as the leader of a new process group; dropping the
+//   guard SIGKILLs every group member, so children and grandchildren that
+//   stay in the group are cleaned up. A descendant that deliberately escapes
+//   (calls setsid()/setpgid into a different group) is NOT covered.
+// - Other platforms: tokio's kill_on_drop kills only the direct shell; a
+//   detached descendant that survives it is not reaped.
+#[cfg(unix)]
+struct ProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+	fn drop(&mut self) {
+		if let Some(pid) = self.0 {
+			// The child was started as the leader of a new process group.
+			unsafe {
+				libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+			}
+		}
+	}
+}
+
 #[async_trait]
 impl EnvConnection for LocalEnv {
 	async fn exec(&self, command: &str, options: ExecOptions) -> Result<ExecResult> {
@@ -48,29 +145,72 @@ impl EnvConnection for LocalEnv {
 			cmd.env(key, value);
 		}
 		cmd.stdin(std::process::Stdio::null());
+		cmd.stdout(std::process::Stdio::piped());
+		cmd.stderr(std::process::Stdio::piped());
 		cmd.kill_on_drop(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::process::CommandExt;
+			cmd.as_std_mut().process_group(0);
+		}
+		let mut child = cmd.spawn()?;
+		#[cfg(unix)]
+		let mut group = ProcessGroup(child.id());
+		let stdout = child.stdout.take().expect("stdout is piped");
+		let stderr = child.stderr.take().expect("stderr is piped");
+		let out = Capture::start(stdout);
+		let err = Capture::start(stderr);
 
-		let child = cmd.output();
-		let output = match options.timeout_ms {
-			Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), child)
-				.await
-				.map_err(|_| Error::Timeout(timeout_ms))?,
-			None => child.await,
-		}?;
+		let status = match options.timeout_ms {
+			Some(timeout_ms) => {
+				match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+					Ok(status) => status?,
+					// Dropping `group` kills the whole process group (Unix).
+					Err(_elapsed) => return Err(Error::Timeout(timeout_ms)),
+				}
+			}
+			None => child.wait().await?,
+		};
+
+		// The shell has exited. Normally the pipes close with it; a descendant
+		// that inherited stdout/stderr keeps them open. Require one silent
+		// grace interval after exit (re-armed on each chunk) before finalizing
+		// with the output gathered so far, so an actively writing descendant
+		// is drained but an idle inherited handle cannot hang exec forever.
+		let grace = Duration::from_millis(EXIT_STDIO_GRACE_MS);
+		let mut deadline = tokio::time::Instant::now() + grace;
+		let mut last_len = out.len() + err.len();
+		while !(out.is_finished() && err.is_finished()) {
+			tokio::time::sleep_until(deadline).await;
+			let now = out.len() + err.len();
+			if now == last_len {
+				break;
+			}
+			last_len = now;
+			deadline = tokio::time::Instant::now() + grace;
+		}
+		let stdout = out.finish();
+		let stderr = err.finish();
+		#[cfg(unix)]
+		{
+			group.0 = None;
+		}
 
 		Ok(ExecResult {
-			stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-			stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-			exit_code: output.status.code(),
+			stdout,
+			stderr,
+			exit_code: status.code(),
 			timed_out: false,
 		})
 	}
 
 	async fn read_file(&self, path: &str) -> Result<String> {
-		tokio::fs::read_to_string(path).await.map_err(|e| match e.kind() {
-			std::io::ErrorKind::NotFound => Error::NotFound(path.to_string()),
-			_ => Error::Io(e),
-		})
+		tokio::fs::read_to_string(path)
+			.await
+			.map_err(|e| match e.kind() {
+				std::io::ErrorKind::NotFound => Error::NotFound(path.to_string()),
+				_ => Error::Io(e),
+			})
 	}
 
 	async fn write_file(&self, path: &str, contents: &str) -> Result<()> {
@@ -107,5 +247,117 @@ impl EnvConnection for LocalEnv {
 
 	fn describe(&self) -> String {
 		"local".to_string()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn limits_and_drains_both_output_streams() {
+		let result = LocalEnv::new()
+			.exec(
+				"yes x | head -c 200000; yes y | head -c 200000 >&2",
+				ExecOptions {
+					timeout_ms: Some(5000),
+					..Default::default()
+				},
+			)
+			.await
+			.unwrap();
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.stdout.len() < 61_000 && result.stdout.contains("output truncated"));
+		assert!(result.stderr.len() < 61_000 && result.stderr.contains("output truncated"));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn timeout_kills_descendants() {
+		let path = std::env::temp_dir().join(format!("pi-env-timeout-{}", std::process::id()));
+		let _ = std::fs::remove_file(&path);
+		let command = format!("(sleep 1; touch '{}') & wait", path.display());
+		let result = LocalEnv::new()
+			.exec(
+				&command,
+				ExecOptions {
+					timeout_ms: Some(100),
+					..Default::default()
+				},
+			)
+			.await;
+		assert!(matches!(result, Err(Error::Timeout(100))));
+		tokio::time::sleep(Duration::from_millis(1200)).await;
+		assert!(!path.exists(), "descendant survived timeout");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn dropping_exec_kills_descendants() {
+		let path = std::env::temp_dir().join(format!("pi-env-cancel-{}", std::process::id()));
+		let _ = std::fs::remove_file(&path);
+		let command = format!("(sleep 1; touch '{}') & wait", path.display());
+		{
+			let env = LocalEnv::new();
+			let exec = env.exec(&command, ExecOptions::default());
+			tokio::pin!(exec);
+			tokio::select! {
+				_ = &mut exec => panic!("command unexpectedly finished"),
+				_ = tokio::time::sleep(Duration::from_millis(100)) => {}
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(1200)).await;
+		assert!(!path.exists(), "descendant survived cancellation");
+	}
+
+	#[tokio::test]
+	async fn exec_returns_while_descendant_holds_pipes() {
+		// A backgrounded descendant inherits stdout/stderr; exec must still
+		// return promptly after the shell exits (post-exit silence grace).
+		let start = std::time::Instant::now();
+		let result = LocalEnv::new()
+			.exec("sleep 5 & echo started", ExecOptions::default())
+			.await
+			.unwrap();
+		assert!(
+			start.elapsed() < Duration::from_secs(3),
+			"exec hung on inherited pipes"
+		);
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.stdout.contains("started"));
+	}
+
+	#[tokio::test]
+	async fn post_exit_output_is_drained() {
+		// A descendant already writing when the shell exits keeps being read;
+		// the silence grace re-arms on every chunk instead of a fixed deadline.
+		let result = LocalEnv::new()
+			.exec(
+				"for i in 1 2 3 4 5 6; do echo $i; sleep 0.05; done & exit",
+				ExecOptions::default(),
+			)
+			.await
+			.unwrap();
+		let ticks = result
+			.stdout
+			.lines()
+			.filter(|l| l.parse::<u32>().is_ok())
+			.count();
+		assert!(ticks >= 3, "post-exit output truncated: {result:?}");
+	}
+
+	#[tokio::test]
+	async fn normal_command_skips_grace_when_pipes_close() {
+		// Streams end with the shell: no grace delay may be observable.
+		let start = std::time::Instant::now();
+		let result = LocalEnv::new()
+			.exec("echo done", ExecOptions::default())
+			.await
+			.unwrap();
+		assert_eq!(result.stdout.trim(), "done");
+		assert!(
+			start.elapsed() < Duration::from_millis(500),
+			"grace leaked into fast path"
+		);
 	}
 }
