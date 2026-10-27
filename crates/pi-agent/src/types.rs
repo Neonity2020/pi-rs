@@ -58,11 +58,17 @@ pub struct AgentToolResult {
 
 impl AgentToolResult {
 	pub fn text(s: impl Into<String>) -> Self {
-		Self { content: vec![TextOrImage::text(s)], ..Default::default() }
+		Self {
+			content: vec![TextOrImage::text(s)],
+			..Default::default()
+		}
 	}
 
 	pub fn error(s: impl Into<String>) -> Self {
-		Self { is_error: true, ..Self::text(s) }
+		Self {
+			is_error: true,
+			..Self::text(s)
+		}
 	}
 }
 
@@ -161,7 +167,8 @@ pub enum AgentTurnDecision {
 /// (`agent-loop.ts`); hooks must not panic.
 pub type BeforeToolCallFn =
 	Arc<dyn Fn(BeforeToolCallContext<'_>) -> BeforeToolCallResult + Send + Sync>;
-pub type AfterToolCallFn = Arc<dyn Fn(AfterToolCallContext<'_>) -> AfterToolCallResult + Send + Sync>;
+pub type AfterToolCallFn =
+	Arc<dyn Fn(AfterToolCallContext<'_>) -> AfterToolCallResult + Send + Sync>;
 
 /// Input accepted by [`crate::Agent::prompt`].
 pub enum PromptInput {
@@ -171,7 +178,9 @@ pub enum PromptInput {
 
 impl From<&str> for PromptInput {
 	fn from(s: &str) -> Self {
-		PromptInput::Text { text: s.to_string() }
+		PromptInput::Text {
+			text: s.to_string(),
+		}
 	}
 }
 
@@ -256,7 +265,10 @@ pub struct PendingMessageQueue {
 
 impl PendingMessageQueue {
 	pub fn new(mode: QueueMode) -> Self {
-		Self { mode, messages: Vec::new() }
+		Self {
+			mode,
+			messages: Vec::new(),
+		}
 	}
 
 	pub fn enqueue(&mut self, message: Message) {
@@ -314,7 +326,13 @@ pub const EMPTY_USAGE: Usage = Usage {
 
 /// Unknown-model placeholder mirroring the TS pi's `DEFAULT_MODEL`.
 pub fn default_model() -> Model {
-	Model::new("unknown", "unknown", pi_ai::Api::new("unknown"), "unknown", "")
+	Model::new(
+		"unknown",
+		"unknown",
+		pi_ai::Api::new("unknown"),
+		"unknown",
+		"",
+	)
 }
 
 /// Extract the tool-call blocks from an assistant message.

@@ -16,13 +16,13 @@ pub mod types;
 
 pub use model::{Api, InputModality, Model, ModelCost};
 pub use stream::{
-	normalize_context, AssistantMessageEvent, AssistantMessageEventStream, StreamFn, StreamOptions,
-	TranscriptContext,
+	AssistantMessageEvent, AssistantMessageEventStream, StreamFn, StreamOptions, TranscriptContext,
+	normalize_context,
 };
 pub use types::{
 	AssistantContent, AssistantMessage, Cost, ImageContent, JsonValue, Message, StopReason,
-	SystemContent, SystemMessage, TextContent, TextOrImage, ThinkingContent, ThinkingLevel,
-	Tool, ToolCall, ToolReference, ToolResultMessage, Usage, UserContent, UserMessage,
+	SystemContent, SystemMessage, TextContent, TextOrImage, ThinkingContent, ThinkingLevel, Tool,
+	ToolCall, ToolReference, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 
 /// Crate-wide error type.

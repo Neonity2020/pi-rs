@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::Model;
 use crate::types::{
-	AssistantMessage, Message, StopReason, SystemMessage, ThinkingLevel, Tool, TextContent,
+	AssistantMessage, Message, StopReason, SystemMessage, TextContent, ThinkingLevel, Tool,
 	ToolCall,
 };
 
@@ -33,9 +33,17 @@ pub struct TranscriptContext {
 /// Folds the `system_prompt` + `tools` shorthand into a leading system message,
 /// mirroring `normalizeContext()`. If the transcript already begins with a
 /// system message it is replaced.
-pub fn normalize_context(system_prompt: Option<&str>, tools: &[Tool], messages: Vec<Message>) -> TranscriptContext {
+pub fn normalize_context(
+	system_prompt: Option<&str>,
+	tools: &[Tool],
+	messages: Vec<Message>,
+) -> TranscriptContext {
 	let mut leading = SystemMessage::prompt(system_prompt.unwrap_or(""));
-	leading.tools_added = if tools.is_empty() { None } else { Some(tools.to_vec()) };
+	leading.tools_added = if tools.is_empty() {
+		None
+	} else {
+		Some(tools.to_vec())
+	};
 
 	let mut out = Vec::with_capacity(messages.len() + 1);
 	out.push(Message::System(leading));
@@ -176,14 +184,19 @@ pub struct TextStreamBuilder {
 
 impl TextStreamBuilder {
 	pub fn new(message: AssistantMessage) -> Self {
-		Self { message, text: String::new() }
+		Self {
+			message,
+			text: String::new(),
+		}
 	}
 
 	pub fn start(mut self) -> Self {
-		self.message.content.push(crate::types::AssistantContent::Text(TextContent {
-			text: String::new(),
-			text_signature: None,
-		}));
+		self.message
+			.content
+			.push(crate::types::AssistantContent::Text(TextContent {
+				text: String::new(),
+				text_signature: None,
+			}));
 		self
 	}
 

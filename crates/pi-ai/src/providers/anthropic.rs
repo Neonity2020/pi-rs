@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use crate::model::Model;
-use crate::stream::{AssistantMessageEvent, AssistantMessageEventStream, StreamFn, StreamOptions, TranscriptContext};
+use crate::stream::{
+	AssistantMessageEvent, AssistantMessageEventStream, StreamFn, StreamOptions, TranscriptContext,
+};
 use crate::types::{AssistantMessage, StopReason};
 
 pub fn stream_fn() -> StreamFn {

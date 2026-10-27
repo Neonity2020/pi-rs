@@ -101,7 +101,10 @@ pub enum TextOrImage {
 
 impl TextOrImage {
 	pub fn text(s: impl Into<String>) -> Self {
-		TextOrImage::Text(TextContent { text: s.into(), text_signature: None })
+		TextOrImage::Text(TextContent {
+			text: s.into(),
+			text_signature: None,
+		})
 	}
 
 	pub fn text_content(&self) -> Option<&str> {
@@ -218,8 +221,16 @@ pub struct Tool {
 }
 
 impl Tool {
-	pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: JsonValue) -> Self {
-		Self { name: name.into(), description: description.into(), parameters }
+	pub fn new(
+		name: impl Into<String>,
+		description: impl Into<String>,
+		parameters: JsonValue,
+	) -> Self {
+		Self {
+			name: name.into(),
+			description: description.into(),
+			parameters,
+		}
 	}
 }
 
@@ -274,7 +285,10 @@ pub struct UserMessage {
 
 impl UserMessage {
 	pub fn text(s: impl Into<String>) -> Self {
-		Self { content: UserContent::text(s), timestamp: now_ms() }
+		Self {
+			content: UserContent::text(s),
+			timestamp: now_ms(),
+		}
 	}
 }
 
@@ -311,9 +325,16 @@ pub struct AssistantMessage {
 
 impl AssistantMessage {
 	/// Empty assistant message carrying an error/abort stop reason.
-	pub fn error(model: &crate::model::Model, stop_reason: StopReason, message: impl Into<String>) -> Self {
+	pub fn error(
+		model: &crate::model::Model,
+		stop_reason: StopReason,
+		message: impl Into<String>,
+	) -> Self {
 		Self {
-			content: vec![AssistantContent::Text(TextContent { text: String::new(), text_signature: None })],
+			content: vec![AssistantContent::Text(TextContent {
+				text: String::new(),
+				text_signature: None,
+			})],
 			api: model.api.to_string(),
 			provider: model.provider.clone(),
 			model: model.id.clone(),

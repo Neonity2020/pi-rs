@@ -1,0 +1,2 @@
+# The codebase uses hard tabs (TS/Go heritage of the pi upstream).
+hard_tabs = true

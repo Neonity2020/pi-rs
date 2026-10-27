@@ -13,10 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use pi_ai::{Message, Model, StreamFn, ThinkingLevel};
 
-use crate::agent_loop::{run_agent_loop, AgentLoopRun, LoopOptions};
+use crate::agent_loop::{AgentLoopRun, LoopOptions, run_agent_loop};
 use crate::types::{
-	default_model, AgentEvent, AgentTool, PendingMessageQueue, PromptInput, QueueMode,
-	ToolExecutionMode, DEFAULT_TOOL_EXECUTION, EMPTY_USAGE,
+	AgentEvent, AgentTool, DEFAULT_TOOL_EXECUTION, EMPTY_USAGE, PendingMessageQueue, PromptInput,
+	QueueMode, ToolExecutionMode, default_model,
 };
 
 /// Options for constructing an [`Agent`] — mirrors `AgentOptions`.
@@ -96,7 +96,8 @@ impl Agent {
 		let mut messages = options.initial_messages.clone();
 		let needs_leading_system = !matches!(messages.first(), Some(Message::System(_)));
 		if needs_leading_system {
-			let mut leading = pi_ai::SystemMessage::prompt(options.system_prompt.clone().unwrap_or_default());
+			let mut leading =
+				pi_ai::SystemMessage::prompt(options.system_prompt.clone().unwrap_or_default());
 			if !options.tools.is_empty() {
 				leading.tools_added =
 					Some(options.tools.iter().map(|t| t.to_declaration()).collect());
@@ -123,7 +124,9 @@ impl Agent {
 			active_run: Mutex::new(None),
 		};
 
-		Self { inner: Arc::new(inner) }
+		Self {
+			inner: Arc::new(inner),
+		}
 	}
 
 	/// Subscribe to agent lifecycle events (`Agent::subscribe` in the TS pi).
@@ -137,7 +140,14 @@ impl Agent {
 		AgentSnapshot {
 			model: self.inner.model.read().unwrap().clone(),
 			thinking_level: *self.inner.thinking_level.read().unwrap(),
-			tool_names: self.inner.tools.read().unwrap().iter().map(|t| t.name().to_string()).collect(),
+			tool_names: self
+				.inner
+				.tools
+				.read()
+				.unwrap()
+				.iter()
+				.map(|t| t.name().to_string())
+				.collect(),
 			system_prompt: replay_system_prompt(&messages),
 			streaming_message: self.inner.streaming.read().unwrap().clone(),
 			queued_steering: self.inner.steering.lock().unwrap().len(),
@@ -174,7 +184,10 @@ impl Agent {
 			PromptInput::Text { text } => vec![Message::user(text)],
 			PromptInput::Messages(messages) => messages,
 		};
-		let opts = LoopOptions { signal: token, skip_initial_steering_poll: false };
+		let opts = LoopOptions {
+			signal: token,
+			skip_initial_steering_poll: false,
+		};
 		let result = self.run_loop(messages, opts).await;
 		self.end_run();
 		result
@@ -198,20 +211,28 @@ impl Agent {
 		if last_role == "assistant" {
 			let steering = self.inner.steering.lock().unwrap().drain();
 			if !steering.is_empty() {
-				let opts = LoopOptions { signal: token, skip_initial_steering_poll: true };
+				let opts = LoopOptions {
+					signal: token,
+					skip_initial_steering_poll: true,
+				};
 				let result = self.run_loop(steering, opts).await;
 				self.end_run();
 				return result;
 			}
 			let follow_ups = self.inner.follow_up.lock().unwrap().drain();
 			if !follow_ups.is_empty() {
-				let opts = LoopOptions { signal: token, skip_initial_steering_poll: false };
+				let opts = LoopOptions {
+					signal: token,
+					skip_initial_steering_poll: false,
+				};
 				let result = self.run_loop(follow_ups, opts).await;
 				self.end_run();
 				return result;
 			}
 			self.end_run();
-			return Err(anyhow::anyhow!("cannot continue from message role: assistant"));
+			return Err(anyhow::anyhow!(
+				"cannot continue from message role: assistant"
+			));
 		}
 
 		if last_role == "system" {
@@ -219,7 +240,10 @@ impl Agent {
 			return Err(anyhow::anyhow!("no messages to continue from"));
 		}
 
-		let opts = LoopOptions { signal: token, skip_initial_steering_poll: false };
+		let opts = LoopOptions {
+			signal: token,
+			skip_initial_steering_poll: false,
+		};
 		let result = self.run_loop(Vec::new(), opts).await;
 		self.end_run();
 		result
@@ -302,7 +326,13 @@ impl Agent {
 	}
 
 	pub fn tool_names(&self) -> Vec<String> {
-		self.inner.tools.read().unwrap().iter().map(|t| t.name().to_string()).collect()
+		self.inner
+			.tools
+			.read()
+			.unwrap()
+			.iter()
+			.map(|t| t.name().to_string())
+			.collect()
 	}
 
 	pub fn session_id(&self) -> Option<String> {
@@ -350,7 +380,11 @@ impl Agent {
 		}
 	}
 
-	async fn run_loop(&self, prompt_messages: Vec<Message>, opts: LoopOptions) -> anyhow::Result<()> {
+	async fn run_loop(
+		&self,
+		prompt_messages: Vec<Message>,
+		opts: LoopOptions,
+	) -> anyhow::Result<()> {
 		let run = self.build_run();
 		let token = opts.signal.clone();
 		let result = run_agent_loop(&run, prompt_messages, opts).await;
@@ -364,7 +398,11 @@ impl Agent {
 	/// observe the normal event sequence.
 	async fn handle_run_failure(&self, error: &anyhow::Error, aborted: bool) {
 		let model = self.inner.model.read().unwrap().clone();
-		let stop_reason = if aborted { pi_ai::StopReason::Aborted } else { pi_ai::StopReason::Error };
+		let stop_reason = if aborted {
+			pi_ai::StopReason::Aborted
+		} else {
+			pi_ai::StopReason::Error
+		};
 		let failure = pi_ai::AssistantMessage {
 			content: vec![pi_ai::AssistantContent::Text(pi_ai::TextContent {
 				text: String::new(),
@@ -388,10 +426,19 @@ impl Agent {
 		let message = Message::Assistant(failure);
 		self.inner.messages.write().unwrap().push(message.clone());
 		let tx = &self.inner.event_tx;
-		let _ = tx.send(AgentEvent::MessageStart { message: message.clone() });
-		let _ = tx.send(AgentEvent::MessageEnd { message: message.clone() });
-		let _ = tx.send(AgentEvent::TurnEnd { message: message.clone(), tool_results: Vec::new() });
-		let _ = tx.send(AgentEvent::AgentEnd { messages: vec![message] });
+		let _ = tx.send(AgentEvent::MessageStart {
+			message: message.clone(),
+		});
+		let _ = tx.send(AgentEvent::MessageEnd {
+			message: message.clone(),
+		});
+		let _ = tx.send(AgentEvent::TurnEnd {
+			message: message.clone(),
+			tool_results: Vec::new(),
+		});
+		let _ = tx.send(AgentEvent::AgentEnd {
+			messages: vec![message],
+		});
 	}
 }
 

@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::model::Model;
 use crate::stream::{AssistantMessageEvent, StreamOptions, TranscriptContext};
 use crate::types::{
-	now_ms, AssistantContent, AssistantMessage, StopReason, TextContent, ToolCall, Usage,
+	AssistantContent, AssistantMessage, StopReason, TextContent, ToolCall, Usage, now_ms,
 };
 
 const CHUNK_CHARS: usize = 24;
@@ -37,9 +37,13 @@ pub fn stream(
 			if signal.is_cancelled() {
 				// Emit a single abort event, then terminate.
 				if i != usize::MAX {
-					let error = AssistantMessage::error(&model, cancelled_reason, "aborted by user");
+					let error =
+						AssistantMessage::error(&model, cancelled_reason, "aborted by user");
 					return Some((
-						AssistantMessageEvent::Error { reason: cancelled_reason, error },
+						AssistantMessageEvent::Error {
+							reason: cancelled_reason,
+							error,
+						},
 						(events, usize::MAX),
 					));
 				}
@@ -52,7 +56,8 @@ pub fn stream(
 			i += 1;
 			if matches!(
 				event,
-				AssistantMessageEvent::TextDelta { .. } | AssistantMessageEvent::ThinkingDelta { .. }
+				AssistantMessageEvent::TextDelta { .. }
+					| AssistantMessageEvent::ThinkingDelta { .. }
 			) {
 				tokio::time::sleep(Duration::from_millis(DELTA_DELAY_MS)).await;
 			}
@@ -68,7 +73,10 @@ fn plan_response(model: &Model, context: &TranscriptContext) -> Vec<AssistantMes
 		Some(crate::types::Message::ToolResult(result)) => {
 			let text = result.text();
 			let preview = truncate_chars(&text, 600);
-			let reply = format!("[mock provider] The `{}` tool returned:\n\n{preview}", result.tool_name);
+			let reply = format!(
+				"[mock provider] The `{}` tool returned:\n\n{preview}",
+				result.tool_name
+			);
 			let usage = fake_usage(reply.len());
 			let mut message = base_message(model, StopReason::Stop, usage);
 			text_events(&mut message, &reply)
@@ -76,7 +84,11 @@ fn plan_response(model: &Model, context: &TranscriptContext) -> Vec<AssistantMes
 		Some(crate::types::Message::User(user)) => {
 			let text = user.content.as_text();
 			let lower = text.to_lowercase();
-			if lower.contains("ls") || lower.contains("list") || text.contains("目录") || text.contains("列表") {
+			if lower.contains("ls")
+				|| lower.contains("list")
+				|| text.contains("目录")
+				|| text.contains("列表")
+			{
 				let call = ToolCall {
 					id: format!("call-mock-{}", now_ms()),
 					name: "ls".to_string(),
@@ -147,16 +159,27 @@ fn fake_usage(output_len: usize) -> Usage {
 fn text_events(message: &mut AssistantMessage, text: &str) -> Vec<AssistantMessageEvent> {
 	let mut events = Vec::new();
 	let mut partial = message.clone();
-	partial.content = vec![AssistantContent::Text(TextContent { text: String::new(), text_signature: None })];
-	events.push(AssistantMessageEvent::Start { partial: partial.clone() });
-	events.push(AssistantMessageEvent::TextStart { content_index: 0, partial: partial.clone() });
+	partial.content = vec![AssistantContent::Text(TextContent {
+		text: String::new(),
+		text_signature: None,
+	})];
+	events.push(AssistantMessageEvent::Start {
+		partial: partial.clone(),
+	});
+	events.push(AssistantMessageEvent::TextStart {
+		content_index: 0,
+		partial: partial.clone(),
+	});
 
 	let chars: Vec<char> = text.chars().collect();
 	let mut acc = String::new();
 	for chunk in chars.chunks(CHUNK_CHARS) {
 		let delta: String = chunk.iter().collect();
 		acc.push_str(&delta);
-		partial.content = vec![AssistantContent::Text(TextContent { text: acc.clone(), text_signature: None })];
+		partial.content = vec![AssistantContent::Text(TextContent {
+			text: acc.clone(),
+			text_signature: None,
+		})];
 		events.push(AssistantMessageEvent::TextDelta {
 			content_index: 0,
 			delta,
@@ -164,7 +187,10 @@ fn text_events(message: &mut AssistantMessage, text: &str) -> Vec<AssistantMessa
 		});
 	}
 
-	partial.content = vec![AssistantContent::Text(TextContent { text: text.to_string(), text_signature: None })];
+	partial.content = vec![AssistantContent::Text(TextContent {
+		text: text.to_string(),
+		text_signature: None,
+	})];
 	events.push(AssistantMessageEvent::TextEnd {
 		content_index: 0,
 		content: text.to_string(),
@@ -184,8 +210,13 @@ fn tool_call_events(mut message: AssistantMessage, call: ToolCall) -> Vec<Assist
 	let mut events = Vec::new();
 	let mut partial = message.clone();
 	partial.content = vec![AssistantContent::ToolCall(call.clone())];
-	events.push(AssistantMessageEvent::Start { partial: partial.clone() });
-	events.push(AssistantMessageEvent::ToolCallStart { content_index: 0, partial: partial.clone() });
+	events.push(AssistantMessageEvent::Start {
+		partial: partial.clone(),
+	});
+	events.push(AssistantMessageEvent::ToolCallStart {
+		content_index: 0,
+		partial: partial.clone(),
+	});
 	events.push(AssistantMessageEvent::ToolCallEnd {
 		content_index: 0,
 		tool_call: call,

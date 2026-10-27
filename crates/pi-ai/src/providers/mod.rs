@@ -23,8 +23,17 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {
-			let error = crate::types::AssistantMessage::error(model, crate::types::StopReason::Error, format!("unsupported provider API: {}", model.api));
-			Box::pin(futures::stream::iter(vec![crate::stream::AssistantMessageEvent::Error { reason: crate::types::StopReason::Error, error }]))
+			let error = crate::types::AssistantMessage::error(
+				model,
+				crate::types::StopReason::Error,
+				format!("unsupported provider API: {}", model.api),
+			);
+			Box::pin(futures::stream::iter(vec![
+				crate::stream::AssistantMessageEvent::Error {
+					reason: crate::types::StopReason::Error,
+					error,
+				},
+			]))
 		}),
 	}
 }

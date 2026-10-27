@@ -26,8 +26,8 @@ use pi_ai::{
 use pi_ai::{AssistantMessageEvent, StreamFn, StreamOptions};
 
 use crate::types::{
-	assistant_tool_calls, is_hard_exit, AgentEvent, AgentTool, AgentToolResult,
-	PendingMessageQueue, ToolUpdate,
+	AgentEvent, AgentTool, AgentToolResult, PendingMessageQueue, ToolUpdate, assistant_tool_calls,
+	is_hard_exit,
 };
 
 /// Converts agent messages to LLM-compatible messages before each call.
@@ -64,7 +64,10 @@ pub struct LoopOptions {
 
 impl Default for LoopOptions {
 	fn default() -> Self {
-		Self { signal: CancellationToken::new(), skip_initial_steering_poll: false }
+		Self {
+			signal: CancellationToken::new(),
+			skip_initial_steering_poll: false,
+		}
 	}
 }
 
@@ -92,7 +95,12 @@ fn append_with_events(run: &AgentLoopRun, message: Message) {
 		let mut messages = run.messages.write().unwrap();
 		messages.push(message.clone());
 	}
-	emit(&run.event_tx, AgentEvent::MessageStart { message: message.clone() });
+	emit(
+		&run.event_tx,
+		AgentEvent::MessageStart {
+			message: message.clone(),
+		},
+	);
 	emit(&run.event_tx, AgentEvent::MessageEnd { message });
 }
 
@@ -131,8 +139,11 @@ pub async fn run_agent_loop(
 			}
 		};
 
-		let reasoning =
-			if run.thinking_level == ThinkingLevel::Off { None } else { Some(run.thinking_level) };
+		let reasoning = if run.thinking_level == ThinkingLevel::Off {
+			None
+		} else {
+			Some(run.thinking_level)
+		};
 		let stream_options = StreamOptions {
 			api_key: None, // resolved by the stream fn via provider config
 			temperature: None,
@@ -142,7 +153,9 @@ pub async fn run_agent_loop(
 			session_id: run.session_id.clone(),
 		};
 
-		let context = TranscriptContext { messages: transcript };
+		let context = TranscriptContext {
+			messages: transcript,
+		};
 		let mut stream = (run.stream_fn)(&run.model, &context, stream_options);
 
 		let mut final_message: Option<AssistantMessage> = None;
@@ -181,7 +194,11 @@ pub async fn run_agent_loop(
 
 		let assistant = final_message.unwrap_or_else(|| {
 			// Protocol violation: stream ended without Done/Error.
-			AssistantMessage::error(&run.model, StopReason::Error, "stream ended without a terminal event")
+			AssistantMessage::error(
+				&run.model,
+				StopReason::Error,
+				"stream ended without a terminal event",
+			)
 		});
 		*run.streaming.write().unwrap() = None;
 
@@ -199,7 +216,10 @@ pub async fn run_agent_loop(
 		let mut terminate_batch = false;
 
 		if has_tool_calls {
-			let tool_calls: Vec<_> = assistant_tool_calls(&assistant).into_iter().cloned().collect();
+			let tool_calls: Vec<_> = assistant_tool_calls(&assistant)
+				.into_iter()
+				.cloned()
+				.collect();
 			for tool_call in &tool_calls {
 				let started = Instant::now();
 				emit(
@@ -215,8 +235,13 @@ pub async fn run_agent_loop(
 				let result = match tool {
 					Some(tool) => {
 						let on_update: Option<ToolUpdate> = None; // wired with streaming tool output
-						tool.execute(&tool_call.id, tool_call.arguments.clone(), signal.clone(), on_update)
-							.await
+						tool.execute(
+							&tool_call.id,
+							tool_call.arguments.clone(),
+							signal.clone(),
+							on_update,
+						)
+						.await
 					}
 					None => AgentToolResult::error(format!(
 						"unknown tool: {} (not in the active tool set)",
@@ -251,7 +276,12 @@ pub async fn run_agent_loop(
 				};
 				let message = Message::ToolResult(result_message.clone());
 				run.messages.write().unwrap().push(message.clone());
-				emit(&run.event_tx, AgentEvent::MessageStart { message: message.clone() });
+				emit(
+					&run.event_tx,
+					AgentEvent::MessageStart {
+						message: message.clone(),
+					},
+				);
 				emit(&run.event_tx, AgentEvent::MessageEnd { message });
 				tool_results.push(result_message);
 			}
