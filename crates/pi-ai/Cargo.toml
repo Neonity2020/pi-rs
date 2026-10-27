@@ -8,7 +8,8 @@ license.workspace = true
 [dependencies]
 pi-telemetry = { workspace = true }
 
-tokio = { workspace = true }
+# "net" is only exercised by the integration tests' local mock SSE server.
+tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
