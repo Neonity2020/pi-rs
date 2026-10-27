@@ -262,6 +262,19 @@ pub fn read_session_messages(dir: &std::path::Path) -> Vec<Message> {
 		.collect()
 }
 
+/// Messages to seed a resumed agent (`--continue` / `--resume`): the persisted
+/// transcript minus system messages. The persist cursor starts past the leading
+/// system message, so the log never contains one; on resume [`Agent::new`]
+/// (pi-agent) seeds a fresh system message from the current environment —
+/// cwd, tools, freshly built prompt — mirroring the upstream
+/// `_rebuildSystemPrompt` behaviour in `core/agent-session.ts`.
+pub fn restore_initial_messages(dir: &std::path::Path) -> Vec<Message> {
+	read_session_messages(dir)
+		.into_iter()
+		.filter(|message| !matches!(message, Message::System(_)))
+		.collect()
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -269,17 +282,20 @@ mod tests {
 	use std::time::Duration;
 
 	fn mock_agent() -> Agent {
-		let stream = Arc::new(
+		Agent::new(AgentOptions {
+			stream_fn: Some(agent_stream_fn()),
+			..Default::default()
+		})
+	}
+
+	fn agent_stream_fn() -> pi_ai::StreamFn {
+		Arc::new(
 			|model: &pi_ai::Model,
 			 context: &pi_ai::TranscriptContext,
 			 options: pi_ai::StreamOptions| {
 				pi_ai::providers::mock::stream(model, context, options)
 			},
-		);
-		Agent::new(AgentOptions {
-			stream_fn: Some(stream),
-			..Default::default()
-		})
+		)
 	}
 
 	#[tokio::test]
@@ -458,6 +474,75 @@ mod tests {
 			"run must survive a broken session log"
 		);
 		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// Resume flow as main.rs drives it: seed `initial_messages` from the
+	/// previous log, reopen the directory, and keep appending.
+	#[tokio::test]
+	async fn resumed_session_appends_without_repersisting_old_messages() {
+		let dir = temp_session_dir("resume");
+
+		// First run: persist one exchange, then "exit".
+		{
+			let agent = Agent::new(AgentOptions {
+				system_prompt: Some("first run".into()),
+				stream_fn: Some(agent_stream_fn()),
+				..AgentOptions::default()
+			});
+			let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+			let session = SessionManager::open(&dir).unwrap();
+			let mut handle = spawn_agent_session(agent, session, registry);
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt {
+					text: "old question".into(),
+				})
+				.unwrap();
+			wait_for_agent_ends(&mut handle, 1).await;
+			handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		}
+
+		// Resumed run: restored transcript + fresh system prompt.
+		let restored = restore_initial_messages(&dir);
+		let roles: Vec<&str> = restored.iter().map(Message::role).collect();
+		assert_eq!(roles, ["user", "assistant"]);
+		let resumed = Agent::new(AgentOptions {
+			system_prompt: Some("resumed run".into()),
+			stream_fn: Some(agent_stream_fn()),
+			initial_messages: restored,
+			..AgentOptions::default()
+		});
+		// The fresh system message is seeded ahead of the restored transcript.
+		assert_eq!(resumed.snapshot().messages[0].role(), "system");
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle =
+			spawn_agent_session(resumed, SessionManager::open(&dir).unwrap(), registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "new question".into(),
+			})
+			.unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+
+		let messages = read_session_messages(&dir);
+		let roles: Vec<&str> = messages.iter().map(Message::role).collect();
+		assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+		// Old messages appear exactly once (never re-persisted), new ones append.
+		let users: Vec<String> = messages
+			.iter()
+			.filter_map(|m| match m {
+				Message::User(u) => Some(u.content.as_text().to_string()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(users, ["old question", "new question"]);
+		let text = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		assert_eq!(text.matches("\"role\":\"user\"").count(), 2);
+		// The fresh system prompt is never persisted.
+		assert!(!text.contains("resumed run"));
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 }

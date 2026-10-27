@@ -177,22 +177,121 @@ impl SessionManager {
 
 	/// List recent sessions (newest first) with their entry counts.
 	pub fn list_recent(limit: usize) -> Vec<(PathBuf, u64)> {
-		let root = config::sessions_dir();
-		let Ok(entries) = std::fs::read_dir(&root) else {
-			return Vec::new();
-		};
-		let mut sessions: Vec<(PathBuf, u64)> = entries
-			.flatten()
-			.filter(|e| e.path().is_dir())
-			.map(|e| {
-				let entries = count_entries(&e.path()).unwrap_or(0);
-				(e.path(), entries)
-			})
-			.collect();
-		sessions.sort_by(|a, b| b.0.cmp(&a.0));
-		sessions.truncate(limit);
-		sessions
+		list_recent_in(&config::sessions_dir(), limit)
 	}
+}
+
+/// Which session a resume flag names — mirrors the `--continue`/`--resume`
+/// selection in `pi/packages/coding-agent/src/main.ts` (`parsed.continue` /
+/// `parsed.resume` + `resolveSessionPath`), reduced to this port's flat
+/// sessions root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSelector {
+	/// `--continue`: the most recent session.
+	Recent,
+	/// `--resume <id|path>`: a session id (directory name under the sessions
+	/// root, exact or unique prefix) or a path to the session directory.
+	ByIdOrPath(String),
+}
+
+/// Locate the session directory a resume selector names.
+pub fn resolve_session(selector: &SessionSelector) -> Result<PathBuf, String> {
+	resolve_session_in(&config::sessions_dir(), selector)
+}
+
+/// Root-parameterized [`resolve_session`] (tests inject a temporary root).
+pub fn resolve_session_in(root: &Path, selector: &SessionSelector) -> Result<PathBuf, String> {
+	match selector {
+		SessionSelector::Recent => list_recent_in(root, 1)
+			.into_iter()
+			.next()
+			.map(|(dir, _)| dir)
+			.ok_or_else(|| "no previous session to continue".to_string()),
+		SessionSelector::ByIdOrPath(arg) => {
+			let candidate = PathBuf::from(arg);
+			if candidate.is_dir() {
+				return Ok(candidate);
+			}
+			// Exact id (directory name), then a unique prefix match.
+			let exact = root.join(arg);
+			if exact.is_dir() {
+				return Ok(exact);
+			}
+			let matches = prefix_matches(root, arg);
+			match matches.as_slice() {
+				[only] => Ok(only.clone()),
+				[] => Err(format!("no session found matching `{arg}`")),
+				many => Err(format!(
+					"session id `{arg}` is ambiguous, {} matches: {}",
+					many.len(),
+					many.iter()
+						.filter_map(|p| p.file_name())
+						.map(|n| n.to_string_lossy().into_owned())
+						.collect::<Vec<_>>()
+						.join(", ")
+				)),
+			}
+		}
+	}
+}
+
+/// Validate a session directory before reopening it, so a missing or corrupt
+/// session fails loudly instead of silently starting an empty log.
+pub fn validate_session_dir(dir: &Path) -> Result<(), String> {
+	let path = dir.join("session.jsonl");
+	let text = std::fs::read_to_string(&path)
+		.map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+	for line in text.lines() {
+		let line = line.trim();
+		if line.is_empty() {
+			continue;
+		}
+		let Ok(value) = serde_json::from_str::<Value>(line) else {
+			break; // torn header line: nothing recoverable before it
+		};
+		if value.get("type").and_then(Value::as_str) == Some("header") {
+			return Ok(());
+		}
+		break;
+	}
+	Err(format!(
+		"{} is not a valid session directory (no session header)",
+		dir.display()
+	))
+}
+
+fn list_recent_in(root: &Path, limit: usize) -> Vec<(PathBuf, u64)> {
+	let Ok(entries) = std::fs::read_dir(root) else {
+		return Vec::new();
+	};
+	let mut sessions: Vec<(PathBuf, u64)> = entries
+		.flatten()
+		.filter(|e| e.path().is_dir())
+		.map(|e| {
+			let entries = count_entries(&e.path()).unwrap_or(0);
+			(e.path(), entries)
+		})
+		.collect();
+	sessions.sort_by(|a, b| b.0.cmp(&a.0));
+	sessions.truncate(limit);
+	sessions
+}
+
+fn prefix_matches(root: &Path, prefix: &str) -> Vec<PathBuf> {
+	let Ok(entries) = std::fs::read_dir(root) else {
+		return Vec::new();
+	};
+	let mut matches: Vec<PathBuf> = entries
+		.flatten()
+		.map(|e| e.path())
+		.filter(|p| {
+			p.is_dir()
+				&& p.file_name()
+					.is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+		})
+		.collect();
+	matches.sort();
+	matches
 }
 
 fn count_entries(dir: &Path) -> Result<u64, SessionError> {
@@ -345,5 +444,142 @@ mod tests {
 		session.append_message(&user_message("ghost")).unwrap();
 		assert_eq!(session.entries_written, 0);
 		assert!(session.session_dir().is_none());
+	}
+
+	// -- resume selection ---------------------------------------------------
+
+	fn resume_root(tag: &str) -> PathBuf {
+		let root = std::env::temp_dir().join(format!(
+			"pi-rs-resolve-{}-{}-{}",
+			tag,
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::create_dir_all(&root).unwrap();
+		root
+	}
+
+	fn make_session(root: &Path, id: &str, text: &str) -> PathBuf {
+		let dir = root.join(id);
+		std::fs::create_dir_all(&dir).unwrap();
+		let mut session = SessionManager::open(&dir).unwrap();
+		session
+			.append(&SessionEntry::Header {
+				version: 1,
+				app: format!("{} {}", crate::config::APP_NAME, crate::config::VERSION),
+				created: pi_ai::types::now_ms(),
+				cwd: root.display().to_string(),
+			})
+			.unwrap();
+		session.append_message(&user_message(text)).unwrap();
+		dir
+	}
+
+	#[test]
+	fn resolve_recent_picks_newest() {
+		let root = resume_root("recent");
+		make_session(&root, "20260101-000000-1", "old");
+		make_session(&root, "20260303-000000-3", "new");
+		make_session(&root, "20260202-000000-2", "mid");
+		let dir = resolve_session_in(&root, &SessionSelector::Recent).unwrap();
+		assert_eq!(dir.file_name().unwrap(), "20260303-000000-3");
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn resolve_recent_without_sessions_errors() {
+		let root = resume_root("empty");
+		assert_eq!(
+			resolve_session_in(&root, &SessionSelector::Recent),
+			Err("no previous session to continue".to_string())
+		);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn resolve_by_exact_id_and_prefix() {
+		let root = resume_root("byid");
+		make_session(&root, "20260101-000000-1", "one");
+		let target = make_session(&root, "20260202-000000-2", "two");
+		assert_eq!(
+			resolve_session_in(
+				&root,
+				&SessionSelector::ByIdOrPath("20260202-000000-2".into())
+			)
+			.unwrap(),
+			target
+		);
+		// Unique prefix match.
+		assert_eq!(
+			resolve_session_in(&root, &SessionSelector::ByIdOrPath("20260202".into())).unwrap(),
+			target
+		);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn resolve_by_path_beats_id_lookup() {
+		let root = resume_root("bypath");
+		let target = make_session(&root, "20260101-000000-1", "one");
+		assert_eq!(
+			resolve_session_in(
+				&root,
+				&SessionSelector::ByIdOrPath(target.display().to_string())
+			)
+			.unwrap(),
+			target
+		);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn resolve_errors_are_specific() {
+		let root = resume_root("errors");
+		make_session(&root, "20260101-000000-1", "one");
+		make_session(&root, "20260101-000000-11", "eleven");
+		assert!(
+			resolve_session_in(&root, &SessionSelector::ByIdOrPath("nope".into()))
+				.unwrap_err()
+				.contains("no session found matching")
+		);
+		// Ambiguous prefix (not an exact id) across two sessions.
+		assert!(
+			resolve_session_in(&root, &SessionSelector::ByIdOrPath("20260101".into()))
+				.unwrap_err()
+				.contains("ambiguous")
+		);
+		// An exact id still wins over a multi-match prefix.
+		assert!(
+			resolve_session_in(
+				&root,
+				&SessionSelector::ByIdOrPath("20260101-000000-1".into())
+			)
+			.is_ok()
+		);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn validation_rejects_missing_or_headerless_dirs() {
+		let root = resume_root("validate");
+		let missing = root.join("missing");
+		assert!(
+			validate_session_dir(&missing)
+				.unwrap_err()
+				.contains("cannot read")
+		);
+
+		let corrupt = root.join("corrupt");
+		std::fs::create_dir_all(&corrupt).unwrap();
+		std::fs::write(corrupt.join("session.jsonl"), "{\"type\":\"message\"}\n").unwrap();
+		assert!(
+			validate_session_dir(&corrupt)
+				.unwrap_err()
+				.contains("no session header")
+		);
+
+		let good = make_session(&root, "20260101-000000-1", "one");
+		assert!(validate_session_dir(&good).is_ok());
+		std::fs::remove_dir_all(root).unwrap();
 	}
 }

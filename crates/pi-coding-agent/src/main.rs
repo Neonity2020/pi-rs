@@ -19,9 +19,11 @@ use pi_agent::{Agent, AgentOptions};
 use pi_ai::ThinkingLevel;
 use pi_tui::Theme;
 
-use crate::core::agent_session::spawn_agent_session;
+use crate::core::agent_session::{restore_initial_messages, spawn_agent_session};
 use crate::core::model_registry::ModelRegistry;
-use crate::core::session_manager::SessionManager;
+use crate::core::session_manager::{
+	SessionManager, SessionSelector, resolve_session, validate_session_dir,
+};
 use crate::core::settings_manager::SettingsManager;
 use crate::core::tools::create_tools;
 
@@ -37,13 +39,22 @@ struct Cli {
 	#[arg(short = 'p', long)]
 	print: bool,
 
-	/// JSONL RPC mode over stdio (framing only at this stage).
+	/// JSONL RPC mode over stdio.
 	#[arg(long)]
 	rpc: bool,
 
 	/// Model to use: provider/id key, id, or fuzzy query.
 	#[arg(short = 'm', long)]
 	model: Option<String>,
+
+	/// Continue the most recent session.
+	#[arg(long, conflicts_with_all = ["resume", "no_session"])]
+	r#continue: bool,
+
+	/// Resume a session by id (sessions-dir entry, exact or unique prefix) or
+	/// by path to its session directory.
+	#[arg(long, value_name = "ID|PATH", conflicts_with = "no_session")]
+	resume: Option<String>,
 
 	/// Disable session persistence.
 	#[arg(long)]
@@ -97,25 +108,49 @@ async fn main() -> anyhow::Result<()> {
 	// Tools + agent + system prompt.
 	let tools = create_tools(&cwd);
 	let system_prompt = crate::core::system_prompt::build_system_prompt(&cwd, &tools);
+
+	// Session persistence. `--continue`/`--resume` reopen an existing log and
+	// seed the agent with its transcript; failures exit before anything is
+	// written (no half-open session is left behind).
+	let (session, initial_messages) = if cli.no_session {
+		(SessionManager::in_memory(), Vec::new())
+	} else {
+		let selector = if cli.r#continue {
+			Some(SessionSelector::Recent)
+		} else {
+			cli.resume
+				.as_deref()
+				.map(|arg| SessionSelector::ByIdOrPath(arg.to_string()))
+		};
+		match selector {
+			None => (SessionManager::create(&cwd)?, Vec::new()),
+			Some(selector) => {
+				let dir = resolve_session(&selector)
+					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+				validate_session_dir(&dir)
+					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+				let restored = restore_initial_messages(&dir);
+				eprintln!("resuming session {}", dir.display());
+				let session = SessionManager::open(&dir)?;
+				(session, restored)
+			}
+		}
+	};
+
 	let agent = Agent::new(AgentOptions {
 		model,
 		thinking_level: parse_thinking(settings.default_thinking_level.as_deref()),
 		tools,
 		system_prompt: Some(system_prompt),
+		initial_messages,
 		..AgentOptions::default()
 	});
 
-	// Session persistence.
-	let session = if cli.no_session {
-		SessionManager::in_memory()
-	} else {
-		SessionManager::create(&cwd)?
-	};
-
-	let handle = spawn_agent_session(agent, session, Arc::new(Mutex::new(registry)));
+	let registry = Arc::new(Mutex::new(registry));
+	let handle = spawn_agent_session(agent, session, registry.clone());
 
 	if cli.rpc {
-		return modes::rpc::run_rpc().await;
+		return modes::rpc::run_rpc(handle, registry).await;
 	}
 
 	let initial_prompt: Option<String> = {
