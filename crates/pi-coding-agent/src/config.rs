@@ -19,7 +19,10 @@ pub fn agent_dir() -> PathBuf {
 	if let Some(dir) = std::env::var_os(AGENT_DIR_ENV) {
 		return PathBuf::from(dir);
 	}
-	dirs::home_dir().unwrap_or_default().join(".pi-rs").join("agent")
+	dirs::home_dir()
+		.unwrap_or_default()
+		.join(".pi-rs")
+		.join("agent")
 }
 
 pub fn sessions_dir() -> PathBuf {

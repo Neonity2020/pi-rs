@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, Write};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub async fn run_rpc() -> anyhow::Result<()> {
 	let stdin = std::io::stdin();

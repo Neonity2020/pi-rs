@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use pi_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdate};
@@ -31,7 +31,15 @@ fn truncate_output(s: &str) -> String {
 	if s.len() <= MAX_OUTPUT_CHARS {
 		s.to_string()
 	} else {
-		format!("{}\n… (output truncated at {} chars)", &s[..MAX_OUTPUT_CHARS], MAX_OUTPUT_CHARS)
+		let mut end = MAX_OUTPUT_CHARS;
+		while !s.is_char_boundary(end) {
+			end -= 1;
+		}
+		format!(
+			"{}\n… (output truncated at {} bytes)",
+			&s[..end],
+			MAX_OUTPUT_CHARS
+		)
 	}
 }
 
@@ -72,7 +80,7 @@ bash for everything else (builds, tests, git, ...)."
 	) -> AgentToolResult {
 		let command = match param_str(&params, "command") {
 			Ok(c) => c,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let timeout_ms = param_u64_or(&params, "timeout_ms", DEFAULT_TIMEOUT_MS);
 
@@ -112,5 +120,18 @@ bash for everything else (builds, tests, git, ...)."
 			},
 			_ = signal.cancelled() => AgentToolResult::error("command aborted"),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn truncates_on_utf8_boundary() {
+		let text = format!("{}中文", "a".repeat(MAX_OUTPUT_CHARS - 1));
+		let truncated = truncate_output(&text);
+		assert!(truncated.starts_with(&"a".repeat(MAX_OUTPUT_CHARS - 1)));
+		assert!(truncated.contains("output truncated"));
 	}
 }

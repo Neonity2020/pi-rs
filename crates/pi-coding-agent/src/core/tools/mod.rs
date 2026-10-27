@@ -15,8 +15,7 @@ use serde_json::Value;
 
 use pi_agent::{AgentTool, AgentToolResult};
 
-pub const ALL_TOOL_NAMES: &[&str] =
-	&["read", "write", "edit", "bash", "grep", "find", "ls"];
+pub const ALL_TOOL_NAMES: &[&str] = &["read", "write", "edit", "bash", "grep", "find", "ls"];
 
 /// `createTools()` — build the active tool set for a working directory.
 pub fn create_tools(cwd: impl Into<PathBuf>) -> Vec<Arc<dyn AgentTool>> {
@@ -47,13 +46,18 @@ pub fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
 	}
 }
 
-/// Extract a required string parameter.
-pub fn param_str(params: &Value, key: &str) -> Result<String, AgentToolResult> {
+/// Extract a required string parameter. The error is boxed because
+/// `AgentToolResult` is large and this helper sits on hot tool paths.
+pub fn param_str(params: &Value, key: &str) -> Result<String, Box<AgentToolResult>> {
 	params
 		.get(key)
 		.and_then(|v| v.as_str())
 		.map(|s| s.to_string())
-		.ok_or_else(|| AgentToolResult::error(format!("missing required string parameter: {key}")))
+		.ok_or_else(|| {
+			Box::new(AgentToolResult::error(format!(
+				"missing required string parameter: {key}"
+			)))
+		})
 }
 
 /// Extract an optional parameter of mixed type.
@@ -62,7 +66,11 @@ pub fn param_value(params: &Value, key: &str) -> Option<Value> {
 }
 
 pub fn param_str_or(params: &Value, key: &str, default: &str) -> String {
-	params.get(key).and_then(|v| v.as_str()).unwrap_or(default).to_string()
+	params
+		.get(key)
+		.and_then(|v| v.as_str())
+		.unwrap_or(default)
+		.to_string()
 }
 
 pub fn param_u64_or(params: &Value, key: &str, default: u64) -> u64 {

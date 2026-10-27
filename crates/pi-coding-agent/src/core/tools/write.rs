@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use pi_agent::{AgentTool, AgentToolResult, ToolUpdate};
@@ -51,18 +51,18 @@ Parent directories are created as needed. Prefer `edit` for partial changes."
 	) -> AgentToolResult {
 		let path = match param_str(&params, "path") {
 			Ok(p) => p,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let content = match param_str(&params, "content") {
 			Ok(c) => c,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let resolved = resolve_path(&self.cwd, &path);
 
-		if let Some(parent) = resolved.parent() {
-			if let Err(e) = tokio::fs::create_dir_all(parent).await {
-				return AgentToolResult::error(format!("cannot create parent dir for {path}: {e}"));
-			}
+		if let Some(parent) = resolved.parent()
+			&& let Err(e) = tokio::fs::create_dir_all(parent).await
+		{
+			return AgentToolResult::error(format!("cannot create parent dir for {path}: {e}"));
 		}
 		match tokio::fs::write(&resolved, &content).await {
 			Ok(()) => {

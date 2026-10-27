@@ -8,6 +8,7 @@
 //! (prompt/steer/follow-up/abort/model/thinking). Compaction, bash
 //! passthrough, and session switch/fork land in later phases.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -23,15 +24,25 @@ use super::session_manager::{SessionEntry, SessionManager};
 /// Commands a mode sends to the session task.
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
-	/// New prompt; demoted to steering when a run is active.
-	Prompt { text: String },
+	/// New prompt; queued when a run is active.
+	Prompt {
+		text: String,
+	},
 	/// Inject mid-run after the current assistant turn.
-	Steer { text: String },
+	Steer {
+		text: String,
+	},
 	/// Queue to run when the agent would otherwise stop.
-	FollowUp { text: String },
+	FollowUp {
+		text: String,
+	},
 	Abort,
-	SetModel { query: String },
-	SetThinking { level: ThinkingLevel },
+	SetModel {
+		query: String,
+	},
+	SetThinking {
+		level: ThinkingLevel,
+	},
 	CycleThinking,
 	Compact,
 	Exit,
@@ -40,11 +51,13 @@ pub enum SessionCommand {
 /// Events the session emits to modes.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-	Agent(AgentEvent),
+	Agent(Box<AgentEvent>),
 	/// Human-facing status/notices (model switched, errors, stub feedback).
 	Notice(String),
 	/// Persisted a session entry (for `/export` etc.).
-	Persisted { kind: &'static str },
+	Persisted {
+		kind: &'static str,
+	},
 }
 
 /// Handle held by modes; the session task runs in the background.
@@ -76,7 +89,12 @@ pub fn spawn_agent_session(
 		event_bus.clone(),
 	));
 
-	SessionHandle { cmd_tx, events: event_bus.subscribe(), agent, session_dir }
+	SessionHandle {
+		cmd_tx,
+		events: event_bus.subscribe(),
+		agent,
+		session_dir,
+	}
 }
 
 async fn session_task(
@@ -87,6 +105,9 @@ async fn session_task(
 	event_bus: EventBus<SessionEvent>,
 ) {
 	let mut agent_rx = agent.subscribe();
+	let mut persisted = agent.snapshot().messages.len();
+	let mut pending = VecDeque::new();
+	let mut run: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
 
 	let notice = |bus: &EventBus<SessionEvent>, text: String| {
 		bus.emit(SessionEvent::Notice(text));
@@ -100,17 +121,14 @@ async fn session_task(
 				let Some(command) = command else { break };
 				match command {
 					SessionCommand::Prompt { text } => {
-						if agent.is_streaming() {
-							agent.steer(text.clone());
-							notice(&event_bus, "run active — message queued as steering".into());
+						if run.is_some() || agent.is_streaming() {
+							pending.push_back(text);
+							notice(&event_bus, "run active — prompt queued".into());
 						} else {
 							let agent = agent.clone();
-							let bus = event_bus.clone();
-							tokio::spawn(async move {
-								if let Err(e) = agent.prompt(PromptInput::Text { text }).await {
-									bus.emit(SessionEvent::Notice(format!("prompt failed: {e}")));
-								}
-							});
+							run = Some(tokio::spawn(async move {
+								agent.prompt(PromptInput::Text { text }).await
+							}));
 						}
 					}
 					SessionCommand::Steer { text } => {
@@ -132,7 +150,9 @@ async fn session_task(
 								agent.set_stream_fn(pi_ai::providers::stream_fn_for(&model));
 								agent.set_model(model.clone());
 								registry.lock().unwrap().set_default(&model);
-								let _ = session.append(&SessionEntry::ModelChange { model: model.key() });
+								if let Err(e) = session.append(&SessionEntry::ModelChange { model: model.key() }) {
+									notice(&event_bus, format!("session write failed: {e}"));
+								}
 								notice(&event_bus, format!("model → {}", model.key()));
 							}
 							None => notice(&event_bus, format!("no model matching `{query}`")),
@@ -154,20 +174,59 @@ async fn session_task(
 				}
 			}
 
+			result = async { run.as_mut().expect("guarded run").await }, if run.is_some() => {
+				run = None;
+				match result {
+					Ok(Ok(())) => {},
+					Ok(Err(e)) => notice(&event_bus, format!("prompt failed: {e}")),
+					Err(e) => notice(&event_bus, format!("prompt task failed: {e}")),
+				}
+				if let Some(text) = pending.pop_front() {
+					let agent = agent.clone();
+					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
+				}
+			}
+
 			event = agent_rx.recv() => {
 				match event {
 					Ok(agent_event) => {
-						if let AgentEvent::MessageEnd { message } = &agent_event {
-							let _ = session.append_message(message);
-							event_bus.emit(SessionEvent::Persisted { kind: "message" });
+						if matches!(&agent_event, AgentEvent::MessageEnd { .. } | AgentEvent::AgentEnd { .. }) {
+							persist_messages(&agent, &mut session, &mut persisted, &event_bus);
 						}
-						event_bus.emit(SessionEvent::Agent(agent_event));
+						event_bus.emit(SessionEvent::Agent(Box::new(agent_event)));
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
 						notice(&event_bus, format!("event lag: dropped {count} events"));
+						persist_messages(&agent, &mut session, &mut persisted, &event_bus);
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
 				}
+			}
+		}
+	}
+	persist_messages(&agent, &mut session, &mut persisted, &event_bus);
+}
+
+// The broadcast channel is lossy; the transcript is the authoritative source.
+// Advance only after a successful append so a later event can retry a failed write.
+fn persist_messages(
+	agent: &Agent,
+	session: &mut SessionManager,
+	persisted: &mut usize,
+	bus: &EventBus<SessionEvent>,
+) {
+	let snapshot = agent.snapshot();
+	for message in snapshot.messages.iter().skip(*persisted) {
+		match session.append_message(message) {
+			Ok(()) => {
+				*persisted += 1;
+				if session.session_dir().is_some() {
+					bus.emit(SessionEvent::Persisted { kind: "message" });
+				}
+			}
+			Err(e) => {
+				bus.emit(SessionEvent::Notice(format!("session write failed: {e}")));
+				break;
 			}
 		}
 	}
@@ -188,7 +247,9 @@ fn next_thinking_level(current: ThinkingLevel) -> ThinkingLevel {
 
 /// Rebuild a transcript from a session file (resume support, reduced).
 pub fn read_session_messages(dir: &std::path::Path) -> Vec<Message> {
-	let Ok(text) = std::fs::read_to_string(dir.join("session.jsonl")) else { return Vec::new() };
+	let Ok(text) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+		return Vec::new();
+	};
 	text.lines()
 		.filter_map(|line| {
 			let value: Value = serde_json::from_str(line).ok()?;
@@ -199,4 +260,204 @@ pub fn read_session_messages(dir: &std::path::Path) -> Vec<Message> {
 			}
 		})
 		.collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use pi_agent::AgentOptions;
+	use std::time::Duration;
+
+	fn mock_agent() -> Agent {
+		let stream = Arc::new(
+			|model: &pi_ai::Model,
+			 context: &pi_ai::TranscriptContext,
+			 options: pi_ai::StreamOptions| {
+				pi_ai::providers::mock::stream(model, context, options)
+			},
+		);
+		Agent::new(AgentOptions {
+			stream_fn: Some(stream),
+			..Default::default()
+		})
+	}
+
+	#[tokio::test]
+	async fn rapid_prompts_are_both_processed() {
+		let agent = mock_agent();
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session(agent.clone(), SessionManager::in_memory(), registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "first".into(),
+			})
+			.unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "second".into(),
+			})
+			.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			let mut completed = 0;
+			while completed < 2 {
+				if let Ok(SessionEvent::Agent(event)) = handle.events.recv().await
+					&& matches!(*event, AgentEvent::AgentEnd { .. })
+				{
+					completed += 1;
+				}
+			}
+		})
+		.await
+		.expect("both prompts should complete");
+		let messages = agent.snapshot().messages;
+		let users: Vec<_> = messages
+			.iter()
+			.filter_map(|m| match m {
+				Message::User(u) => Some(u.content.as_text()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(users, vec!["first", "second"]);
+	}
+
+	#[tokio::test]
+	async fn persistence_reconciles_transcript_without_events() {
+		let dir = std::env::temp_dir().join(format!(
+			"pi-rs-session-test-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let mut session = SessionManager::open(&dir).unwrap();
+		let agent = mock_agent();
+		let mut persisted = agent.snapshot().messages.len();
+		agent
+			.prompt(PromptInput::Text {
+				text: "hello".into(),
+			})
+			.await
+			.unwrap();
+		let bus = EventBus::new();
+		persist_messages(&agent, &mut session, &mut persisted, &bus);
+		persist_messages(&agent, &mut session, &mut persisted, &bus);
+		let messages = read_session_messages(&dir);
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages[0].role(), "user");
+		assert_eq!(messages[1].role(), "assistant");
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	fn temp_session_dir(tag: &str) -> std::path::PathBuf {
+		let dir = std::env::temp_dir().join(format!(
+			"pi-rs-agent-session-{}-{}-{}",
+			tag,
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	async fn wait_for_agent_ends(handle: &mut SessionHandle, count: usize) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			let mut completed = 0;
+			while completed < count {
+				if let Ok(SessionEvent::Agent(event)) = handle.events.recv().await
+					&& matches!(*event, AgentEvent::AgentEnd { .. })
+				{
+					completed += 1;
+				}
+			}
+		})
+		.await
+		.expect("runs should complete in time");
+	}
+
+	#[tokio::test]
+	async fn queued_prompts_persist_in_order() {
+		let dir = temp_session_dir("ordered");
+		let agent = mock_agent();
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let session = SessionManager::open(&dir).unwrap();
+		let mut handle = spawn_agent_session(agent, session, registry);
+		for text in ["one", "two", "three"] {
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt { text: text.into() })
+				.unwrap();
+		}
+		wait_for_agent_ends(&mut handle, 3).await;
+
+		let messages = read_session_messages(&dir);
+		let roles: Vec<&str> = messages.iter().map(Message::role).collect();
+		assert_eq!(
+			roles,
+			[
+				"user",
+				"assistant",
+				"user",
+				"assistant",
+				"user",
+				"assistant"
+			]
+		);
+		let users: Vec<String> = messages
+			.iter()
+			.filter_map(|m| match m {
+				Message::User(u) => Some(u.content.as_text()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(users, vec!["one", "two", "three"]);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn write_failure_notifies_without_blocking_runs() {
+		let dir = temp_session_dir("iofail");
+		let path = dir.join("readonly.jsonl");
+		std::fs::write(&path, "").unwrap();
+		let readonly = std::fs::File::open(&path).unwrap();
+		let agent = mock_agent();
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let session = SessionManager::with_file(dir.clone(), readonly);
+		let mut handle = spawn_agent_session(agent, session, registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "hello".into(),
+			})
+			.unwrap();
+
+		let (writes_failed, ended) = tokio::time::timeout(Duration::from_secs(5), async {
+			let mut writes_failed = false;
+			let mut ended = false;
+			while !(writes_failed && ended) {
+				match handle.events.recv().await {
+					Ok(SessionEvent::Notice(text)) if text.contains("session write failed") => {
+						writes_failed = true;
+					}
+					Ok(SessionEvent::Agent(event))
+						if matches!(*event, AgentEvent::AgentEnd { .. }) =>
+					{
+						ended = true;
+					}
+					Ok(_) => {}
+					Err(e) => panic!("event stream error: {e}"),
+				}
+			}
+			(writes_failed, ended)
+		})
+		.await
+		.expect("failure notice and agent end should arrive in time");
+		assert!(
+			writes_failed && ended,
+			"run must survive a broken session log"
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
 }

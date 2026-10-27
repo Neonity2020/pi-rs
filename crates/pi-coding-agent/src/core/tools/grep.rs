@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
@@ -62,7 +62,7 @@ skipping .git/node_modules/target."
 	) -> AgentToolResult {
 		let pattern = match param_str(&params, "pattern") {
 			Ok(p) => p,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let path = param_str_or(&params, "path", ".");
 
@@ -94,7 +94,11 @@ skipping .git/node_modules/target."
 		let mut truncated = false;
 		for entry in WalkDir::new(&root)
 			.into_iter()
-			.filter_entry(|e| !(e.depth() > 0 && e.file_type().is_dir() && skip_dir(e.file_name().to_string_lossy().as_ref())))
+			.filter_entry(|e| {
+				!(e.depth() > 0
+					&& e.file_type().is_dir()
+					&& skip_dir(e.file_name().to_string_lossy().as_ref()))
+			})
 			.flatten()
 		{
 			if signal.is_cancelled() {
@@ -104,8 +108,15 @@ skipping .git/node_modules/target."
 				continue;
 			}
 			// Skip obvious binaries cheaply by extension.
-			let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
-			if matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "lock") {
+			let ext = entry
+				.path()
+				.extension()
+				.and_then(|e| e.to_str())
+				.unwrap_or("");
+			if matches!(
+				ext,
+				"png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "lock"
+			) {
 				continue;
 			}
 			let Ok(text) = std::fs::read_to_string(entry.path()) else {

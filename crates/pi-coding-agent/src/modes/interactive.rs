@@ -14,18 +14,18 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
-use ratatui::Frame;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 use pi_agent::AgentEvent;
 use pi_ai::{Message, Model, StopReason};
-use pi_tui::components::{markdown_lines, Component, SelectAction, SelectItem, SelectList};
-use pi_tui::{Editor, ScrollView, Theme, TerminalGuard};
+use pi_tui::components::{Component, SelectAction, SelectItem, SelectList, markdown_lines};
+use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
 
 use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle};
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
@@ -80,13 +80,20 @@ impl ModelOverlay {
 				if m.name != m.id {
 					desc.push_str(&format!(" · {}", m.name));
 				}
-				SelectItem { value: m.key(), label: m.id.clone(), description: Some(desc) }
+				SelectItem {
+					value: m.key(),
+					label: m.id.clone(),
+					description: Some(desc),
+				}
 			})
 			.collect();
 		let mut list = SelectList::new(items, 10);
 		list.set_no_match_message("No matching models");
 		list.set_mark_value(Some(current_key.to_string()));
-		Self { search: String::new(), list }
+		Self {
+			search: String::new(),
+			list,
+		}
 	}
 }
 
@@ -148,12 +155,7 @@ pub fn format_duration(ms: u128) -> String {
 }
 
 impl InteractiveMode {
-	pub fn new(
-		session: SessionHandle,
-		models: Vec<Model>,
-		cwd: String,
-		theme: Theme,
-	) -> Self {
+	pub fn new(session: SessionHandle, models: Vec<Model>, cwd: String, theme: Theme) -> Self {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 		Self {
 			session,
@@ -190,10 +192,10 @@ impl InteractiveMode {
 
 		self.refresh_branch();
 
-		if let Some(prompt) = initial_prompt {
-			if !prompt.trim().is_empty() {
-				self.send_prompt(prompt);
-			}
+		if let Some(prompt) = initial_prompt
+			&& !prompt.trim().is_empty()
+		{
+			self.send_prompt(prompt);
 		}
 
 		let (term_tx, mut term_rx) = mpsc::unbounded_channel::<TermEvent>();
@@ -281,8 +283,12 @@ impl InteractiveMode {
 		// Search-line editing first (printable chars and backspace), matching
 		// pi's search Input. Ctrl combos go straight to the list (ctrl+c
 		// cancels via the list's handler).
-		if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-			let Some(overlay) = self.overlay.as_mut() else { return };
+		if !key.modifiers.contains(KeyModifiers::CONTROL)
+			&& !key.modifiers.contains(KeyModifiers::ALT)
+		{
+			let Some(overlay) = self.overlay.as_mut() else {
+				return;
+			};
 			match key.code {
 				KeyCode::Char(c) => {
 					overlay.search.push(c);
@@ -304,12 +310,19 @@ impl InteractiveMode {
 		match action {
 			SelectAction::Select(index) => {
 				let value = match self.overlay.as_ref() {
-					Some(overlay) => overlay.list.filtered().get(index).map(|item| item.value.clone()),
+					Some(overlay) => overlay
+						.list
+						.filtered()
+						.get(index)
+						.map(|item| item.value.clone()),
 					None => None,
 				};
 				if let Some(value) = value {
 					self.overlay = None;
-					let _ = self.session.cmd_tx.send(SessionCommand::SetModel { query: value });
+					let _ = self
+						.session
+						.cmd_tx
+						.send(SessionCommand::SetModel { query: value });
 				}
 				// No match under the cursor: keep the overlay open (pi behavior).
 			}
@@ -388,7 +401,9 @@ impl InteractiveMode {
 				for info in BUILTIN_SLASH_COMMANDS {
 					text.push_str(&format!("  /{:<10} {}\n", info.name, info.description));
 				}
-				text.push_str("\nkeys: ctrl+o expand tool output · ctrl+t toggle thinking · pgup/pgdn scroll");
+				text.push_str(
+					"\nkeys: ctrl+o expand tool output · ctrl+t toggle thinking · pgup/pgdn scroll",
+				);
 				self.push_notice(text);
 			}
 			"exit" | "quit" | "q" => self.quit = true,
@@ -401,7 +416,9 @@ impl InteractiveMode {
 					let current = self.session.agent.model().key();
 					self.overlay = Some(ModelOverlay::new(&self.models, &current));
 				} else {
-					let _ = self.session.cmd_tx.send(SessionCommand::SetModel { query: args.to_string() });
+					let _ = self.session.cmd_tx.send(SessionCommand::SetModel {
+						query: args.to_string(),
+					});
 				}
 			}
 			"thinking" => {
@@ -414,7 +431,10 @@ impl InteractiveMode {
 			"prompt" => {
 				let prompt = self.session.agent.snapshot().system_prompt;
 				let preview: Vec<&str> = prompt.lines().take(30).collect();
-				self.push_notice(format!("system prompt (first 30 lines):\n{}\n…", preview.join("\n")));
+				self.push_notice(format!(
+					"system prompt (first 30 lines):\n{}\n…",
+					preview.join("\n")
+				));
 			}
 			"compact" => {
 				let _ = self.session.cmd_tx.send(SessionCommand::Compact);
@@ -429,7 +449,9 @@ impl InteractiveMode {
 						.map(|(dir, entries)| {
 							format!(
 								"  {:<28} {} entries",
-								dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+								dir.file_name()
+									.map(|n| n.to_string_lossy().into_owned())
+									.unwrap_or_default(),
 								entries
 							)
 						})
@@ -448,7 +470,7 @@ impl InteractiveMode {
 
 	fn handle_session_event(&mut self, event: SessionEvent) {
 		match event {
-			SessionEvent::Agent(event) => self.handle_agent_event(event),
+			SessionEvent::Agent(event) => self.handle_agent_event(*event),
 			SessionEvent::Notice(text) => self.push_notice(text),
 			SessionEvent::Persisted { .. } => {}
 		}
@@ -485,37 +507,62 @@ impl InteractiveMode {
 				self.chat.scroll_to_bottom(usize::MAX);
 			}
 			AgentEvent::MessageUpdate { message } => {
-				if let Message::Assistant(assistant) = &message {
-					if let Some(ChatBlock::Assistant { text, thinking, rendered, .. }) =
-						self.blocks.iter_mut().rev().find(|b| matches!(b, ChatBlock::Assistant { streaming: true, .. }))
-					{
-						*text = assistant.text();
-						*thinking = assistant.thinking();
-						*rendered = None;
-					}
+				if let Message::Assistant(assistant) = &message
+					&& let Some(ChatBlock::Assistant {
+						text,
+						thinking,
+						rendered,
+						..
+					}) = self.blocks.iter_mut().rev().find(|b| {
+						matches!(
+							b,
+							ChatBlock::Assistant {
+								streaming: true,
+								..
+							}
+						)
+					}) {
+					*text = assistant.text();
+					*thinking = assistant.thinking();
+					*rendered = None;
 				}
 			}
 			AgentEvent::MessageEnd { message } => {
 				if let Message::Assistant(assistant) = &message {
-					if let Some(ChatBlock::Assistant { streaming, stop_note, error, rendered, .. }) =
-						self.blocks.iter_mut().rev().find(|b| matches!(b, ChatBlock::Assistant { streaming: true, .. }))
-					{
+					if let Some(ChatBlock::Assistant {
+						streaming,
+						stop_note,
+						error,
+						rendered,
+						..
+					}) = self.blocks.iter_mut().rev().find(|b| {
+						matches!(
+							b,
+							ChatBlock::Assistant {
+								streaming: true,
+								..
+							}
+						)
+					}) {
 						*streaming = false;
 						*rendered = None;
 						*error = assistant.error_message.clone();
 						// stopReason notes (assistant-message.ts): length truncation,
 						// aborted runs and errors surface after the partial content.
 						*stop_note = match &assistant.stop_reason {
-							StopReason::Length => Some("Response was truncated before completion.".into()),
-							StopReason::Aborted => Some(
-								match assistant.error_message.as_deref() {
-									Some(e) if e != "Request was aborted" => e.to_string(),
-									_ => "Operation aborted".into(),
-								},
-							),
+							StopReason::Length => {
+								Some("Response was truncated before completion.".into())
+							}
+							StopReason::Aborted => Some(match assistant.error_message.as_deref() {
+								Some(e) if e != "Request was aborted" => e.to_string(),
+								_ => "Operation aborted".into(),
+							}),
 							StopReason::Error => Some(format!(
 								"Error: {}",
-								assistant.error_message.as_deref().unwrap_or("Unknown error")
+								assistant
+									.error_message
+									.as_deref()
+									.unwrap_or("Unknown error")
 							)),
 							_ => None,
 						};
@@ -526,14 +573,20 @@ impl InteractiveMode {
 					*cache_read += assistant.usage.cache_read;
 					*cache_write += assistant.usage.cache_write;
 					*cost += assistant.usage.cost.total.unwrap_or(0.0);
-					let prompt = assistant.usage.input + assistant.usage.cache_read + assistant.usage.cache_write;
+					let prompt = assistant.usage.input
+						+ assistant.usage.cache_read
+						+ assistant.usage.cache_write;
 					if prompt > 0 {
 						self.last_prompt_tokens = Some(prompt);
 					}
 				}
 				self.chat.scroll_to_bottom(usize::MAX);
 			}
-			AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
+			AgentEvent::ToolExecutionStart {
+				tool_call_id,
+				tool_name,
+				args,
+			} => {
 				self.blocks.push(ChatBlock::Tool {
 					id: tool_call_id,
 					name: tool_name,
@@ -548,7 +601,10 @@ impl InteractiveMode {
 				self.chat.scroll_to_bottom(usize::MAX);
 			}
 			AgentEvent::ToolExecutionEnd {
-				tool_call_id, result, is_error: is_error_, ..
+				tool_call_id,
+				result,
+				is_error: is_error_,
+				..
 			} => {
 				let output = result
 					.get("content")
@@ -561,12 +617,17 @@ impl InteractiveMode {
 							.join("\n")
 					})
 					.unwrap_or_default();
-				if let Some(ChatBlock::Tool { running, is_error, output: out, started, duration_ms, rendered, .. }) =
-					self.blocks
-						.iter_mut()
-						.rev()
-						.find(|b| matches!(b, ChatBlock::Tool { id, running: true, .. } if *id == tool_call_id))
-				{
+				if let Some(ChatBlock::Tool {
+					running,
+					is_error,
+					output: out,
+					started,
+					duration_ms,
+					rendered,
+					..
+				}) = self.blocks.iter_mut().rev().find(
+					|b| matches!(b, ChatBlock::Tool { id, running: true, .. } if *id == tool_call_id),
+				) {
 					*running = false;
 					*is_error = is_error_;
 					*rendered = None;
@@ -574,7 +635,9 @@ impl InteractiveMode {
 					*duration_ms = started.map(|s| s.elapsed().as_millis());
 				}
 			}
-			AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } | AgentEvent::ToolExecutionUpdate { .. } => {}
+			AgentEvent::TurnStart
+			| AgentEvent::TurnEnd { .. }
+			| AgentEvent::ToolExecutionUpdate { .. } => {}
 		}
 	}
 
@@ -634,9 +697,14 @@ impl InteractiveMode {
 		let line = Line::from(vec![
 			Span::styled(
 				format!(" {} ", crate::config::APP_NAME),
-				Style::new().fg(self.theme.accent).add_modifier(Modifier::BOLD),
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
 			),
-			Span::styled(format!("v{} ", crate::config::VERSION), Style::new().fg(self.theme.muted)),
+			Span::styled(
+				format!("v{} ", crate::config::VERSION),
+				Style::new().fg(self.theme.muted),
+			),
 			Span::styled(model.key(), Style::new().fg(self.theme.tool)),
 			Span::styled(format!("  {cwd_short}"), Style::new().fg(self.theme.muted)),
 		]);
@@ -647,7 +715,11 @@ impl InteractiveMode {
 		let block = Block::bordered()
 			.border_style(Style::new().fg(self.theme.border))
 			.title(Span::styled(
-				if self.working { " steering/prompt (esc aborts) " } else { " prompt " },
+				if self.working {
+					" steering/prompt (esc aborts) "
+				} else {
+					" prompt "
+				},
 				Style::new().fg(self.theme.muted),
 			));
 		let inner = block.inner(area);
@@ -681,7 +753,10 @@ impl InteractiveMode {
 			Some(branch) => format!("{pwd} ({branch})"),
 			None => pwd,
 		};
-		let pwd_line = Line::from(Span::styled(truncate_to_width(&pwd, width), Style::new().fg(self.theme.muted)));
+		let pwd_line = Line::from(Span::styled(
+			truncate_to_width(&pwd, width),
+			Style::new().fg(self.theme.muted),
+		));
 		frame.render_widget(Paragraph::new(pwd_line), area);
 
 		// Line 2: stats.
@@ -750,15 +825,21 @@ impl InteractiveMode {
 				Style::new().fg(self.theme.muted),
 			))
 		};
-		let stats_area = Rect { y: area.y + 1, height: 1, ..area };
+		let stats_area = Rect {
+			y: area.y + 1,
+			height: 1,
+			..area
+		};
 		frame.render_widget(Paragraph::new(stats_line), stats_area);
 	}
 
 	/// Model selector overlay (model-selector.ts): bordered panel with a search
 	/// line, the filtered list and a key hint.
 	fn draw_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
-		let Some(overlay) = self.overlay.as_ref() else { return };
-		let width = chat_area.width.min(72).max(24);
+		let Some(overlay) = self.overlay.as_ref() else {
+			return;
+		};
+		let width = chat_area.width.clamp(24, 72);
 		let list_height = 10usize;
 		let height = (list_height + 6) as u16;
 		if chat_area.width < width || chat_area.height < height {
@@ -766,14 +847,21 @@ impl InteractiveMode {
 		}
 		let x = chat_area.x + (chat_area.width - width) / 2;
 		let y = chat_area.y + (chat_area.height - height) * 2 / 5;
-		let area = Rect { x, y, width, height };
+		let area = Rect {
+			x,
+			y,
+			width,
+			height,
+		};
 
 		frame.render_widget(Clear, area);
 		let block = Block::bordered()
 			.border_style(Style::new().fg(self.theme.accent))
 			.title(Span::styled(
 				" Select model ",
-				Style::new().fg(self.theme.accent).add_modifier(Modifier::BOLD),
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
 			));
 		let inner = block.inner(area);
 		frame.render_widget(block, area);
@@ -810,16 +898,29 @@ impl InteractiveMode {
 					}
 					lines.push(Line::default());
 				}
-				ChatBlock::Assistant { text, thinking, streaming, stop_note, error, rendered } => {
-					if let Some((w, cached)) = rendered {
-						if *w == width {
-							lines.extend(cached.iter().cloned());
-							continue;
-						}
+				ChatBlock::Assistant {
+					text,
+					thinking,
+					streaming,
+					stop_note,
+					error,
+					rendered,
+				} => {
+					if let Some((w, cached)) = rendered
+						&& *w == width
+					{
+						lines.extend(cached.iter().cloned());
+						continue;
 					}
 					let out = render_assistant_block(
-						text, thinking, *streaming, stop_note.as_deref(), error.as_deref(),
-						width, &theme, thinking_expanded,
+						text,
+						thinking,
+						*streaming,
+						stop_note.as_deref(),
+						error.as_deref(),
+						width,
+						&theme,
+						thinking_expanded,
 					);
 					// Cache finished blocks only; streaming ones invalidate anyway.
 					if !*streaming {
@@ -827,18 +928,34 @@ impl InteractiveMode {
 					}
 					lines.extend(out);
 				}
-				ChatBlock::Tool { name, args, running, is_error, output, duration_ms, rendered, .. } => {
-					if !*running {
-						if let Some((w, cached)) = rendered {
-							if *w == width {
-								lines.extend(cached.iter().cloned());
-								continue;
-							}
-						}
+				ChatBlock::Tool {
+					name,
+					args,
+					running,
+					is_error,
+					output,
+					duration_ms,
+					rendered,
+					..
+				} => {
+					if !*running
+						&& let Some((w, cached)) = rendered
+						&& *w == width
+					{
+						lines.extend(cached.iter().cloned());
+						continue;
 					}
 					let out = render_tool_block(
-						name, args, *running, *is_error, output, *duration_ms,
-						width, &theme, tools_expanded, tick,
+						name,
+						args,
+						*running,
+						*is_error,
+						output,
+						*duration_ms,
+						width,
+						&theme,
+						tools_expanded,
+						tick,
 					);
 					if !*running {
 						*rendered = Some((width, out.clone()));
@@ -879,15 +996,21 @@ fn render_assistant_block(
 		if thinking_expanded {
 			lines.push(Line::from(Span::styled(
 				"· thinking (ctrl+t to hide)",
-				Style::new().fg(theme.thinking).add_modifier(Modifier::ITALIC),
+				Style::new()
+					.fg(theme.thinking)
+					.add_modifier(Modifier::ITALIC),
 			)));
 			for line in markdown_lines(thinking.trim(), width, theme) {
-				lines.push(patch_line(line, |s| s.fg(theme.thinking).add_modifier(Modifier::ITALIC)));
+				lines.push(patch_line(line, |s| {
+					s.fg(theme.thinking).add_modifier(Modifier::ITALIC)
+				}));
 			}
 		} else {
 			lines.push(Line::from(Span::styled(
 				"· thinking hidden (ctrl+t to show)",
-				Style::new().fg(theme.thinking).add_modifier(Modifier::ITALIC),
+				Style::new()
+					.fg(theme.thinking)
+					.add_modifier(Modifier::ITALIC),
 			)));
 		}
 	}
@@ -898,7 +1021,10 @@ fn render_assistant_block(
 		lines.push(Line::from(Span::styled("▌", Style::new().fg(theme.accent))));
 	}
 	if let Some(note) = stop_note {
-		lines.push(Line::from(Span::styled(note.to_string(), Style::new().fg(theme.error))));
+		lines.push(Line::from(Span::styled(
+			note.to_string(),
+			Style::new().fg(theme.error),
+		)));
 	}
 	if let Some(error) = error {
 		lines.push(Line::from(Span::styled(
@@ -951,7 +1077,10 @@ fn render_tool_block(
 		// COLLAPSED_ARGS_CHARS (formatToolCallWithArgs).
 		let pairs = compact_args_pairs(args);
 		if !pairs.is_empty() {
-			spans.push(Span::styled(format!(" {pairs}"), Style::new().fg(theme.muted)));
+			spans.push(Span::styled(
+				format!(" {pairs}"),
+				Style::new().fg(theme.muted),
+			));
 		}
 		lines.push(Line::from(spans));
 	} else {
@@ -964,7 +1093,11 @@ fn render_tool_block(
 					other => other.to_string(),
 				};
 				for (i, part) in text.lines().enumerate() {
-					let prefix = if i == 0 { format!("  {key}: ") } else { "    ".to_string() };
+					let prefix = if i == 0 {
+						format!("  {key}: ")
+					} else {
+						"    ".to_string()
+					};
 					lines.push(Line::from(Span::styled(
 						format!("{prefix}{part}"),
 						Style::new().fg(theme.muted),
@@ -976,7 +1109,11 @@ fn render_tool_block(
 
 	if !output.is_empty() {
 		let out_lines: Vec<&str> = output.lines().collect();
-		let shown = if tools_expanded { out_lines.len() } else { out_lines.len().min(TOOL_PREVIEW_LINES) };
+		let shown = if tools_expanded {
+			out_lines.len()
+		} else {
+			out_lines.len().min(TOOL_PREVIEW_LINES)
+		};
 		let out_style = if is_error {
 			Style::new().fg(theme.error)
 		} else {

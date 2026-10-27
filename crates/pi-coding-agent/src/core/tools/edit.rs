@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use pi_agent::{AgentTool, AgentToolResult, ToolUpdate};
@@ -56,15 +56,15 @@ file content exactly and must be unique unless `replace_all` is true. Always \
 	) -> AgentToolResult {
 		let path = match param_str(&params, "path") {
 			Ok(p) => p,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let old_string = match param_str(&params, "old_string") {
 			Ok(s) => s,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let new_string = match param_str(&params, "new_string") {
 			Ok(s) => s,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let replace_all = param_bool_or(&params, "replace_all", false);
 

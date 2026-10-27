@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
@@ -78,7 +78,7 @@ at 500. Skips .git/node_modules/target."
 	) -> AgentToolResult {
 		let pattern = match param_str(&params, "pattern") {
 			Ok(p) => p,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let path = param_str_or(&params, "path", ".");
 
@@ -125,10 +125,10 @@ at 500. Skips .git/node_modules/target."
 			if !regex.is_match(name) {
 				continue;
 			}
-			if let Some(prefix) = &prefix {
-				if !rel.starts_with(prefix.as_str()) {
-					continue;
-				}
+			if let Some(prefix) = &prefix
+				&& !rel.starts_with(prefix.as_str())
+			{
+				continue;
 			}
 			if results.len() >= MAX_RESULTS {
 				truncated = true;

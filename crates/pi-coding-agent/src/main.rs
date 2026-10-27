@@ -86,7 +86,9 @@ async fn main() -> anyhow::Result<()> {
 	// Model resolution.
 	let mut registry = ModelRegistry::load(settings.default_model.as_deref());
 	let model = match &cli.model {
-		Some(query) => registry.find(query).ok_or_else(|| anyhow::anyhow!("no model matching `{query}`"))?,
+		Some(query) => registry
+			.find(query)
+			.ok_or_else(|| anyhow::anyhow!("no model matching `{query}`"))?,
 		None => registry.default_model(),
 	};
 	registry.set_default(&model);
@@ -129,8 +131,13 @@ async fn main() -> anyhow::Result<()> {
 		std::process::exit(code);
 	}
 
-	let theme = if cli.light { Theme::light() } else { Theme::dark() };
-	let mode = modes::interactive::InteractiveMode::new(handle, models, cwd.display().to_string(), theme);
+	let theme = if cli.light {
+		Theme::light()
+	} else {
+		Theme::dark()
+	};
+	let mode =
+		modes::interactive::InteractiveMode::new(handle, models, cwd.display().to_string(), theme);
 	mode.run(initial_prompt).await
 }
 

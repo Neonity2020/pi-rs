@@ -48,24 +48,28 @@ impl ModelRegistry {
 	/// Load the catalog: built-ins plus `~/.pi-rs/agent/models.json`.
 	pub fn load(settings_default_model: Option<&str>) -> Self {
 		let mut models = builtin_models();
-		if let Ok(text) = std::fs::read_to_string(config::models_json_path()) {
-			if let Ok(file) = serde_json::from_str::<ModelsFile>(&text) {
-				for provider in file.providers {
-					let api = Api::new(provider.api.unwrap_or_else(|| Api::OPENAI_COMPLETIONS.to_string()));
-					for model in provider.models {
-						models.push(Model {
-							id: model.id.clone(),
-							name: model.name.unwrap_or_else(|| model.id.clone()),
-							api: api.clone(),
-							provider: provider.name.clone(),
-							base_url: provider.base_url.clone().unwrap_or_default(),
-							reasoning: false,
-							input: vec![pi_ai::InputModality::Text],
-							cost: Default::default(),
-							context_window: model.context_window.unwrap_or(128_000),
-							max_tokens: model.max_tokens.unwrap_or(8_192),
-						});
-					}
+		if let Ok(text) = std::fs::read_to_string(config::models_json_path())
+			&& let Ok(file) = serde_json::from_str::<ModelsFile>(&text)
+		{
+			for provider in file.providers {
+				let api = Api::new(
+					provider
+						.api
+						.unwrap_or_else(|| Api::OPENAI_COMPLETIONS.to_string()),
+				);
+				for model in provider.models {
+					models.push(Model {
+						id: model.id.clone(),
+						name: model.name.unwrap_or_else(|| model.id.clone()),
+						api: api.clone(),
+						provider: provider.name.clone(),
+						base_url: provider.base_url.clone().unwrap_or_default(),
+						reasoning: false,
+						input: vec![pi_ai::InputModality::Text],
+						cost: Default::default(),
+						context_window: model.context_window.unwrap_or(128_000),
+						max_tokens: model.max_tokens.unwrap_or(8_192),
+					});
 				}
 			}
 		}
@@ -74,10 +78,10 @@ impl ModelRegistry {
 		let default_model = settings_default_model
 			.map(|s| s.to_string())
 			.or_else(|| Some("mimo/mimo-v2.6-pro".to_string()));
-		if let Some(default_key) = default_model {
-			if let Some(model) = models.iter_mut().find(|m| matches_key(m, &default_key)) {
-				model.name = format!("{} (default)", model.name);
-			}
+		if let Some(default_key) = default_model
+			&& let Some(model) = models.iter_mut().find(|m| matches_key(m, &default_key))
+		{
+			model.name = format!("{} (default)", model.name);
 		}
 
 		Self { models }
@@ -91,7 +95,8 @@ impl ModelRegistry {
 		if let Some(model) = self.models.iter().find(|m| m.name.ends_with("(default)")) {
 			return model.clone();
 		}
-		self.find("mimo/mimo-v2.6-pro").expect("registry always contains the MiMo model")
+		self.find("mimo/mimo-v2.6-pro")
+			.expect("registry always contains the MiMo model")
 	}
 
 	/// Find by exact key (`provider/id`), id, or case-insensitive substring.
@@ -116,7 +121,11 @@ impl ModelRegistry {
 				m.name = m.name.replace(" (default)", "");
 			}
 		}
-		if let Some(m) = self.models.iter_mut().find(|m| m.id == model.id && m.provider == model.provider) {
+		if let Some(m) = self
+			.models
+			.iter_mut()
+			.find(|m| m.id == model.id && m.provider == model.provider)
+		{
 			m.name = format!("{} (default)", m.name);
 		}
 	}
@@ -133,15 +142,10 @@ fn builtin_models() -> Vec<Model> {
 		"MiMo V2.6 Pro (Token Plan CN)",
 		Api::OPENAI_COMPLETIONS,
 		"mimo",
-		std::env::var("MIMO_BASE_URL").unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string()),
+		std::env::var("MIMO_BASE_URL")
+			.unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string()),
 	);
-	let mut mock = Model::new(
-		"mock-echo",
-		"Mock (built-in)",
-		Api::new("mock"),
-		"mock",
-		"",
-	);
+	let mut mock = Model::new("mock-echo", "Mock (built-in)", Api::new("mock"), "mock", "");
 	mock.context_window = 128_000;
 	mock.max_tokens = 8_192;
 
@@ -156,7 +160,11 @@ fn builtin_models() -> Vec<Model> {
 	sonnet.reasoning = true;
 	sonnet.context_window = 200_000;
 	sonnet.max_tokens = 64_000;
-	sonnet.cost = pi_ai::ModelCost { input: 3.0, output: 15.0, ..Default::default() };
+	sonnet.cost = pi_ai::ModelCost {
+		input: 3.0,
+		output: 15.0,
+		..Default::default()
+	};
 
 	let gpt = Model::new(
 		"gpt-5.2",

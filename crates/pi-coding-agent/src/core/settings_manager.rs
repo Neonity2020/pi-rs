@@ -46,24 +46,49 @@ impl SettingsManager {
 		let project_path = project_cwd.map(|cwd| config::project_pi_dir(cwd).join("settings.json"));
 
 		let global = load_settings(&global_path).unwrap_or_default();
-		let project = project_path.as_deref().and_then(load_settings).unwrap_or_default();
+		let project = project_path
+			.as_deref()
+			.and_then(load_settings)
+			.unwrap_or_default();
 
-		Self { global_path, project_path, global, project, modified: Vec::new() }
+		Self {
+			global_path,
+			project_path,
+			global,
+			project,
+			modified: Vec::new(),
+		}
 	}
 
 	/// Effective settings: project over global, `None`s fall through.
 	pub fn effective(&self) -> Settings {
 		Settings {
-			default_provider: self.project.default_provider.clone().or(self.global.default_provider.clone()),
-			default_model: self.project.default_model.clone().or(self.global.default_model.clone()),
+			default_provider: self
+				.project
+				.default_provider
+				.clone()
+				.or(self.global.default_provider.clone()),
+			default_model: self
+				.project
+				.default_model
+				.clone()
+				.or(self.global.default_model.clone()),
 			default_thinking_level: self
 				.project
 				.default_thinking_level
 				.clone()
 				.or(self.global.default_thinking_level.clone()),
 			theme: self.project.theme.clone().or(self.global.theme.clone()),
-			external_editor: self.project.external_editor.clone().or(self.global.external_editor.clone()),
-			shell_path: self.project.shell_path.clone().or(self.global.shell_path.clone()),
+			external_editor: self
+				.project
+				.external_editor
+				.clone()
+				.or(self.global.external_editor.clone()),
+			shell_path: self
+				.project
+				.shell_path
+				.clone()
+				.or(self.global.shell_path.clone()),
 		}
 	}
 

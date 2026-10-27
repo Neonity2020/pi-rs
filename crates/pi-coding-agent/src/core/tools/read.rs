@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use pi_agent::{AgentTool, AgentToolResult, ToolUpdate};
@@ -56,7 +56,7 @@ of large files. Prefer this over bash cat."
 	) -> AgentToolResult {
 		let path = match param_str(&params, "path") {
 			Ok(p) => p,
-			Err(e) => return e,
+			Err(e) => return *e,
 		};
 		let offset = param_u64_or(&params, "offset", 1).max(1);
 		let limit = param_u64_or(&params, "limit", MAX_LINES).min(MAX_LINES);
@@ -72,7 +72,9 @@ of large files. Prefer this over bash cat."
 						continue;
 					}
 					if count >= limit {
-						out.push_str(&format!("... (truncated at line {line_no}, use offset to continue)\n"));
+						out.push_str(&format!(
+							"... (truncated at line {line_no}, use offset to continue)\n"
+						));
 						break;
 					}
 					let line = if line.chars().count() > MAX_LINE_WIDTH {
