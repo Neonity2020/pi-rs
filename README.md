@@ -8,12 +8,14 @@
 
 | 能力 | 当前状态 |
 |---|---|
-| 交互和 print 模式 | 可用于实验；支持内置工具调用和本地 JSONL 会话记录 |
-| OpenAI 兼容 Chat Completions | 支持文本和工具调用；响应完整接收后才显示，尚非增量流式输出 |
-| 其他 HTTP provider | 尚未完成；mock provider 可用于本地演示 |
-| 会话恢复和压缩 | 尚未接入命令行工作流 |
-| MCP、SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
-| `--rpc` | 仅 JSONL 帧处理；所有 RPC 命令均返回未实现 |
+| 交互和 print 模式 | 可用于实验；支持内置工具调用、本地 JSONL 会话记录与 `--continue`/`--resume` 会话恢复 |
+| OpenAI 兼容 Chat Completions | 支持增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
+| 其他 HTTP provider | Anthropic 为 fail-fast 桩；mock provider 可用于本地演示 |
+| 会话压缩 | 尚未实现（会话恢复已接入 CLI） |
+| MCP | stdio 传输、客户端（list/call tools）与 AgentTool 桥已完成并通过测试；尚未接入 CLI 工具装配 |
+| SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
+| `--rpc` | 已实现 prompt/steer/follow_up/abort/set_model/set_thinking/get_state/get_messages 等命令与事件帧；与上游 wire 形态的偏差见 rpc.rs 模块文档 |
+| TUI 主题与键位 | 主题文件解析（含 OKHSL 色值）与键位管理器已库级移植并测试；尚未接入 CLI 配置加载 |
 
 本项目仍在开发中，运行模型生成的 shell 命令和文件修改时，请在可信环境中使用并检查结果。
 
