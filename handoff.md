@@ -6,7 +6,7 @@
 
 pi-rs 是 pi coding agent 的 Rust 移植，README 定位为框架阶段。第一轮已完成连续 prompt 排队、快照补齐持久化、进程组清理、输出限幅与 CI 工作流（见 git log 与下方记录）。本轮接手后完成：严格 Clippy 门禁清零、rustfmt 基线、会话持久化加固、bash 管道滞留修复。验收围绕可靠的 agent、工具和会话关键路径，并准确说明尚未实现的能力。
 
-工作目录为本仓库，分支 `main`。2026-10-27 再次扫描时 HEAD 为 `49d9ded`，下述改动已分批提交，扫描前工作区干净。最新计划和认领状态见 `TASKS.md`；本文件保留上一轮实现记录。保留现有工作区内容，不要重置。仓库内 `pi/`、`pi-tutorial/`、`t3code/` 为独立或参考目录，不应修改。
+工作目录为本仓库，分支 `main`。2026-10-27 再次扫描时 HEAD 为 `b4df566`，前几轮改动已分批提交；当前后续修复以 `git status` 为准。最新计划和认领状态见 `TASKS.md`；本文件保留上一轮实现记录。保留现有工作区内容，不要重置。仓库内 `pi/`、`pi-tutorial/`、`t3code/` 为独立或参考目录，不应修改。
 
 ## 本轮完成
 
@@ -41,16 +41,29 @@ pi-rs 是 pi coding agent 的 Rust 移植，README 定位为框架阶段。第�
 - **pi-mcp（stdio + 工具桥）**：stdio transport 完整实现（行帧 16 MiB 上限、stderr 持续排空留 64 KiB 尾部、close 走 stdin→宽限→SIGTERM→SIGKILL 组、drop 守卫防孤儿）；`list_tools` 补 nextCursor 分页、`call_tool` 按上游 wire 形态；`McpTool` 桥实现 `pi_agent::AgentTool`（`mcp__<server>__<tool>` 命名、content 块映射、isError 传播）。**顺带修复框架期 bug：protocol 类型全部缺 camelCase rename（`nextCursor`/`inputSchema`/`isError` 等 snake_case 上 wire），与任何真实 MCP server 都无法互通**，已加 rename 并有真进程往返测试。
 - **pi-tui（主题 + 键位，库级）**：`theme.rs` 按上游 theme.schema.json（vars 变量引用解析 + 环检测、`#rgb/#rrggbb`、0–255 索引、`""`→Reset、oklch/okhsl——完整移植 oklab.ts，测试期望值用上游 TS 实际运行生成）；`keys.rs`/`keybindings.rs` 移植 chord 解析与 47 项默认键位表、rebuild 覆盖/禁用/冲突语义。未接入 CLI。
 
-**集成验证（主会话实测，全工作区）**：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked` 全部通过，**124 项测试**（第二轮 46 → 124）。改动未提交，等用户指令。README 能力表已同步更新。
+**集成验证（主会话实测，全工作区）**：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked` 全部通过，**124 项测试**（第二轮 46 → 124）。第三轮改动已分批提交至 `b4df566`。README 能力表已同步更新。
 
-**交接事项**：并行存在另一个会话在本工作区产出 `TASKS.md`（任务认领清单）、`docs/`（484 行文档树）并编辑了本文件指向 TASKS.md——非本轮 4 个 agent 所为；`docs/internals/session-and-persistence.md` 里 JSONL 示例首行写的是 `{"type":"session",...}`，实际实现是 `"header"`，若继续维护文档需修正。TASKS.md 的 T3/T4/T5（恢复 CLI、provider HTTP 契约测试、流式）已由本轮完成，认领状态未同步。
+**交接事项**：并行存在另一个会话在本工作区产出 `TASKS.md`（任务认领清单）、`docs/`（484 行文档树）并编辑了本文件指向 TASKS.md——非本轮 4 个 agent 所为；JSONL 示例已改为 `header`；任务清单状态以 `TASKS.md` 为准。
+
+## 第四轮：下一阶段冲刺（2026-10-27，4 个子 agent 按 crate 领地并行）
+
+基线 `b4df566`（第三轮已推送，远程 CI 三 job 全过）。四个互不重叠的任务包并行完成：
+
+- **Anthropic Messages provider 完整实现**（`crates/pi-ai/src/providers/anthropic.rs`，对照上游 `anthropic-messages.ts` + `simple-options.ts`）：/v1/messages 请求 wire（system 顶层折叠、tools 有序回放、thinking budget 按 ThinkingLevel 映射、ephemeral cache breakpoint、x-api-key/anthropic-version 头、key 走运行时 env）；专用 SseDecoder 处理 message_start/content_block_delta（text/thinking/input_json）/message_delta/stop 全事件；tool_use 按 block index 累积（open_blocks map，交错 index 正确）；stopReason/usage（cache_read/cache_creation/ephemeral_1h/thinking_tokens）忠实移植 mapStopReason；错误路径全带 partial、abort 即时生效。`json_repair.rs` 从 openai_completions 提取为共享模块。17 个新测试（13 provider 集成 + 4 agent loop 集成，本地 mock HTTP+SSE）。
+- **Agent 历史替换 API + 会话压缩**（`pi-agent/src/agent.rs` + `pi-coding-agent/src/core/compaction.rs` 新模块）：`Agent::replace_messages`（运行中拒绝，对齐上游"只压缩空闲 agent"）与 `Agent::stream_fn`；压缩核心对照上游 compaction.ts——SUMMARIZATION_PROMPT 逐字移植、总结调用用 agent 自身 model+stream_fn、error/length 停止原因拒绝落盘、tool call 拒绝；`SessionEntry::Compaction`（wire `{type:"compaction", summary, firstKeptEntryId, tokensBefore, id}`，对齐上游 keep-nothing）；接线 /compact（运行中拒绝、压缩中 prompt 排队）；恢复时 compaction entry 重建 summary 为普通消息。测试：prompt→压缩→再 prompt→恢复全往返。未做：自动阈值触发、branch-summarization。
+- **MCP 接入 CLI**（`core/mcp_config.rs` 新 + `core/tools/mod.rs` + main.rs）：`~/.pi-rs/agent/mcp.json` 装配（逐项校验镜像上游、坏文件非致命）、10s/server 预算、失败隔离成 notice、`McpAssembly::shutdown` 在三条退出路径执行（rpc 返回/print exit 前/interactive 返回后）；pi-mcp 补 `McpClient::close()`。冒烟：好 server 连接 + 坏 server 隔离 + 正常回包。
+- **TUI 主题/键位接线**（`core/ui_config.rs` 新 + modes/interactive.rs + pi-tui 小补充）：上游实际形态为 `themes/<name>.json` + settings `theme` 字段（非 theme.json，已对齐上游）；keybindings.json 覆盖喂 `KeybindingsManager`（上游静默回退，pi-rs 改 notice 送达，注释标明分歧）；interactive 硬编码键位改为 `resolve_global_action` 纯函数分发（app.model.select ctrl+l 等接通），overlay 列表键走 `handle_key_with`；pty 冒烟验证主题色值/键位覆盖/坏文件回退全链路。
+
+**跨 agent 集成（主会话）**：MCP/resume 启动 notice 统一按模式分发（interactive 进 `UiConfig.notices` 聊天通道，print/rpc 走 stderr）。**全工作区门禁：fmt/clippy -D warnings/test 全过，199 项测试**（124 → 199）。第四轮改动未提交，等用户指令。README 能力表已同步。
+
+**交接事项**：`bash-executor.ts`/`powershell.ts`（上游 bash 工具的 stdin transport 与 Windows 路径）未移植；MCP 剩余：streamable HTTP/OAuth、项目级 `.pi/mcp.json`、env 展开；压缩剩余：自动阈值、branch-summarization。
 
 ## 未完成与建议分工
 
-1. **提交状态**：第二轮改动已推送至 `49d9ded`；**第三轮（并行冲刺）改动在工作区未提交**，建议按 crate 分四个提交（流式 / 会话恢复+RPC / MCP / TUI+文档），遵循用户指令执行。
-2. **CI 远程验证**：第二轮三 job 已在 GitHub Actions 全过。第三轮改动 push 后需再确认（本轮新增的 mock HTTP 测试绑定本机随机端口，Linux 兼容；stdio 测试依赖 `/bin/sh`）。
-3. **产品能力剩余**（README 路线图）：Anthropic Messages provider 完整实现（当前 fail-fast 桩）、会话压缩、MCP 工具接入 CLI 装配（`McpTool` 已就绪，缺配置加载与生命周期管理）、TUI 主题/键位接入配置加载、扩展系统。
-4. **持久化下一步**：事务性同步持久化（崩溃安全）仍是有意不做；若产品需要，设计 WAL 或 double-buffer 方案。会话恢复 `read_session_messages` 已能跳过撕裂行。
+1. **提交状态**：第二轮已推送至 `49d9ded`；第三轮已提交至 `b4df566` 并推送；**第四轮（Anthropic/压缩/MCP 接入/TUI 接线）改动在工作区未提交**，建议按 crate 分批提交，遵循用户指令执行。
+2. **CI 远程验证**：第三轮三 job 已在 GitHub Actions 全过。第四轮改动 push 后需再确认。
+3. **产品能力剩余**（README 路线图）：扩展系统、bash stdin transport/powershell、MCP streamable HTTP 与项目级配置、压缩自动阈值、RPC 与上游剩余命令对齐。
+4. **持久化下一步**：事务性同步持久化（崩溃安全）仍是有意不做；若产品需要，设计 WAL 或 double-buffer 方案。会话恢复 `read_session_messages` 已能跳过撕裂行与 compaction entry。
 5. **进程生命周期边界**：setsid 脱离组的后代不会被清理（已文档化）；若产品需要，可考虑退出后扫描 reap。`ExecResult.timed_out` 恒为 false（超时走 `Err(Error::Timeout)`），bash 工具里的 `timed_out` 分支是防御性死代码，可在超时改为携带部分输出时一并清理。
 
 ## 恢复命令

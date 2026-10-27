@@ -8,14 +8,15 @@
 
 | 能力 | 当前状态 |
 |---|---|
-| 交互和 print 模式 | 可用于实验；支持内置工具调用、本地 JSONL 会话记录与 `--continue`/`--resume` 会话恢复 |
-| OpenAI 兼容 Chat Completions | 支持增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
-| 其他 HTTP provider | Anthropic 为 fail-fast 桩；mock provider 可用于本地演示 |
-| 会话压缩 | 尚未实现（会话恢复已接入 CLI） |
-| MCP | stdio 传输、客户端（list/call tools）与 AgentTool 桥已完成并通过测试；尚未接入 CLI 工具装配 |
+| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录、`--continue`/`--resume` 会话恢复、`/compact` 会话压缩 |
+| OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
+| Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
+| 其他 HTTP provider | mock provider 可用于本地演示 |
+| 会话压缩 | `/compact` 已实现：LLM 总结、历史替换、日志 entry、恢复重建；自动阈值触发尚未实现 |
+| MCP | 已接入 CLI：`~/.pi-rs/agent/mcp.json` 装配 stdio server，工具以 `mcp__<server>__<tool>` 进入工具表；失败隔离、退出清理 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
 | `--rpc` | 已实现 prompt/steer/follow_up/abort/set_model/set_thinking/get_state/get_messages 等命令与事件帧；与上游 wire 形态的偏差见 rpc.rs 模块文档 |
-| TUI 主题与键位 | 主题文件解析（含 OKHSL 色值）与键位管理器已库级移植并测试；尚未接入 CLI 配置加载 |
+| TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示 |
 
 本项目仍在开发中，运行模型生成的 shell 命令和文件修改时，请在可信环境中使用并检查结果。
 

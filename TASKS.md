@@ -1,6 +1,6 @@
 # 下一阶段计划与任务认领清单
 
-基线：2026-10-27 扫描 `main`，HEAD `49d9ded`；扫描前工作区干净。已提交 agent 测试、格式化、进程管理、会话持久化和 CI 门禁。当前本地 `cargo test --workspace --locked`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 均通过；GitHub 远程 CI 状态未验证。
+基线：2026-10-27 验收扫描 `main`，HEAD `b4df566`；后续修复状态以 `git status` 为准。已提交 agent 测试、格式化、进程管理、会话持久化和 CI 门禁。当前本地 `cargo test --workspace --locked`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 均通过；GitHub 远程 CI 状态未验证。
 
 目标：先保证会话和进程的生命周期可靠，再交付一个可恢复会话、可验证的 OpenAI 兼容工作流。MCP、RPC 和其他 provider 保持后续阶段，避免同时扩大接口与风险面。
 
@@ -15,12 +15,12 @@
 
 ### T1 — 会话关闭与失败恢复（P0）
 
-- [x] 已完成（第二轮，见 git log `49d9ded` 与 handoff.md 第二/三轮记录）；Agent：主会话集成轮；开始：2026-10-27
+- [ ] 验收整改中；Agent：主会话；开始：2026-10-27
 - 范围：`crates/pi-coding-agent/src/core/agent_session.rs`、`session_manager.rs`。
 - 核查并修复退出或通道关闭时仍有运行任务的生命周期；验证 panic 后运行状态能恢复。检查 `write_all` 部分失败、`sync_data` 失败后重试是否造成破损行或重复记录；按实际需要设计明确的持久化提交语义。
 - 验收：退出、取消、失败注入和重试有自动化测试，证明消息顺序及重复/丢失行为；文档准确说明崩溃保证。避免在没有证据时宣称事务性持久化。
 - 依赖：无。与 T3 协调会话恢复接口，T3 不修改上述核心文件，除非经协调。
-- 结果：fsync 每条目 + 撕裂行自愈 + 写失败游标不推进有测试；持久化为有序、逐条落盘，非事务（模块文档如实标注）。
+- 结果：退出时停止活动任务并等待后保存；同步失败重试避免重复追加，写入失败尝试回滚。已增加部分写入及同步失败注入、通道关闭时等待和模型变更同步恢复测试；持久化非事务。仍需独立验证各模式退出的端到端行为和异常路径。
 
 ### T2 — 进程生命周期与跨平台验证（P1）
 
