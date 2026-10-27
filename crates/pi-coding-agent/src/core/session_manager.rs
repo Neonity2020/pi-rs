@@ -7,13 +7,12 @@
 //! session-resume phase.
 //!
 //! Durability: each entry is written and fsynced (`sync_data`) before
-//! `append` returns, so completed appends survive process and machine
-//! crashes. The log is ordered but not transactional: a crash mid-write can
+//! `append` returns. Filesystem and hardware durability guarantees vary;
+//! the log is ordered but not transactional: a crash mid-write can
 //! leave a partial final line. Reopening the session terminates that torn
 //! line with a newline, so later appends stay valid, and readers
 //! (`read_session_messages`, `count_entries`) skip lines that fail to parse.
-//! The TS original does not fsync; this port trades a little latency for
-//! that guarantee.
+//! The TS original does not fsync; this port trades latency for a sync request.
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -40,15 +39,56 @@ pub enum SessionEntry {
 	ModelChange {
 		model: String,
 	},
+	/// Compaction boundary — upstream `CompactionEntry`
+	/// (`pi/packages/coding-agent/src/core/session-manager.ts`). This flat-log
+	/// port summarizes the whole non-system transcript ("keep nothing"), so
+	/// `firstKeptEntryId` mirrors upstream's `firstKeptEntryId ?? id`: it
+	/// points at the compaction entry itself. Upstream's optional fields
+	/// (`details`, `usage`, `fromHook`, `systemMessage`) are not produced yet;
+	/// their absence stays wire-compatible. The variant-level `rename_all`
+	/// covers its multi-word fields (the container attribute names variants).
+	#[serde(rename_all = "camelCase")]
+	Compaction {
+		id: String,
+		summary: String,
+		first_kept_entry_id: String,
+		tokens_before: u64,
+	},
 	Custom {
 		kind: String,
 		data: Value,
 	},
 }
 
+impl SessionEntry {
+	/// Build a compaction entry with a fresh unique id (upstream
+	/// `SessionManager.appendCompaction`, reduced to the keep-nothing form).
+	pub fn compaction(summary: impl Into<String>, tokens_before: u64) -> Self {
+		let id = generate_entry_id();
+		Self::Compaction {
+			id: id.clone(),
+			summary: summary.into(),
+			first_kept_entry_id: id,
+			tokens_before,
+		}
+	}
+}
+
+/// Time-plus-counter entry id (upstream `generateId`); only uniqueness within
+/// one log matters to this port.
+fn generate_entry_id() -> String {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+	format!("{:x}-{:x}", pi_ai::types::now_ms(), n)
+}
+
 pub struct SessionManager {
 	session_dir: PathBuf,
 	file: Option<std::fs::File>,
+	pending_sync: Option<String>,
+	pending_metadata: bool,
+	write_broken: bool,
 	pub entries_written: u64,
 }
 
@@ -75,6 +115,9 @@ impl SessionManager {
 		let mut manager = Self {
 			session_dir: dir,
 			file: None,
+			pending_sync: None,
+			pending_metadata: false,
+			write_broken: false,
 			entries_written: 0,
 		};
 		manager.open_file()?;
@@ -92,6 +135,9 @@ impl SessionManager {
 		Self {
 			session_dir: PathBuf::new(),
 			file: None,
+			pending_sync: None,
+			pending_metadata: false,
+			write_broken: false,
 			entries_written: 0,
 		}
 	}
@@ -101,6 +147,9 @@ impl SessionManager {
 		let mut manager = Self {
 			session_dir: dir.to_path_buf(),
 			file: None,
+			pending_sync: None,
+			pending_metadata: false,
+			write_broken: false,
 			entries_written: count_entries(dir)?,
 		};
 		manager.open_file()?;
@@ -113,6 +162,9 @@ impl SessionManager {
 		Self {
 			session_dir: dir,
 			file: Some(file),
+			pending_sync: None,
+			pending_metadata: false,
+			write_broken: false,
 			entries_written: 0,
 		}
 	}
@@ -158,13 +210,50 @@ impl SessionManager {
 
 	/// Append one entry; no-op for in-memory sessions.
 	pub fn append(&mut self, entry: &SessionEntry) -> Result<(), SessionError> {
+		self.append_with_io(
+			entry,
+			|file, bytes| file.write_all(bytes),
+			|file| file.sync_data(),
+		)
+	}
+
+	fn append_with_io(
+		&mut self,
+		entry: &SessionEntry,
+		write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+		sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+	) -> Result<(), SessionError> {
 		let Some(file) = &mut self.file else {
 			return Ok(());
 		};
 		let mut line = serde_json::to_string(entry)?;
 		line.push('\n');
-		file.write_all(line.as_bytes())?;
-		file.sync_data()?;
+		if self.write_broken {
+			return Err(std::io::Error::other(
+				"session log requires reopening after failed rollback",
+			)
+			.into());
+		}
+		if let Some(pending) = &self.pending_sync {
+			if pending != &line {
+				return Err(
+					std::io::Error::other("previous session entry still awaiting sync").into(),
+				);
+			}
+		} else {
+			let original_len = file.metadata()?.len();
+			if let Err(error) = write(file, line.as_bytes()) {
+				if file.set_len(original_len).is_err() {
+					self.write_broken = true;
+				}
+				return Err(error.into());
+			}
+			self.pending_sync = Some(line);
+			self.pending_metadata = !matches!(entry, SessionEntry::Message { .. });
+		}
+		sync(file)?;
+		self.pending_sync = None;
+		self.pending_metadata = false;
 		self.entries_written += 1;
 		Ok(())
 	}
@@ -173,6 +262,19 @@ impl SessionManager {
 		self.append(&SessionEntry::Message {
 			message: Box::new(message.clone()),
 		})
+	}
+
+	/// Finish a previously written metadata entry before appending messages.
+	pub fn sync_pending_metadata(&mut self) -> Result<(), SessionError> {
+		if self.pending_metadata {
+			if let Some(file) = &self.file {
+				file.sync_data()?;
+			}
+			self.pending_sync = None;
+			self.pending_metadata = false;
+			self.entries_written += 1;
+		}
+		Ok(())
 	}
 
 	/// List recent sessions (newest first) with their entry counts.
@@ -439,11 +541,139 @@ mod tests {
 	}
 
 	#[test]
+	fn retry_after_sync_failure_does_not_append_twice() {
+		let dir = temp_session_dir("sync-retry");
+		let mut session = SessionManager::open(&dir).unwrap();
+		let entry = SessionEntry::Message {
+			message: Box::new(user_message("once")),
+		};
+		assert!(
+			session
+				.append_with_io(
+					&entry,
+					|f, bytes| f.write_all(bytes),
+					|_| { Err(std::io::Error::other("injected sync failure")) }
+				)
+				.is_err()
+		);
+		assert!(session.append_message(&user_message("different")).is_err());
+		session.append(&entry).unwrap();
+		assert_eq!(session.entries_written, 1);
+		assert_eq!(
+			crate::core::agent_session::read_session_messages(&dir).len(),
+			1
+		);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn partial_write_failure_rolls_back_before_retry() {
+		let dir = temp_session_dir("partial-write");
+		let mut session = SessionManager::open(&dir).unwrap();
+		session.append_message(&user_message("before")).unwrap();
+		let entry = SessionEntry::Message {
+			message: Box::new(user_message("after")),
+		};
+		assert!(
+			session
+				.append_with_io(
+					&entry,
+					|file, bytes| {
+						file.write_all(&bytes[..bytes.len() / 2])?;
+						Err(std::io::Error::other("injected partial write"))
+					},
+					|file| file.sync_data()
+				)
+				.is_err()
+		);
+		assert_eq!(session.entries_written, 1);
+		session.append(&entry).unwrap();
+		let messages = crate::core::agent_session::read_session_messages(&dir);
+		assert_eq!(messages.len(), 2);
+		let text = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		assert_eq!(text.lines().count(), 2);
+		assert!(
+			text.lines()
+				.all(|line| serde_json::from_str::<Value>(line).is_ok())
+		);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn failed_metadata_sync_can_be_finished_before_message() {
+		let dir = temp_session_dir("metadata-sync");
+		let mut session = SessionManager::open(&dir).unwrap();
+		let change = SessionEntry::ModelChange {
+			model: "test/model".into(),
+		};
+		assert!(
+			session
+				.append_with_io(
+					&change,
+					|file, bytes| file.write_all(bytes),
+					|_| { Err(std::io::Error::other("injected sync failure")) }
+				)
+				.is_err()
+		);
+		session.sync_pending_metadata().unwrap();
+		session.append_message(&user_message("after")).unwrap();
+		let text = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		assert_eq!(text.lines().count(), 2);
+		assert_eq!(session.entries_written, 2);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
 	fn in_memory_append_never_fails_and_writes_nothing() {
 		let mut session = SessionManager::in_memory();
 		session.append_message(&user_message("ghost")).unwrap();
 		assert_eq!(session.entries_written, 0);
 		assert!(session.session_dir().is_none());
+	}
+
+	// -- compaction entry ----------------------------------------------------
+
+	#[test]
+	fn compaction_entry_serializes_camel_case() {
+		let entry = SessionEntry::compaction("the summary", 1234);
+		let value = serde_json::to_value(&entry).unwrap();
+		assert_eq!(value["type"], "compaction");
+		assert_eq!(value["summary"], "the summary");
+		assert_eq!(value["tokensBefore"], 1234);
+		// Keep-nothing form: the entry keeps itself (upstream `firstKeptEntryId ?? id`).
+		assert_eq!(value["firstKeptEntryId"], value["id"]);
+		assert!(!value["id"].as_str().unwrap().is_empty());
+	}
+
+	#[test]
+	fn compaction_entry_ids_are_unique() {
+		let first = serde_json::to_value(SessionEntry::compaction("a", 1)).unwrap();
+		let second = serde_json::to_value(SessionEntry::compaction("b", 2)).unwrap();
+		assert_ne!(first["id"], second["id"]);
+	}
+
+	#[test]
+	fn existing_entry_shapes_are_stable() {
+		let header = serde_json::to_value(&SessionEntry::Header {
+			version: 1,
+			app: "pi-rs 0.1.0".into(),
+			created: 42,
+			cwd: "/tmp".into(),
+		})
+		.unwrap();
+		assert_eq!(header["type"], "header");
+		let change = serde_json::to_value(&SessionEntry::ModelChange {
+			model: "mock/mock".into(),
+		})
+		.unwrap();
+		assert_eq!(change["type"], "modelChange");
+		assert_eq!(change["model"], "mock/mock");
+		let message = serde_json::to_value(&SessionEntry::Message {
+			message: Box::new(user_message("hi")),
+		})
+		.unwrap();
+		assert_eq!(message["type"], "message");
+		assert_eq!(message["message"]["role"], "user");
 	}
 
 	// -- resume selection ---------------------------------------------------

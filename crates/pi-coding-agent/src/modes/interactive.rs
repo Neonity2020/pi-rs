@@ -25,10 +25,12 @@ use unicode_width::UnicodeWidthStr;
 use pi_agent::AgentEvent;
 use pi_ai::{Message, Model, StopReason};
 use pi_tui::components::{Component, SelectAction, SelectItem, SelectList, markdown_lines};
+use pi_tui::keybindings::KeybindingsManager;
 use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
 
 use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle};
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
+use crate::core::ui_config::UiConfig;
 
 const TICK_MS: u64 = 80;
 const TOOL_PREVIEW_LINES: usize = 10;
@@ -101,6 +103,11 @@ pub struct InteractiveMode {
 	session: SessionHandle,
 	models: Vec<Model>,
 	theme: Theme,
+	// Resolved app keybindings (ui_config.rs): default table + user
+	// keybindings.json overrides.
+	keybindings: KeybindingsManager,
+	// Config notices (bad keybindings.json / theme file) shown at startup.
+	startup_notices: Vec<String>,
 	editor: Editor,
 	chat: ScrollView,
 	blocks: Vec<ChatBlock>,
@@ -154,13 +161,66 @@ pub fn format_duration(ms: u128) -> String {
 	}
 }
 
+/// The app-level actions pi-rs interactive dispatches. The definition table
+/// (ui_config.rs) carries upstream's full app action list; the ones pi-rs
+/// has not implemented stay in the table but resolve to nothing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalAction {
+	Interrupt,
+	Exit,
+	Clear,
+	ModelSelect,
+	ToolsExpand,
+	ThinkingToggle,
+}
+
+/// Resolve a key to a global action, mirroring upstream
+/// `custom-editor.ts` `handleInput` order: app.interrupt, app.exit (only
+/// with an empty editor), then the other registered app actions. Per-action
+/// `matches` instead of `action_for_event` — the merged table also holds
+/// `tui.*` actions whose defaults shadow app chords (escape is
+/// `tui.select.cancel`, ctrl+d `tui.editor.deleteCharForward`, ctrl+c
+/// `tui.input.copy`), and upstream checks `app.interrupt` before all of
+/// them. Pure so the keybindings wiring is testable without a TTY.
+fn resolve_global_action(
+	keybindings: &KeybindingsManager,
+	key: &KeyEvent,
+	editor_is_empty: bool,
+) -> Option<GlobalAction> {
+	if keybindings.matches("app.interrupt", key) {
+		return Some(GlobalAction::Interrupt);
+	}
+	// app.exit only exits with an empty editor; with content, upstream falls
+	// through (the editor deletes a char forward) and the remaining app
+	// actions still get their chance.
+	if keybindings.matches("app.exit", key) && editor_is_empty {
+		return Some(GlobalAction::Exit);
+	}
+	if keybindings.matches("app.clear", key) {
+		return Some(GlobalAction::Clear);
+	}
+	if keybindings.matches("app.model.select", key) {
+		return Some(GlobalAction::ModelSelect);
+	}
+	if keybindings.matches("app.tools.expand", key) {
+		return Some(GlobalAction::ToolsExpand);
+	}
+	if keybindings.matches("app.thinking.toggle", key) {
+		return Some(GlobalAction::ThinkingToggle);
+	}
+	None
+}
+
 impl InteractiveMode {
-	pub fn new(session: SessionHandle, models: Vec<Model>, cwd: String, theme: Theme) -> Self {
+	pub fn new(session: SessionHandle, models: Vec<Model>, cwd: String, ui: UiConfig) -> Self {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+		let theme = ui.theme;
 		Self {
 			session,
 			models,
 			theme: theme.clone(),
+			keybindings: ui.keybindings,
+			startup_notices: ui.notices,
 			editor: Editor::new("❯ ").with_style(Style::new().fg(theme.assistant)),
 			chat: ScrollView::new(),
 			blocks: Vec::new(),
@@ -183,11 +243,17 @@ impl InteractiveMode {
 	pub async fn run(mut self, initial_prompt: Option<String>) -> anyhow::Result<()> {
 		let mut guard = TerminalGuard::new()?;
 
-		// Welcome banner.
+		// Config problems first (keybindings.json / theme load failures), then
+		// the welcome banner with the effective bindings.
+		for notice in std::mem::take(&mut self.startup_notices) {
+			self.push_notice(notice);
+		}
 		self.push_notice(format!(
-			"{} v{} — type /help for commands; ctrl+c exits, esc aborts a run.",
+			"{} v{} — type /help for commands; {} exits, {} aborts a run.",
 			crate::config::APP_NAME,
-			crate::config::VERSION
+			crate::config::VERSION,
+			self.keybinding_hint("app.clear", "ctrl+c"),
+			self.keybinding_hint("app.interrupt", "escape"),
 		));
 
 		self.refresh_branch();
@@ -249,6 +315,10 @@ impl InteractiveMode {
 		}
 
 		let _ = self.session.cmd_tx.send(SessionCommand::Exit);
+		while !matches!(
+			self.session.events.recv().await,
+			Err(tokio::sync::broadcast::error::RecvError::Closed)
+		) {}
 		Ok(())
 	}
 
@@ -280,9 +350,11 @@ impl InteractiveMode {
 	}
 
 	fn handle_overlay_key(&mut self, key: KeyEvent) {
-		// Search-line editing first (printable chars and backspace), matching
-		// pi's search Input. Ctrl combos go straight to the list (ctrl+c
-		// cancels via the list's handler).
+		// Search-line editing first (printable chars and backspace). Upstream
+		// drives the search input through the editor, so its keys follow the
+		// tui.editor.* bindings; the pi-rs Editor does not consult the
+		// keybindings manager, so this line stays hardcoded — unlike the list
+		// actions below, which go through the table.
 		if !key.modifiers.contains(KeyModifiers::CONTROL)
 			&& !key.modifiers.contains(KeyModifiers::ALT)
 		{
@@ -303,8 +375,11 @@ impl InteractiveMode {
 				_ => {}
 			}
 		}
+		// List navigation/confirm/cancel via the keybindings manager
+		// (upstream model-selector.ts asks it for tui.select.* / tui.input.tab
+		// / app.models.save; pi-rs dispatches the select actions only).
 		let action = match self.overlay.as_mut() {
-			Some(overlay) => overlay.list.handle_key(key),
+			Some(overlay) => overlay.list.handle_key_with(key, &self.keybindings),
 			None => return,
 		};
 		match action {
@@ -332,18 +407,25 @@ impl InteractiveMode {
 	}
 
 	fn handle_global_key(&mut self, key: KeyEvent) -> bool {
-		match (key.code, key.modifiers) {
-			(KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-				self.quit = true;
-				true
+		let Some(action) = resolve_global_action(&self.keybindings, &key, self.editor.is_empty())
+		else {
+			return false;
+		};
+		match action {
+			GlobalAction::Interrupt => {
+				// Escape always aborts/consumes (pi behavior), even idle.
+				if self.working {
+					let _ = self.session.cmd_tx.send(SessionCommand::Abort);
+				}
 			}
-			(KeyCode::Char('d'), m)
-				if m.contains(KeyModifiers::CONTROL) && self.editor.is_empty() =>
-			{
-				self.quit = true;
-				true
+			// pi divergence: upstream app.clear clears the editor (double
+			// press exits); pi-rs keeps its simpler ctrl+c exits.
+			GlobalAction::Clear | GlobalAction::Exit => self.quit = true,
+			GlobalAction::ModelSelect => {
+				let current = self.session.agent.model().key();
+				self.overlay = Some(ModelOverlay::new(&self.models, &current));
 			}
-			(KeyCode::Char('o'), m) if m.contains(KeyModifiers::CONTROL) => {
+			GlobalAction::ToolsExpand => {
 				// app.tools.expand (tool-execution.ts): toggle full tool output.
 				self.tools_expanded = !self.tools_expanded;
 				for block in &mut self.blocks {
@@ -351,9 +433,8 @@ impl InteractiveMode {
 						*rendered = None;
 					}
 				}
-				true
 			}
-			(KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
+			GlobalAction::ThinkingToggle => {
 				// app.thinking.toggle: show/hide thinking blocks.
 				self.thinking_expanded = !self.thinking_expanded;
 				for block in &mut self.blocks {
@@ -361,15 +442,17 @@ impl InteractiveMode {
 						*rendered = None;
 					}
 				}
-				true
 			}
-			(KeyCode::Esc, _) => {
-				if self.working {
-					let _ = self.session.cmd_tx.send(SessionCommand::Abort);
-				}
-				true
-			}
-			_ => false,
+		}
+		true
+	}
+
+	/// The action's effective bindings as a hint string (`ctrl+o/ctrl+p`
+	/// style), falling back to the default chord when unbound.
+	fn keybinding_hint(&self, action: &str, fallback: &str) -> String {
+		match self.keybindings.formatted_keys(action) {
+			Some(keys) if !keys.is_empty() => keys.join("/"),
+			_ => fallback.to_string(),
 		}
 	}
 
@@ -401,9 +484,13 @@ impl InteractiveMode {
 				for info in BUILTIN_SLASH_COMMANDS {
 					text.push_str(&format!("  /{:<10} {}\n", info.name, info.description));
 				}
-				text.push_str(
-					"\nkeys: ctrl+o expand tool output · ctrl+t toggle thinking · pgup/pgdn scroll",
-				);
+				// Hints reflect keybindings.json (upstream renders hints from
+				// the keybindings manager too).
+				text.push_str(&format!(
+					"\nkeys: {} expand tool output · {} toggle thinking · pgup/pgdn scroll",
+					self.keybinding_hint("app.tools.expand", "ctrl+o"),
+					self.keybinding_hint("app.thinking.toggle", "ctrl+t"),
+				));
 				self.push_notice(text);
 			}
 			"exit" | "quit" | "q" => self.quit = true,
@@ -875,7 +962,11 @@ impl InteractiveMode {
 		let mut lines = vec![search_line, Line::default()];
 		lines.extend(list_lines);
 		lines.push(Line::from(Span::styled(
-			" enter select · esc cancel · type to filter",
+			format!(
+				" {} select · {} cancel · type to filter",
+				self.keybinding_hint("tui.select.confirm", "enter"),
+				self.keybinding_hint("tui.select.cancel", "esc"),
+			),
 			Style::new().fg(self.theme.muted),
 		)));
 		// Pad/trim to the inner height.
@@ -887,6 +978,9 @@ impl InteractiveMode {
 		let theme = self.theme.clone();
 		let tools_expanded = self.tools_expanded;
 		let thinking_expanded = self.thinking_expanded;
+		// Block-level hints follow keybindings.json (fallback: the defaults).
+		let expand_hint = self.keybinding_hint("app.tools.expand", "ctrl+o");
+		let thinking_hint = self.keybinding_hint("app.thinking.toggle", "ctrl+t");
 		let tick = self.tick;
 		let mut lines: Vec<Line<'static>> = Vec::new();
 		for block in &mut self.blocks {
@@ -921,6 +1015,7 @@ impl InteractiveMode {
 						width,
 						&theme,
 						thinking_expanded,
+						&thinking_hint,
 					);
 					// Cache finished blocks only; streaming ones invalidate anyway.
 					if !*streaming {
@@ -956,6 +1051,7 @@ impl InteractiveMode {
 						&theme,
 						tools_expanded,
 						tick,
+						&expand_hint,
 					);
 					if !*running {
 						*rendered = Some((width, out.clone()));
@@ -990,12 +1086,13 @@ fn render_assistant_block(
 	width: usize,
 	theme: &Theme,
 	thinking_expanded: bool,
+	toggle_hint: &str,
 ) -> Vec<Line<'static>> {
 	let mut lines: Vec<Line<'static>> = Vec::new();
 	if !thinking.trim().is_empty() {
 		if thinking_expanded {
 			lines.push(Line::from(Span::styled(
-				"· thinking (ctrl+t to hide)",
+				format!("· thinking ({toggle_hint} to hide)"),
 				Style::new()
 					.fg(theme.thinking)
 					.add_modifier(Modifier::ITALIC),
@@ -1007,7 +1104,7 @@ fn render_assistant_block(
 			}
 		} else {
 			lines.push(Line::from(Span::styled(
-				"· thinking hidden (ctrl+t to show)",
+				format!("· thinking hidden ({toggle_hint} to show)"),
 				Style::new()
 					.fg(theme.thinking)
 					.add_modifier(Modifier::ITALIC),
@@ -1038,7 +1135,7 @@ fn render_assistant_block(
 
 /// Tool execution lines (tool-execution.ts + render-utils.ts): state glyph,
 /// bold tool name, duration, collapsed `key=value` args or expanded `key:
-/// value` lines, and a 10-line output preview with a ctrl+o expand hint.
+/// value` lines, and a 10-line output preview with an expand hint.
 #[allow(clippy::too_many_arguments)]
 fn render_tool_block(
 	name: &str,
@@ -1051,6 +1148,7 @@ fn render_tool_block(
 	theme: &Theme,
 	tools_expanded: bool,
 	tick: u64,
+	expand_hint: &str,
 ) -> Vec<Line<'static>> {
 	let _ = width;
 	let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1125,7 +1223,7 @@ fn render_tool_block(
 		let remaining = out_lines.len() - shown;
 		if remaining > 0 {
 			lines.push(Line::from(Span::styled(
-				format!("  … ({remaining} more lines, ctrl+o to expand)"),
+				format!("  … ({remaining} more lines, {expand_hint} to expand)"),
 				Style::new().fg(theme.muted),
 			)));
 		}
@@ -1226,6 +1324,12 @@ fn shorten_path(path: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use pi_tui::keybindings::KeybindingsManager;
+	use pi_tui::parse_chord;
+
+	fn key_event(chord: &str) -> KeyEvent {
+		parse_chord(chord).unwrap().to_key_event()
+	}
 
 	#[test]
 	fn token_formatting() {
@@ -1257,5 +1361,104 @@ mod tests {
 		let pairs = compact_args_pairs(&serde_json::Value::Object(obj));
 		assert!(pairs.chars().count() <= COLLAPSED_ARGS_CHARS);
 		assert!(pairs.ends_with("..."));
+	}
+
+	#[test]
+	fn global_actions_resolve_from_default_table() {
+		// The manager interactive uses: TUI + app definitions merged.
+		let keybindings = crate::core::ui_config::new_keybindings_manager();
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+c"), true),
+			Some(GlobalAction::Clear)
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+d"), true),
+			Some(GlobalAction::Exit)
+		);
+		// ctrl+d only exits with an empty editor; otherwise it falls through
+		// to the editor (upstream app.exit behavior).
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+d"), false),
+			None
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+o"), false),
+			Some(GlobalAction::ToolsExpand)
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+t"), false),
+			Some(GlobalAction::ThinkingToggle)
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+l"), false),
+			Some(GlobalAction::ModelSelect)
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("escape"), false),
+			Some(GlobalAction::Interrupt)
+		);
+		// Keys bound to undispatched actions stay undispatched (upstream
+		// app.suspend / app.tree.filter.cycleForward share chords with
+		// dispatched actions but must not fire here).
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+z"), false),
+			None
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("x"), false),
+			None
+		);
+	}
+
+	#[test]
+	fn custom_binding_replaces_the_default_key() {
+		// keybindings.json `{"app.tools.expand": ["ctrl+y"]}`: the new chord
+		// triggers tool expansion, the old default no longer does.
+		let mut keybindings = crate::core::ui_config::new_keybindings_manager();
+		keybindings
+			.set_user_bindings(
+				std::iter::once(("app.tools.expand".to_string(), vec!["ctrl+y".to_string()]))
+					.collect(),
+			)
+			.unwrap();
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+y"), false),
+			Some(GlobalAction::ToolsExpand)
+		);
+		// ctrl+o is still bound in the merged table
+		// (app.tree.filter.cycleForward) but no longer to a dispatched action.
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+o"), false),
+			None
+		);
+	}
+
+	#[test]
+	fn interrupt_takes_precedence_over_shadowing_tui_actions() {
+		// The merged table binds escape to tui.select.cancel (and ctrl+d to
+		// tui.editor.deleteCharForward); the app actions are checked first,
+		// mirroring custom-editor.ts.
+		let keybindings = crate::core::ui_config::new_keybindings_manager();
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("escape"), false),
+			Some(GlobalAction::Interrupt)
+		);
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+d"), true),
+			Some(GlobalAction::Exit)
+		);
+	}
+
+	#[test]
+	fn disabled_action_falls_through() {
+		// keybindings.json `{"app.tools.expand": []}` disables the action.
+		let mut keybindings = KeybindingsManager::new();
+		keybindings
+			.set_user_bindings(std::iter::once(("app.tools.expand".to_string(), vec![])).collect())
+			.unwrap();
+		assert_eq!(
+			resolve_global_action(&keybindings, &key_event("ctrl+o"), false),
+			None
+		);
 	}
 }

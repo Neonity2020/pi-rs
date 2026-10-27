@@ -48,5 +48,9 @@ pub async fn run_print(session: SessionHandle, prompt: String) -> anyhow::Result
 	}
 
 	let _ = session.cmd_tx.send(SessionCommand::Exit);
+	while !matches!(
+		events.recv().await,
+		Err(tokio::sync::broadcast::error::RecvError::Closed)
+	) {}
 	Ok(exit_code)
 }

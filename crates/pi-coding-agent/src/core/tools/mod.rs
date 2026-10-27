@@ -10,10 +10,15 @@ pub mod write;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use pi_agent::{AgentTool, AgentToolResult};
+use pi_mcp::transports::stdio::StdioTransport;
+use pi_mcp::{McpClient, McpTool, SharedMcpClient};
+
+use crate::core::mcp_config::{McpConfig, McpServerEntry};
 
 pub const ALL_TOOL_NAMES: &[&str] = &["read", "write", "edit", "bash", "grep", "find", "ls"];
 
@@ -29,6 +34,142 @@ pub fn create_tools(cwd: impl Into<PathBuf>) -> Vec<Arc<dyn AgentTool>> {
 		Arc::new(find::FindTool::new(cwd.clone())),
 		Arc::new(ls::LsTool::new(cwd)),
 	]
+}
+
+// -------------------------------------------------------------------------------------------
+// MCP server assembly — the startup wiring of the upstream MCP extension
+// (`pi/packages/coding-agent/src/extensions/mcp/index.ts`, `session_start`
+// handler), reduced to the synchronous connect path: load the global
+// `mcp.json`, connect every enabled stdio server, bridge its tools into the
+// tool table (`create_tools` result). Failure isolation follows upstream: one
+// server failing (spawn error, initialize timeout, protocol error) becomes a
+// notice while the rest continue; all servers failing still yields a
+// startup-ready tool set.
+// -------------------------------------------------------------------------------------------
+
+/// Budget for one server's startup (spawn + initialize + list_tools),
+/// mirroring the upstream MCP extension's `startupWaitMs` default of 10s.
+pub const MCP_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound per server for the graceful close ladder in
+/// [`McpAssembly::shutdown`].
+const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connected MCP servers: the bridged tools plus the clients they run
+/// against. Main keeps the assembly alive for the session and calls
+/// [`McpAssembly::shutdown`] on exit (upstream `session_shutdown`).
+pub struct McpAssembly {
+	/// Bridged `mcp__<server>__<tool>` tools, ready for `AgentOptions.tools`.
+	pub tools: Vec<Arc<dyn AgentTool>>,
+	/// Shared clients behind the tools; kept here so the server processes
+	/// stay owned until shutdown.
+	pub clients: Vec<SharedMcpClient>,
+	/// One human-readable line per config error and per server outcome.
+	pub notices: Vec<String>,
+}
+
+impl McpAssembly {
+	/// Run every transport's graceful close ladder (stdin close → grace →
+	/// SIGTERM → SIGKILL of the server's process group) and wait for the
+	/// child to be reaped, bounded so process exit cannot hang on a stuck
+	/// server. Dropping the assembly without `shutdown` still reaps the
+	/// groups via the transports' orphan guards — just less gently.
+	pub async fn shutdown(&self) {
+		for client in &self.clients {
+			let mut client = client.lock().await;
+			let _ = tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, client.close()).await;
+		}
+	}
+}
+
+/// Connect every enabled stdio server in `config` and bridge its tools.
+pub async fn connect_mcp_servers(config: &McpConfig) -> McpAssembly {
+	connect_mcp_servers_with(config, MCP_START_TIMEOUT).await
+}
+
+/// [`connect_mcp_servers`] with an explicit per-server startup budget (tests
+/// shrink it).
+pub async fn connect_mcp_servers_with(config: &McpConfig, timeout: Duration) -> McpAssembly {
+	let mut assembly = McpAssembly {
+		tools: Vec::new(),
+		clients: Vec::new(),
+		notices: Vec::new(),
+	};
+	// Config problems first, like upstream `reportProblems`.
+	for error in &config.errors {
+		assembly.notices.push(format!("config: {error}"));
+	}
+	for entry in &config.servers {
+		if !entry.enabled {
+			continue; // Parsed but unconnected, like a disabled server upstream.
+		}
+		match tokio::time::timeout(timeout, connect_one(entry)).await {
+			Ok(Ok((client, tools))) => {
+				assembly.notices.push(format!(
+					"{name}: connected ({summary})",
+					name = entry.name,
+					summary = tool_summary(&tools)
+				));
+				assembly.tools.extend(
+					tools
+						.into_iter()
+						.map(|tool| Arc::new(tool) as Arc<dyn AgentTool>),
+				);
+				assembly.clients.push(client);
+			}
+			Ok(Err(error)) => assembly
+				.notices
+				.push(format!("{}: failed: {error}", entry.name)),
+			Err(_) => assembly.notices.push(format!(
+				"{}: failed: startup timed out after {}s",
+				entry.name,
+				timeout.as_secs()
+			)),
+		}
+	}
+	assembly
+}
+
+/// `N tools` with the first few `mcp__<server>__<tool>` names spelled out —
+/// the startup notice doubles as the smoke signal that the bridged tools
+/// reached the tool table.
+fn tool_summary(tools: &[McpTool]) -> String {
+	match tools.len() {
+		0 => "0 tools".to_string(),
+		1 => format!("1 tool: {}", tools[0].name()),
+		_ => {
+			const SHOWN: usize = 3;
+			let names: Vec<String> = tools
+				.iter()
+				.take(SHOWN)
+				.map(|t| t.name().to_string())
+				.collect();
+			let more = tools.len() - SHOWN;
+			let ellipsis = if more > 0 {
+				format!(", … +{more} more")
+			} else {
+				String::new()
+			};
+			format!("{} tools: {}{}", tools.len(), names.join(", "), ellipsis)
+		}
+	}
+}
+
+/// One server: stdio transport → client → initialize handshake → bridge the
+/// tool table (`McpServerConnection` upstream, startup path only). The
+/// transport owns the child's process group, so a dropped future (startup
+/// timeout) or a dropped client cleans the server up.
+async fn connect_one(entry: &McpServerEntry) -> anyhow::Result<(SharedMcpClient, Vec<McpTool>)> {
+	let mut transport =
+		StdioTransport::new(entry.command.clone(), entry.args.clone(), entry.env.clone());
+	if let Some(cwd) = &entry.cwd {
+		transport = transport.with_cwd(cwd);
+	}
+	let mut client = McpClient::new(entry.name.clone(), Box::new(transport));
+	client.initialize(crate::config::VERSION).await?;
+	let client: SharedMcpClient = Arc::new(tokio::sync::Mutex::new(client));
+	let tools = McpTool::all_for(&client).await?;
+	Ok((client, tools))
 }
 
 /// Resolve a tool-provided path against the tool cwd, mirroring
@@ -79,4 +220,196 @@ pub fn param_u64_or(params: &Value, key: &str, default: u64) -> u64 {
 
 pub fn param_bool_or(params: &Value, key: &str, default: bool) -> bool {
 	params.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+#[cfg(test)]
+mod mcp_assembly_tests {
+	use super::*;
+	use crate::core::mcp_config::load_mcp_config_from;
+	use serde_json::json;
+	use tokio_util::sync::CancellationToken;
+
+	/// Fake MCP server over `sh -c` — the same script the pi-mcp stdio
+	/// transport tests use: answers initialize, tools/list, and tools/call
+	/// with one `echo` tool.
+	const FAKE_SERVER: &str = r#"printf 'fake-mcp ready\n' >&2
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo a message","inputSchema":{"type":"object","properties":{"message":{"type":"string"}}}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"hello from fake server"}],"isError":false}}\n' "$id" ;;
+  esac
+done
+"#;
+
+	fn write_config(tag: &str, config: Value) -> PathBuf {
+		let path = std::env::temp_dir().join(format!(
+			"pi-rs-mcp-assembly-{}-{}-{}.json",
+			tag,
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::write(&path, config.to_string()).unwrap();
+		path
+	}
+
+	fn remove_config(path: &PathBuf) {
+		let _ = std::fs::remove_file(path);
+	}
+
+	fn tool_named<'a>(tools: &'a [Arc<dyn AgentTool>], name: &str) -> &'a Arc<dyn AgentTool> {
+		tools
+			.iter()
+			.find(|tool| tool.name() == name)
+			.unwrap_or_else(|| panic!("missing tool {name}"))
+	}
+
+	fn text_of(result: &AgentToolResult) -> String {
+		result
+			.content
+			.iter()
+			.filter_map(|block| block.text_content())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	/// The full startup path through a config file: MCP tools join the
+	/// `create_tools` result (system prompt + tool table), and one call
+	/// round-trips to the fake server and back.
+	#[tokio::test]
+	async fn mcp_tools_join_the_table_and_roundtrip() {
+		let path = write_config(
+			"roundtrip",
+			json!({"mcpServers": {"fake": {"command": "sh", "args": ["-c", FAKE_SERVER]}}}),
+		);
+		let config = load_mcp_config_from(&path);
+		remove_config(&path);
+
+		let mut assembly = connect_mcp_servers(&config).await;
+		assert!(
+			assembly.notices.iter().any(|n| n.contains("connected")),
+			"{:?}",
+			assembly.notices
+		);
+
+		let mut tools = create_tools(std::env::temp_dir());
+		tools.extend(std::mem::take(&mut assembly.tools));
+		assert!(
+			tools.iter().any(|t| t.name() == "read"),
+			"built-ins survive the merge"
+		);
+		let echo = tool_named(&tools, "mcp__fake__echo");
+		assert_eq!(echo.description(), "Echo a message");
+
+		let result = echo
+			.execute(
+				"call-1",
+				json!({"message": "hi"}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(!result.is_error);
+		assert_eq!(text_of(&result), "hello from fake server");
+
+		// Shutdown runs the graceful close ladder; afterwards the tool
+		// reports the closed transport instead of hanging.
+		assembly.shutdown().await;
+		let after = echo
+			.execute("call-2", json!({}), CancellationToken::new(), None)
+			.await;
+		assert!(after.is_error);
+		assert!(text_of(&after).contains("closed"), "{}", text_of(&after));
+	}
+
+	#[tokio::test]
+	async fn a_broken_server_does_not_block_the_good_one() {
+		let path = write_config(
+			"partial-failure",
+			json!({
+				"mcpServers": {
+					"broken": { "command": "/nonexistent/pi-rs-mcp-server" },
+					"fake": { "command": "sh", "args": ["-c", FAKE_SERVER] }
+				}
+			}),
+		);
+		let config = load_mcp_config_from(&path);
+		remove_config(&path);
+
+		let mut assembly = connect_mcp_servers(&config).await;
+		assert!(
+			assembly
+				.notices
+				.iter()
+				.any(|n| n.starts_with("broken: failed:")),
+			"{:?}",
+			assembly.notices
+		);
+		assert!(
+			assembly
+				.notices
+				.iter()
+				.any(|n| n.starts_with("fake: connected")),
+			"{:?}",
+			assembly.notices
+		);
+		// The good server's tools are in the table despite the broken one.
+		let mut tools = create_tools(std::env::temp_dir());
+		tools.extend(std::mem::take(&mut assembly.tools));
+		tool_named(&tools, "mcp__fake__echo");
+		assembly.shutdown().await;
+	}
+
+	#[tokio::test]
+	async fn all_servers_failing_still_yields_a_startup_ready_toolset() {
+		let path = write_config(
+			"all-fail",
+			json!({
+				"mcpServers": {
+					"missing": { "command": "/nonexistent/pi-rs-mcp-server" },
+					"garbage": { "command": "false" }
+				}
+			}),
+		);
+		let config = load_mcp_config_from(&path);
+		remove_config(&path);
+
+		let assembly = connect_mcp_servers(&config).await;
+		assert!(assembly.tools.is_empty() && assembly.clients.is_empty());
+		assert_eq!(assembly.notices.len(), 2, "{:?}", assembly.notices);
+		// The CLI would start with the built-in tool set only.
+		let tools = create_tools(std::env::temp_dir());
+		assert_eq!(tools.len(), 7);
+		assembly.shutdown().await;
+	}
+
+	#[tokio::test]
+	async fn a_hanging_server_hits_the_startup_budget() {
+		let path = write_config(
+			"hanging",
+			json!({"mcpServers": {"sleepy": {"command": "sh", "args": ["-c", "sleep 30"]}}}),
+		);
+		let config = load_mcp_config_from(&path);
+		remove_config(&path);
+
+		// Shrunk budget: `sleep 30` never answers the initialize handshake.
+		let assembly = connect_mcp_servers_with(&config, Duration::from_secs(1)).await;
+		assert!(assembly.tools.is_empty());
+		assert!(
+			assembly
+				.notices
+				.iter()
+				.any(|n| n.contains("sleepy: failed: startup timed out after 1s")),
+			"{:?}",
+			assembly.notices
+		);
+		// Dropping the assembly (without shutdown) kills the timed-out
+		// server's process group via the transport's orphan guard.
+		drop(assembly);
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
 }

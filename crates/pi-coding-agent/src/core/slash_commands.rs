@@ -47,7 +47,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 	),
 	info(
 		"compact",
-		"compact the context (stub)",
+		"summarize the conversation and replace the history",
 		SlashCommandSource::Builtin,
 	),
 	info(

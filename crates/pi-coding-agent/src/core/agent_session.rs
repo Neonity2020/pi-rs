@@ -5,8 +5,10 @@
 //! `AgentSession` is the mode-agnostic core shared by interactive/print/rpc:
 //! it owns the [`Agent`], forwards agent events to subscribers, persists
 //! messages to the session log, and serializes UI commands into agent calls
-//! (prompt/steer/follow-up/abort/model/thinking). Compaction, bash
-//! passthrough, and session switch/fork land in later phases.
+//! (prompt/steer/follow-up/abort/model/thinking). Manual `/compact` runs the
+//! summarization in `core/compaction.rs` and swaps the transcript; automatic
+//! threshold triggering, bash passthrough, and session switch/fork land in
+//! later phases.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,6 +19,7 @@ use tokio::sync::mpsc;
 use pi_agent::{Agent, AgentEvent, PromptInput};
 use pi_ai::{Message, ThinkingLevel};
 
+use super::compaction::{self, CompactionOutcome};
 use super::event_bus::EventBus;
 use super::model_registry::ModelRegistry;
 use super::session_manager::{SessionEntry, SessionManager};
@@ -49,6 +52,12 @@ pub enum SessionCommand {
 }
 
 /// Events the session emits to modes.
+///
+/// Compaction reports through `Notice` (upstream has dedicated
+/// `compaction_start`/`compaction_end` session events; modes here match
+/// `SessionEvent` exhaustively, so a dedicated variant lands with the phase
+/// that owns them). Notices use stable prefixes: `compacted:`,
+/// `compaction failed:`, `cannot compact:`.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
 	Agent(Box<AgentEvent>),
@@ -108,6 +117,8 @@ async fn session_task(
 	let mut persisted = agent.snapshot().messages.len();
 	let mut pending = VecDeque::new();
 	let mut run: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+	// In-flight compaction summarization; the agent is idle while this runs.
+	let mut compacting: Option<tokio::task::JoinHandle<anyhow::Result<CompactionOutcome>>> = None;
 
 	let notice = |bus: &EventBus<SessionEvent>, text: String| {
 		bus.emit(SessionEvent::Notice(text));
@@ -121,9 +132,13 @@ async fn session_task(
 				let Some(command) = command else { break };
 				match command {
 					SessionCommand::Prompt { text } => {
-						if run.is_some() || agent.is_streaming() {
+						if run.is_some() || agent.is_streaming() || compacting.is_some() {
 							pending.push_back(text);
-							notice(&event_bus, "run active — prompt queued".into());
+							if compacting.is_some() {
+								notice(&event_bus, "compaction running — prompt queued".into());
+							} else {
+								notice(&event_bus, "run active — prompt queued".into());
+							}
 						} else {
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move {
@@ -168,7 +183,32 @@ async fn session_task(
 						notice(&event_bus, format!("thinking → {next:?}"));
 					}
 					SessionCommand::Compact => {
-						notice(&event_bus, "/compact lands with the compaction phase (core/compaction)".into());
+						// A finished-but-unreaped run is select-order lag, not an
+						// active run; reap it so acceptance reflects the agent.
+						if run.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+							if let Some(task) = run.as_mut() {
+								match task.await {
+									Ok(Ok(())) => {},
+									Ok(Err(e)) => notice(&event_bus, format!("prompt failed: {e}")),
+									Err(e) => notice(&event_bus, format!("prompt task failed: {e}")),
+								}
+							}
+							run = None;
+						}
+						if run.is_some() || agent.is_streaming() {
+							// Upstream aborts the run before compacting; this port
+							// refuses instead so a slash command never discards an
+							// in-flight turn.
+							notice(&event_bus, "cannot compact: agent run active".into());
+						} else if compacting.is_some() {
+							notice(&event_bus, "compaction already running".into());
+						} else {
+							notice(&event_bus, "compacting…".into());
+							let agent = agent.clone();
+							compacting = Some(tokio::spawn(async move {
+								compaction::compact_agent(&agent).await
+							}));
+						}
 					}
 					SessionCommand::Exit => break,
 				}
@@ -182,6 +222,25 @@ async fn session_task(
 					Err(e) => notice(&event_bus, format!("prompt task failed: {e}")),
 				}
 				if let Some(text) = pending.pop_front() {
+					let agent = agent.clone();
+					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
+				}
+			}
+
+			result = async { compacting.as_mut().expect("guarded compaction").await }, if compacting.is_some() => {
+				compacting = None;
+				match result {
+					Ok(Ok(outcome)) => {
+						apply_compaction(&agent, &mut session, &mut persisted, &event_bus, outcome);
+					}
+					Ok(Err(e)) => notice(&event_bus, format!("compaction failed: {e}")),
+					Err(e) => notice(&event_bus, format!("compaction task failed: {e}")),
+				}
+				// Prompts queued while compacting start now that the agent is idle.
+				if run.is_none()
+					&& !agent.is_streaming()
+					&& let Some(text) = pending.pop_front()
+				{
 					let agent = agent.clone();
 					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
 				}
@@ -204,6 +263,22 @@ async fn session_task(
 			}
 		}
 	}
+	// Stop the active run before taking the final transcript snapshot. A task
+	// that has not started yet has no cancellation token, so abort it directly.
+	if let Some(mut task) = run {
+		if agent.is_streaming() {
+			agent.abort();
+		} else {
+			task.abort();
+		}
+		if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+			.await
+			.is_err()
+		{
+			task.abort();
+			let _ = task.await;
+		}
+	}
 	persist_messages(&agent, &mut session, &mut persisted, &event_bus);
 }
 
@@ -215,6 +290,12 @@ fn persist_messages(
 	persisted: &mut usize,
 	bus: &EventBus<SessionEvent>,
 ) {
+	if let Err(error) = session.sync_pending_metadata() {
+		bus.emit(SessionEvent::Notice(format!(
+			"session write failed: {error}"
+		)));
+		return;
+	}
 	let snapshot = agent.snapshot();
 	for message in snapshot.messages.iter().skip(*persisted) {
 		match session.append_message(message) {
@@ -232,6 +313,42 @@ fn persist_messages(
 	}
 }
 
+/// Commit a finished compaction: write the log entry first — it is the
+/// authoritative record (upstream `SessionManager.appendCompaction`) — then
+/// swap the agent history. A failed write leaves the transcript untouched, so
+/// the log never claims a compaction the agent did not apply.
+fn apply_compaction(
+	agent: &Agent,
+	session: &mut SessionManager,
+	persisted: &mut usize,
+	bus: &EventBus<SessionEvent>,
+	outcome: CompactionOutcome,
+) {
+	let entry = SessionEntry::compaction(outcome.summary.clone(), outcome.tokens_before);
+	if let Err(error) = session.append(&entry) {
+		bus.emit(SessionEvent::Notice(format!(
+			"session write failed: {error}"
+		)));
+		return;
+	}
+	if session.session_dir().is_some() {
+		bus.emit(SessionEvent::Persisted { kind: "compaction" });
+	}
+	let history = compaction::replacement_history(&agent.snapshot().messages, &outcome.summary);
+	if let Err(error) = agent.replace_messages(history) {
+		bus.emit(SessionEvent::Notice(format!("compaction failed: {error}")));
+		return;
+	}
+	// The summary reached the log through the compaction entry, never as a
+	// message entry: rebase the persist cursor onto the replaced transcript so
+	// it is not double-persisted.
+	*persisted = agent.snapshot().messages.len();
+	bus.emit(SessionEvent::Notice(format!(
+		"compacted: {} tokens summarized",
+		outcome.tokens_before
+	)));
+}
+
 fn next_thinking_level(current: ThinkingLevel) -> ThinkingLevel {
 	use ThinkingLevel::*;
 	match current {
@@ -245,21 +362,43 @@ fn next_thinking_level(current: ThinkingLevel) -> ThinkingLevel {
 	}
 }
 
-/// Rebuild a transcript from a session file (resume support, reduced).
+/// Rebuild a transcript from a session file (resume support).
+///
+/// Compaction entries replay as their summary message: this port summarizes
+/// the whole non-system transcript ("keep nothing" cut), so everything
+/// accumulated before the entry was compacted into it and is replaced by the
+/// rebuilt summary — the flat-log equivalent of upstream's
+/// `buildContextEntries` (`pi/packages/coding-agent/src/core/session-manager.ts`),
+/// where a compaction entry contributes
+/// `[systemMessage?, compactionSummary]` and the summarized older entries are
+/// omitted. A compaction entry without a parsable summary cannot be rebuilt
+/// and is skipped, keeping the accumulated prefix.
 pub fn read_session_messages(dir: &std::path::Path) -> Vec<Message> {
 	let Ok(text) = std::fs::read_to_string(dir.join("session.jsonl")) else {
 		return Vec::new();
 	};
-	text.lines()
-		.filter_map(|line| {
-			let value: Value = serde_json::from_str(line).ok()?;
-			if value.get("type")?.as_str()? == "message" {
-				serde_json::from_value(value.get("message")?.clone()).ok()
-			} else {
-				None
+	let mut messages: Vec<Message> = Vec::new();
+	for line in text.lines() {
+		let Ok(value) = serde_json::from_str::<Value>(line) else {
+			continue;
+		};
+		match value.get("type").and_then(Value::as_str) {
+			Some("message") => {
+				if let Some(message) = value.get("message")
+					&& let Ok(message) = serde_json::from_value::<Message>(message.clone())
+				{
+					messages.push(message);
+				}
 			}
-		})
-		.collect()
+			Some("compaction") => {
+				if let Some(summary) = value.get("summary").and_then(Value::as_str) {
+					messages = vec![compaction::compaction_summary_message(summary)];
+				}
+			}
+			_ => {}
+		}
+	}
+	messages
 }
 
 /// Messages to seed a resumed agent (`--continue` / `--resume`): the persisted
@@ -267,7 +406,10 @@ pub fn read_session_messages(dir: &std::path::Path) -> Vec<Message> {
 /// system message, so the log never contains one; on resume [`Agent::new`]
 /// (pi-agent) seeds a fresh system message from the current environment —
 /// cwd, tools, freshly built prompt — mirroring the upstream
-/// `_rebuildSystemPrompt` behaviour in `core/agent-session.ts`.
+/// [`_rebuildSystemPrompt`] behaviour in `core/agent-session.ts`. A compaction
+/// entry replays as an ordinary user message (see
+/// [`read_session_messages`]), so it survives the filter and the fresh system
+/// message lands ahead of it, matching the post-compaction transcript shape.
 pub fn restore_initial_messages(dir: &std::path::Path) -> Vec<Message> {
 	read_session_messages(dir)
 		.into_iter()
@@ -365,6 +507,77 @@ mod tests {
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 
+	#[tokio::test]
+	async fn exit_cancels_active_run_before_session_closes() {
+		let dir = temp_session_dir("exit-active");
+		let agent = mock_agent();
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle =
+			spawn_agent_session(agent.clone(), SessionManager::open(&dir).unwrap(), registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "hello".into(),
+			})
+			.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !agent.is_streaming() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while handle.events.recv().await.is_ok() {}
+		})
+		.await
+		.expect("session must close");
+		assert!(!agent.is_streaming());
+		assert_eq!(
+			read_session_messages(&dir).len(),
+			agent.snapshot().messages.len() - 1
+		);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn closing_command_channel_waits_for_active_run_and_persists_tail() {
+		let dir = temp_session_dir("channel-close");
+		let agent = mock_agent();
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let (tx, rx) = mpsc::unbounded_channel();
+		let bus = EventBus::new();
+		let task = tokio::spawn(session_task(
+			agent.clone(),
+			SessionManager::open(&dir).unwrap(),
+			registry,
+			rx,
+			bus,
+		));
+		tx.send(SessionCommand::Prompt {
+			text: "hello".into(),
+		})
+		.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !agent.is_streaming() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		drop(tx);
+		tokio::time::timeout(Duration::from_secs(5), task)
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(!agent.is_streaming());
+		let messages = read_session_messages(&dir);
+		assert_eq!(messages.len(), agent.snapshot().messages.len() - 1);
+		assert_eq!(messages[0].role(), "user");
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
 	fn temp_session_dir(tag: &str) -> std::path::PathBuf {
 		let dir = std::env::temp_dir().join(format!(
 			"pi-rs-agent-session-{}-{}-{}",
@@ -374,6 +587,390 @@ mod tests {
 		));
 		std::fs::create_dir_all(&dir).unwrap();
 		dir
+	}
+
+	// -- compaction -----------------------------------------------------------
+
+	fn compaction_entry_values(dir: &std::path::Path) -> Vec<Value> {
+		let log = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		log.lines()
+			.filter_map(|line| serde_json::from_str::<Value>(line).ok())
+			.filter(|value| value["type"] == "compaction")
+			.collect()
+	}
+
+	/// A stop-level assistant message carrying `text` (echo replies).
+	fn echo_assistant_message(model: &pi_ai::Model, text: String) -> pi_ai::AssistantMessage {
+		pi_ai::AssistantMessage {
+			content: vec![pi_ai::AssistantContent::Text(pi_ai::TextContent {
+				text,
+				text_signature: None,
+			})],
+			api: model.api.as_str().to_string(),
+			provider: model.provider.clone(),
+			model: model.id.clone(),
+			response_model: None,
+			response_id: None,
+			thinking_level: None,
+			usage: pi_ai::Usage::default(),
+			stop_reason: pi_ai::StopReason::Stop,
+			error_message: None,
+			raw_stop_reason: None,
+			end_turn: None,
+			timestamp: pi_ai::types::now_ms(),
+			duration_ms: None,
+		}
+	}
+
+	/// The last user message's text — the summarization request carries the
+	/// whole conversation in one user message.
+	fn last_user_text(context: &pi_ai::TranscriptContext) -> String {
+		context
+			.messages
+			.iter()
+			.rev()
+			.find_map(|message| match message {
+				Message::User(user) => Some(user.content.as_text()),
+				_ => None,
+			})
+			.unwrap_or_default()
+	}
+
+	fn is_summarization_request(context: &pi_ai::TranscriptContext) -> bool {
+		matches!(
+			context.messages.first(),
+			Some(Message::System(system))
+				if matches!(
+					&system.content,
+					pi_ai::SystemContent::Text(text)
+						if text.as_str() == compaction::SUMMARIZATION_SYSTEM_PROMPT
+				)
+		)
+	}
+
+	/// Mock-provider turns, except the standalone summarization call, which is
+	/// answered with the mock's echo behavior. Upstream's verbatim
+	/// `SUMMARIZATION_PROMPT` contains the word "list" ("Ordered list of what
+	/// should happen next"), which trips `providers/mock.rs` into its
+	/// tool-call path; the summarization request is recognized by its system
+	/// prompt and echoed instead, so the summary carries the conversation back
+	/// to the assertions.
+	fn compaction_test_stream_fn() -> pi_ai::StreamFn {
+		Arc::new(
+			move |model: &pi_ai::Model,
+			      context: &pi_ai::TranscriptContext,
+			      options: pi_ai::StreamOptions| {
+				if is_summarization_request(context) {
+					let model = model.clone();
+					let text = format!("[mock summary] {}", last_user_text(context));
+					Box::pin(futures::stream::once(async move {
+						pi_ai::AssistantMessageEvent::Done {
+							reason: pi_ai::StopReason::Stop,
+							message: echo_assistant_message(&model, text),
+						}
+					})) as pi_ai::AssistantMessageEventStream
+				} else {
+					pi_ai::providers::mock::stream(model, context, options)
+				}
+			},
+		)
+	}
+
+	/// /compact round trip: the agent history shrinks to
+	/// [system, summary], the log gains one parseable compaction entry, a
+	/// follow-up turn appends after the summary, and a resumed session
+	/// rebuilds the summary as an ordinary message without re-persisting old
+	/// content. The mock provider acts as the summarizer (echo), so the
+	/// summary text proves the transcript reached a standalone LLM call.
+	#[tokio::test]
+	async fn compact_replaces_history_logs_entry_and_survives_resume() {
+		let dir = temp_session_dir("compact-roundtrip");
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+
+		// First run: one turn, compact, one more turn.
+		{
+			let agent = Agent::new(AgentOptions {
+				stream_fn: Some(compaction_test_stream_fn()),
+				..Default::default()
+			});
+			let mut handle = spawn_agent_session(
+				agent.clone(),
+				SessionManager::open(&dir).unwrap(),
+				registry.clone(),
+			);
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt {
+					text: "first question".into(),
+				})
+				.unwrap();
+			wait_for_agent_ends(&mut handle, 1).await;
+			assert_eq!(agent.snapshot().messages.len(), 3);
+
+			handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+			tokio::time::timeout(Duration::from_secs(20), async {
+				loop {
+					match handle.events.recv().await {
+						Ok(SessionEvent::Notice(text)) if text.starts_with("compacted:") => break,
+						Ok(SessionEvent::Notice(text))
+							if text.contains("compaction") && text != "compacting…" =>
+						{
+							panic!("compaction failed: {text}")
+						}
+						Ok(_) => {}
+						Err(e) => panic!("event stream error: {e}"),
+					}
+				}
+			})
+			.await
+			.expect("compaction should finish");
+
+			// History replaced: system + the compaction summary message.
+			let messages = agent.snapshot().messages;
+			assert_eq!(messages.len(), 2);
+			assert_eq!(messages[0].role(), "system");
+			let Message::User(summary) = &messages[1] else {
+				panic!("expected summary message")
+			};
+			let summary_text = summary.content.as_text();
+			assert!(summary_text.contains(compaction::COMPACTION_SUMMARY_PREFIX));
+			assert!(summary_text.contains(compaction::COMPACTION_SUMMARY_SUFFIX));
+			// "[mock summary]" proves the transcript reached the standalone
+			// summarization call; "[User]: first question" proves the
+			// serialized conversation rode inside it.
+			assert!(summary_text.contains("[mock summary]"));
+			assert!(summary_text.contains("[User]: first question"));
+
+			// The log carries exactly one parseable compaction entry.
+			let entries = compaction_entry_values(&dir);
+			assert_eq!(entries.len(), 1);
+			assert!(
+				entries[0]["summary"]
+					.as_str()
+					.unwrap()
+					.contains("[mock summary]")
+			);
+			assert!(entries[0]["tokensBefore"].as_u64().unwrap() > 0);
+			assert_eq!(entries[0]["firstKeptEntryId"], entries[0]["id"]);
+			// Replay: the summarized turns collapse into the summary message.
+			assert_eq!(read_session_messages(&dir).len(), 1);
+
+			// A turn after compaction appends behind the summary.
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt {
+					text: "second question".into(),
+				})
+				.unwrap();
+			wait_for_agent_ends(&mut handle, 1).await;
+			let roles: Vec<&str> = agent
+				.snapshot()
+				.messages
+				.iter()
+				.map(Message::role)
+				.collect();
+			assert_eq!(roles, ["system", "user", "user", "assistant"]);
+			handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		}
+
+		// Resume: the compaction entry rebuilds as an ordinary user message.
+		// Wait for the second turn's tail to reach the log (the session task
+		// persists concurrently with the run).
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while read_session_messages(&dir).len() < 3 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("post-compaction turn should persist");
+		let restored = restore_initial_messages(&dir);
+		let roles: Vec<&str> = restored.iter().map(Message::role).collect();
+		assert_eq!(roles, ["user", "user", "assistant"]);
+		let Message::User(summary) = &restored[0] else {
+			panic!("expected rebuilt summary message")
+		};
+		assert!(
+			summary
+				.content
+				.as_text()
+				.contains(compaction::COMPACTION_SUMMARY_PREFIX)
+		);
+
+		let resumed = Agent::new(AgentOptions {
+			system_prompt: Some("resumed run".into()),
+			stream_fn: Some(agent_stream_fn()),
+			initial_messages: restored,
+			..AgentOptions::default()
+		});
+		assert_eq!(resumed.snapshot().messages.len(), 4);
+		let mut handle =
+			spawn_agent_session(resumed, SessionManager::open(&dir).unwrap(), registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "third question".into(),
+			})
+			.unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+
+		// Old content is never re-persisted: the original turn-1 user entry
+		// (exact JSON string) appears exactly once, and the compaction entry
+		// stays unique.
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while read_session_messages(&dir).len() < 5 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("resumed turn should persist");
+		let log = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		assert_eq!(log.matches("\"first question\"").count(), 1);
+		assert_eq!(log.matches("\"type\":\"compaction\"").count(), 1);
+		let roles: Vec<&str> = read_session_messages(&dir)
+			.iter()
+			.map(Message::role)
+			.collect();
+		assert_eq!(roles, ["user", "user", "assistant", "user", "assistant"]);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// /compact while a run is active is refused with a notice (upstream
+	/// semantics for this port: never discard an in-flight turn); once idle,
+	/// the same command compacts. A prompt arriving while compaction runs is
+	/// queued and starts afterwards.
+	#[tokio::test]
+	async fn compact_during_run_rejected_then_idle_compact_queues_prompts() {
+		let dir = temp_session_dir("compact-busy");
+		// A gated provider keeps the run active until the test opens it.
+		let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+		let agent = Agent::new(AgentOptions {
+			stream_fn: Some(gated_stream_fn(gate_rx)),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle =
+			spawn_agent_session(agent.clone(), SessionManager::open(&dir).unwrap(), registry);
+
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "long running".into(),
+			})
+			.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !agent.is_streaming() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+
+		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				match handle.events.recv().await {
+					Ok(SessionEvent::Notice(text)) if text.starts_with("cannot compact") => break,
+					Ok(SessionEvent::Notice(text)) if text.starts_with("compacted:") => {
+						panic!("compaction must be refused while a run is active")
+					}
+					Ok(_) => {}
+					Err(e) => panic!("event stream error: {e}"),
+				}
+			}
+		})
+		.await
+		.expect("rejection notice should arrive");
+		assert_eq!(agent.snapshot().messages.len(), 2); // untouched transcript
+		assert!(compaction_entry_values(&dir).is_empty());
+
+		// Finish the run, then compact; queue a prompt while compacting.
+		gate_tx.send(true).unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "queued during compaction".into(),
+			})
+			.unwrap();
+		tokio::time::timeout(Duration::from_secs(20), async {
+			loop {
+				match handle.events.recv().await {
+					Ok(SessionEvent::Notice(text)) if text.starts_with("compacted:") => break,
+					Ok(SessionEvent::Notice(text)) if text.contains("compaction failed") => {
+						panic!("compaction failed: {text}")
+					}
+					Ok(_) => {}
+					Err(e) => panic!("event stream error: {e}"),
+				}
+			}
+		})
+		.await
+		.expect("idle compaction should finish");
+		wait_for_agent_ends(&mut handle, 1).await;
+
+		// The queued prompt ran after the summary, in order.
+		let messages = agent.snapshot().messages;
+		let roles: Vec<&str> = messages.iter().map(Message::role).collect();
+		assert_eq!(roles, ["system", "user", "user", "assistant"]);
+		let Message::User(summary) = &messages[1] else {
+			panic!("expected summary message")
+		};
+		assert!(summary.content.as_text().contains("[User]: long running"));
+		let Message::User(prompt) = &messages[2] else {
+			panic!("expected queued prompt")
+		};
+		assert_eq!(prompt.content.as_text(), "queued during compaction");
+		let entries = compaction_entry_values(&dir);
+		assert_eq!(entries.len(), 1);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// Provider whose single response waits on a watch channel (or reports
+	/// abort on cancellation), so tests control exactly when a run ends. It
+	/// echoes the last user message, so summarization results carry the
+	/// serialized conversation back to the assertions.
+	fn gated_stream_fn(gate: tokio::sync::watch::Receiver<bool>) -> pi_ai::StreamFn {
+		Arc::new(
+			move |model: &pi_ai::Model,
+			      context: &pi_ai::TranscriptContext,
+			      options: pi_ai::StreamOptions| {
+				let mut gate = gate.clone();
+				let signal = options.signal;
+				let model = model.clone();
+				let prompt_text = last_user_text(context);
+				Box::pin(futures::stream::once(async move {
+					loop {
+						tokio::select! {
+							_ = gate.changed() => {
+								if *gate.borrow() {
+									break;
+								}
+							}
+							_ = signal.cancelled() => {
+								return pi_ai::AssistantMessageEvent::Error {
+									reason: pi_ai::StopReason::Aborted,
+									error: pi_ai::AssistantMessage::error(
+										&model,
+										pi_ai::StopReason::Aborted,
+										"aborted by user",
+									),
+								};
+							}
+						}
+					}
+					pi_ai::AssistantMessageEvent::Done {
+						reason: pi_ai::StopReason::Stop,
+						message: echo_assistant_message(
+							&model,
+							format!("[gated echo] {prompt_text}"),
+						),
+					}
+				})) as pi_ai::AssistantMessageEventStream
+			},
+		)
 	}
 
 	async fn wait_for_agent_ends(handle: &mut SessionHandle, count: usize) {

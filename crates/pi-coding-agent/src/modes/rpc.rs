@@ -172,14 +172,6 @@ impl RpcSession {
 	/// transcript tail is persisted, then stop the session task (upstream
 	/// `shutdown()` → `runtimeHost.dispose()` in `rpc-mode.ts`).
 	pub async fn shutdown_settled(&mut self) {
-		if self.is_run_active() {
-			let _ = self.cmd_tx.send(SessionCommand::Abort);
-			while let Some(frame) = self.next_event_frame().await {
-				if frame.contains("\"agent_end\"") {
-					break;
-				}
-			}
-		}
 		self.shutdown();
 		while self.next_event_frame().await.is_some() {}
 	}
