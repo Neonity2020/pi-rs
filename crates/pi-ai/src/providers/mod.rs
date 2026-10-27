@@ -6,6 +6,7 @@
 //! unknown APIs return an explicit error.
 
 pub mod anthropic;
+mod json_repair;
 pub mod mock;
 pub mod openai_completions;
 
