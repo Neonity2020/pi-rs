@@ -218,7 +218,9 @@ pub const TUI_KEYBINDINGS: KeybindingDefinitions = &[
 
 /// Global keybinding registry (upstream `KeybindingsManager`).
 pub struct KeybindingsManager {
-	definitions: KeybindingDefinitions,
+	/// Owned because applications extend the static base table with their
+	/// own definitions (upstream spreads `{ ...TUI_KEYBINDINGS, ...APP }`).
+	definitions: Vec<(&'static str, KeybindingDefinition)>,
 	user_bindings: HashMap<String, Vec<KeyChord>>,
 	keys_by_action: HashMap<&'static str, Vec<KeyChord>>,
 	conflicts: Vec<KeybindingConflict>,
@@ -239,6 +241,18 @@ impl KeybindingsManager {
 	/// A registry over a custom definition table (upstream passes app-level
 	/// definitions merged with `TUI_KEYBINDINGS`).
 	pub fn with_definitions(definitions: KeybindingDefinitions) -> Self {
+		Self::with_merged_definitions(definitions, &[])
+	}
+
+	/// A registry over `base` extended with `extra` (upstream's
+	/// `KEYBINDINGS = { ...TUI_KEYBINDINGS, ...APP_KEYBINDINGS }` merge).
+	/// `base` entries keep precedence in [`Self::action_for_event`] order.
+	pub fn with_merged_definitions(
+		base: KeybindingDefinitions,
+		extra: KeybindingDefinitions,
+	) -> Self {
+		let mut definitions: Vec<(&'static str, KeybindingDefinition)> = base.to_vec();
+		definitions.extend(extra.iter().copied());
 		let mut manager = KeybindingsManager {
 			definitions,
 			user_bindings: HashMap::new(),
@@ -284,7 +298,7 @@ impl KeybindingsManager {
 			.collect();
 		self.conflicts.sort_unstable_by_key(|conflict| conflict.key);
 
-		for (id, definition) in self.definitions {
+		for (id, definition) in &self.definitions {
 			let keys = match self.user_bindings.get(*id) {
 				Some(chords) => normalize_keys(chords),
 				None => normalize_keys(
@@ -623,5 +637,38 @@ mod tests {
 		// Bare KeyChord construction also matches.
 		let chord = KeyChord::bare(KeyName::Escape);
 		assert!(chord.matches_event(&event(KeyCode::Esc, KeyModifiers::empty())));
+	}
+
+	#[test]
+	fn merged_definitions_keep_base_order_and_resolve_extras() {
+		const EXTRA: KeybindingDefinitions = &[(
+			"app.interrupt",
+			KeybindingDefinition {
+				default_keys: &["escape"],
+				description: "Cancel or abort",
+			},
+		)];
+		let manager = KeybindingsManager::with_merged_definitions(TUI_KEYBINDINGS, EXTRA);
+		assert_eq!(manager.resolved_bindings().len(), TUI_KEYBINDINGS.len() + 1);
+		// Base entries keep precedence: escape resolves to the earlier
+		// tui.select.cancel, not the appended app.interrupt.
+		assert_eq!(
+			manager.action_for_event(&event(KeyCode::Esc, KeyModifiers::empty())),
+			Some("tui.select.cancel")
+		);
+		assert!(manager.matches("app.interrupt", &event(KeyCode::Esc, KeyModifiers::empty())));
+		// User overrides still apply across both halves of the table.
+		let mut manager = manager;
+		manager
+			.set_user_bindings(HashMap::from([(
+				"app.interrupt".to_string(),
+				vec!["ctrl+x".to_string()],
+			)]))
+			.unwrap();
+		assert!(manager.matches(
+			"app.interrupt",
+			&event(KeyCode::Char('x'), KeyModifiers::CONTROL)
+		));
+		assert!(!manager.matches("app.interrupt", &event(KeyCode::Esc, KeyModifiers::empty())));
 	}
 }

@@ -9,6 +9,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::keybindings::KeybindingsManager;
 use crate::theme::Theme;
 
 /// One selectable row.
@@ -162,6 +163,36 @@ impl SelectList {
 		}
 	}
 
+	/// Handle a key through resolved select bindings (upstream
+	/// `select-list.ts` asks the keybindings manager for `tui.select.*`, so
+	/// user overrides rebind overlays too). Keys bound to none of the
+	/// supported select actions are `Ignored` — unlike [`Self::handle_key`]
+	/// there are no built-in fallback chords, so disabling an action in
+	/// keybindings.json disables it here as well. Page actions stay
+	/// undispatched: this list has no paging.
+	pub fn handle_key_with(
+		&mut self,
+		key: KeyEvent,
+		keybindings: &KeybindingsManager,
+	) -> SelectAction {
+		if key.kind == KeyEventKind::Release {
+			return SelectAction::Handled;
+		}
+		if keybindings.matches("tui.select.up", &key) {
+			self.move_selection(-1);
+			SelectAction::Handled
+		} else if keybindings.matches("tui.select.down", &key) {
+			self.move_selection(1);
+			SelectAction::Handled
+		} else if keybindings.matches("tui.select.confirm", &key) {
+			SelectAction::Select(self.selected)
+		} else if keybindings.matches("tui.select.cancel", &key) {
+			SelectAction::Cancel
+		} else {
+			SelectAction::Ignored
+		}
+	}
+
 	/// Render the visible window of items at `width` cells.
 	pub fn render_lines(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
 		if self.filtered.is_empty() {
@@ -256,5 +287,95 @@ pub fn select_list_event(list: &mut SelectList, event: &Event) -> SelectAction {
 	match event {
 		Event::Key(key) => list.handle_key(*key),
 		_ => SelectAction::Ignored,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::keybindings::TUI_KEYBINDINGS;
+	use crossterm::event::KeyModifiers;
+
+	fn list() -> SelectList {
+		SelectList::new(
+			vec![
+				SelectItem {
+					value: "a".into(),
+					label: "first".into(),
+					description: None,
+				},
+				SelectItem {
+					value: "b".into(),
+					label: "second".into(),
+					description: None,
+				},
+			],
+			10,
+		)
+	}
+
+	#[test]
+	fn handle_key_with_uses_default_select_bindings() {
+		let keybindings = KeybindingsManager::new();
+		let mut list = list();
+		assert_eq!(
+			list.handle_key_with(
+				KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+				&keybindings
+			),
+			SelectAction::Handled
+		);
+		assert_eq!(list.selected_index(), 1); // wraps to the last row
+		assert_eq!(
+			list.handle_key_with(
+				KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+				&keybindings
+			),
+			SelectAction::Select(1)
+		);
+		assert_eq!(
+			list.handle_key_with(
+				KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+				&keybindings
+			),
+			SelectAction::Cancel
+		);
+	}
+
+	#[test]
+	fn handle_key_with_honors_user_overrides() {
+		use std::collections::HashMap;
+		let mut keybindings = KeybindingsManager::with_merged_definitions(TUI_KEYBINDINGS, &[]);
+		keybindings
+			.set_user_bindings(HashMap::from([
+				("tui.select.confirm".to_string(), vec!["ctrl+y".to_string()]),
+				("tui.select.cancel".to_string(), vec![]),
+			]))
+			.unwrap();
+		let mut list = list();
+		// Rebound confirm fires on the new chord...
+		assert_eq!(
+			list.handle_key_with(
+				KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+				&keybindings
+			),
+			SelectAction::Select(0)
+		);
+		// ...the old default no longer confirms...
+		assert_eq!(
+			list.handle_key_with(
+				KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+				&keybindings
+			),
+			SelectAction::Ignored
+		);
+		// ...and a disabled action stops canceling.
+		assert_eq!(
+			list.handle_key_with(
+				KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+				&keybindings
+			),
+			SelectAction::Ignored
+		);
 	}
 }
