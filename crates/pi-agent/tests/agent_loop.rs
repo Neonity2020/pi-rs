@@ -41,6 +41,23 @@ fn mock_agent(tools: Vec<Arc<dyn AgentTool>>) -> Agent {
 }
 
 #[tokio::test]
+async fn panic_releases_active_run() {
+	let agent = Agent::new(AgentOptions {
+		stream_fn: Some(Arc::new(|_, _, _| panic!("provider panic"))),
+		..Default::default()
+	});
+	let worker = agent.clone();
+	assert!(
+		tokio::spawn(async move { worker.prompt("hello".into()).await })
+			.await
+			.is_err()
+	);
+	assert!(!agent.is_streaming());
+	agent.set_stream_fn(Arc::new(pi_ai::providers::mock::stream));
+	agent.prompt("again".into()).await.unwrap();
+}
+
+#[tokio::test]
 async fn tool_call_round_trip_preserves_result_and_events() {
 	let agent = mock_agent(vec![Arc::new(ListTool)]);
 	let mut events = agent.subscribe();

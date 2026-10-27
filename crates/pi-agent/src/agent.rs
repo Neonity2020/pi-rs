@@ -89,6 +89,14 @@ pub struct Agent {
 	inner: Arc<AgentInner>,
 }
 
+struct RunGuard(Agent);
+
+impl Drop for RunGuard {
+	fn drop(&mut self) {
+		self.0.end_run();
+	}
+}
+
 impl Agent {
 	pub fn new(options: AgentOptions) -> Self {
 		let (event_tx, _) = broadcast::channel(1024);
@@ -180,6 +188,7 @@ impl Agent {
 	/// is already active — use `steer`/`follow_up` to queue instead.
 	pub async fn prompt(&self, input: PromptInput) -> anyhow::Result<()> {
 		let token = self.begin_run()?;
+		let _guard = RunGuard(self.clone());
 		let messages = match input {
 			PromptInput::Text { text } => vec![Message::user(text)],
 			PromptInput::Messages(messages) => messages,
@@ -188,9 +197,7 @@ impl Agent {
 			signal: token,
 			skip_initial_steering_poll: false,
 		};
-		let result = self.run_loop(messages, opts).await;
-		self.end_run();
-		result
+		self.run_loop(messages, opts).await
 	}
 
 	/// Continue from the current transcript (`Agent::continue()`): drains
@@ -198,6 +205,7 @@ impl Agent {
 	/// user or tool-result message.
 	pub async fn continue_run(&self) -> anyhow::Result<()> {
 		let token = self.begin_run()?;
+		let _guard = RunGuard(self.clone());
 
 		let last_role = self
 			.inner
@@ -216,7 +224,6 @@ impl Agent {
 					skip_initial_steering_poll: true,
 				};
 				let result = self.run_loop(steering, opts).await;
-				self.end_run();
 				return result;
 			}
 			let follow_ups = self.inner.follow_up.lock().unwrap().drain();
@@ -226,17 +233,14 @@ impl Agent {
 					skip_initial_steering_poll: false,
 				};
 				let result = self.run_loop(follow_ups, opts).await;
-				self.end_run();
 				return result;
 			}
-			self.end_run();
 			return Err(anyhow::anyhow!(
 				"cannot continue from message role: assistant"
 			));
 		}
 
 		if last_role == "system" {
-			self.end_run();
 			return Err(anyhow::anyhow!("no messages to continue from"));
 		}
 
@@ -244,9 +248,7 @@ impl Agent {
 			signal: token,
 			skip_initial_steering_poll: false,
 		};
-		let result = self.run_loop(Vec::new(), opts).await;
-		self.end_run();
-		result
+		self.run_loop(Vec::new(), opts).await
 	}
 
 	// -- queues ---------------------------------------------------------------
@@ -314,8 +316,27 @@ impl Agent {
 		*self.inner.thinking_level.read().unwrap()
 	}
 
+	pub fn stream_fn(&self) -> StreamFn {
+		self.inner.stream_fn.read().unwrap().clone()
+	}
+
 	pub fn set_stream_fn(&self, stream_fn: StreamFn) {
 		*self.inner.stream_fn.write().unwrap() = stream_fn;
+	}
+
+	/// Replace the whole transcript with `messages` — the mutation behind
+	/// context compaction (`AgentSession.compact` swaps in
+	/// `[system…, compaction summary]` after `compaction.ts` produced the
+	/// summary). Refused while a run is active: the loop would keep appending
+	/// past the replacement, which is why upstream only compacts an idle
+	/// agent. The replacement is authoritative; queues are left untouched.
+	pub fn replace_messages(&self, messages: Vec<Message>) -> anyhow::Result<()> {
+		let mut transcript = self.inner.messages.write().unwrap();
+		if self.inner.active_run.lock().unwrap().is_some() {
+			anyhow::bail!("cannot replace messages while a run is active");
+		}
+		*transcript = messages;
+		Ok(())
 	}
 
 	/// Replace the executable tool set. Differences from the tools declared in
@@ -462,4 +483,92 @@ fn replay_system_prompt(messages: &[Message]) -> String {
 		}
 	}
 	prompt
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn replace_messages_swaps_transcript_and_snapshot_reflects_it() {
+		let agent = Agent::new(AgentOptions::default());
+		let replacement = vec![
+			Message::System(pi_ai::SystemMessage::prompt("kept prompt")),
+			Message::user("carry-over summary"),
+		];
+		agent.replace_messages(replacement.clone()).unwrap();
+		assert_eq!(agent.snapshot().messages, replacement);
+		// snapshot().system_prompt terminates each replayed system message with \n.
+		assert_eq!(agent.snapshot().system_prompt, "kept prompt\n");
+	}
+
+	#[test]
+	fn replacement_without_system_message_yields_empty_prompt() {
+		let agent = Agent::new(AgentOptions {
+			system_prompt: Some("old".into()),
+			..Default::default()
+		});
+		agent
+			.replace_messages(vec![Message::user("fresh")])
+			.unwrap();
+		assert_eq!(agent.snapshot().messages.len(), 1);
+		assert_eq!(agent.snapshot().system_prompt, "");
+	}
+
+	/// The next run must build on the replacement, not the old transcript.
+	#[tokio::test]
+	async fn run_after_replacement_uses_the_new_history() {
+		let agent = Agent::new(AgentOptions {
+			stream_fn: Some(Arc::new(pi_ai::providers::mock::stream)),
+			..Default::default()
+		});
+		agent
+			.replace_messages(vec![
+				Message::System(pi_ai::SystemMessage::prompt("compacted agent")),
+				Message::user("carry-over summary"),
+			])
+			.unwrap();
+		agent.prompt("again".into()).await.unwrap();
+		let roles: Vec<&str> = agent
+			.snapshot()
+			.messages
+			.iter()
+			.map(Message::role)
+			.collect();
+		assert_eq!(roles, ["system", "user", "user", "assistant"]);
+		let snapshot = agent.snapshot();
+		let Message::Assistant(reply) = snapshot.messages.last().unwrap() else {
+			panic!("expected assistant reply")
+		};
+		assert!(reply.text().contains("again"));
+	}
+
+	#[tokio::test]
+	async fn replace_messages_is_refused_while_a_run_is_active() {
+		let agent = Agent::new(AgentOptions {
+			stream_fn: Some(Arc::new(|_, _, _| {
+				Box::pin(futures::stream::pending::<pi_ai::AssistantMessageEvent>())
+			})),
+			..Default::default()
+		});
+		let worker = agent.clone();
+		let task = tokio::spawn(async move { worker.prompt("hello".into()).await });
+		tokio::time::timeout(std::time::Duration::from_secs(5), async {
+			while !agent.is_streaming() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		assert!(agent.replace_messages(Vec::new()).is_err());
+		// The transcript is untouched: system + the prompt still in flight.
+		assert_eq!(agent.snapshot().messages.len(), 2);
+		task.abort();
+		let _ = task.await;
+		assert!(!agent.is_streaming());
+		agent
+			.replace_messages(vec![Message::user("fresh")])
+			.unwrap();
+		assert_eq!(agent.snapshot().messages, vec![Message::user("fresh")]);
+	}
 }
