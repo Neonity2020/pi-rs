@@ -28,7 +28,16 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 regex = { workspace = true }
 walkdir = { workspace = true }
+# ripgrep's own walker: .gitignore/.ignore/global git excludes + binary skipping
+# for the grep/find tools (upstream shells out to rg/fd; see tools/grep.rs).
+ignore = "0.4"
+# rg-compatible `--glob` matching (`*` crosses `/`), which the ignore crate's
+# gitignore-style overrides do not provide.
+globset = "0.4"
 clap = { workspace = true }
 dirs = { workspace = true }
 unicode-width = { workspace = true }
 dotenvy = "0.15"
+# Session header ids: upstream uses uuidv7 (`createSessionId` in
+# session-manager.ts); entry ids are 8-hex prefixes of random v4 UUIDs.
+uuid = { version = "1", features = ["v4", "v7"] }

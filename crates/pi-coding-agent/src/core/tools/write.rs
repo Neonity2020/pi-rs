@@ -1,4 +1,11 @@
 //! `write` tool — port of `pi/packages/coding-agent/src/core/tools/write.ts`.
+//!
+//! Behavior matches upstream: `path` + `content`, parent directories are
+//! created as needed (mkdir -p), the file is overwritten when it exists.
+//!
+//! Accepted difference: upstream serializes all file mutations through a
+//! per-path `withFileMutationQueue`; pi-rs runs tools sequentially and does
+//! not have the extension-host machinery yet (P2), so no queue is ported.
 
 use std::path::PathBuf;
 
@@ -27,16 +34,16 @@ impl AgentTool for WriteTool {
 	}
 
 	fn description(&self) -> &str {
-		"Write a file to the local filesystem, overwriting it if it exists. \
-Parent directories are created as needed. Prefer `edit` for partial changes."
+		"Write content to a file. Creates the file if it doesn't exist, \
+overwrites if it does. Automatically creates parent directories."
 	}
 
 	fn parameters_schema(&self) -> Value {
 		json!({
 			"type": "object",
 			"properties": {
-				"path": { "type": "string" },
-				"content": { "type": "string" }
+				"path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
+				"content": { "type": "string", "description": "Content to write to the file" }
 			},
 			"required": ["path", "content"]
 		})
@@ -65,11 +72,72 @@ Parent directories are created as needed. Prefer `edit` for partial changes."
 			return AgentToolResult::error(format!("cannot create parent dir for {path}: {e}"));
 		}
 		match tokio::fs::write(&resolved, &content).await {
-			Ok(()) => {
-				let lines = content.lines().count();
-				AgentToolResult::text(format!("wrote {path} ({lines} lines)"))
-			}
+			Ok(()) => AgentToolResult::text(format!("Successfully wrote to {path}")),
 			Err(e) => AgentToolResult::error(format!("cannot write {path}: {e}")),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::path::{Path, PathBuf};
+
+	fn tmp_dir(tag: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!(
+			"pi-rs-write-{tag}-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	async fn run(cwd: &Path, params: Value) -> AgentToolResult {
+		WriteTool::new(cwd.to_path_buf())
+			.execute("test", params, CancellationToken::new(), None)
+			.await
+	}
+
+	fn text(result: &AgentToolResult) -> String {
+		result
+			.content
+			.iter()
+			.filter_map(|c| c.text_content())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	#[tokio::test]
+	async fn writes_new_file_and_creates_parents() {
+		let dir = tmp_dir("new");
+		let result = run(
+			&dir,
+			json!({"path": "a/b/c.txt", "content": "hello\nworld\n"}),
+		)
+		.await;
+		assert!(!result.is_error, "{}", text(&result));
+		assert_eq!(text(&result), "Successfully wrote to a/b/c.txt");
+		assert_eq!(
+			std::fs::read_to_string(dir.join("a/b/c.txt")).unwrap(),
+			"hello\nworld\n"
+		);
+	}
+
+	#[tokio::test]
+	async fn overwrites_existing_file() {
+		let dir = tmp_dir("overwrite");
+		std::fs::write(dir.join("f.txt"), "old").unwrap();
+		let result = run(&dir, json!({"path": "f.txt", "content": "new"})).await;
+		assert!(!result.is_error, "{}", text(&result));
+		assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "new");
+	}
+
+	#[tokio::test]
+	async fn missing_params_error() {
+		let dir = tmp_dir("params");
+		let result = run(&dir, json!({"path": "f.txt"})).await;
+		assert!(result.is_error);
+		assert_eq!(text(&result), "missing required string parameter: content");
 	}
 }

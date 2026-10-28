@@ -2,10 +2,12 @@
 
 pub mod bash;
 pub mod edit;
+pub mod edit_diff;
 pub mod find;
 pub mod grep;
 pub mod ls;
 pub mod read;
+pub mod truncate;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -179,18 +181,23 @@ async fn connect_one(entry: &McpServerEntry) -> anyhow::Result<(SharedMcpClient,
 }
 
 /// Resolve a tool-provided path against the tool cwd, mirroring
-/// `path-utils.ts` (absolute paths pass through, `~` expands).
+/// `path-utils.ts` (absolute paths pass through, `~` expands). The result is
+/// lexically normalized so a default "." argument does not leave a trailing
+/// `/.` segment behind (which would break literal path matching).
 pub fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
 	let expanded = if let Some(rest) = path.strip_prefix("~/") {
 		dirs::home_dir().unwrap_or_default().join(rest)
 	} else {
 		PathBuf::from(path)
 	};
-	if expanded.is_absolute() {
+	let joined = if expanded.is_absolute() {
 		expanded
 	} else {
 		cwd.join(expanded)
-	}
+	};
+	// `components()` normalizes away interior `.` segments (Rust keeps only
+	// a leading one for relative paths), e.g. `/a/b/.` becomes `/a/b`.
+	joined.components().collect::<PathBuf>()
 }
 
 /// Extract a required string parameter. The error is boxed because
