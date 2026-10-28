@@ -1,22 +1,29 @@
 //! `bash` tool — port of `pi/packages/coding-agent/src/core/tools/bash.ts`.
 //! Uses pi-env's `LocalEnv` so the same tool runs over SSH later. The
-//! hook/timeout-broadcast machinery from the TS original lands with the
-//! shell-integration phase.
+//! hook machinery from the TS original lands with the shell-integration
+//! phase; output truncation keeps the pi-rs 60k byte cap (upstream truncates
+//! by lines + bytes via `OutputAccumulator`) and spills the full stream to a
+//! temp file like upstream's `full_output_path`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use pi_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdate};
-use pi_env::{EnvConnection, ExecOptions};
+use pi_env::{EnvConnection, ExecOptions, OutputChunkCallback};
 
 use super::{param_str, param_u64_or};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_OUTPUT_CHARS: usize = 60_000;
-const UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+// Leading-edge throttle for partial updates — `BASH_UPDATE_THROTTLE_MS` in
+// `pi/packages/coding-agent/src/core/tools/renderers/bash.ts`: the first
+// chunk emits immediately, later chunks coalesce into at most one update per
+// window, and the newest text is always flushed at the end.
+const UPDATE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct UpdateTask(tokio::task::JoinHandle<()>);
 
@@ -26,13 +33,54 @@ impl Drop for UpdateTask {
 	}
 }
 
+/// Session metadata exposed to commands as `PI_RS_*` environment variables —
+/// port of the `exposeSessionEnvironment` block in `core/tools/bash.ts`
+/// (upstream uses the `PI_` prefix). All fields optional; a missing value is
+/// simply not injected.
+#[derive(Debug, Default, Clone)]
+pub struct SessionToolContext {
+	pub session_id: Option<String>,
+	pub session_file: Option<String>,
+	pub provider: Option<String>,
+	pub model: Option<String>,
+	pub reasoning_level: Option<String>,
+}
+
+impl SessionToolContext {
+	fn env_vars(&self) -> Vec<(String, String)> {
+		let mut vars = Vec::new();
+		for (key, value) in [
+			("PI_RS_SESSION_ID", &self.session_id),
+			("PI_RS_SESSION_FILE", &self.session_file),
+			("PI_RS_PROVIDER", &self.provider),
+			("PI_RS_MODEL", &self.model),
+			("PI_RS_REASONING_LEVEL", &self.reasoning_level),
+		] {
+			if let Some(value) = value {
+				vars.push((key.to_string(), value.clone()));
+			}
+		}
+		vars
+	}
+}
+
 pub struct BashTool {
 	cwd: PathBuf,
+	session_context: SessionToolContext,
 }
 
 impl BashTool {
 	pub fn new(cwd: PathBuf) -> Self {
-		Self { cwd }
+		Self {
+			cwd,
+			session_context: SessionToolContext::default(),
+		}
+	}
+
+	/// Builder: inject session metadata as `PI_RS_*` env vars on every exec.
+	pub fn with_session_context(mut self, ctx: SessionToolContext) -> Self {
+		self.session_context = ctx;
+		self
 	}
 }
 
@@ -95,22 +143,28 @@ bash for everything else (builds, tests, git, ...)."
 
 		let env = pi_env::LocalEnv::with_cwd(self.cwd.to_string_lossy().into_owned());
 		let stop_updates = CancellationToken::new();
+		// Wakes the throttled updater; each stdout chunk pings it so the
+		// leading edge of the throttle is immediate.
+		let chunk_wake = Arc::new(tokio::sync::Notify::new());
 		let mut update_task = None;
-		let captured = std::sync::Arc::new(std::sync::Mutex::new((Vec::<u8>::new(), false)));
+		let captured = Arc::new(std::sync::Mutex::new((Vec::<u8>::new(), false)));
 		if let Some(update) = on_update {
 			let snapshot = captured.clone();
 			let stop = stop_updates.clone();
+			let wake = chunk_wake.clone();
 			update_task = Some(UpdateTask(tokio::spawn(async move {
-				let mut interval = tokio::time::interval(UPDATE_INTERVAL);
-				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+				let mut last_emit: Option<std::time::Instant> = None;
 				loop {
 					let finished = tokio::select! {
 						_ = stop.cancelled() => true,
-						_ = interval.tick() => false,
+						_ = wake.notified() => false,
 					};
+					let due = last_emit
+						.map(|since| since.elapsed() >= UPDATE_THROTTLE)
+						.unwrap_or(true);
 					let text = {
 						let mut state = snapshot.lock().unwrap_or_else(|e| e.into_inner());
-						if state.1 {
+						if state.1 && (due || finished) {
 							state.1 = false;
 							Some(String::from_utf8_lossy(&state.0).into_owned())
 						} else {
@@ -119,6 +173,7 @@ bash for everything else (builds, tests, git, ...)."
 					};
 					if let Some(text) = text {
 						update(AgentToolResult::text(text));
+						last_emit = Some(std::time::Instant::now());
 					}
 					if finished {
 						break;
@@ -127,7 +182,7 @@ bash for everything else (builds, tests, git, ...)."
 			})));
 		}
 		let output_buffer = captured.clone();
-		let on_output = Some(std::sync::Arc::new(move |chunk: &[u8]| {
+		let on_output = Some(Arc::new(move |chunk: &[u8]| {
 			let mut state = output_buffer.lock().unwrap_or_else(|e| e.into_inner());
 			let bytes = &mut state.0;
 			bytes.extend_from_slice(chunk);
@@ -137,15 +192,27 @@ bash for everything else (builds, tests, git, ...)."
 			}
 			state.1 = true;
 		}) as pi_env::connection::OutputCallback);
+		let chunk_callback: OutputChunkCallback = match update_task.is_some() {
+			true => {
+				let wake = chunk_wake.clone();
+				Arc::new(move |_chunk: &str| {
+					// The captured text already carries the chunk; this ping
+					// only drives the leading edge of the update throttle.
+					wake.notify_one();
+				})
+			}
+			// No update stream to feed — keep the no-op cheap.
+			false => Arc::new(|_| {}),
+		};
 		let options = ExecOptions {
 			cwd: Some(self.cwd.to_string_lossy().into_owned()),
 			timeout_ms: Some(timeout_ms),
-			env: Vec::new(),
+			env: self.session_context.env_vars(),
 			on_output,
 		};
 
 		// Race the exec against the agent abort signal.
-		let exec = env.exec(&command, options);
+		let exec = env.exec_streaming(&command, options, chunk_callback);
 		let result = tokio::select! {
 			result = exec => match result {
 				Ok(output) => {
@@ -161,7 +228,27 @@ bash for everything else (builds, tests, git, ...)."
 					if text.is_empty() {
 						text = "(no output)".into();
 					}
-					let failed = output.exit_code.map(|c| c != 0).unwrap_or(false) || output.timed_out;
+					// Truncation spilled the complete stream to a temp file
+					// (upstream's `full_output_path`).
+					for path in [&output.full_stdout_path, &output.full_stderr_path]
+						.into_iter()
+						.flatten()
+					{
+						text.push('\n');
+						text.push_str(&format!("(full output: {path})"));
+					}
+					// A signal-killed shell has no exit code; use the standard
+					// 128+n shell convention so the failure is not mistaken for
+					// a successful command (upstream maps signalCode the same way).
+					if output.exit_code.is_none()
+						&& let Some(sig) = output.signal
+					{
+						text.push('\n');
+						text.push_str(&format!("terminated by signal {sig}"));
+					}
+					let failed = output.exit_code.map(|c| c != 0).unwrap_or(false)
+						|| output.signal.is_some()
+						|| output.timed_out;
 					if output.timed_out {
 						AgentToolResult::error(format!("command timed out after {timeout_ms}ms\n{text}"))
 					} else {
@@ -327,5 +414,114 @@ mod tests {
 		})
 		.await
 		.expect("update task retained callback after execute dropped");
+	}
+
+	fn result_text(result: &AgentToolResult) -> String {
+		result
+			.content
+			.iter()
+			.filter_map(|c| c.text_content())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	#[tokio::test]
+	async fn session_context_is_injected_as_pi_rs_env_vars() {
+		let ctx = SessionToolContext {
+			session_id: Some("sess-1".into()),
+			session_file: Some("/tmp/session.jsonl".into()),
+			provider: Some("mock".into()),
+			model: Some("mock-echo".into()),
+			reasoning_level: Some("high".into()),
+		};
+		let tool = BashTool::new(std::env::current_dir().unwrap()).with_session_context(ctx);
+		let result = tool
+			.execute(
+				"test",
+				json!({"command":"echo \"$PI_RS_SESSION_ID|$PI_RS_SESSION_FILE|$PI_RS_PROVIDER|$PI_RS_MODEL|$PI_RS_REASONING_LEVEL\""}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(!result.is_error);
+		assert_eq!(
+			result_text(&result),
+			"sess-1|/tmp/session.jsonl|mock|mock-echo|high"
+		);
+	}
+
+	#[tokio::test]
+	async fn missing_session_context_fields_are_not_injected() {
+		let ctx = SessionToolContext {
+			session_id: Some("sess-2".into()),
+			..SessionToolContext::default()
+		};
+		let tool = BashTool::new(std::env::current_dir().unwrap()).with_session_context(ctx);
+		let result = tool
+			.execute(
+				"test",
+				json!({"command":"echo \"$PI_RS_SESSION_ID\"; [ -z \"$PI_RS_MODEL\" ] && [ -z \"$PI_RS_PROVIDER\" ] && [ -z \"$PI_RS_SESSION_FILE\" ] && [ -z \"$PI_RS_REASONING_LEVEL\" ] && echo unset"}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(!result.is_error, "text: {}", result_text(&result));
+		assert_eq!(result_text(&result), "sess-2\nunset");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn signal_termination_fails_with_128_plus_signal() {
+		let tool = BashTool::new(std::env::current_dir().unwrap());
+		let result = tool
+			.execute(
+				"test",
+				json!({"command":"printf partial; kill -TERM $$"}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(result.is_error);
+		let text = result_text(&result);
+		assert!(text.contains("partial"));
+		assert!(text.contains("terminated by signal 15"), "text: {text}");
+	}
+
+	#[tokio::test]
+	async fn truncated_output_is_spilled_to_a_temp_file() {
+		let tool = BashTool::new(std::env::current_dir().unwrap());
+		let result = tool
+			.execute(
+				"test",
+				json!({"command":"yes x | head -c 80000"}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(!result.is_error);
+		let text = result_text(&result);
+		let path = text
+			.lines()
+			.find_map(|line| line.strip_prefix("(full output: "))
+			.and_then(|rest| rest.strip_suffix(')'))
+			.expect("result notes the full output path");
+		let full = std::fs::read_to_string(path).unwrap();
+		assert_eq!(full.len(), 80_000, "spill holds the complete stream");
+		assert!(full.ends_with("x\n"));
+		std::fs::remove_file(path).unwrap();
+	}
+
+	#[tokio::test]
+	async fn fitting_output_is_not_spilled() {
+		let tool = BashTool::new(std::env::current_dir().unwrap());
+		let result = tool
+			.execute(
+				"test",
+				json!({"command":"echo small"}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(!result_text(&result).contains("(full output:"));
 	}
 }

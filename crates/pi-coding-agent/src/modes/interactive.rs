@@ -6,11 +6,14 @@
 //! markdown (`components/assistant-message.ts` / `user-message.ts`), tool
 //! calls use the `formatToolCallWithArgs` collapsed/expanded layout with a
 //! 10-line output preview and ctrl+o expansion (`components/tool-execution.ts`,
-//! `core/tools/render-utils.ts`), and the footer is the two-line
-//! `components/footer.ts` (cwd+branch / token·cost·context% with the model
-//! right-aligned). `/model` opens the fuzzy model selector overlay
+//! `core/tools/render-utils.ts`), running tools preview their streaming output
+//! tail, and the footer is the two-line `components/footer.ts` (cwd+branch /
+//! token·cost·context% with the model right-aligned; context % comes from the
+//! unified `core/context_usage.rs` algorithm with the `(auto)` compaction
+//! indicator). `/model` opens the fuzzy model selector overlay
 //! (`components/model-selector.ts`).
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -34,6 +37,9 @@ use crate::core::ui_config::UiConfig;
 
 const TICK_MS: u64 = 80;
 const TOOL_PREVIEW_LINES: usize = 10;
+/// Running tools preview their live output tail (bash-execution.ts
+/// `PREVIEW_LINES`), finished ones the first lines.
+const TOOL_RUNNING_PREVIEW_LINES: usize = 20;
 const COLLAPSED_ARGS_CHARS: usize = 100;
 const EDITOR_MAX_ROWS: usize = 8;
 
@@ -115,9 +121,9 @@ pub struct InteractiveMode {
 	quit: bool,
 	tick: u64,
 	cwd: String,
-	// Footer data (footer.ts): usage totals, latest prompt tokens, git branch.
+	// Footer data (footer.ts): usage totals, git branch. Context usage is not
+	// cached here — it comes from the unified core::context_usage algorithm.
 	usage: (u64, u64, u64, u64, f64), // input, output, cache_read, cache_write, cost
-	last_prompt_tokens: Option<u64>,
 	branch: Option<String>,
 	branch_refresh_tick: u64,
 	// Toggles (pi keybindings app.tools.expand / app.thinking.toggle).
@@ -159,6 +165,39 @@ pub fn format_duration(ms: u128) -> String {
 		let hours = minutes / 60;
 		format!("{hours}h {}m {rem}s", minutes % 60)
 	}
+}
+
+/// Footer context segment (footer.ts render): `71.4%/200k`, or `?/200k` while
+/// usage is unknown (after compaction, before the next response) with the
+/// window still taken from the model. The `(auto)` indicator follows the
+/// window while auto-compaction is enabled. Color thresholds are strict:
+/// >90% error, >70% warning, unknown stays neutral.
+fn footer_context_segment(
+	usage: Option<(u64, u64)>,
+	model_window: u64,
+	auto_compaction: bool,
+	theme: &Theme,
+) -> (String, Style) {
+	let window = usage.map(|(_, window)| window).unwrap_or(model_window);
+	let auto = if auto_compaction { " (auto)" } else { "" };
+	let Some((tokens, _)) = usage else {
+		return (
+			format!("?/{}{auto}", format_tokens(window)),
+			Style::default(),
+		);
+	};
+	let percent = tokens as f64 / window as f64 * 100.0;
+	let style = if percent > 90.0 {
+		Style::new().fg(theme.error)
+	} else if percent > 70.0 {
+		Style::new().fg(theme.tool) // warning slot
+	} else {
+		Style::default()
+	};
+	(
+		format!("{percent:.1}%/{}{auto}", format_tokens(window)),
+		style,
+	)
 }
 
 /// The app-level actions pi-rs interactive dispatches. The definition table
@@ -229,7 +268,6 @@ impl InteractiveMode {
 			tick: 0,
 			cwd,
 			usage: (0, 0, 0, 0, 0.0),
-			last_prompt_tokens: None,
 			branch: None,
 			branch_refresh_tick: 0,
 			tools_expanded: false,
@@ -660,12 +698,6 @@ impl InteractiveMode {
 					*cache_read += assistant.usage.cache_read;
 					*cache_write += assistant.usage.cache_write;
 					*cost += assistant.usage.cost.total.unwrap_or(0.0);
-					let prompt = assistant.usage.input
-						+ assistant.usage.cache_read
-						+ assistant.usage.cache_write;
-					if prompt > 0 {
-						self.last_prompt_tokens = Some(prompt);
-					}
 				}
 				self.chat.scroll_to_bottom(usize::MAX);
 			}
@@ -692,14 +724,10 @@ impl InteractiveMode {
 				partial_result,
 				..
 			} => {
-				if let Some(ChatBlock::Tool {
-					output, rendered, ..
-				}) = self.blocks.iter_mut().rev().find(
-					|b| matches!(b, ChatBlock::Tool { id, running: true, .. } if *id == tool_call_id),
-				) {
-					*output = tool_result_text(&partial_result);
-					*rendered = None;
-				}
+				// Streaming deltas append to the running block's output so the
+				// preview follows the live stream; no result cache to clear
+				// beyond the running block's (never cached anyway).
+				apply_tool_update(&mut self.blocks, &tool_call_id, &partial_result);
 			}
 			AgentEvent::ToolExecutionEnd {
 				tool_call_id,
@@ -823,7 +851,8 @@ impl InteractiveMode {
 	}
 
 	/// Two-line footer (footer.ts): cwd (+git branch), then token/cost/context
-	/// stats with the model right-aligned.
+	/// stats with the model right-aligned. The context segment shows `?` while
+	/// usage is unknown and the `(auto)` indicator while auto-compaction is on.
 	fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
 		let width = area.width as usize;
 		if width == 0 {
@@ -867,24 +896,16 @@ impl InteractiveMode {
 			stats.push(format!("${cost:.3}"));
 		}
 
-		// Context usage from the latest prompt tokens and the model window.
-		let model = self.session.agent.model();
-		let window = model.context_window;
-		let (context_style, context_text) = match self.last_prompt_tokens {
-			Some(tokens) if window > 0 => {
-				let percent = tokens as f64 / window as f64 * 100.0;
-				let style = if percent > 90.0 {
-					Style::new().fg(self.theme.error)
-				} else if percent > 70.0 {
-					Style::new().fg(self.theme.tool) // warning slot
-				} else {
-					Style::default()
-				};
-				(style, format!("{percent:.1}%/{}", format_tokens(window)))
-			}
-			_ => (Style::default(), format!("?/{}", format_tokens(window))),
-		};
+		// Context usage via the unified algorithm (core/context_usage.rs, the
+		// footer.ts getSessionStats path): provider usage preferred with
+		// trailing estimation; None after compaction until the next response.
+		let usage = crate::core::context_usage::compute(&self.session.agent);
+		let model_window = self.session.agent.model().context_window;
+		let auto_compaction = self.session.auto_compaction.load(Ordering::Relaxed);
+		let (context_text, context_style) =
+			footer_context_segment(usage, model_window, auto_compaction, &self.theme);
 
+		let model = self.session.agent.model();
 		let thinking = self.session.agent.thinking_level();
 		let mut right = model.id.clone();
 		if model.reasoning {
@@ -1031,6 +1052,7 @@ impl InteractiveMode {
 					running,
 					is_error,
 					output,
+					started,
 					duration_ms,
 					rendered,
 					..
@@ -1042,13 +1064,17 @@ impl InteractiveMode {
 						lines.extend(cached.iter().cloned());
 						continue;
 					}
+					// Live elapsed while running (render-utils.ts toolTimerText
+					// partial path); the final recorded duration wins.
+					let shown_ms =
+						(*duration_ms).or_else(|| started.map(|s| s.elapsed().as_millis()));
 					let out = render_tool_block(
 						name,
 						args,
 						*running,
 						*is_error,
 						output,
-						*duration_ms,
+						shown_ms,
 						width,
 						&theme,
 						tools_expanded,
@@ -1090,6 +1116,44 @@ fn tool_result_text(result: &serde_json::Value) -> String {
 				.join("\n")
 		})
 		.unwrap_or_default()
+}
+
+/// Text delta of a streaming update: the `text` field of the
+/// `{"text": "...", "isError": bool}` partial payload (agent_loop
+/// ToolExecutionUpdate), falling back to final-result content parsing.
+fn partial_output_text(partial_result: &serde_json::Value) -> Option<String> {
+	if let Some(text) = partial_result.get("text").and_then(|v| v.as_str()) {
+		return Some(text.to_string());
+	}
+	let text = tool_result_text(partial_result);
+	(!text.is_empty()).then_some(text)
+}
+
+/// Append a streaming update to the running tool block with the matching call
+/// id (bash streams chunked output; the preview shows the live tail). Already
+/// finished blocks and unknown ids are ignored. Returns whether it applied.
+fn apply_tool_update(
+	blocks: &mut [ChatBlock],
+	tool_call_id: &str,
+	partial_result: &serde_json::Value,
+) -> bool {
+	let Some(delta) = partial_output_text(partial_result) else {
+		return false;
+	};
+	let Some(ChatBlock::Tool {
+		output, rendered, ..
+	}) = blocks
+		.iter_mut()
+		.rev()
+		.find(|b| matches!(b, ChatBlock::Tool { id, running: true, .. } if *id == tool_call_id))
+	else {
+		return false;
+	};
+	// Progress bars rewrite lines with \r; the plain-text preview drops the
+	// carriage returns (render-utils.ts normalizeDisplayText).
+	output.push_str(&delta.replace('\r', ""));
+	*rendered = None;
+	true
 }
 
 /// Assistant message lines (assistant-message.ts): thinking block first
@@ -1226,10 +1290,15 @@ fn render_tool_block(
 
 	if !output.is_empty() {
 		let out_lines: Vec<&str> = output.lines().collect();
+		let preview_lines = if running {
+			TOOL_RUNNING_PREVIEW_LINES
+		} else {
+			TOOL_PREVIEW_LINES
+		};
 		let shown = if tools_expanded {
 			out_lines.len()
 		} else {
-			out_lines.len().min(TOOL_PREVIEW_LINES)
+			out_lines.len().min(preview_lines)
 		};
 		let out_style = if is_error {
 			Style::new().fg(theme.error)
@@ -1381,6 +1450,175 @@ mod tests {
 		assert_eq!(format_duration(4200), "4.2s");
 		assert_eq!(format_duration(90_000), "1m 30s");
 		assert_eq!(format_duration(3_723_000), "1h 2m 3s");
+	}
+
+	#[test]
+	fn footer_context_segment_formats_percent_and_unknown() {
+		let theme = Theme::default();
+		let (text, style) = footer_context_segment(Some((1000, 200_000)), 0, false, &theme);
+		assert_eq!(text, "0.5%/200k");
+		assert_eq!(style, Style::default());
+
+		// Unknown usage (post-compaction): `?` in the percent slot, the window
+		// still from the model, neutral color (footer.ts).
+		let (text, style) = footer_context_segment(None, 200_000, false, &theme);
+		assert_eq!(text, "?/200k");
+		assert_eq!(style, Style::default());
+
+		// Zero window falls back to the same `?/0` shape.
+		let (text, _) = footer_context_segment(None, 0, false, &theme);
+		assert_eq!(text, "?/0");
+	}
+
+	#[test]
+	fn footer_context_segment_thresholds_and_auto_indicator() {
+		let theme = Theme::default();
+		let (text, style) = footer_context_segment(Some((150_000, 200_000)), 0, true, &theme);
+		assert_eq!(text, "75.0%/200k (auto)");
+		assert_eq!(style, Style::new().fg(theme.tool));
+
+		let (text, style) = footer_context_segment(Some((190_000, 200_000)), 0, true, &theme);
+		assert_eq!(text, "95.0%/200k (auto)");
+		assert_eq!(style, Style::new().fg(theme.error));
+
+		// Thresholds are strict (>70, >90): exactly 70% stays neutral, exactly
+		// 90% falls into the warning band (footer.ts).
+		let (_, style) = footer_context_segment(Some((140_000, 200_000)), 0, false, &theme);
+		assert_eq!(style, Style::default());
+		let (_, style) = footer_context_segment(Some((180_000, 200_000)), 0, false, &theme);
+		assert_eq!(style, Style::new().fg(theme.tool));
+
+		// Unknown usage is neutral even with auto-compaction enabled.
+		let (_, style) = footer_context_segment(None, 200_000, true, &theme);
+		assert_eq!(style, Style::default());
+	}
+
+	fn tool_block(id: &str, running: bool, output: &str) -> ChatBlock {
+		ChatBlock::Tool {
+			id: id.to_string(),
+			name: "bash".to_string(),
+			args: serde_json::json!({"command": "echo hi"}),
+			running,
+			is_error: false,
+			output: output.to_string(),
+			started: None,
+			duration_ms: None,
+			rendered: None,
+		}
+	}
+
+	#[test]
+	fn tool_update_appends_text_to_running_block() {
+		let mut blocks = vec![tool_block("call-1", true, "")];
+		assert!(apply_tool_update(
+			&mut blocks,
+			"call-1",
+			&serde_json::json!({"text": "line1\n", "isError": false})
+		));
+		assert!(apply_tool_update(
+			&mut blocks,
+			"call-1",
+			&serde_json::json!({"text": "line2\n"})
+		));
+		let ChatBlock::Tool { output, .. } = &blocks[0] else {
+			panic!("expected tool block");
+		};
+		assert_eq!(output, "line1\nline2\n");
+
+		// Carriage returns are dropped (progress-bar redraws).
+		assert!(apply_tool_update(
+			&mut blocks,
+			"call-1",
+			&serde_json::json!({"text": "50%\r"})
+		));
+		let ChatBlock::Tool { output, .. } = &blocks[0] else {
+			panic!("expected tool block");
+		};
+		assert_eq!(output, "line1\nline2\n50%");
+	}
+
+	#[test]
+	fn tool_update_ignores_finished_and_unknown_blocks() {
+		let mut blocks = vec![
+			tool_block("done", false, "final"),
+			tool_block("running", true, "tail"),
+		];
+		// A late update after ToolExecutionEnd must not touch the block.
+		assert!(!apply_tool_update(
+			&mut blocks,
+			"done",
+			&serde_json::json!({"text": "x"})
+		));
+		// Unknown ids are ignored.
+		assert!(!apply_tool_update(
+			&mut blocks,
+			"call-9",
+			&serde_json::json!({"text": "x"})
+		));
+		// The matching running block still receives its own updates.
+		assert!(apply_tool_update(
+			&mut blocks,
+			"running",
+			&serde_json::json!({"text": "!"})
+		));
+		let ChatBlock::Tool { output, .. } = &blocks[1] else {
+			panic!("expected tool block");
+		};
+		assert_eq!(output, "tail!");
+		let ChatBlock::Tool { output, .. } = &blocks[0] else {
+			panic!("expected tool block");
+		};
+		assert_eq!(output, "final");
+	}
+
+	#[test]
+	fn tool_update_falls_back_to_content_payload() {
+		let mut blocks = vec![tool_block("call-1", true, "")];
+		assert!(apply_tool_update(
+			&mut blocks,
+			"call-1",
+			&serde_json::json!({"content": [{"type": "text", "text": "chunk"}]})
+		));
+		let ChatBlock::Tool { output, .. } = &blocks[0] else {
+			panic!("expected tool block");
+		};
+		assert_eq!(output, "chunk");
+	}
+
+	#[test]
+	fn running_tool_preview_shows_output_tail() {
+		let theme = Theme::default();
+		let output = (0..30)
+			.map(|i| format!("line{i}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let lines = render_tool_block(
+			"bash",
+			&serde_json::json!({"command": "yes"}),
+			true,
+			false,
+			&output,
+			None,
+			120,
+			&theme,
+			false,
+			0,
+			"ctrl+o",
+		);
+		let rendered: Vec<String> = lines
+			.iter()
+			.map(|l| {
+				l.spans
+					.iter()
+					.map(|s| s.content.to_string())
+					.collect::<String>()
+			})
+			.collect();
+		// Tail preview: the last source line is visible, the first is not.
+		assert!(rendered.iter().any(|l| l.contains("line29")));
+		assert!(!rendered.iter().any(|l| l.contains("line0")));
+		// Hidden head count with the expand hint.
+		assert!(rendered.iter().any(|l| l.contains("10 more lines")));
 	}
 
 	#[test]

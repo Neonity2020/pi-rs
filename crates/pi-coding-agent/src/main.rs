@@ -12,6 +12,7 @@ mod config;
 mod core;
 mod modes;
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -19,14 +20,15 @@ use pi_agent::{Agent, AgentOptions};
 use pi_ai::ThinkingLevel;
 
 use crate::core::agent_session::{restore_initial_messages, spawn_agent_session_with_settings};
-use crate::core::mcp_config;
 use crate::core::model_registry::ModelRegistry;
 use crate::core::session_manager::{
 	SessionManager, SessionSelector, resolve_session, validate_session_dir,
 };
 use crate::core::settings_manager::SettingsManager;
+use crate::core::tools::bash::{BashTool, SessionToolContext};
 use crate::core::tools::{connect_mcp_servers, create_tools};
 use crate::core::ui_config;
+use crate::core::{mcp_config, trust};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +62,10 @@ struct Cli {
 	/// Disable session persistence.
 	#[arg(long)]
 	no_session: bool,
+
+	/// Disable loading AGENTS.md and CLAUDE.md context files.
+	#[arg(long)]
+	no_context_files: bool,
 
 	/// Light theme.
 	#[arg(long)]
@@ -110,20 +116,28 @@ async fn main() -> anyhow::Result<()> {
 	let mut tools = create_tools(&cwd);
 	// MCP servers — startup assembly mirroring the upstream MCP extension's
 	// session_start wiring (`pi/packages/coding-agent/src/extensions/mcp/
-	// index.ts`), reduced to the global `mcp.json`: connect every enabled
-	// stdio server, bridge its `mcp__<server>__<tool>` tools into the tool
-	// table (and with it the system prompt). One server failing becomes a
-	// notice; all servers failing does not block startup. The assembly must
-	// outlive the agent so the server processes stay owned until exit.
+	// index.ts`): connect every enabled server (stdio and streamable HTTP),
+	// bridge its `mcp__<server>__<tool>` tools into the tool table (and with
+	// it the system prompt). The config merges the global `mcp.json` with the
+	// project's, gated on project trust. One server failing becomes a notice;
+	// all servers failing does not block startup. The assembly must outlive
+	// the agent so the server processes stay owned until exit.
 	let mut mcp = {
-		let config = mcp_config::load_mcp_config();
-		let assembly = connect_mcp_servers(&config).await;
+		// Trust gate: a project `.pi/mcp.json` loads only for trusted
+		// projects. Interactive runs get a one-time prompt whose answer is
+		// stored; print/rpc skip project servers with a notice instead.
+		let mut trust_notices: Vec<String> = Vec::new();
+		resolve_project_mcp_trust(&cwd, &cli, &mut trust_notices)?;
+		let config = mcp_config::load_mcp_config().await;
+		let mut assembly = connect_mcp_servers(&config).await;
+		assembly.notices.splice(..0, trust_notices);
 		// Notices are surfaced per mode at dispatch (stderr for print/rpc,
 		// chat notices for the interactive TUI), not here.
 		assembly
 	};
 	tools.extend(std::mem::take(&mut mcp.tools));
-	let system_prompt = crate::core::system_prompt::build_system_prompt(&cwd, &tools);
+	let system_prompt =
+		crate::core::system_prompt::build_system_prompt(&cwd, &tools, !cli.no_context_files);
 
 	// Session persistence. `--continue`/`--resume` reopen an existing log and
 	// seed the agent with its transcript; failures exit before anything is
@@ -154,9 +168,27 @@ async fn main() -> anyhow::Result<()> {
 		}
 	};
 
+	// Session-scoped environment for the bash tool (`PI_RS_*` variables),
+	// wired after session resolution so the log path is known. The tool
+	// declaration is unchanged, so the already-built system prompt stays
+	// valid.
+	let thinking_level = parse_thinking(settings.default_thinking_level.as_deref());
+	if let Some(index) = tools.iter().position(|tool| tool.name() == "bash") {
+		let context = SessionToolContext {
+			session_id: session.session_id(),
+			session_file: session
+				.session_dir()
+				.map(|dir| dir.join("session.jsonl").to_string_lossy().into_owned()),
+			provider: Some(model.provider.clone()),
+			model: Some(model.id.clone()),
+			reasoning_level: Some(format!("{thinking_level:?}").to_lowercase()),
+		};
+		tools[index] = Arc::new(BashTool::new(cwd.clone()).with_session_context(context));
+	}
+
 	let agent = Agent::new(AgentOptions {
 		model,
-		thinking_level: parse_thinking(settings.default_thinking_level.as_deref()),
+		thinking_level,
 		tools,
 		system_prompt: Some(system_prompt),
 		initial_messages,
@@ -226,4 +258,37 @@ async fn main() -> anyhow::Result<()> {
 fn is_tty() -> bool {
 	use std::io::IsTerminal;
 	std::io::stdin().is_terminal()
+}
+
+/// Trust gate for the project-level `.pi/mcp.json` — the pi-rs cut of
+/// upstream `resolveProjectTrusted` (which gates every project resource).
+/// Trusted or absent projects pass through; an interactive TTY gets a
+/// one-time prompt whose answer is stored in the trust file; print/rpc
+/// (non-TTY) never prompt — the project file is skipped with a notice.
+/// Ctrl+C at the prompt errors out of startup.
+fn resolve_project_mcp_trust(
+	cwd: &Path,
+	cli: &Cli,
+	notices: &mut Vec<String>,
+) -> anyhow::Result<()> {
+	let project_config = cwd.join(".pi").join("mcp.json");
+	if !project_config.exists() || trust::is_trusted(cwd) {
+		return Ok(());
+	}
+	let interactive_tty = !cli.rpc && !cli.print && is_tty();
+	if !interactive_tty {
+		notices.push(format!(
+			"project {} exists but the project is not trusted; project MCP servers are skipped",
+			project_config.display()
+		));
+		return Ok(());
+	}
+	match trust::prompt_trust(&project_config)? {
+		true => trust::trust(cwd)?,
+		false => notices.push(format!(
+			"project {} was not trusted; project MCP servers are skipped",
+			project_config.display()
+		)),
+	}
+	Ok(())
 }

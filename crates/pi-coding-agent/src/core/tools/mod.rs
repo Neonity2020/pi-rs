@@ -292,7 +292,7 @@ done
 			"roundtrip",
 			json!({"mcpServers": {"fake": {"command": "sh", "args": ["-c", FAKE_SERVER]}}}),
 		);
-		let config = load_mcp_config_from(&path);
+		let config = load_mcp_config_from(&path).await;
 		remove_config(&path);
 
 		let mut assembly = connect_mcp_servers(&config).await;
@@ -389,7 +389,7 @@ done
 			"http",
 			json!({"mcpServers":{"web":{"url":url,"headers":{"X-Test":"secret"}}}}),
 		);
-		let config = load_mcp_config_from(&path);
+		let config = load_mcp_config_from(&path).await;
 		remove_config(&path);
 		assert!(config.errors.is_empty(), "{:?}", config.errors);
 		let assembly = connect_mcp_servers(&config).await;
@@ -420,7 +420,7 @@ done
 				}
 			}),
 		);
-		let config = load_mcp_config_from(&path);
+		let config = load_mcp_config_from(&path).await;
 		remove_config(&path);
 
 		let mut assembly = connect_mcp_servers(&config).await;
@@ -458,7 +458,7 @@ done
 				}
 			}),
 		);
-		let config = load_mcp_config_from(&path);
+		let config = load_mcp_config_from(&path).await;
 		remove_config(&path);
 
 		let assembly = connect_mcp_servers(&config).await;
@@ -476,7 +476,7 @@ done
 			"hanging",
 			json!({"mcpServers": {"sleepy": {"command": "sh", "args": ["-c", "sleep 30"]}}}),
 		);
-		let config = load_mcp_config_from(&path);
+		let config = load_mcp_config_from(&path).await;
 		remove_config(&path);
 
 		// Shrunk budget: `sleep 30` never answers the initialize handshake.

@@ -4,17 +4,21 @@
 //! serialization, failure checks), plus the compaction-summary message
 //! conversion from `pi/packages/coding-agent/src/core/messages.ts`.
 //!
-//! Reduced to the manual `/compact` path: the whole non-system transcript is
-//! summarized by one standalone LLM call through the agent's own
-//! model/stream_fn, and the history is replaced with
-//! `[system messages…, compaction summary]` — upstream's "keep nothing" cut
-//! (`firstKeptEntryId = entry id`).
+//! A compaction summarizes the transcript prefix up to a cut point with one
+//! standalone LLM call through the agent's own model/stream_fn and replaces
+//! the history with `[system messages…, compaction summary, kept tail…]`.
+//! Without an explicit cut (manual `/compact` on a small session) the whole
+//! non-system transcript is summarized — upstream's "keep nothing" cut
+//! (`firstKeptEntryId = entry id`). When the transcript already carries a
+//! compaction summary, its text rides along as `<previous-summary>` context
+//! and [`UPDATE_SUMMARIZATION_PROMPT`] merges it with the new range.
 //!
 //! Not ported yet (listed against the upstream source):
-//! - automatic threshold/overflow triggering (`shouldCompact`,
-//!   `CompactionSettings`, context-window percentage math);
-//! - keep-recent-tail cut points and split turns (`findCutPoint`,
-//!   `prepareCompaction`);
+//! - split turns (`findTurnStartIndex`,
+//!   `TURN_PREFIX_SUMMARIZATION_PROMPT`): a cut point in the middle of a
+//!   multi-assistant turn currently falls back to the turn's leading user
+//!   message, so the whole turn is summarized or kept as a unit;
+//! - per-model compaction settings (`CompactionSettings.modelOverrides`);
 //! - branch summarization (`compaction/branch-summarization.ts`);
 //! - file-operation tracking appended to summaries (`utils.ts`
 //!   `extractFileOpsFromMessage`).
@@ -45,6 +49,11 @@ pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before thi
 
 /// Verbatim from `core/messages.ts` (`COMPACTION_SUMMARY_SUFFIX`).
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+
+/// Verbatim from `compaction/compaction.ts` (`UPDATE_SUMMARIZATION_PROMPT`,
+/// which upstream templates from `UPDATE_SUMMARIZATION_INSTRUCTIONS`; kept as
+/// one literal because `concat!` accepts no consts).
+pub const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Maximum characters for a tool result in serialized summaries
 /// (`TOOL_RESULT_MAX_CHARS` in `compaction/utils.ts`).
@@ -83,6 +92,70 @@ pub fn replacement_history(messages: &[Message], summary: &str) -> Vec<Message> 
 	history
 }
 
+/// Whether a compaction cut may land on this message (`isCutPointMessage`
+/// upstream): user or assistant boundaries only. A cut between an assistant
+/// and its tool results would strand the results in the summarized range
+/// while their tool call is kept (or vice versa), so tool results — and
+/// system prompt state — are never cut points. Cutting at an assistant with
+/// tool calls is safe: its results follow it and are kept with the tail.
+pub fn is_cut_point_message(message: &Message) -> bool {
+	matches!(message, Message::User(_) | Message::Assistant(_))
+}
+
+/// First kept index of the keep-recent tail (`findCutPoint` upstream, over
+/// the flat non-system message array this port compacts). Walks backwards
+/// accumulating `estimate_tokens` until `keep_recent_tokens` is reached and
+/// cuts at the closest valid cut point at or after that message; when
+/// trailing tool results exceed the budget by themselves, their preceding
+/// assistant tool call is kept instead of falling back to the first message.
+/// Returns 0 when nothing can be summarized (no valid cut point, or the
+/// budget is never reached before the first message).
+pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
+	let cut_points: Vec<usize> = (0..messages.len())
+		.filter(|&index| is_cut_point_message(&messages[index]))
+		.collect();
+	if cut_points.is_empty() {
+		return 0;
+	}
+	let mut accumulated = 0u64;
+	let mut cut = cut_points[0];
+	for index in (0..messages.len()).rev() {
+		let tokens = estimate_tokens(&messages[index]);
+		if tokens == 0 {
+			continue;
+		}
+		accumulated = accumulated.saturating_add(tokens);
+		if accumulated >= keep_recent_tokens {
+			cut = cut_points
+				.iter()
+				.find(|&&candidate| candidate >= index)
+				.copied()
+				.unwrap_or(*cut_points.last().unwrap_or(&0));
+			break;
+		}
+	}
+	cut
+}
+
+/// Raw summary text carried by the transcript's last compaction-summary
+/// message, if any (upstream reads it off the projected compaction entry).
+fn previous_summary(messages: &[Message]) -> Option<(usize, String)> {
+	let index = messages.iter().rposition(|message| {
+		matches!(message, Message::User(user) if user.content.as_text().starts_with(COMPACTION_SUMMARY_PREFIX))
+	})?;
+	let Message::User(user) = &messages[index] else {
+		return None;
+	};
+	let text = user.content.as_text();
+	let inner = text
+		.strip_prefix(COMPACTION_SUMMARY_PREFIX)
+		.unwrap_or(&text);
+	let inner = inner
+		.strip_suffix(COMPACTION_SUMMARY_SUFFIX)
+		.unwrap_or(inner);
+	Some((index, inner.to_string()))
+}
+
 /// Summarize the agent's current transcript (everything except system
 /// messages) with one standalone LLM call. Errors mirror upstream's
 /// `getSummarizationFailure`: error/length stop reasons and tool calls in the
@@ -115,11 +188,41 @@ pub async fn compact_prefix(
 	} else {
 		(&transcript[..], Vec::new(), None)
 	};
-	let conversation = serialize_conversation(prefix);
+	// A prior summary inside the summarized range is merged, not re-summarized:
+	// it rides as <previous-summary> context (upstream `generateSummaryWithUsage`
+	// passes `previousSummary` and switches to the update prompt), so the new
+	// summary never nests the old one's full text twice.
+	let (previous, previous_index) = match previous_summary(prefix) {
+		Some((index, summary)) => (Some(summary), Some(index)),
+		None => (None, None),
+	};
+	let to_summarize: Vec<Message> = prefix
+		.iter()
+		.enumerate()
+		.filter(|&(index, _)| Some(index) != previous_index)
+		.map(|(_, message)| message.clone())
+		.collect();
+	if to_summarize.is_empty() && kept.is_empty() {
+		// Only an (already merged) summary is left — upstream prepareCompaction
+		// returns undefined right after a compaction and `compact()` reports
+		// "Already compacted".
+		anyhow::bail!("Nothing to compact (session too small)");
+	}
+	let conversation = serialize_conversation(&to_summarize);
 	// Wrap the serialized conversation in tags so the model treats it as data,
-	// not as a conversation to continue (`buildSummarizationContext` upstream).
-	let prompt_text =
-		format!("<conversation>\n{conversation}\n</conversation>\n\n{SUMMARIZATION_PROMPT}");
+	// not as a conversation to continue (`buildSummarizationContext` upstream);
+	// the base prompt follows upstream's ordering: conversation, previous
+	// summary, then the instructions.
+	let mut prompt_text = format!("<conversation>\n{conversation}\n</conversation>\n\n");
+	if let Some(summary) = &previous {
+		prompt_text.push_str(&format!(
+			"<previous-summary>\n{summary}\n</previous-summary>\n\n"
+		));
+	}
+	prompt_text.push_str(match &previous {
+		Some(_) => UPDATE_SUMMARIZATION_PROMPT,
+		None => SUMMARIZATION_PROMPT,
+	});
 
 	let model = agent.model();
 	let stream_fn = agent.stream_fn();
@@ -375,5 +478,112 @@ mod tests {
 			estimate_tokens(&Message::User(UserMessage::text("abcde"))),
 			2
 		);
+	}
+
+	fn tool_result(chars: usize) -> Message {
+		Message::ToolResult(ToolResultMessage::text_result(
+			"call-1",
+			"ls",
+			"x".repeat(chars),
+			false,
+		))
+	}
+
+	/// ~400 tokens of text per message ("x" * 1600).
+	fn heavy_user() -> Message {
+		Message::user("x".repeat(1600))
+	}
+
+	#[test]
+	fn cut_point_walks_backwards_to_the_budget() {
+		let messages = vec![heavy_user(), heavy_user(), heavy_user(), heavy_user()];
+		// Budget 500: the newest message alone (~400) stays under, two (~800)
+		// exceed it → the tail from the second-newest message is kept.
+		assert_eq!(find_cut_point(&messages, 500), 2);
+		// Budget far above the transcript: never reached → nothing summarized.
+		assert_eq!(find_cut_point(&messages, 100_000), 0);
+	}
+
+	#[test]
+	fn cut_point_never_lands_on_a_tool_result() {
+		// The budget is exceeded while walking the trailing tool result; with
+		// no valid cut point at or after it, the cut falls back to the closest
+		// preceding assistant so its tool result stays with the kept tail.
+		let messages = vec![
+			Message::user("x".repeat(400)),
+			assistant_with_text("tool turn"),
+			tool_result(1600),
+		];
+		assert_eq!(find_cut_point(&messages, 400), 1);
+		// Exceeded only at the first message → nothing summarizable.
+		assert_eq!(find_cut_point(&messages, 503), 0);
+		// A later user message is preferred over stranding the tool result.
+		let messages = vec![
+			heavy_user(),
+			assistant_with_text("tool turn"),
+			tool_result(1600),
+			heavy_user(),
+		];
+		assert_eq!(find_cut_point(&messages, 500), 3);
+	}
+
+	#[test]
+	fn cut_point_without_valid_boundaries_keeps_everything() {
+		let messages = vec![tool_result(1600), tool_result(1600)];
+		assert_eq!(find_cut_point(&messages, 1), 0);
+	}
+
+	#[tokio::test]
+	async fn second_compaction_merges_the_previous_summary() {
+		use std::sync::Arc;
+		let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let capture = seen.clone();
+		let stream: StreamFn = Arc::new(move |_model, context, _| {
+			// The summarization request rides as one user message; capture it
+			// and echo a fixed summary back so the assertions can inspect the
+			// prompt shape through the recorded prompts.
+			let prompt = match context.messages.last() {
+				Some(Message::User(user)) => user.content.as_text(),
+				_ => String::new(),
+			};
+			capture.lock().unwrap().push(prompt);
+			let Message::Assistant(message) = assistant_with_text("[mock summary]") else {
+				unreachable!("assistant_with_text builds an assistant message")
+			};
+			Box::pin(futures::stream::once(async move {
+				pi_ai::AssistantMessageEvent::Done {
+					reason: StopReason::Stop,
+					message,
+				}
+			})) as pi_ai::AssistantMessageEventStream
+		});
+		let agent = Agent::new(pi_agent::AgentOptions {
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		agent
+			.replace_messages(vec![
+				Message::System(pi_ai::SystemMessage::prompt("prompt")),
+				Message::user("older work"),
+				assistant_with_text("older reply"),
+			])
+			.unwrap();
+		let first = compact_agent(&agent).await.unwrap();
+		assert!(first.kept.is_empty());
+		assert!(seen.lock().unwrap()[0].ends_with(SUMMARIZATION_PROMPT));
+		// Apply the first compaction, add a fresh turn, then compact again.
+		let mut merged = replacement_history(&first.source_messages, &first.summary);
+		merged.push(Message::user("newer work"));
+		agent.replace_messages(merged).unwrap();
+		let second = compact_agent(&agent).await.unwrap();
+		let prompts = seen.lock().unwrap();
+		let second_prompt = &prompts[1];
+		// The old summary text is passed as <previous-summary> context and the
+		// update instructions replace the initial prompt verbatim.
+		assert!(second_prompt.contains("<previous-summary>"));
+		assert!(second_prompt.contains("[mock summary]"));
+		assert!(second_prompt.contains("[User]: newer work"));
+		assert!(second_prompt.ends_with(UPDATE_SUMMARIZATION_PROMPT));
+		assert_eq!(second.summary, "[mock summary]");
 	}
 }

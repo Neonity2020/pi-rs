@@ -10,15 +10,37 @@
 //! (camelCase fields, `type: "response"` + `command` + `success` +
 //! `data`/`error`). Deviations from the upstream wire:
 //!
-//! - Command subset: `prompt`, `steer`, `follow_up`, `abort`, `set_model`,
-//!   `set_thinking_level`, `get_state`, `get_messages`,
-//!   `get_available_models`, `get_available_thinking_levels`. Everything else
-//!   (bash, compaction, session tree/fork/clone, extension UI, retry controls)
-//!   answers with an error frame until the corresponding phases land.
+//! - Command subset (wire names follow upstream `rpc-types.ts`): served —
+//!   `prompt`, `steer`, `follow_up`, `abort`, `clear_queue`, `set_model`,
+//!   `cycle_model`, `set_thinking_level`, `cycle_thinking_level`, `get_state`,
+//!   `get_messages`, `get_available_models`, `get_available_thinking_levels`,
+//!   `set_steering_mode`, `set_follow_up_mode`, `compact`,
+//!   `set_auto_compaction`, `get_last_assistant_text`, `get_commands`.
+//!   Deferred until their phases land, and answered with an error frame
+//!   meanwhile: `bash`/`abort_bash` (bash passthrough), the session-tree
+//!   family (`fork`, `clone`, `get_tree`, `get_entries`,
+//!   `get_fork_messages`, `switch_session`, `new_session`), `export_html`,
+//!   `get_session_stats`, `set_session_name`, the retry controls
+//!   (`set_auto_retry`/`abort_retry`), `prompt`'s images/streamingBehavior,
+//!   and the extension UI bridge (`extension_ui_request`/
+//!   `extension_ui_response`).
 //! - `prompt` answers immediately with `{disposition: "started" | "queued"}`,
 //!   inferred from the agent state at enqueue time; upstream reports the
 //!   disposition from prompt preflight. `steer`/`follow_up` always answer
 //!   `{disposition: "queued"}` (this port has no extension input handlers).
+//!   `compact` answers with the same disposition inference instead of the
+//!   upstream `CompactionResult` — the session task reports compaction
+//!   progress through notices.
+//! - `clear_queue` returns `{steering, followUp}` like upstream, but pi-agent
+//!   exposes only a combined steering-first peek, so the drained texts cannot
+//!   be attributed per queue; they are reported under `steering` (the
+//!   drain-priority queue) and `followUp` stays empty until a per-queue
+//!   accessor lands.
+//! - `get_state` omits `isCompacting` (the state lives inside the session
+//!   task; a shared flag lands with the session-event surface) and
+//!   `sessionName` (no naming support yet). `cycle_model` reuses the
+//!   `set_model` response shape (the model object) instead of upstream's
+//!   `{model, thinkingLevel, isScoped}`.
 //! - Event frame field names follow the upstream camelCase convention.
 //!   Session notices — which upstream routes
 //!   through extensions — are emitted as `{"type": "notice", "message": ...}`.
@@ -54,18 +76,49 @@ pub enum RpcCommand {
 		message: String,
 	},
 	Abort,
+	ClearQueue,
 	SetModel {
 		provider: String,
 		#[serde(rename = "modelId")]
 		model_id: String,
 	},
+	CycleModel,
 	SetThinkingLevel {
 		level: ThinkingLevel,
 	},
+	CycleThinkingLevel,
 	GetState,
 	GetMessages,
 	GetAvailableModels,
 	GetAvailableThinkingLevels,
+	SetSteeringMode {
+		mode: RpcQueueMode,
+	},
+	SetFollowUpMode {
+		mode: RpcQueueMode,
+	},
+	Compact,
+	SetAutoCompaction {
+		enabled: bool,
+	},
+	GetLastAssistantText,
+	GetCommands,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RpcQueueMode {
+	All,
+	OneAtATime,
+}
+
+impl From<RpcQueueMode> for pi_agent::QueueMode {
+	fn from(mode: RpcQueueMode) -> Self {
+		match mode {
+			RpcQueueMode::All => Self::All,
+			RpcQueueMode::OneAtATime => Self::OneAtATime,
+		}
+	}
 }
 
 /// Command half of the RPC surface. Pure: parses a frame, translates it into
@@ -78,6 +131,9 @@ pub struct RpcSession {
 	session_dir: Option<std::path::PathBuf>,
 	registry: Arc<Mutex<ModelRegistry>>,
 	events: broadcast::Receiver<SessionEvent>,
+	/// Mirrors the session task's auto-compaction toggle (lock-free probe for
+	/// `get_state`; the session task owns the authoritative state).
+	auto_compaction: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RpcSession {
@@ -87,6 +143,7 @@ impl RpcSession {
 			events,
 			agent,
 			session_dir,
+			auto_compaction,
 			..
 		} = handle;
 		Self {
@@ -95,6 +152,7 @@ impl RpcSession {
 			session_dir,
 			registry,
 			events,
+			auto_compaction,
 		}
 	}
 
@@ -199,6 +257,27 @@ impl RpcSession {
 				let _ = self.cmd_tx.send(SessionCommand::Abort);
 				success_frame(&id, "abort", Value::Null)
 			}
+			RpcCommand::ClearQueue => {
+				// Upstream returns the drained texts split per queue
+				// (`{steering, followUp}`); pi-agent exposes only a combined
+				// steering-first peek, so the texts are reported under
+				// `steering` (see the module doc deviation note).
+				let texts: Vec<String> = self
+					.agent
+					.peek_queued_messages()
+					.iter()
+					.map(|message| match message {
+						pi_ai::Message::User(user) => user.content.as_text(),
+						_ => String::new(),
+					})
+					.collect();
+				self.agent.clear_all_queues();
+				success_frame(
+					&id,
+					"clear_queue",
+					json!({"steering": texts, "followUp": []}),
+				)
+			}
 			RpcCommand::SetModel { provider, model_id } => {
 				let query = format!("{provider}/{model_id}");
 				let found = self
@@ -218,9 +297,47 @@ impl RpcSession {
 					None => error_frame(&id, "set_model", format!("Model not found: {query}")),
 				}
 			}
+			RpcCommand::CycleModel => {
+				// Next registry model after the current one, wrapping around
+				// (upstream `_cycleAvailableModel`); an unknown current model
+				// starts the cycle at the first registry entry.
+				let current = self.agent.model();
+				let next = {
+					let registry = self.registry.lock().unwrap();
+					let models = registry.models();
+					if models.is_empty() {
+						None
+					} else {
+						let index = models
+							.iter()
+							.position(|m| m.provider == current.provider && m.id == current.id)
+							.unwrap_or(0);
+						Some(models[(index + 1) % models.len()].clone())
+					}
+				};
+				match next {
+					// Same success/failure shape as `set_model`; the session
+					// task announces the switch with a `model → …` notice.
+					Some(model) => {
+						let data = serde_json::to_value(&model).unwrap_or(Value::Null);
+						let _ = self
+							.cmd_tx
+							.send(SessionCommand::SetModel { query: model.key() });
+						success_frame(&id, "cycle_model", data)
+					}
+					None => error_frame(&id, "cycle_model", "no models available to cycle"),
+				}
+			}
 			RpcCommand::SetThinkingLevel { level } => {
 				let _ = self.cmd_tx.send(SessionCommand::SetThinking { level });
 				success_frame(&id, "set_thinking_level", Value::Null)
+			}
+			RpcCommand::CycleThinkingLevel => {
+				let next = next_thinking_level(self.agent.thinking_level());
+				let _ = self
+					.cmd_tx
+					.send(SessionCommand::SetThinking { level: next });
+				success_frame(&id, "cycle_thinking_level", json!({ "level": next }))
 			}
 			RpcCommand::GetState => success_frame(&id, "get_state", self.state_value()),
 			RpcCommand::GetMessages => {
@@ -236,6 +353,71 @@ impl RpcSession {
 				"get_available_thinking_levels",
 				json!({ "levels": all_thinking_levels() }),
 			),
+			RpcCommand::SetSteeringMode { mode } => {
+				self.agent.set_steering_mode(mode.into());
+				success_frame(&id, "set_steering_mode", Value::Null)
+			}
+			RpcCommand::SetFollowUpMode { mode } => {
+				self.agent.set_follow_up_mode(mode.into());
+				success_frame(&id, "set_follow_up_mode", Value::Null)
+			}
+			RpcCommand::Compact => {
+				// Same disposition inference as `prompt`; the session task
+				// reports progress/refusals through notices.
+				let disposition = if self.is_run_active() {
+					"queued"
+				} else {
+					"started"
+				};
+				let _ = self.cmd_tx.send(SessionCommand::Compact);
+				success_frame(&id, "compact", json!({ "disposition": disposition }))
+			}
+			RpcCommand::SetAutoCompaction { enabled } => {
+				let _ = self
+					.cmd_tx
+					.send(SessionCommand::SetAutoCompaction { enabled });
+				success_frame(&id, "set_auto_compaction", Value::Null)
+			}
+			RpcCommand::GetLastAssistantText => {
+				let snapshot = self.agent.snapshot();
+				let last = snapshot
+					.messages
+					.iter()
+					.rev()
+					.find_map(|message| match message {
+						pi_ai::Message::Assistant(assistant)
+							if assistant.stop_reason != pi_ai::StopReason::Aborted
+								|| !assistant.content.is_empty() =>
+						{
+							Some(assistant)
+						}
+						_ => None,
+					});
+				let text = last
+					.map(|message| message.text())
+					.filter(|text| !text.trim().is_empty());
+				// Upstream wire: `data: { text: string | null }` — no text is
+				// a success with a null field, not an error.
+				success_frame(&id, "get_last_assistant_text", json!({ "text": text }))
+			}
+			RpcCommand::GetCommands => {
+				// pi-rs has a single command source: the built-in slash
+				// commands of `core/slash_commands.rs`. Upstream also merges
+				// extension commands and `skill:` entries (sources
+				// "extension"/"skill" with `sourceInfo`); those land with the
+				// extension phase, so every command reports source "prompt".
+				let commands: Vec<Value> = crate::core::slash_commands::BUILTIN_SLASH_COMMANDS
+					.iter()
+					.map(|command| {
+						json!({
+							"name": command.name,
+							"description": command.description,
+							"source": "prompt",
+						})
+					})
+					.collect();
+				success_frame(&id, "get_commands", json!({ "commands": commands }))
+			}
 		}
 	}
 
@@ -256,6 +438,9 @@ impl RpcSession {
 			"sessionId": self.agent.session_id(),
 			"messageCount": snapshot.messages.len(),
 			"pendingMessageCount": snapshot.queued_steering + snapshot.queued_follow_up,
+			"autoCompactionEnabled": self
+				.auto_compaction
+				.load(std::sync::atomic::Ordering::Relaxed),
 		})
 	}
 }
@@ -304,6 +489,22 @@ fn agent_event_frame(event: &pi_agent::AgentEvent) -> String {
 
 fn all_thinking_levels() -> [&'static str; 7] {
 	["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+}
+
+/// Cycle order for `cycle_thinking_level` — mirrors the private
+/// `next_thinking_level` in `core/agent_session.rs` (upstream
+/// `cycleThinkingLevel` walks `THINKING_LEVEL_OPTIONS` and wraps).
+fn next_thinking_level(current: ThinkingLevel) -> ThinkingLevel {
+	use ThinkingLevel::*;
+	match current {
+		Off => Minimal,
+		Minimal => Low,
+		Low => Medium,
+		Medium => High,
+		High => Xhigh,
+		Xhigh => Max,
+		Max => Off,
+	}
 }
 
 fn success_frame(id: &Option<Value>, command: &str, data: Value) -> String {
@@ -508,6 +709,7 @@ mod tests {
 		assert_eq!(data["thinkingLevel"], "off");
 		assert_eq!(data["messageCount"], 1); // leading system message
 		assert_eq!(data["pendingMessageCount"], 0);
+		assert_eq!(data["autoCompactionEnabled"], true);
 		assert!(data["model"]["provider"].is_string());
 	}
 
@@ -610,6 +812,176 @@ mod tests {
 		let session = RpcSession::new(handle, registry);
 		let frame = parse_frame(&session.handle_line(r#"{"type":"get_messages"}"#)[0]);
 		assert_eq!(frame["data"]["messages"][0]["role"], "system");
+	}
+
+	#[tokio::test]
+	async fn queue_modes_validate_wire_values_and_apply_to_agent() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		let frame = parse_frame(
+			&session.handle_line(r#"{"type":"set_steering_mode","mode":"all","id":"s"}"#)[0],
+		);
+		assert_eq!(
+			frame,
+			json!({"id":"s","type":"response","command":"set_steering_mode","success":true})
+		);
+		session.agent.steer("one");
+		session.agent.steer("two");
+		assert_eq!(session.agent.peek_queued_messages().len(), 2);
+		session.agent.clear_all_queues();
+		let frame = parse_frame(
+			&session.handle_line(r#"{"type":"set_follow_up_mode","mode":"one-at-a-time"}"#)[0],
+		);
+		assert_eq!(frame["success"], true);
+		session.agent.follow_up("one");
+		session.agent.follow_up("two");
+		assert_eq!(session.agent.peek_queued_messages().len(), 1);
+		let frame = parse_frame(
+			&session.handle_line(r#"{"type":"set_follow_up_mode","mode":"invalid"}"#)[0],
+		);
+		assert_eq!(frame["success"], false);
+	}
+
+	#[tokio::test]
+	async fn last_assistant_text_matches_upstream_empty_and_completed_shapes() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_last_assistant_text"}"#)[0]);
+		// Upstream wire: `data: { text: string | null }` — empty stays a success.
+		assert_eq!(frame["data"], json!({"text": null}));
+		session.handle_line(r#"{"type":"prompt","message":"hello"}"#);
+		until_agent_end(&mut session).await;
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_last_assistant_text"}"#)[0]);
+		assert!(frame["data"]["text"].as_str().unwrap().contains("hello"));
+	}
+
+	#[tokio::test]
+	async fn clear_queue_drains_and_reports_the_queued_texts() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		session.agent.steer("one");
+		session.agent.follow_up("two");
+		let frame = parse_frame(&session.handle_line(r#"{"type":"clear_queue","id":"c1"}"#)[0]);
+		assert_eq!(frame["id"], "c1");
+		assert_eq!(frame["success"], true);
+		// pi-agent peeks steering-first; see the module doc deviation note.
+		assert_eq!(frame["data"]["steering"], json!(["one"]));
+		assert_eq!(frame["data"]["followUp"], json!([]));
+		assert!(session.agent.peek_queued_messages().is_empty());
+	}
+
+	#[tokio::test]
+	async fn cycle_model_moves_off_the_current_registry_model() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		assert_eq!(session.agent.model().id, "mock-echo");
+		let frame = parse_frame(&session.handle_line(r#"{"type":"cycle_model","id":"m"}"#)[0]);
+		assert_eq!(frame["command"], "cycle_model");
+		assert_eq!(frame["success"], true);
+		assert_eq!(frame["id"], "m");
+		assert!(frame["data"]["provider"].is_string());
+		assert!(frame["data"]["id"].is_string());
+		assert_ne!(frame["data"]["id"], "mock-echo");
+		// Applied by the session task, which announces the switch.
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let frame = session.next_event_frame().await.unwrap();
+				if frame.contains("model →") {
+					break;
+				}
+			}
+		})
+		.await
+		.expect("model notice should arrive in time");
+		assert_ne!(session.agent.model().id, "mock-echo");
+	}
+
+	#[tokio::test]
+	async fn cycle_thinking_level_walks_the_ladder_and_wraps() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		assert_eq!(session.agent.thinking_level(), ThinkingLevel::Off);
+		// Each cycle reads the level the session task last applied, so the
+		// next command must wait for the previous notice (same visibility a
+		// real RPC client has).
+		for expected in ["minimal", "low", "medium", "high", "xhigh", "max", "off"] {
+			let frame = parse_frame(&session.handle_line(r#"{"type":"cycle_thinking_level"}"#)[0]);
+			assert_eq!(frame["data"]["level"], expected);
+			tokio::time::timeout(Duration::from_secs(5), async {
+				loop {
+					let frame = session.next_event_frame().await.unwrap();
+					if frame.contains("thinking") {
+						break;
+					}
+				}
+			})
+			.await
+			.expect("thinking notice should arrive in time");
+		}
+		assert_eq!(session.agent.thinking_level(), ThinkingLevel::Off);
+	}
+
+	#[tokio::test]
+	async fn compact_reports_prompt_style_disposition() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		let frame = parse_frame(&session.handle_line(r#"{"type":"compact","id":"k"}"#)[0]);
+		assert_eq!(frame["command"], "compact");
+		assert_eq!(frame["success"], true);
+		assert_eq!(frame["id"], "k");
+		assert_eq!(frame["data"]["disposition"], "started");
+	}
+
+	#[tokio::test]
+	async fn set_auto_compaction_toggles_the_state_flag() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		let frame = parse_frame(
+			&session.handle_line(r#"{"type":"set_auto_compaction","enabled":false,"id":"a"}"#)[0],
+		);
+		assert_eq!(frame["command"], "set_auto_compaction");
+		assert_eq!(frame["success"], true);
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let frame = session.next_event_frame().await.unwrap();
+				if frame.contains("auto-compaction disabled") {
+					break;
+				}
+			}
+		})
+		.await
+		.expect("notice should arrive in time");
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
+		assert_eq!(frame["data"]["autoCompactionEnabled"], false);
+
+		session.handle_line(r#"{"type":"set_auto_compaction","enabled":true}"#);
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let frame = session.next_event_frame().await.unwrap();
+				if frame.contains("auto-compaction enabled") {
+					break;
+				}
+			}
+		})
+		.await
+		.expect("notice should arrive in time");
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
+		assert_eq!(frame["data"]["autoCompactionEnabled"], true);
+	}
+
+	#[tokio::test]
+	async fn get_commands_lists_builtin_slash_commands_as_prompt_source() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_commands"}"#)[0]);
+		assert_eq!(frame["success"], true);
+		let commands = frame["data"]["commands"].as_array().unwrap();
+		assert!(!commands.is_empty());
+		assert!(commands.iter().any(|command| {
+			command["name"] == "help"
+				&& command["source"] == "prompt"
+				&& command["description"].is_string()
+		}));
 	}
 
 	#[tokio::test]

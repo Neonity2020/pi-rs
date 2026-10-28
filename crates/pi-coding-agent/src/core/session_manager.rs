@@ -56,6 +56,12 @@ pub enum SessionEntry {
 		first_kept_entry_id: String,
 		tokens_before: u64,
 	},
+	/// Persistently omit a failed assistant response from the context.
+	#[serde(rename = "context_edit", rename_all = "camelCase")]
+	ContextEdit {
+		target_id: String,
+		replacement: Option<Value>,
+	},
 	Custom {
 		kind: String,
 		data: Value,

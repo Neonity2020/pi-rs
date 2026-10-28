@@ -5,10 +5,18 @@
 //! `AgentSession` is the mode-agnostic core shared by interactive/print/rpc:
 //! it owns the [`Agent`], forwards agent events to subscribers, persists
 //! messages to the session log, and serializes UI commands into agent calls
-//! (prompt/steer/follow-up/abort/model/thinking). Manual `/compact` runs the
-//! summarization in `core/compaction.rs` and swaps the transcript; automatic
-//! threshold triggering, bash passthrough, and session switch/fork land in
-//! later phases.
+//! (prompt/steer/follow-up/abort/model/thinking). Compaction is wired end to
+//! end: manual `/compact` and the automatic triggers share
+//! `core/compaction.rs` — threshold checks run when a prompt is accepted
+//! while idle and after a run completes, and a context-overflow or
+//! recoverable-length tail attempt is omitted (see [`omit_failed_attempt`]),
+//! compacted, and retried exactly once.
+//!
+//! Not ported yet (listed against the upstream source):
+//! - mid-run compaction checks before the next assistant request
+//!   (`agent.ts` `prepareNextTurn` hook — pi-agent has no such hook), listed
+//!   as follow-up;
+//! - bash passthrough, session switch/fork, and the extension hook surface.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,7 +25,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use pi_agent::{Agent, AgentEvent, PromptInput};
-use pi_ai::{Message, ThinkingLevel};
+use pi_ai::{AssistantMessage, Message, StopReason, ThinkingLevel};
 
 use super::compaction::{self, CompactionOutcome};
 use super::event_bus::EventBus;
@@ -165,6 +173,8 @@ async fn session_task(
 	// In-flight compaction summarization; the agent is idle while this runs.
 	let mut compacting: Option<tokio::task::JoinHandle<anyhow::Result<CompactionOutcome>>> = None;
 	let mut compaction_commit_failed = false;
+	let mut recovery_compaction = false;
+	let mut overflow_attempted = false;
 
 	let notice = |bus: &EventBus<SessionEvent>, text: String| {
 		bus.emit(SessionEvent::Notice(text));
@@ -190,10 +200,11 @@ async fn session_task(
 							&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
 							&& let Some(cut) = auto_compaction_cut(&agent, &session, persisted, settings.keep_recent_tokens.unwrap_or(20_000)) {
 							pending.push_back(text);
-							notice(&event_bus, "automatically compacting…".into());
+							notice(&event_bus, "auto-compaction (threshold)…".into());
 							let agent = agent.clone();
 							compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
 						} else {
+							overflow_attempted = false;
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move {
 								agent.prompt(PromptInput::Text { text }).await
@@ -209,6 +220,7 @@ async fn session_task(
 						notice(&event_bus, "follow-up message queued".into());
 					}
 					SessionCommand::Abort => {
+						recovery_compaction = false;
 						let stopped_compaction = if let Some(task) = compacting.take() {
 							task.abort();
 							let _ = task.await;
@@ -218,6 +230,7 @@ async fn session_task(
 						notice(&event_bus, "aborting…".into());
 						if stopped_compaction && run.is_none() && !agent.is_streaming()
 							&& let Some(text) = pending.pop_front() {
+							overflow_attempted = false;
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
 						}
@@ -304,16 +317,42 @@ async fn session_task(
 				}
 				// Persist the completed turn before selecting a durable cut.
 				persist_messages(&agent, &mut session, &mut persisted, &event_bus);
-				if auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
+				let snapshot = agent.snapshot();
+				let recover = auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
+					&& snapshot.messages.last().is_some_and(|m| matches!(m, Message::Assistant(a) if recoverable_overflow(a, &agent.model())));
+				if recover && !overflow_attempted {
+					if let Some(cut) = auto_compaction_cut(&agent, &session, persisted, settings.keep_recent_tokens.unwrap_or(20_000)) {
+						match omit_failed_attempt(&agent, &mut session, &mut persisted) {
+							Ok(()) => {
+								overflow_attempted = true;
+								recovery_compaction = true;
+								notice(&event_bus, "context overflow: compacting before one retry".into());
+								let agent = agent.clone();
+								compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+							}
+							Err(error) => {
+								compaction_commit_failed = true;
+								notice(&event_bus, format!("overflow recovery commit failed: {error}; reopen to recover"));
+								break;
+							}
+						}
+					} else {
+						notice(&event_bus, "overflow recovery unavailable: no durable compaction boundary".into());
+					}
+				} else if recover && overflow_attempted {
+					notice(&event_bus, "overflow recovery failed after one compact-and-retry attempt".into());
+				}
+				if !recover && auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
 					&& let Some((tokens, window)) = super::context_usage::compute(&agent)
 					&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
 					&& let Some(cut) = auto_compaction_cut(&agent, &session, persisted, settings.keep_recent_tokens.unwrap_or(20_000))
 				{
-					notice(&event_bus, "automatically compacting…".into());
+					notice(&event_bus, "auto-compaction (threshold)…".into());
 					let agent = agent.clone();
 					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
 				}
 				if compacting.is_none() && let Some(text) = pending.pop_front() {
+					overflow_attempted = false;
 					let agent = agent.clone();
 					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
 				}
@@ -321,6 +360,7 @@ async fn session_task(
 
 			result = async { compacting.as_mut().expect("guarded compaction").await }, if compacting.is_some() => {
 				compacting = None;
+				let mut committed = false;
 				match result {
 					Ok(Ok(outcome)) => {
 						if !apply_compaction(&agent, &mut session, &mut persisted, &event_bus, outcome) {
@@ -328,9 +368,17 @@ async fn session_task(
 							notice(&event_bus, "session stopped after compaction commit failure; reopen to recover".into());
 							break;
 						}
+						committed = true;
 					}
 					Ok(Err(e)) => notice(&event_bus, format!("compaction failed: {e}")),
 					Err(e) => notice(&event_bus, format!("compaction task failed: {e}")),
+				}
+				if recovery_compaction {
+					recovery_compaction = false;
+					if committed {
+						let agent = agent.clone();
+						run = Some(tokio::spawn(async move { agent.continue_run().await }));
+					}
 				}
 				// Prompts queued while compacting start now that the agent is idle.
 				if run.is_none()
@@ -439,20 +487,18 @@ fn auto_compaction_cut(
 	if persisted != snapshot.messages.len() {
 		return None;
 	}
-	let messages: Vec<_> = snapshot
+	let messages: Vec<Message> = snapshot
 		.messages
 		.iter()
 		.filter(|m| !matches!(m, Message::System(_)))
+		.cloned()
 		.collect();
-	let mut total = 0u64;
-	let mut target = 0;
-	for index in (0..messages.len()).rev() {
-		total = total.saturating_add(compaction::estimate_tokens(messages[index]));
-		if total >= keep_tokens {
-			target = index;
-			break;
-		}
-	}
+	// Upstream also cuts at assistant messages; this pipeline omits a failed
+	// tail assistant before summarizing, so a cut landing on that tail would
+	// dangle after the omission — clamp to the closest user boundary, which
+	// starts the turn where the budget was exceeded (conservative because
+	// split-turn cuts are not ported).
+	let target = compaction::find_cut_point(&messages, keep_tokens);
 	let cut = (0..=target)
 		.rev()
 		.find(|&index| matches!(messages[index], Message::User(_)))?;
@@ -476,6 +522,163 @@ fn auto_compaction_cut(
 		None
 	};
 	Some((cut, id))
+}
+
+/// Case-insensitive fragments identifying context-overflow errors — port of
+/// `OVERFLOW_PATTERNS` in `pi/packages/ai/src/utils/overflow.ts`, reduced
+/// from regexes to literal substrings (upstream's patterns are all fixed
+/// phrases around provider overflow wording).
+const OVERFLOW_PATTERNS: &[&str] = &[
+	"prompt is too long",                    // Anthropic, z.ai
+	"prompt too long",                       // Ollama, z.ai CN endpoint
+	"prompt exceeds max length",             // z.ai CN endpoint
+	"request_too_large",                     // Anthropic HTTP 413 body
+	"input is too long for requested model", // Amazon Bedrock
+	"exceeds the context window",            // OpenAI
+	"maximum context length",                // OpenAI-compatible proxies, OpenRouter, Mistral
+	"input token count",                     // Google Gemini
+	"exceeds the maximum",                   // Gemini tail, generic
+	"maximum prompt length is",              // xAI (Grok)
+	"reduce the length of the messages",     // Groq
+	"maximum allowed input length",          // OpenRouter/Poolside
+	"longer than the model",                 // Together AI
+	"exceeds the limit of",                  // GitHub Copilot
+	"exceeds the available context size",    // llama.cpp server
+	"greater than the context length",       // LM Studio
+	"context window exceeds limit",          // MiniMax
+	"exceeded model token limit",            // Kimi For Coding
+	"too large for model with",              // Mistral
+	"configured context size",               // DS4 server
+	"model_context_window_exceeded",         // z.ai finish reason
+	"range of input length should be",       // DashScope/Qwen
+	"context length exceeded",               // generic fallback
+	"context_length_exceeded",               // generic fallback
+	"context-length-exceeded",               // generic fallback
+	"too many tokens",                       // generic fallback
+	"token limit exceeded",                  // generic fallback
+];
+
+/// Non-overflow errors excluded from overflow detection even when they also
+/// match an overflow fragment (`NON_OVERFLOW_PATTERNS` upstream): throttling
+/// and rate limiting must not trigger a compaction.
+const NON_OVERFLOW_PATTERNS: &[&str] = &[
+	"throttling",
+	"service unavailable",
+	"rate limit",
+	"too many requests",
+];
+
+/// HTTP 413 means request-size overflow regardless of body text (upstream
+/// matches `^[\w -]+ API error \(413\):` and `^413(\s|:|$)`).
+fn http_413_overflow(lower: &str) -> bool {
+	if let Some(rest) = lower.strip_prefix("413") {
+		return rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':');
+	}
+	lower.contains("api error (413):")
+}
+
+/// Whether an assistant message indicates a context overflow — port of
+/// `isContextOverflow` (`pi/packages/ai/src/utils/overflow.ts`): an error
+/// stop whose message matches a provider overflow pattern, a successful
+/// response whose input silently exceeded the window, or a length stop with
+/// no room left for output.
+fn is_context_overflow(message: &AssistantMessage, context_window: u64) -> bool {
+	if message.stop_reason == StopReason::Error
+		&& let Some(error) = message.error_message.as_deref()
+	{
+		let lower = error.to_lowercase();
+		let non_overflow = NON_OVERFLOW_PATTERNS.iter().any(|p| lower.contains(p));
+		if !non_overflow
+			&& (OVERFLOW_PATTERNS.iter().any(|p| lower.contains(p)) || http_413_overflow(&lower))
+		{
+			return true;
+		}
+	}
+	if context_window > 0 {
+		let input = message.usage.input.saturating_add(message.usage.cache_read);
+		// Silent overflow: the provider accepted the request and answered past
+		// the window (z.ai style).
+		if message.stop_reason == StopReason::Stop && input > context_window {
+			return true;
+		}
+		// Length stop with zero output: the server truncated oversized input to
+		// fill the window (Xiaomi MiMo style), leaving no room to generate.
+		if message.stop_reason == StopReason::Length
+			&& message.usage.output == 0
+			&& input.saturating_mul(100) >= context_window.saturating_mul(99)
+		{
+			return true;
+		}
+	}
+	false
+}
+
+/// Whether a length stop ended below the model's intended output limit, so
+/// one bounded compact-and-retry attempt may still finish the turn
+/// (`isRecoverableLength` upstream).
+fn is_recoverable_length(message: &AssistantMessage, desired_max_output: u64) -> bool {
+	message.stop_reason == StopReason::Length
+		&& desired_max_output > 0
+		&& message.usage.output < desired_max_output
+}
+
+/// One recovery signal for the run-completion branch (`_checkCompaction`
+/// upstream): an explicit overflow error or a recoverable length truncation.
+/// Aborted messages never reach here — the caller only inspects the tail of a
+/// finished run, and user aborts must not compact.
+fn recoverable_overflow(message: &AssistantMessage, model: &pi_ai::Model) -> bool {
+	is_context_overflow(message, model.context_window)
+		|| is_recoverable_length(message, model.max_tokens)
+}
+
+/// Persistently drop the failed final attempt from the model context — port
+/// of `_omitRecoveryAttempt` (`agent-session.ts`). A length/error stop ends
+/// the run without executing tools, so the attempt is the transcript tail
+/// with nothing following it. The transcript is only rewritten after the
+/// `context_edit` tombstone reached the append-only log (the commit order of
+/// [`apply_compaction`]): the omitted entry stays in the log for audit, the
+/// tombstone keeps resumed sessions from replaying it, and the persist cursor
+/// is rebased so the removed message is never written twice.
+fn omit_failed_attempt(
+	agent: &Agent,
+	session: &mut SessionManager,
+	persisted: &mut usize,
+) -> anyhow::Result<()> {
+	let snapshot = agent.snapshot();
+	if *persisted != snapshot.messages.len() {
+		anyhow::bail!("transcript is not fully persisted");
+	}
+	let Some(Message::Assistant(_)) = snapshot.messages.last() else {
+		anyhow::bail!("transcript does not end with the failed assistant");
+	};
+	let Some(dir) = session.session_dir() else {
+		anyhow::bail!("overflow recovery needs a session log");
+	};
+	let (projection, _) = read_session_projection(dir);
+	let Some((entry_id, logged)) = projection.last() else {
+		anyhow::bail!("session log is empty");
+	};
+	let Some(target_id) = entry_id.clone() else {
+		anyhow::bail!("failed attempt has no log entry id");
+	};
+	if !message_projection_eq(logged, snapshot.messages.last().unwrap()) {
+		anyhow::bail!("session log tail is not the failed attempt");
+	}
+	let mut without_attempt = snapshot.messages.clone();
+	without_attempt.pop();
+	let tombstone = SessionEntry::ContextEdit {
+		target_id,
+		replacement: None,
+	};
+	agent.replace_messages_transactionally(&snapshot.messages, without_attempt, || {
+		session.append(&tombstone)?;
+		Ok(())
+	})?;
+	// The failed attempt was persisted behind the old cursor; everything that
+	// remains was persisted before it, so rebasing keeps the log append-only
+	// without duplicating any of them.
+	*persisted = agent.snapshot().messages.len();
+	Ok(())
 }
 
 /// Commit a finished compaction: write the log entry first — it is the
@@ -580,6 +783,16 @@ fn read_session_projection(dir: &std::path::Path) -> (Vec<(Option<String>, Messa
 					));
 				}
 			}
+			Some("context_edit") if value.get("replacement").is_some_and(Value::is_null) => {
+				if let Some(target) = value.get("targetId").and_then(Value::as_str)
+					&& let Some(index) = messages
+						.iter()
+						.position(|(id, _)| id.as_deref() == Some(target))
+				{
+					messages.remove(index);
+					usage_valid_from = usage_valid_from.min(messages.len());
+				}
+			}
 			Some("compaction") => {
 				if let Some(summary) = value.get("summary").and_then(Value::as_str) {
 					let id = value.get("id").and_then(Value::as_str);
@@ -646,6 +859,381 @@ mod tests {
 				pi_ai::providers::mock::stream(model, context, options)
 			},
 		)
+	}
+
+	#[test]
+	fn overflow_patterns_match_provider_wording() {
+		let model = pi_ai::Model::new("m", "m", "openai-completions", "m", "http://localhost");
+		let mut message = echo_assistant_message(&model, String::new());
+		message.stop_reason = StopReason::Error;
+		for error in [
+			// Anthropic
+			"prompt is too long: 213462 tokens > 200000 maximum",
+			// OpenAI
+			"Your input exceeds the context window of this model",
+			// Google Gemini
+			"The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+			// OpenRouter/Poolside
+			"Input length 265330 exceeds the maximum allowed input length of 262144.",
+			// raw HTTP 413 status line and GitHub Copilot's SDK prefix
+			"413 Request Entity Too Large",
+			"github-copilot API error (413): {\"message\":\"failed to parse request\"}",
+		] {
+			message.error_message = Some(error.into());
+			assert!(is_context_overflow(&message, 0), "`{error}` is overflow");
+		}
+		// Throttling and rate limiting are excluded even with overlapping
+		// fragments ("too many tokens", "exceeded").
+		message.error_message =
+			Some("ThrottlingException: Too many tokens, please wait before trying again.".into());
+		assert!(!is_context_overflow(&message, 0));
+		message.error_message = Some("rate limit exceeded, retry later".into());
+		assert!(!is_context_overflow(&message, 0));
+		// Silent overflow: a successful stop whose input passed the window.
+		message.stop_reason = StopReason::Stop;
+		message.error_message = None;
+		message.usage.input = 250_000;
+		assert!(is_context_overflow(&message, 200_000));
+		assert!(!is_context_overflow(&message, 0));
+		// Length-stop overflow: zero output on a window-filling input.
+		message.stop_reason = StopReason::Length;
+		message.usage.input = 199_000;
+		message.usage.output = 0;
+		assert!(is_context_overflow(&message, 200_000));
+		message.usage.output = 100;
+		assert!(!is_context_overflow(&message, 200_000));
+		// Recoverable length: truncated below the model's output limit.
+		message.usage.output = 99;
+		assert!(is_recoverable_length(&message, 100));
+		assert!(!is_recoverable_length(&message, 0));
+		message.usage.output = 100;
+		assert!(!is_recoverable_length(&message, 100));
+	}
+
+	/// Scripted provider for recovery tests: summarization requests echo the
+	/// conversation; ordinary request `turn` plays `script(turn, model)`.
+	fn recovery_stream_fn(
+		script: impl Fn(usize, &pi_ai::Model) -> pi_ai::AssistantMessageEvent + Send + Sync + 'static,
+	) -> (pi_ai::StreamFn, std::sync::Arc<std::sync::Mutex<usize>>) {
+		let script = std::sync::Arc::new(script);
+		let requests = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+		let counter = requests.clone();
+		let stream: pi_ai::StreamFn = Arc::new(move |model, context, _| {
+			if is_summarization_request(context) {
+				let model = model.clone();
+				let text = format!("[mock summary] {}", last_user_text(context));
+				return Box::pin(futures::stream::once(async move {
+					pi_ai::AssistantMessageEvent::Done {
+						reason: StopReason::Stop,
+						message: echo_assistant_message(&model, text),
+					}
+				})) as pi_ai::AssistantMessageEventStream;
+			}
+			let turn = {
+				let mut count = counter.lock().unwrap();
+				*count += 1;
+				*count
+			};
+			let script = script.clone();
+			let model = model.clone();
+			Box::pin(futures::stream::once(async move { script(turn, &model) }))
+				as pi_ai::AssistantMessageEventStream
+		});
+		(stream, requests)
+	}
+
+	fn stop_reply(model: &pi_ai::Model, text: &str) -> pi_ai::AssistantMessageEvent {
+		pi_ai::AssistantMessageEvent::Done {
+			reason: StopReason::Stop,
+			message: echo_assistant_message(model, text.to_string()),
+		}
+	}
+
+	fn overflow_error(model: &pi_ai::Model) -> pi_ai::AssistantMessageEvent {
+		let mut message = echo_assistant_message(model, String::new());
+		message.stop_reason = StopReason::Error;
+		message.error_message = Some("prompt is too long: 213462 tokens > 200000 maximum".into());
+		pi_ai::AssistantMessageEvent::Error {
+			reason: StopReason::Error,
+			error: message,
+		}
+	}
+
+	fn truncated_length(model: &pi_ai::Model, output: u64) -> pi_ai::AssistantMessageEvent {
+		let mut message = echo_assistant_message(model, "partial answer".into());
+		message.stop_reason = StopReason::Length;
+		message.usage.output = output;
+		pi_ai::AssistantMessageEvent::Done {
+			reason: StopReason::Length,
+			message,
+		}
+	}
+
+	fn recovery_model() -> pi_ai::Model {
+		let mut model = pi_ai::Model::new(
+			"mock",
+			"mock",
+			"openai-completions",
+			"mock",
+			"http://localhost",
+		);
+		model.context_window = 30_000;
+		model.max_tokens = 100;
+		model
+	}
+
+	fn recovery_settings() -> CompactionSettings {
+		CompactionSettings {
+			enabled: Some(true),
+			reserve_tokens: Some(16_384),
+			// keep-recent 0: the tiny scripted transcripts stay below any real
+			// budget, so only a zero budget yields a summarizable prefix while
+			// keeping the newest turn (the cut lands on its user message).
+			keep_recent_tokens: Some(0),
+		}
+	}
+
+	/// Collects every notice emitted while `ends` more runs finish. Notices
+	/// preceding a buffered `AgentEnd` (the recovery trigger fires in the
+	/// run-completion branch, ahead of the re-emitted agent events) are part
+	/// of the window and must not be dropped.
+	async fn notices_until_agent_ends(handle: &mut SessionHandle, ends: usize) -> Vec<String> {
+		let mut notices = Vec::new();
+		tokio::time::timeout(Duration::from_secs(30), async {
+			let mut completed = 0;
+			while completed < ends {
+				match handle.events.recv().await {
+					Ok(SessionEvent::Notice(text)) => notices.push(text),
+					Ok(SessionEvent::Agent(event))
+						if matches!(*event, AgentEvent::AgentEnd { .. }) =>
+					{
+						completed += 1;
+					}
+					Ok(_) => {}
+					Err(e) => panic!("event stream error: {e}"),
+				}
+			}
+		})
+		.await
+		.expect("runs should finish in time");
+		notices
+	}
+
+	fn context_edit_count(dir: &std::path::Path) -> usize {
+		let log = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		log.lines()
+			.filter_map(|line| serde_json::from_str::<Value>(line).ok())
+			.filter(|value| value["type"] == "context_edit")
+			.count()
+	}
+
+	/// A run ending in a context-overflow error recovers once: the failed
+	/// attempt is omitted (tombstoned in the append-only log), the older prefix
+	/// is compacted, and the turn is retried exactly once.
+	#[tokio::test]
+	async fn overflow_error_recovers_through_compaction_and_retries_once() {
+		let dir = temp_session_dir("overflow-error");
+		let (stream, requests) = recovery_stream_fn(|turn, model| match turn {
+			1 => stop_reply(model, "first answer"),
+			2 => overflow_error(model),
+			_ => stop_reply(model, "recovered answer"),
+		});
+		let agent = Agent::new(AgentOptions {
+			model: recovery_model(),
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session_with_settings(
+			agent.clone(),
+			SessionManager::open(&dir).unwrap(),
+			registry,
+			recovery_settings(),
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "first".into(),
+			})
+			.unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "second".into(),
+			})
+			.unwrap();
+		// Turn 2 ends with the overflow; the recovery compaction and the retry
+		// run before the next agent_end.
+		let notices = notices_until_agent_ends(&mut handle, 2).await;
+		assert_eq!(*requests.lock().unwrap(), 3, "retried exactly once");
+		assert!(
+			notices
+				.iter()
+				.any(|t| t == "context overflow: compacting before one retry")
+		);
+		assert!(notices.iter().any(|t| t.starts_with("compacted:")));
+		assert_eq!(
+			notices
+				.iter()
+				.filter(|t| t.contains("context overflow"))
+				.count(),
+			1,
+			"only one recovery attempt"
+		);
+
+		// Transcript: the failed attempt is gone, the kept prompt and the
+		// retried reply follow the summary.
+		let snapshot = agent.snapshot();
+		let roles: Vec<&str> = snapshot.messages.iter().map(Message::role).collect();
+		assert_eq!(roles, ["system", "user", "user", "assistant"]);
+		assert!(
+			!snapshot
+				.messages
+				.iter()
+				.any(|m| matches!(m, Message::Assistant(a) if a.stop_reason == StopReason::Error))
+		);
+		let Message::Assistant(last) = snapshot.messages.last().unwrap() else {
+			panic!("expected the retried reply")
+		};
+		assert_eq!(last.text(), "recovered answer");
+
+		// Log: one compaction, one tombstone, the failed attempt written
+		// exactly once — never re-persisted after the omission.
+		assert_eq!(compaction_entry_values(&dir).len(), 1);
+		assert_eq!(context_edit_count(&dir), 1);
+		let log = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		assert_eq!(
+			log.matches("prompt is too long").count(),
+			1,
+			"the failed attempt must not be persisted twice"
+		);
+
+		// Replay: summary + kept prompt + retry reply, still error-free.
+		let restored = read_session_messages(&dir);
+		let roles: Vec<&str> = restored.iter().map(Message::role).collect();
+		assert_eq!(roles, ["user", "user", "assistant"]);
+		assert!(
+			restored
+				.iter()
+				.all(|m| !matches!(m, Message::Assistant(a) if a.stop_reason == StopReason::Error))
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// A length truncation below the model's output limit recovers the same
+	/// way as an overflow error.
+	#[tokio::test]
+	async fn recoverable_length_recovers_through_compaction_and_retries_once() {
+		let dir = temp_session_dir("overflow-length");
+		let (stream, requests) = recovery_stream_fn(|turn, model| match turn {
+			1 => stop_reply(model, "first answer"),
+			2 => truncated_length(model, 5),
+			_ => stop_reply(model, "recovered answer"),
+		});
+		let agent = Agent::new(AgentOptions {
+			model: recovery_model(),
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session_with_settings(
+			agent.clone(),
+			SessionManager::open(&dir).unwrap(),
+			registry,
+			recovery_settings(),
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "first".into(),
+			})
+			.unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "second".into(),
+			})
+			.unwrap();
+		// Turn 2 ends with the overflow; the recovery compaction and the retry
+		// run before the next agent_end.
+		let notices = notices_until_agent_ends(&mut handle, 2).await;
+		assert_eq!(*requests.lock().unwrap(), 3, "retried exactly once");
+		assert!(
+			notices
+				.iter()
+				.any(|t| t == "context overflow: compacting before one retry")
+		);
+		assert_eq!(compaction_entry_values(&dir).len(), 1);
+		let snapshot = agent.snapshot();
+		let roles: Vec<&str> = snapshot.messages.iter().map(Message::role).collect();
+		assert_eq!(roles, ["system", "user", "user", "assistant"]);
+		assert!(
+			!snapshot
+				.messages
+				.iter()
+				.any(|m| matches!(m, Message::Assistant(a) if a.stop_reason == StopReason::Length))
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// A second overflow after the recovery retry gives up instead of looping:
+	/// the retried attempt stays in the transcript and the log gains no second
+	/// compaction or tombstone.
+	#[tokio::test]
+	async fn second_overflow_gives_up_after_one_retry() {
+		let dir = temp_session_dir("overflow-giveup");
+		let (stream, requests) = recovery_stream_fn(|turn, model| match turn {
+			1 => stop_reply(model, "first answer"),
+			_ => overflow_error(model),
+		});
+		let agent = Agent::new(AgentOptions {
+			model: recovery_model(),
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session_with_settings(
+			agent.clone(),
+			SessionManager::open(&dir).unwrap(),
+			registry,
+			recovery_settings(),
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "first".into(),
+			})
+			.unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "second".into(),
+			})
+			.unwrap();
+		// Turn 2 ends with the overflow; the recovery compaction and the retry
+		// run before the next agent_end.
+		let notices = notices_until_agent_ends(&mut handle, 2).await;
+		assert_eq!(*requests.lock().unwrap(), 3);
+		assert!(
+			notices
+				.iter()
+				.any(|t| t.starts_with("overflow recovery failed after one compact-and-retry"))
+		);
+		assert_eq!(compaction_entry_values(&dir).len(), 1);
+		assert_eq!(context_edit_count(&dir), 1);
+		// The retried attempt stays: no second omission after a failed retry.
+		let snapshot = agent.snapshot();
+		let Message::Assistant(last) = snapshot.messages.last().unwrap() else {
+			panic!("expected the failed retry")
+		};
+		assert_eq!(last.stop_reason, StopReason::Error);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
 	}
 
 	#[tokio::test]

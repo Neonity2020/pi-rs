@@ -1,21 +1,24 @@
 //! System prompt builder — port of
 //! `pi/packages/coding-agent/src/core/system-prompt.ts`.
 //!
-//! Framework stage: identity, environment block, and tool list. Project
-//! context files (AGENTS.md / CLAUDE.md / .pi/prompts) and per-tool prompt
-//! snippets land with the extensions phase.
+//! Includes global and ancestor project instruction files; other resources and
+//! per-tool prompt snippets are still being ported.
 
 use std::path::Path;
 
 use pi_agent::AgentTool;
 
-pub fn build_system_prompt(cwd: &Path, tools: &[std::sync::Arc<dyn AgentTool>]) -> String {
+pub fn build_system_prompt(
+	cwd: &Path,
+	tools: &[std::sync::Arc<dyn AgentTool>],
+	context_files: bool,
+) -> String {
 	let tool_lines: Vec<String> = tools
 		.iter()
 		.map(|t| format!("- {}: {}", t.name(), first_line(t.description())))
 		.collect();
 
-	format!(
+	let mut prompt = format!(
 		"You are {app} {version}, a coding agent running in the user's terminal. \
 You help with software engineering tasks: reading and editing code, running \
 commands, and answering questions about the repository.
@@ -51,7 +54,56 @@ prefer the dedicated file tools over bash for file operations.
 		platform = std::env::consts::OS,
 		date = today(),
 		tools = tool_lines.join("\n"),
-	)
+	);
+	if context_files {
+		let files = load_project_context(cwd, &crate::config::agent_dir());
+		if !files.is_empty() {
+			prompt
+				.push_str("\n\n# Project context\n\nProject-specific instructions and guidelines:");
+			for (path, content) in files {
+				prompt.push_str(&format!(
+					"\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+					path.display(),
+					content
+				));
+			}
+		}
+	}
+	prompt
+}
+
+/// Load the first matching file from the global agent directory and each
+/// ancestor, in increasing scope order. Per-directory precedence matches pi.
+fn load_project_context(cwd: &Path, agent_dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+	fn from_dir(dir: &Path) -> Option<(std::path::PathBuf, String)> {
+		for name in [
+			"AGENTS.override.md",
+			"AGENTS.md",
+			"AGENTS.MD",
+			"CLAUDE.md",
+			"CLAUDE.MD",
+		] {
+			let path = dir.join(name);
+			if !path.is_file() {
+				continue;
+			}
+			match std::fs::read_to_string(&path) {
+				Ok(content) => {
+					return Some((path, content.trim_start_matches('\u{feff}').to_owned()));
+				}
+				Err(error) => eprintln!("Warning: Could not read {}: {error}", path.display()),
+			}
+		}
+		None
+	}
+	let global = from_dir(agent_dir);
+	let mut ancestors: Vec<_> = cwd.ancestors().filter_map(from_dir).collect();
+	ancestors.reverse();
+	if let Some(global) = global {
+		ancestors.retain(|(path, _)| *path != global.0);
+		ancestors.insert(0, global);
+	}
+	ancestors
 }
 
 fn first_line(s: &str) -> String {
@@ -73,4 +125,34 @@ fn today() -> String {
 	let mth = if mp < 10 { mp + 3 } else { mp - 9 };
 	let y = if mth <= 2 { y + 1 } else { y };
 	format!("{y:04}-{mth:02}-{d:02}")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn context_precedence_order_and_bom() {
+		let root = std::env::temp_dir().join(format!(
+			"pi-context-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let project = root.join("project");
+		let nested = project.join("nested");
+		let global = root.join("global");
+		std::fs::create_dir_all(&nested).unwrap();
+		std::fs::create_dir_all(&global).unwrap();
+		std::fs::write(global.join("AGENTS.md"), "global").unwrap();
+		std::fs::write(project.join("CLAUDE.md"), "ignored").unwrap();
+		std::fs::write(project.join("AGENTS.md"), "\u{feff}project").unwrap();
+		std::fs::write(nested.join("AGENTS.override.md"), "nested").unwrap();
+		let files = load_project_context(&nested, &global);
+		let relevant: Vec<_> = files
+			.iter()
+			.filter(|(p, _)| p.starts_with(&root))
+			.map(|(_, c)| c.as_str())
+			.collect();
+		assert_eq!(relevant, ["global", "project", "nested"]);
+		std::fs::remove_dir_all(root).unwrap();
+	}
 }

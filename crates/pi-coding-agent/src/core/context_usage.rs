@@ -1,22 +1,12 @@
 //! Context usage calculation for the footer and compaction threshold.
-//! Mirrors the upstream usage preference and trailing-message estimation.
+//! Mirrors the upstream usage preference and trailing-message estimation;
+//! the per-usage total comes from `Usage::context_tokens`
+//! (`calculateContextTokens` upstream).
 
 use pi_agent::Agent;
-use pi_ai::{Message, StopReason, Usage};
+use pi_ai::{Message, StopReason};
 
 use super::compaction::estimate_tokens;
-
-pub fn usage_tokens(usage: &Usage) -> u64 {
-	if usage.total_tokens > 0 {
-		usage.total_tokens
-	} else {
-		usage
-			.input
-			.saturating_add(usage.output)
-			.saturating_add(usage.cache_read)
-			.saturating_add(usage.cache_write)
-	}
-}
 
 /// Returns `(context_tokens, context_window)`, or `None` when unknown.
 pub fn compute(agent: &Agent) -> Option<(u64, u64)> {
@@ -42,7 +32,7 @@ fn estimate(messages: &[Message], start: usize) -> Option<u64> {
 					StopReason::Aborted | StopReason::Error
 				) =>
 			{
-				let count = usage_tokens(&assistant.usage);
+				let count = assistant.usage.context_tokens();
 				(count > 0).then_some((index, count))
 			}
 			_ => None,
@@ -65,16 +55,16 @@ mod tests {
 
 	#[test]
 	fn totals_prefer_reported_total_and_include_output_in_fallback() {
-		let mut usage = Usage {
+		let mut usage = pi_ai::Usage {
 			input: 10,
 			output: 2,
 			cache_read: 3,
 			cache_write: 4,
 			..Default::default()
 		};
-		assert_eq!(usage_tokens(&usage), 19);
+		assert_eq!(usage.context_tokens(), 19);
 		usage.total_tokens = 25;
-		assert_eq!(usage_tokens(&usage), 25);
+		assert_eq!(usage.context_tokens(), 25);
 	}
 
 	#[test]
@@ -100,7 +90,18 @@ mod tests {
 		];
 		assert_eq!(estimate(&compacted, 2), None);
 		let mut after = compacted;
-		after.push(Message::Assistant(assistant));
+		after.push(Message::Assistant(assistant.clone()));
 		assert_eq!(estimate(&after, 2), Some(100));
+
+		// A newer response with all-zero usage is skipped for an older valid
+		// one; a zero-usage tail keeps the older usage plus the estimate.
+		let mut zero = assistant.clone();
+		zero.usage = pi_ai::Usage::default();
+		let mixed = vec![
+			Message::Assistant(assistant),
+			Message::Assistant(zero),
+			Message::user("123456"),
+		];
+		assert_eq!(estimate(&mixed, 0), Some(102));
 	}
 }

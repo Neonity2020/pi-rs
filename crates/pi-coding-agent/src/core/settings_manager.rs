@@ -23,6 +23,11 @@ pub struct Settings {
 	pub compaction: Option<CompactionSettings>,
 }
 
+/// `compaction` settings — upstream `CompactionSettings`
+/// (`compaction/compaction.ts` `DEFAULT_COMPACTION_SETTINGS`: enabled,
+/// reserveTokens 16384, keepRecentTokens 20000; the call sites in
+/// `agent_session.rs` fill those defaults for absent fields). Per-model
+/// overrides (`compaction.modelOverrides`) are deferred.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {

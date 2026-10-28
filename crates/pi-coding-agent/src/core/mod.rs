@@ -12,6 +12,7 @@ pub mod settings_manager;
 pub mod slash_commands;
 pub mod system_prompt;
 pub mod tools;
+pub mod trust;
 pub mod ui_config;
 
 pub use session_manager::SessionManager;

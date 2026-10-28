@@ -10,7 +10,9 @@ pub mod errors;
 pub mod local;
 pub mod remote;
 
-pub use connection::{DirEntryInfo, EnvConnection, ExecOptions, ExecResult, FileType, WatchEvent};
+pub use connection::{
+	DirEntryInfo, EnvConnection, ExecOptions, ExecResult, FileType, OutputChunkCallback, WatchEvent,
+};
 pub use errors::{Error, Result};
 pub use local::LocalEnv;
 pub use remote::RemoteEnv;
