@@ -389,6 +389,7 @@ struct ToolAccumulator {
 	id: String,
 	name: String,
 	arguments_text: String,
+	started: bool,
 }
 
 /// Accumulates the assistant response and turns parsed SSE payloads into
@@ -599,6 +600,7 @@ impl StreamSession {
 					id: id.to_string(),
 					name: name.to_string(),
 					arguments_text: String::new(),
+					started: false,
 				});
 				if let Some(index) = stream_index {
 					self.tool_slot_by_stream_index.insert(index, slot);
@@ -606,10 +608,6 @@ impl StreamSession {
 				if !id.is_empty() {
 					self.tool_slot_by_id.insert(id.to_string(), slot);
 				}
-				events.push(Event::ToolCallStart {
-					content_index,
-					partial: self.message.clone(),
-				});
 				slot
 			}
 		};
@@ -626,17 +624,35 @@ impl StreamSession {
 		let arguments = lenient_partial_json(&accumulator.arguments_text);
 		let (id, name) = (accumulator.id.clone(), accumulator.name.clone());
 		let content_index = accumulator.content_index;
+		let should_start = !accumulator.started && !id.is_empty() && !name.is_empty();
+		let delta_to_emit = if should_start {
+			accumulator.arguments_text.clone()
+		} else {
+			delta.to_string()
+		};
+		if should_start {
+			accumulator.started = true;
+		}
+		let started = accumulator.started;
 		if let Some(AssistantContent::ToolCall(block)) = self.message.content.get_mut(content_index)
 		{
 			block.id = id;
 			block.name = name;
 			block.arguments = arguments;
 		}
-		events.push(Event::ToolCallDelta {
-			content_index,
-			delta: delta.to_string(),
-			partial: self.message.clone(),
-		});
+		if should_start {
+			events.push(Event::ToolCallStart {
+				content_index,
+				partial: self.message.clone(),
+			});
+		}
+		if started {
+			events.push(Event::ToolCallDelta {
+				content_index,
+				delta: delta_to_emit,
+				partial: self.message.clone(),
+			});
+		}
 	}
 
 	/// Ends open blocks in content order and applies the missing-finish-reason
@@ -661,6 +677,19 @@ impl StreamSession {
 					});
 				}
 				AssistantContent::ToolCall(_) => {
+					if !self.tools[tool_cursor].started {
+						events.push(Event::ToolCallStart {
+							content_index: index,
+							partial: self.message.clone(),
+						});
+						if !self.tools[tool_cursor].arguments_text.is_empty() {
+							events.push(Event::ToolCallDelta {
+								content_index: index,
+								delta: self.tools[tool_cursor].arguments_text.clone(),
+								partial: self.message.clone(),
+							});
+						}
+					}
 					let (arguments, arguments_error) =
 						parse_tool_call_arguments(&self.tools[tool_cursor].arguments_text);
 					tool_cursor += 1;

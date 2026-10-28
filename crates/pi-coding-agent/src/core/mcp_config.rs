@@ -17,11 +17,10 @@
 //! }
 //! ```
 //!
-//! This build implements stdio servers (`command`/`args`/`env`/`cwd`, plus
-//! `enabled: false` to keep an entry without connecting). Upstream forms that
-//! are not implemented yet are reported as non-fatal config errors, like a
-//! validation failure upstream: `url` servers (streamable HTTP with
-//! `headers`/`oauth`/`auth`), the legacy `sse` type, and the exposure
+//! This build implements stdio and streamable HTTP servers, plus
+//! `enabled: false` to keep an entry without connecting. Unsupported forms
+//! are reported as non-fatal config errors: HTTP OAuth/auth,
+//! the legacy `sse` type, and the exposure
 //! pipeline (`exposure`/`toolExposure` for codemode/tool_search — tolerated
 //! as unknown fields). Unknown fields are ignored so configs written for
 //! other clients load. Env values that reference variables (`${NAME}`) or
@@ -48,6 +47,8 @@ pub fn mcp_json_path() -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerEntry {
 	pub name: String,
+	pub url: Option<String>,
+	pub headers: Vec<(String, String)>,
 	pub command: String,
 	pub args: Vec<String>,
 	/// Extra environment entries; the child inherits the parent environment
@@ -158,12 +159,43 @@ fn validate_server(name: &str, value: &Value) -> Result<McpServerEntry, String> 
 			"server \"{name}\": legacy SSE transport is not supported; use the streamable HTTP URL"
 		));
 	}
-	// Upstream branches on a string `url` first (streamable HTTP); this port
-	// only connects stdio servers, so the entry is reported and skipped.
-	if object.get("url").is_some_and(Value::is_string) {
-		return Err(format!(
-			"server \"{name}\": streamable HTTP servers are not supported in this build (stdio only)"
-		));
+	if let Some(url) = object.get("url").and_then(Value::as_str) {
+		if !(url.starts_with("https://") || url.starts_with("http://")) {
+			return Err(format!("server \"{name}\": URL must use http or https"));
+		}
+		if object.contains_key("oauth") || object.contains_key("auth") {
+			return Err(format!(
+				"server \"{name}\": HTTP OAuth/auth is not supported"
+			));
+		}
+		let headers = match object.get("headers") {
+			None => Vec::new(),
+			Some(Value::Object(map)) if map.values().all(Value::is_string) => map
+				.iter()
+				.map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+				.collect(),
+			_ => {
+				return Err(format!(
+					"server \"{name}\": headers must map names to strings"
+				));
+			}
+		};
+		let enabled = match object.get("enabled") {
+			None => true,
+			Some(value) => value
+				.as_bool()
+				.ok_or_else(|| format!("server \"{name}\": enabled must be a boolean"))?,
+		};
+		return Ok(McpServerEntry {
+			name: name.to_string(),
+			url: Some(url.to_string()),
+			headers,
+			command: String::new(),
+			args: Vec::new(),
+			env: Vec::new(),
+			cwd: None,
+			enabled,
+		});
 	}
 	let Some(command) = object.get("command").and_then(Value::as_str) else {
 		return Err(format!(
@@ -210,6 +242,8 @@ fn validate_server(name: &str, value: &Value) -> Result<McpServerEntry, String> 
 	};
 	Ok(McpServerEntry {
 		name: name.to_string(),
+		url: None,
+		headers: Vec::new(),
 		command: command.to_string(),
 		args,
 		env,
@@ -340,9 +374,14 @@ mod tests {
 		)
 		.unwrap();
 		let config = load_mcp_config_from(&path);
-		// The one good entry still loads; every invalid one is an error line.
-		assert_eq!(config.servers.len(), 1);
-		assert_eq!(config.servers[0].name, "good");
+		assert_eq!(config.servers.len(), 2);
+		assert!(config.servers.iter().any(|s| s.name == "good"));
+		assert!(
+			config
+				.servers
+				.iter()
+				.any(|s| s.name == "http" && s.url.as_deref() == Some("https://example.com/mcp"))
+		);
 		let messages: Vec<String> = config.errors;
 		let find = |needle: &str| {
 			messages
@@ -352,7 +391,6 @@ mod tests {
 		};
 		find("invalid server name \"bad name\"");
 		find("server \"not-object\" must be an object");
-		find("server \"http\": streamable HTTP servers are not supported");
 		find("server \"sse\": legacy SSE transport is not supported");
 		find("server \"no-transport\" needs either \"command\"");
 		find("server \"bad-args\": args must be an array of strings");

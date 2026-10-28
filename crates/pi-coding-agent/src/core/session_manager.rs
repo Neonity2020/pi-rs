@@ -34,6 +34,8 @@ pub enum SessionEntry {
 		cwd: String,
 	},
 	Message {
+		#[serde(skip_serializing_if = "Option::is_none")]
+		id: Option<String>,
 		message: Box<Message>,
 	},
 	ModelChange {
@@ -88,6 +90,9 @@ pub struct SessionManager {
 	file: Option<std::fs::File>,
 	pending_sync: Option<String>,
 	pending_metadata: bool,
+	pending_message_id: Option<String>,
+	#[cfg(test)]
+	fail_next_sync: bool,
 	write_broken: bool,
 	pub entries_written: u64,
 }
@@ -117,6 +122,9 @@ impl SessionManager {
 			file: None,
 			pending_sync: None,
 			pending_metadata: false,
+			pending_message_id: None,
+			#[cfg(test)]
+			fail_next_sync: false,
 			write_broken: false,
 			entries_written: 0,
 		};
@@ -137,6 +145,9 @@ impl SessionManager {
 			file: None,
 			pending_sync: None,
 			pending_metadata: false,
+			pending_message_id: None,
+			#[cfg(test)]
+			fail_next_sync: false,
 			write_broken: false,
 			entries_written: 0,
 		}
@@ -149,6 +160,9 @@ impl SessionManager {
 			file: None,
 			pending_sync: None,
 			pending_metadata: false,
+			pending_message_id: None,
+			#[cfg(test)]
+			fail_next_sync: false,
 			write_broken: false,
 			entries_written: count_entries(dir)?,
 		};
@@ -164,6 +178,9 @@ impl SessionManager {
 			file: Some(file),
 			pending_sync: None,
 			pending_metadata: false,
+			pending_message_id: None,
+			#[cfg(test)]
+			fail_next_sync: false,
 			write_broken: false,
 			entries_written: 0,
 		}
@@ -210,6 +227,14 @@ impl SessionManager {
 
 	/// Append one entry; no-op for in-memory sessions.
 	pub fn append(&mut self, entry: &SessionEntry) -> Result<(), SessionError> {
+		#[cfg(test)]
+		if std::mem::take(&mut self.fail_next_sync) {
+			return self.append_with_io(
+				entry,
+				|file, bytes| file.write_all(bytes),
+				|_| Err(std::io::Error::other("injected sync failure")),
+			);
+		}
 		self.append_with_io(
 			entry,
 			|file, bytes| file.write_all(bytes),
@@ -259,9 +284,23 @@ impl SessionManager {
 	}
 
 	pub fn append_message(&mut self, message: &Message) -> Result<(), SessionError> {
-		self.append(&SessionEntry::Message {
+		let id = self
+			.pending_message_id
+			.get_or_insert_with(generate_entry_id)
+			.clone();
+		let result = self.append(&SessionEntry::Message {
+			id: Some(id),
 			message: Box::new(message.clone()),
-		})
+		});
+		if result.is_ok() {
+			self.pending_message_id = None;
+		}
+		result
+	}
+
+	#[cfg(test)]
+	pub(crate) fn fail_next_sync(&mut self) {
+		self.fail_next_sync = true;
 	}
 
 	/// Finish a previously written metadata entry before appending messages.
@@ -545,6 +584,7 @@ mod tests {
 		let dir = temp_session_dir("sync-retry");
 		let mut session = SessionManager::open(&dir).unwrap();
 		let entry = SessionEntry::Message {
+			id: None,
 			message: Box::new(user_message("once")),
 		};
 		assert!(
@@ -572,6 +612,7 @@ mod tests {
 		let mut session = SessionManager::open(&dir).unwrap();
 		session.append_message(&user_message("before")).unwrap();
 		let entry = SessionEntry::Message {
+			id: None,
 			message: Box::new(user_message("after")),
 		};
 		assert!(
@@ -669,6 +710,7 @@ mod tests {
 		assert_eq!(change["type"], "modelChange");
 		assert_eq!(change["model"], "mock/mock");
 		let message = serde_json::to_value(&SessionEntry::Message {
+			id: None,
 			message: Box::new(user_message("hi")),
 		})
 		.unwrap();

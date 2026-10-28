@@ -6,7 +6,10 @@
 //! mutability, so `Agent` is `Clone` and can be shared between the session
 //! task and UI status probes while a run is in flight.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+	Arc, Mutex, RwLock,
+	atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -59,6 +62,7 @@ pub struct AgentSnapshot {
 	pub thinking_level: ThinkingLevel,
 	pub tool_names: Vec<String>,
 	pub messages: Vec<Message>,
+	pub usage_valid_from: usize,
 	pub streaming_message: Option<Message>,
 	pub system_prompt: String,
 	pub queued_steering: usize,
@@ -71,6 +75,7 @@ struct AgentInner {
 	thinking_level: RwLock<ThinkingLevel>,
 	tools: RwLock<Vec<Arc<dyn AgentTool>>>,
 	messages: Arc<RwLock<Vec<Message>>>,
+	usage_valid_from: AtomicUsize,
 	streaming: Arc<RwLock<Option<Message>>>,
 	error_message: RwLock<Option<String>>,
 	steering: Arc<Mutex<PendingMessageQueue>>,
@@ -122,6 +127,7 @@ impl Agent {
 			thinking_level: RwLock::new(options.thinking_level),
 			tools: RwLock::new(options.tools),
 			messages: Arc::new(RwLock::new(messages)),
+			usage_valid_from: AtomicUsize::new(0),
 			streaming: Arc::new(RwLock::new(None)),
 			error_message: RwLock::new(None),
 			steering: Arc::new(Mutex::new(PendingMessageQueue::new(options.steering_mode))),
@@ -144,7 +150,10 @@ impl Agent {
 
 	/// Current state snapshot.
 	pub fn snapshot(&self) -> AgentSnapshot {
-		let messages = self.inner.messages.read().unwrap().clone();
+		let transcript = self.inner.messages.read().unwrap();
+		let usage_valid_from = self.inner.usage_valid_from.load(Ordering::SeqCst);
+		let messages = transcript.clone();
+		drop(transcript);
 		AgentSnapshot {
 			model: self.inner.model.read().unwrap().clone(),
 			thinking_level: *self.inner.thinking_level.read().unwrap(),
@@ -162,6 +171,7 @@ impl Agent {
 			queued_follow_up: self.inner.follow_up.lock().unwrap().len(),
 			error_message: self.inner.error_message.read().unwrap().clone(),
 			messages,
+			usage_valid_from,
 		}
 	}
 
@@ -335,8 +345,41 @@ impl Agent {
 		if self.inner.active_run.lock().unwrap().is_some() {
 			anyhow::bail!("cannot replace messages while a run is active");
 		}
+		self.inner.usage_valid_from.store(0, Ordering::SeqCst);
 		*transcript = messages;
 		Ok(())
+	}
+
+	/// Atomically validate and persist a transcript replacement while excluding
+	/// concurrent agent runs. The synchronous commit must not call Agent APIs.
+	pub fn replace_messages_transactionally<F>(
+		&self,
+		expected: &[Message],
+		replacement: Vec<Message>,
+		commit: F,
+	) -> anyhow::Result<()>
+	where
+		F: FnOnce() -> anyhow::Result<()>,
+	{
+		let mut transcript = self.inner.messages.write().unwrap();
+		let active = self.inner.active_run.lock().unwrap();
+		if active.is_some() {
+			anyhow::bail!("cannot replace messages while a run is active");
+		}
+		if *transcript != expected {
+			anyhow::bail!("transcript changed during compaction");
+		}
+		commit()?;
+		self.inner
+			.usage_valid_from
+			.store(replacement.len(), Ordering::SeqCst);
+		*transcript = replacement;
+		Ok(())
+	}
+
+	/// Set the earliest transcript index with post-compaction provider usage.
+	pub fn set_usage_valid_from(&self, index: usize) {
+		self.inner.usage_valid_from.store(index, Ordering::SeqCst);
 	}
 
 	/// Replace the executable tool set. Differences from the tools declared in
@@ -488,6 +531,50 @@ fn replay_system_prompt(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn transaction_excludes_concurrent_runs_and_rejects_failures() {
+		let agent = Agent::new(AgentOptions::default());
+		let original = agent.snapshot().messages;
+		let called = std::sync::atomic::AtomicBool::new(false);
+		assert!(
+			agent
+				.replace_messages_transactionally(&[], vec![], || {
+					called.store(true, Ordering::SeqCst);
+					Ok(())
+				})
+				.is_err()
+		);
+		assert!(!called.load(Ordering::SeqCst));
+		assert!(
+			agent
+				.replace_messages_transactionally(&original, vec![], || anyhow::bail!("injected"))
+				.is_err()
+		);
+		assert_eq!(agent.snapshot().messages, original);
+		let competing = agent.clone();
+		let (tx, rx) = std::sync::mpsc::channel();
+		let mut thread = None;
+		agent
+			.replace_messages_transactionally(&original, vec![Message::user("new")], || {
+				thread = Some(std::thread::spawn(move || {
+					let acquired = competing.begin_run().is_ok();
+					let _ = tx.send(acquired);
+					if acquired {
+						competing.end_run();
+					}
+				}));
+				assert!(
+					rx.recv_timeout(std::time::Duration::from_millis(30))
+						.is_err()
+				);
+				Ok(())
+			})
+			.unwrap();
+		assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+		thread.unwrap().join().unwrap();
+		assert_eq!(agent.snapshot().messages[0].role(), "user");
+	}
 
 	#[test]
 	fn replace_messages_swaps_transcript_and_snapshot_reflects_it() {

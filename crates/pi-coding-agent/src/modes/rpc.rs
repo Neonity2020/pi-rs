@@ -19,14 +19,11 @@
 //!   inferred from the agent state at enqueue time; upstream reports the
 //!   disposition from prompt preflight. `steer`/`follow_up` always answer
 //!   `{disposition: "queued"}` (this port has no extension input handlers).
-//! - Event frames are the serde serialization of `AgentEvent`
-//!   (`{"type": "message_start", "message": {...}}`, camelCase);
-//!   `message_update` carries the cumulative assistant message instead of
-//!   upstream's stripped delta shape. Session notices — which upstream routes
+//! - Event frame field names follow the upstream camelCase convention.
+//!   Session notices — which upstream routes
 //!   through extensions — are emitted as `{"type": "notice", "message": ...}`.
 //!   `Persisted` bookkeeping events are not forwarded.
-//! - `set_model` takes upstream's `provider` + `modelId`; the pair is resolved
-//!   through this port's registry query matcher (`provider/id`, id, or fuzzy).
+//! - `set_model` matches the upstream's exact `provider` + `modelId` pair.
 //! - No stdout backpressure handling and no signal handling (upstream waits on
 //!   raw-stdout backpressure and traps SIGTERM/SIGHUP).
 
@@ -90,6 +87,7 @@ impl RpcSession {
 			events,
 			agent,
 			session_dir,
+			..
 		} = handle;
 		Self {
 			cmd_tx,
@@ -145,7 +143,7 @@ impl RpcSession {
 		loop {
 			match self.events.recv().await {
 				Ok(SessionEvent::Agent(event)) => {
-					return Some(serde_json::to_string(&*event).expect("agent events serialize"));
+					return Some(agent_event_frame(&event));
 				}
 				Ok(SessionEvent::Notice(text)) => {
 					return Some(json!({"type": "notice", "message": text}).to_string());
@@ -203,7 +201,14 @@ impl RpcSession {
 			}
 			RpcCommand::SetModel { provider, model_id } => {
 				let query = format!("{provider}/{model_id}");
-				let found = self.registry.lock().unwrap().find(&query);
+				let found = self
+					.registry
+					.lock()
+					.unwrap()
+					.models()
+					.iter()
+					.find(|model| model.provider == provider && model.id == model_id)
+					.cloned();
 				match found {
 					Some(model) => {
 						let data = serde_json::to_value(&model).unwrap_or(Value::Null);
@@ -253,6 +258,48 @@ impl RpcSession {
 			"pendingMessageCount": snapshot.queued_steering + snapshot.queued_follow_up,
 		})
 	}
+}
+
+/// Rename only event envelope fields; tool payloads and arbitrary user JSON
+/// are opaque and must not be recursively rewritten.
+fn agent_event_frame(event: &pi_agent::AgentEvent) -> String {
+	if let pi_agent::AgentEvent::MessageUpdate {
+		message,
+		assistant_message_event,
+	} = event
+	{
+		let pi_ai::Message::Assistant(message) = message else {
+			unreachable!("message updates are always assistant messages");
+		};
+		let mut delta = assistant_message_event.clone();
+		if delta["type"] == "toolcall_start" {
+			let index = delta["contentIndex"].as_u64().unwrap_or(u64::MAX) as usize;
+			if let Some(pi_ai::AssistantContent::ToolCall(call)) = message.content.get(index) {
+				delta["id"] = json!(call.id);
+				delta["toolName"] = json!(call.name);
+			}
+		}
+		delta
+			.as_object_mut()
+			.expect("assistant event is an object")
+			.remove("partial");
+		return json!({"type": "message_update", "usage": message.usage, "assistantMessageEvent": delta}).to_string();
+	}
+	let mut value = serde_json::to_value(event).expect("agent events serialize");
+	let object = value.as_object_mut().expect("agent event is an object");
+	for (source, target) in [
+		("tool_results", "toolResults"),
+		("tool_call_id", "toolCallId"),
+		("tool_name", "toolName"),
+		("partial_result", "partialResult"),
+		("is_error", "isError"),
+		("duration_ms", "durationMs"),
+	] {
+		if let Some(field) = object.remove(source) {
+			object.insert(target.into(), field);
+		}
+	}
+	value.to_string()
 }
 
 fn all_thinking_levels() -> [&'static str; 7] {
@@ -507,6 +554,38 @@ mod tests {
 		assert_eq!(frame["success"], false);
 		assert_eq!(frame["id"], "m1");
 		assert!(frame["error"].as_str().unwrap().contains("Model not found"));
+
+		// A fuzzy match must not accept a different provider or model ID.
+		let frame = parse_frame(
+			&session.handle_line(r#"{"type":"set_model","provider":"mock","modelId":"mock"}"#)[0],
+		);
+		assert_eq!(frame["success"], false);
+	}
+
+	#[test]
+	fn agent_event_wire_fields_are_camel_case_without_rewriting_payloads() {
+		use pi_agent::AgentEvent;
+		let frame = parse_frame(&agent_event_frame(&AgentEvent::ToolExecutionUpdate {
+			tool_call_id: "call-1".into(),
+			tool_name: "test".into(),
+			args: json!({"user_key": 1}),
+			partial_result: json!({"nested_key": 2}),
+		}));
+		assert_eq!(
+			frame,
+			json!({"type":"tool_execution_update", "toolCallId":"call-1",
+			"toolName":"test", "args":{"user_key":1}, "partialResult":{"nested_key":2}})
+		);
+		let frame = parse_frame(&agent_event_frame(&AgentEvent::ToolExecutionEnd {
+			tool_call_id: "call-1".into(),
+			tool_name: "test".into(),
+			result: json!({}),
+			is_error: false,
+			duration_ms: Some(5),
+		}));
+		assert_eq!(frame["isError"], false);
+		assert_eq!(frame["durationMs"], 5);
+		assert!(frame.get("is_error").is_none());
 	}
 
 	#[tokio::test]
@@ -550,6 +629,16 @@ mod tests {
 		assert!(kinds.contains(&"message_start"));
 		assert!(kinds.contains(&"message_end"));
 		assert_eq!(*kinds.last().unwrap(), "agent_end");
+		let update = events
+			.iter()
+			.find(|e| {
+				e["type"] == "message_update" && e["assistantMessageEvent"]["type"] == "text_delta"
+			})
+			.expect("stream includes a text delta");
+		assert!(update["assistantMessageEvent"]["delta"].is_string());
+		assert!(update["usage"].is_object());
+		assert!(update.get("message").is_none());
+		assert!(update["assistantMessageEvent"].get("partial").is_none());
 		// The final assistant text echoes the prompt (mock provider).
 		let message_end = events
 			.iter()

@@ -57,8 +57,17 @@ struct Capture {
 	task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for Capture {
+	fn drop(&mut self) {
+		self.task.abort();
+	}
+}
+
 impl Capture {
-	fn start<R: AsyncRead + Unpin + Send + 'static>(mut reader: R) -> Self {
+	fn start<R: AsyncRead + Unpin + Send + 'static>(
+		mut reader: R,
+		on_output: Option<crate::connection::OutputCallback>,
+	) -> Self {
 		let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let task = {
@@ -72,6 +81,9 @@ impl Capture {
 					match reader.read(&mut chunk).await {
 						Ok(0) | Err(_) => break,
 						Ok(n) => {
+							if let Some(callback) = &on_output {
+								callback(&chunk[..n]);
+							}
 							let mut guard = buf.lock().unwrap();
 							let keep = n.min(MAX_CAPTURE_BYTES.saturating_sub(guard.len()));
 							truncated.store(keep < n, std::sync::atomic::Ordering::Relaxed);
@@ -158,8 +170,8 @@ impl EnvConnection for LocalEnv {
 		let mut group = ProcessGroup(child.id());
 		let stdout = child.stdout.take().expect("stdout is piped");
 		let stderr = child.stderr.take().expect("stderr is piped");
-		let out = Capture::start(stdout);
-		let err = Capture::start(stderr);
+		let out = Capture::start(stdout, options.on_output.clone());
+		let err = Capture::start(stderr, options.on_output.clone());
 
 		let status = match options.timeout_ms {
 			Some(timeout_ms) => {

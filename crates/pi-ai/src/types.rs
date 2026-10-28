@@ -193,6 +193,22 @@ pub struct Usage {
 	pub cost: Cost,
 }
 
+impl Usage {
+	/// Total context tokens consumed by the request (`calculateContextTokens`
+	/// upstream, `pi/packages/ai` compaction accounting): the provider-reported
+	/// `total_tokens` when positive, otherwise the sum of the components.
+	pub fn context_tokens(&self) -> u64 {
+		if self.total_tokens > 0 {
+			self.total_tokens
+		} else {
+			self.input
+				.saturating_add(self.output)
+				.saturating_add(self.cache_read)
+				.saturating_add(self.cache_write)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -478,4 +494,40 @@ pub fn now_ms() -> u64 {
 		.duration_since(std::time::UNIX_EPOCH)
 		.map(|d| d.as_millis() as u64)
 		.unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn context_tokens_prefers_provider_total() {
+		let usage = Usage {
+			input: 100,
+			output: 20,
+			cache_read: 30,
+			cache_write: 40,
+			total_tokens: 250,
+			..Default::default()
+		};
+		assert_eq!(usage.context_tokens(), 250);
+	}
+
+	#[test]
+	fn context_tokens_falls_back_to_components() {
+		let usage = Usage {
+			input: 100,
+			output: 20,
+			cache_read: 30,
+			cache_write: 40,
+			total_tokens: 0,
+			..Default::default()
+		};
+		assert_eq!(usage.context_tokens(), 190);
+	}
+
+	#[test]
+	fn context_tokens_of_default_usage_is_zero() {
+		assert_eq!(Usage::default().context_tokens(), 0);
+	}
 }

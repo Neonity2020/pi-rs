@@ -212,6 +212,8 @@ pub enum AgentEvent {
 	/// Only emitted for assistant messages during streaming.
 	MessageUpdate {
 		message: Message,
+		/// Original provider delta, retained for consumers of streaming protocols.
+		assistant_message_event: Value,
 	},
 	MessageEnd {
 		message: Message,
@@ -224,6 +226,7 @@ pub enum AgentEvent {
 	ToolExecutionUpdate {
 		tool_call_id: String,
 		tool_name: String,
+		args: Value,
 		partial_result: Value,
 	},
 	ToolExecutionEnd {

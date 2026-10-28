@@ -57,6 +57,9 @@ pub struct CompactionOutcome {
 	pub summary: String,
 	/// Estimated context tokens before compaction (`tokensBefore` upstream).
 	pub tokens_before: u64,
+	pub kept: Vec<Message>,
+	pub first_kept_id: Option<String>,
+	pub source_messages: Vec<Message>,
 }
 
 /// The compaction product as it lives in the agent transcript: a user message
@@ -85,6 +88,13 @@ pub fn replacement_history(messages: &[Message], summary: &str) -> Vec<Message> 
 /// `getSummarizationFailure`: error/length stop reasons and tool calls in the
 /// response refuse to become a checkpoint.
 pub async fn compact_agent(agent: &Agent) -> anyhow::Result<CompactionOutcome> {
+	compact_prefix(agent, None).await
+}
+
+pub async fn compact_prefix(
+	agent: &Agent,
+	cut: Option<(usize, Option<String>)>,
+) -> anyhow::Result<CompactionOutcome> {
 	let snapshot = agent.snapshot();
 	let transcript: Vec<Message> = snapshot
 		.messages
@@ -97,7 +107,15 @@ pub async fn compact_agent(agent: &Agent) -> anyhow::Result<CompactionOutcome> {
 	}
 
 	let tokens_before: u64 = snapshot.messages.iter().map(estimate_tokens).sum();
-	let conversation = serialize_conversation(&transcript);
+	let (prefix, kept, first_kept_id) = if let Some((index, id)) = cut {
+		if index == 0 || index >= transcript.len() {
+			anyhow::bail!("invalid compaction boundary");
+		}
+		(&transcript[..index], transcript[index..].to_vec(), id)
+	} else {
+		(&transcript[..], Vec::new(), None)
+	};
+	let conversation = serialize_conversation(prefix);
 	// Wrap the serialized conversation in tags so the model treats it as data,
 	// not as a conversation to continue (`buildSummarizationContext` upstream).
 	let prompt_text =
@@ -115,6 +133,9 @@ pub async fn compact_agent(agent: &Agent) -> anyhow::Result<CompactionOutcome> {
 	Ok(CompactionOutcome {
 		summary: response.text(),
 		tokens_before,
+		kept,
+		first_kept_id,
+		source_messages: snapshot.messages,
 	})
 }
 
@@ -239,7 +260,7 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
 
 /// chars/4 heuristic — port of `estimateTokens` (`compaction/compaction.ts`),
 /// reduced to the four standard roles.
-fn estimate_tokens(message: &Message) -> u64 {
+pub(crate) fn estimate_tokens(message: &Message) -> u64 {
 	let chars: usize = match message {
 		Message::System(system) => match &system.content {
 			SystemContent::Text(text) => text.len(),

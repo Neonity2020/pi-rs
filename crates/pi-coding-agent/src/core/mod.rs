@@ -3,6 +3,7 @@
 
 pub mod agent_session;
 pub mod compaction;
+pub mod context_usage;
 pub mod event_bus;
 pub mod mcp_config;
 pub mod model_registry;

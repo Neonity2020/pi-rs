@@ -12,8 +12,8 @@
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
 | 其他 HTTP provider | mock provider 可用于本地演示 |
-| 会话压缩 | `/compact` 已实现：LLM 总结、历史替换、日志 entry、恢复重建；自动阈值触发尚未实现 |
-| MCP | 已接入 CLI：`~/.pi-rs/agent/mcp.json` 装配 stdio server，工具以 `mcp__<server>__<tool>` 进入工具表；失败隔离、退出清理 |
+| 会话压缩 | `/compact` 和按配置阈值自动压缩：保留最近整轮、日志记录与恢复；溢出后的自动重试尚未实现 |
+| MCP | 已接入 CLI：`~/.pi-rs/agent/mcp.json` 装配 stdio 和 HTTP server，工具以 `mcp__<server>__<tool>` 进入工具表；失败隔离、退出清理 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
 | `--rpc` | 已实现 prompt/steer/follow_up/abort/set_model/set_thinking/get_state/get_messages 等命令与事件帧；与上游 wire 形态的偏差见 rpc.rs 模块文档 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示 |
@@ -39,7 +39,7 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 
 默认模型为 `mimo/mimo-v2.6-pro`。在 `.env` 中设置 `MIMO_API_KEY=你的Token Plan密钥` 后即可运行。默认地址为 `https://token-plan-cn.xiaomimimo.com/v1`；如订阅页面提供不同地址，可设置 `MIMO_BASE_URL`。Token Plan 密钥和按量付费密钥不可混用，请以订阅页面的凭证为准。
 
-设置 `OPENAI_API_KEY` 后运行 `cargo run -p pi-coding-agent -- -p "你好" -m openai/gpt-5.2`。也可在 `~/.pi-rs/agent/models.json` 中使用 `providers` 数组配置 `name`、`api`（`openai-completions`）、`base_url` 和 `models`（含 `id`），再通过 `-m provider/model-id` 选择。自定义接口当前同样读取 `OPENAI_API_KEY`。响应当前在完整接收后显示，尚不支持增量流式输出。
+设置 `OPENAI_API_KEY` 后运行 `cargo run -p pi-coding-agent -- -p "你好" -m openai/gpt-5.2`。也可在 `~/.pi-rs/agent/models.json` 中使用 `providers` 数组配置 `name`、`api`（`openai-completions`）、`base_url` 和 `models`（含 `id`），再通过 `-m provider/model-id` 选择。自定义接口当前同样读取 `OPENAI_API_KEY`。响应支持增量流式输出。
 
 也可在当前目录或其父目录的 `.env` 中设置 `OPENAI_API_KEY=你的密钥`。启动时自动加载，已有环境变量优先；`.env` 已加入 Git 忽略列表。
 
@@ -53,8 +53,8 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 | `pi-chord` | `packages/chord` | 占位 | 插件宿主 / 复制状态 / JSON 链路 RPC |
 | `pi-tui` | `packages/tui` | **核心可用** | ratatui + crossterm 上的组件体系：`Component` trait、多行 emacs 风格 `Editor`（词导航/kill/`\` 续行）、`ScrollView`、pulldown-cmark `Markdown`（对照 markdown.ts）、fuzzy 匹配 + `SelectList`、`Theme`（含 md 配色）、终端生命周期 |
 | `pi-codemode` | `packages/codemode` | 占位 | 沙箱脚本执行，仅能调用注入的工具 |
-| `pi-mcp` | `packages/mcp` | 骨架 | MCP 客户端：JSON-RPC 协议类型、transport trait（stdio/streamable-http 桩、in-memory 实现）、client |
-| `pi-ai` | `packages/ai` | **核心完成** | 归一化消息模型、`AssistantMessageEvent` 流协议、模型目录、provider 适配器注册（OpenAI Chat Completions、mock；Anthropic 为桩） |
+| `pi-mcp` | `packages/mcp` | 骨架 | MCP 客户端：JSON-RPC 协议类型、transport trait（stdio、streamable-http 和 in-memory 实现）、client |
+| `pi-ai` | `packages/ai` | **核心完成** | 归一化消息模型、`AssistantMessageEvent` 流协议、模型目录、provider 适配器注册（OpenAI Chat Completions、Anthropic Messages 和 mock） |
 | `pi-durable` | `packages/durable` | 占位 | 持久会话 / 任务 / 文档运行时 |
 | `pi-env` | `packages/env` | **本地实现** | `EnvConnection` 抽象（exec/read/write/list/watch），本地实现完整，SSH 远程为桩 |
 | `pi-agent` | `packages/agent` | **核心完成** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent` |
@@ -84,7 +84,7 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 1. **providers** — anthropic-messages（SSE）、openai-completions/responses（工具调用增量、reasoning content、compat 覆盖）、google-generative-ai；models 目录 hydrate 与 pi models.json 完全互通；auth.json/OAuth。
 2. **agent loop 完整化** — 并行工具执行（JoinSet 预检/并发）、`prepare_request`/`finish_turn`/`prepare_next_turn`/`after_tool_call` hook、错误自动重试。
 3. **session/compaction** — resume（`--continue`/`--session`）、分支树投影（`/tree`）、compaction（token 预算 + 摘要）、HTML 导出。
-4. **MCP** — stdio/streamable-http transport 实装、OAuth、`mcp__<server>__<tool>` 注册进 agent、`/mcp` UI。
+4. **MCP** — streamable-http 的 POST SSE 续传、OAuth、`mcp__<server>__<tool>` 注册进 agent、`/mcp` UI。
 5. **TUI 完善** — 已完成 markdown+cmark 渲染、模型选择器浮层、footer、工具展开；剩余：keybindings.json、主题文件（theme.schema.json）、语法高亮、外部编辑器（ctrl+g）、图片粘贴、会话/设置选择器。
 6. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。

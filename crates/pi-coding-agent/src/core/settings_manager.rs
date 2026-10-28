@@ -20,6 +20,31 @@ pub struct Settings {
 	pub theme: Option<String>,
 	pub external_editor: Option<String>,
 	pub shell_path: Option<String>,
+	pub compaction: Option<CompactionSettings>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CompactionSettings {
+	pub enabled: Option<bool>,
+	pub reserve_tokens: Option<u64>,
+	pub keep_recent_tokens: Option<u64>,
+}
+
+impl CompactionSettings {
+	fn merged(project: Option<&Self>, global: Option<&Self>) -> Self {
+		Self {
+			enabled: project
+				.and_then(|s| s.enabled)
+				.or_else(|| global.and_then(|s| s.enabled)),
+			reserve_tokens: project
+				.and_then(|s| s.reserve_tokens)
+				.or_else(|| global.and_then(|s| s.reserve_tokens)),
+			keep_recent_tokens: project
+				.and_then(|s| s.keep_recent_tokens)
+				.or_else(|| global.and_then(|s| s.keep_recent_tokens)),
+		}
+	}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +88,10 @@ impl SettingsManager {
 	/// Effective settings: project over global, `None`s fall through.
 	pub fn effective(&self) -> Settings {
 		Settings {
+			compaction: Some(CompactionSettings::merged(
+				self.project.compaction.as_ref(),
+				self.global.compaction.as_ref(),
+			)),
 			default_provider: self
 				.project
 				.default_provider
@@ -109,4 +138,28 @@ impl SettingsManager {
 fn load_settings(path: &std::path::Path) -> Option<Settings> {
 	let text = std::fs::read_to_string(path).ok()?;
 	serde_json::from_str(&text).ok()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn compaction_merges_individual_settings() {
+		let global: Settings = serde_json::from_str(
+			r#"{"compaction":{"enabled":false,"reserveTokens":100,"keepRecentTokens":200}}"#,
+		)
+		.unwrap();
+		let project: Settings =
+			serde_json::from_str(r#"{"compaction":{"reserveTokens":50}}"#).unwrap();
+		let merged =
+			CompactionSettings::merged(project.compaction.as_ref(), global.compaction.as_ref());
+		assert_eq!(
+			(
+				merged.enabled,
+				merged.reserve_tokens,
+				merged.keep_recent_tokens
+			),
+			(Some(false), Some(50), Some(200))
+		);
+	}
 }

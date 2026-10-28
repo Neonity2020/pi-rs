@@ -593,7 +593,7 @@ impl InteractiveMode {
 				}
 				self.chat.scroll_to_bottom(usize::MAX);
 			}
-			AgentEvent::MessageUpdate { message } => {
+			AgentEvent::MessageUpdate { message, .. } => {
 				if let Message::Assistant(assistant) = &message
 					&& let Some(ChatBlock::Assistant {
 						text,
@@ -687,23 +687,27 @@ impl InteractiveMode {
 				});
 				self.chat.scroll_to_bottom(usize::MAX);
 			}
+			AgentEvent::ToolExecutionUpdate {
+				tool_call_id,
+				partial_result,
+				..
+			} => {
+				if let Some(ChatBlock::Tool {
+					output, rendered, ..
+				}) = self.blocks.iter_mut().rev().find(
+					|b| matches!(b, ChatBlock::Tool { id, running: true, .. } if *id == tool_call_id),
+				) {
+					*output = tool_result_text(&partial_result);
+					*rendered = None;
+				}
+			}
 			AgentEvent::ToolExecutionEnd {
 				tool_call_id,
 				result,
 				is_error: is_error_,
 				..
 			} => {
-				let output = result
-					.get("content")
-					.and_then(|c| c.as_array())
-					.map(|items| {
-						items
-							.iter()
-							.filter_map(|item| item.as_str())
-							.collect::<Vec<_>>()
-							.join("\n")
-					})
-					.unwrap_or_default();
+				let output = tool_result_text(&result);
 				if let Some(ChatBlock::Tool {
 					running,
 					is_error,
@@ -722,9 +726,7 @@ impl InteractiveMode {
 					*duration_ms = started.map(|s| s.elapsed().as_millis());
 				}
 			}
-			AgentEvent::TurnStart
-			| AgentEvent::TurnEnd { .. }
-			| AgentEvent::ToolExecutionUpdate { .. } => {}
+			AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
 		}
 	}
 
@@ -1073,6 +1075,23 @@ impl InteractiveMode {
 	}
 }
 
+fn tool_result_text(result: &serde_json::Value) -> String {
+	result
+		.get("content")
+		.and_then(|c| c.as_array())
+		.map(|items| {
+			items
+				.iter()
+				.filter_map(|item| {
+					item.as_str()
+						.or_else(|| item.get("text").and_then(|v| v.as_str()))
+				})
+				.collect::<Vec<_>>()
+				.join("\n")
+		})
+		.unwrap_or_default()
+}
+
 /// Assistant message lines (assistant-message.ts): thinking block first
 /// (ctrl+t collapses it to a label), then the markdown text, then stopReason
 /// notes for truncation/abort/error.
@@ -1217,7 +1236,12 @@ fn render_tool_block(
 		} else {
 			Style::new().fg(theme.tool_output)
 		};
-		for line in out_lines.iter().take(shown) {
+		let start = if running && !tools_expanded {
+			out_lines.len() - shown
+		} else {
+			0
+		};
+		for line in out_lines.iter().skip(start).take(shown) {
 			lines.push(Line::from(Span::styled(format!("    {line}"), out_style)));
 		}
 		let remaining = out_lines.len() - shown;
@@ -1326,6 +1350,18 @@ mod tests {
 	use super::*;
 	use pi_tui::keybindings::KeybindingsManager;
 	use pi_tui::parse_chord;
+
+	#[test]
+	fn tool_result_text_handles_partial_and_final_content() {
+		assert_eq!(
+			tool_result_text(&serde_json::json!({"content": [{"type":"text", "text":"running"}]})),
+			"running"
+		);
+		assert_eq!(
+			tool_result_text(&serde_json::json!({"content": ["done"]})),
+			"done"
+		);
+	}
 
 	fn key_event(chord: &str) -> KeyEvent {
 		parse_chord(chord).unwrap().to_key_event()

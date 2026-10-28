@@ -248,6 +248,39 @@ async fn text_deltas_arrive_incrementally_and_assemble() {
 }
 
 #[tokio::test]
+async fn tool_call_start_waits_for_identity_and_preserves_early_arguments() {
+	let base = serve_raw(vec![sse_response(&[
+		frame(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":"}}]}}]}"#),
+		frame(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"1}"}}]}}]}"#),
+		frame(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+		"[DONE]\n\n".to_string(),
+	], true)]).await;
+	let events = collect(stream_for(&base)).await;
+	let start = events
+		.iter()
+		.position(|event| matches!(event, AssistantMessageEvent::ToolCallStart { .. }))
+		.unwrap();
+	let AssistantMessageEvent::ToolCallStart { partial, .. } = &events[start] else {
+		unreachable!()
+	};
+	assert_eq!(partial.tool_calls()[0].id, "call_1");
+	assert_eq!(partial.tool_calls()[0].name, "lookup");
+	let deltas: String = events
+		.iter()
+		.filter_map(|event| match event {
+			AssistantMessageEvent::ToolCallDelta { delta, .. } => Some(delta.as_str()),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(deltas, "{\"x\":1}");
+	assert!(
+		events[..start]
+			.iter()
+			.all(|event| !matches!(event, AssistantMessageEvent::ToolCallDelta { .. }))
+	);
+}
+
+#[tokio::test]
 async fn tool_call_deltas_accumulate_into_complete_calls() {
 	let base = serve_raw(vec![sse_response(
 		&[

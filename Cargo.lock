@@ -1031,6 +1031,7 @@ dependencies = [
  "libc",
  "pi-agent",
  "pi-ai",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

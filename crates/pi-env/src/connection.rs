@@ -22,7 +22,10 @@ pub struct DirEntryInfo {
 	pub size: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Receives raw output chunks from either stream as they arrive.
+pub type OutputCallback = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct ExecOptions {
 	/// Working directory for the command.
 	pub cwd: Option<String>,
@@ -30,6 +33,8 @@ pub struct ExecOptions {
 	pub timeout_ms: Option<u64>,
 	/// Extra environment variables.
 	pub env: Vec<(String, String)>,
+	/// Optional incremental output observer. Output is still captured normally.
+	pub on_output: Option<OutputCallback>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

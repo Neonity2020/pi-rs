@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use pi_agent::{AgentTool, AgentToolResult};
 use pi_mcp::transports::stdio::StdioTransport;
+use pi_mcp::transports::streamable_http::StreamableHttpTransport;
 use pi_mcp::{McpClient, McpTool, SharedMcpClient};
 
 use crate::core::mcp_config::{McpConfig, McpServerEntry};
@@ -160,12 +161,17 @@ fn tool_summary(tools: &[McpTool]) -> String {
 /// transport owns the child's process group, so a dropped future (startup
 /// timeout) or a dropped client cleans the server up.
 async fn connect_one(entry: &McpServerEntry) -> anyhow::Result<(SharedMcpClient, Vec<McpTool>)> {
-	let mut transport =
-		StdioTransport::new(entry.command.clone(), entry.args.clone(), entry.env.clone());
-	if let Some(cwd) = &entry.cwd {
-		transport = transport.with_cwd(cwd);
-	}
-	let mut client = McpClient::new(entry.name.clone(), Box::new(transport));
+	let transport: Box<dyn pi_mcp::Transport> = if let Some(url) = &entry.url {
+		Box::new(StreamableHttpTransport::new(url, entry.headers.clone()))
+	} else {
+		let mut transport =
+			StdioTransport::new(entry.command.clone(), entry.args.clone(), entry.env.clone());
+		if let Some(cwd) = &entry.cwd {
+			transport = transport.with_cwd(cwd);
+		}
+		Box::new(transport)
+	};
+	let mut client = McpClient::new(entry.name.clone(), transport);
 	client.initialize(crate::config::VERSION).await?;
 	let client: SharedMcpClient = Arc::new(tokio::sync::Mutex::new(client));
 	let tools = McpTool::all_for(&client).await?;
@@ -324,6 +330,83 @@ done
 			.await;
 		assert!(after.is_error);
 		assert!(text_of(&after).contains("closed"), "{}", text_of(&after));
+	}
+
+	#[tokio::test]
+	async fn http_config_connects_and_calls_tool() {
+		use std::io::{Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let server = std::thread::spawn(move || {
+			for stream in listener.incoming().take(5) {
+				let mut stream = stream.unwrap();
+				stream
+					.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+					.unwrap();
+				let mut bytes = Vec::new();
+				loop {
+					let mut chunk = [0; 4096];
+					let n = stream.read(&mut chunk).unwrap();
+					if n == 0 {
+						break;
+					}
+					bytes.extend_from_slice(&chunk[..n]);
+					if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+						let head = String::from_utf8_lossy(&bytes[..end]);
+						let len = head
+							.lines()
+							.find_map(|l| {
+								l.to_ascii_lowercase()
+									.strip_prefix("content-length: ")
+									.and_then(|n| n.parse::<usize>().ok())
+							})
+							.unwrap_or(0);
+						if bytes.len() >= end + 4 + len {
+							break;
+						}
+					}
+				}
+				let request = String::from_utf8(bytes).unwrap();
+				assert!(request.to_ascii_lowercase().contains("x-test: secret"));
+				let (status, body) = if request.starts_with("GET ") {
+					("405 Method Not Allowed", String::new())
+				} else {
+					let body = request.split_once("\r\n\r\n").unwrap().1;
+					let frame: Value = serde_json::from_str(body).unwrap();
+					let id = frame["id"].clone();
+					match frame["method"].as_str().unwrap() {
+						"notifications/initialized" => ("202 Accepted", String::new()),
+						"initialize" => ("200 OK", json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}).to_string()),
+						"tools/list" => ("200 OK", json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}).to_string()),
+						"tools/call" => ("200 OK", json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"HTTP works"}]}}).to_string()),
+						other => panic!("unexpected method {other}"),
+					}
+				};
+				write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+			}
+		});
+		let path = write_config(
+			"http",
+			json!({"mcpServers":{"web":{"url":url,"headers":{"X-Test":"secret"}}}}),
+		);
+		let config = load_mcp_config_from(&path);
+		remove_config(&path);
+		assert!(config.errors.is_empty(), "{:?}", config.errors);
+		let assembly = connect_mcp_servers(&config).await;
+		assert!(
+			assembly
+				.notices
+				.iter()
+				.any(|notice| notice.contains("connected")),
+			"{:?}",
+			assembly.notices
+		);
+		let result = assembly.tools[0]
+			.execute("id", json!({}), CancellationToken::new(), None)
+			.await;
+		assert_eq!(text_of(&result), "HTTP works");
+		assembly.shutdown().await;
+		server.join().unwrap();
 	}
 
 	#[tokio::test]

@@ -155,3 +155,74 @@ async fn abort_stops_stream_and_releases_agent() {
 	};
 	assert_eq!(reply.stop_reason, StopReason::Aborted);
 }
+
+struct UpdatingTool {
+	callback: std::sync::Mutex<Option<ToolUpdate>>,
+}
+
+#[async_trait]
+impl AgentTool for UpdatingTool {
+	fn name(&self) -> &str {
+		"ls"
+	}
+	fn description(&self) -> &str {
+		"List files"
+	}
+	fn parameters_schema(&self) -> Value {
+		json!({"type": "object"})
+	}
+	async fn execute(
+		&self,
+		_: &str,
+		_: Value,
+		_: CancellationToken,
+		on_update: Option<ToolUpdate>,
+	) -> AgentToolResult {
+		let callback = on_update.expect("update callback");
+		let mut partial = AgentToolResult::text("partial");
+		partial.details = Some(json!({"count": 1}));
+		partial.structured_content = Some(json!({"item": "a"}));
+		callback(partial);
+		*self.callback.lock().unwrap() = Some(callback);
+		let mut result = AgentToolResult::text("done");
+		result.structured_content = Some(json!({"final": true}));
+		result
+	}
+}
+
+#[tokio::test]
+async fn tool_updates_preserve_result_and_stop_after_execution() {
+	let tool = Arc::new(UpdatingTool {
+		callback: std::sync::Mutex::new(None),
+	});
+	let agent = mock_agent(vec![tool.clone()]);
+	let mut events = agent.subscribe();
+	agent.prompt("list files".into()).await.unwrap();
+	tool.callback.lock().unwrap().as_ref().unwrap()(AgentToolResult::text("late"));
+	let mut lifecycle = Vec::new();
+	while let Ok(event) = events.try_recv() {
+		match event {
+			AgentEvent::ToolExecutionStart { .. } => lifecycle.push("start"),
+			AgentEvent::ToolExecutionUpdate {
+				tool_name,
+				args,
+				partial_result,
+				..
+			} => {
+				lifecycle.push("update");
+				assert_eq!(tool_name, "ls");
+				assert_eq!(args["path"], ".");
+				assert_eq!(partial_result["content"][0]["text"], "partial");
+				assert_eq!(partial_result["details"]["count"], 1);
+				assert_eq!(partial_result["structuredContent"]["item"], "a");
+			}
+			AgentEvent::ToolExecutionEnd { result, .. } => {
+				lifecycle.push("end");
+				assert_eq!(result["content"][0], json!({"type":"text", "text":"done"}));
+				assert_eq!(result["structuredContent"]["final"], true);
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(lifecycle, ["start", "update", "end"]);
+}

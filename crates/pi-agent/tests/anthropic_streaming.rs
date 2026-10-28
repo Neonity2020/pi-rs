@@ -255,7 +255,7 @@ async fn anthropic_deltas_drive_message_updates_and_tool_round_trip() {
 	let mut assistant_ends = 0;
 	while let Ok(event) = events.try_recv() {
 		match event {
-			AgentEvent::MessageUpdate { message } => {
+			AgentEvent::MessageUpdate { message, .. } => {
 				updates += 1;
 				assert!(matches!(message, Message::Assistant(_)));
 			}
@@ -314,7 +314,7 @@ async fn thinking_then_text_streams_both_blocks_through_the_loop() {
 
 	let mut saw_thinking_update = false;
 	while let Ok(event) = events.try_recv() {
-		if let AgentEvent::MessageUpdate { message } = event {
+		if let AgentEvent::MessageUpdate { message, .. } = event {
 			let Message::Assistant(partial) = message else {
 				continue;
 			};

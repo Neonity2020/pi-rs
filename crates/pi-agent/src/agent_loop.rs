@@ -73,16 +73,24 @@ impl Default for LoopOptions {
 
 /// Serialized summary of a tool result for `tool_execution_end` events.
 fn result_summary(result: &AgentToolResult) -> serde_json::Value {
-	serde_json::json!({
-		"isError": result.is_error,
-		"terminate": result.terminate,
-		"content": result
-			.content
-			.iter()
-			.filter_map(|c| c.text_content())
-			.collect::<Vec<_>>(),
-		"details": result.details.clone().unwrap_or(serde_json::Value::Null),
-	})
+	let mut value = serde_json::json!({"content": result.content});
+	let object = value.as_object_mut().expect("object");
+	if let Some(details) = &result.details {
+		object.insert("details".into(), details.clone());
+	}
+	if let Some(content) = &result.structured_content {
+		object.insert("structuredContent".into(), content.clone());
+	}
+	if let Some(usage) = &result.usage {
+		object.insert("usage".into(), serde_json::json!(usage));
+	}
+	if result.is_error {
+		object.insert("isError".into(), true.into());
+	}
+	if result.terminate {
+		object.insert("terminate".into(), true.into());
+	}
+	value
 }
 
 fn emit(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
@@ -107,6 +115,67 @@ fn append_with_events(run: &AgentLoopRun, message: Message) {
 /// Run the agent loop to completion. Appends `prompt_messages` to the
 /// transcript (with lifecycle events), then streams turns until the exit
 /// conditions above. Emits `AgentStart` first and `AgentEnd` last.
+fn assistant_event_json(event: &AssistantMessageEvent) -> serde_json::Value {
+	use AssistantMessageEvent as E;
+	let mut value = match event {
+		E::TextStart { content_index, .. } => {
+			serde_json::json!({"type":"text_start", "contentIndex": content_index})
+		}
+		E::TextDelta {
+			content_index,
+			delta,
+			..
+		} => serde_json::json!({"type":"text_delta", "contentIndex": content_index, "delta":delta}),
+		E::TextEnd {
+			content_index,
+			content,
+			..
+		} => {
+			serde_json::json!({"type":"text_end", "contentIndex": content_index, "content":content})
+		}
+		E::ThinkingStart { content_index, .. } => {
+			serde_json::json!({"type":"thinking_start", "contentIndex": content_index})
+		}
+		E::ThinkingDelta {
+			content_index,
+			delta,
+			..
+		} => {
+			serde_json::json!({"type":"thinking_delta", "contentIndex": content_index, "delta":delta})
+		}
+		E::ThinkingEnd {
+			content_index,
+			partial,
+		} => {
+			let content = match partial.content.get(*content_index) {
+				Some(pi_ai::AssistantContent::Thinking(thinking)) => thinking.thinking.as_str(),
+				_ => "",
+			};
+			serde_json::json!({"type":"thinking_end", "contentIndex": content_index, "content":content})
+		}
+		E::ToolCallStart { content_index, .. } => {
+			serde_json::json!({"type":"toolcall_start", "contentIndex": content_index})
+		}
+		E::ToolCallDelta {
+			content_index,
+			delta,
+			..
+		} => {
+			serde_json::json!({"type":"toolcall_delta", "contentIndex": content_index, "delta":delta})
+		}
+		E::ToolCallEnd {
+			content_index,
+			tool_call,
+			..
+		} => {
+			serde_json::json!({"type":"toolcall_end", "contentIndex": content_index, "toolCall":tool_call})
+		}
+		_ => unreachable!("only non-terminal update events are forwarded"),
+	};
+	value["partial"] = serde_json::json!(event.partial());
+	value
+}
+
 pub async fn run_agent_loop(
 	run: &AgentLoopRun,
 	prompt_messages: Vec<Message>,
@@ -171,7 +240,13 @@ pub async fn run_agent_loop(
 				| AssistantMessageEvent::ToolCallStart { .. } => {
 					let message = Message::Assistant(event.partial().clone());
 					*run.streaming.write().unwrap() = Some(message.clone());
-					emit(&run.event_tx, AgentEvent::MessageUpdate { message });
+					emit(
+						&run.event_tx,
+						AgentEvent::MessageUpdate {
+							message,
+							assistant_message_event: assistant_event_json(&event),
+						},
+					);
 				}
 				AssistantMessageEvent::TextDelta { .. }
 				| AssistantMessageEvent::ThinkingDelta { .. }
@@ -181,7 +256,13 @@ pub async fn run_agent_loop(
 				| AssistantMessageEvent::ToolCallEnd { .. } => {
 					let message = Message::Assistant(event.partial().clone());
 					*run.streaming.write().unwrap() = Some(message.clone());
-					emit(&run.event_tx, AgentEvent::MessageUpdate { message });
+					emit(
+						&run.event_tx,
+						AgentEvent::MessageUpdate {
+							message,
+							assistant_message_event: assistant_event_json(&event),
+						},
+					);
 				}
 				AssistantMessageEvent::Done { message, .. } => {
 					final_message = Some(message);
@@ -234,14 +315,58 @@ pub async fn run_agent_loop(
 				let tool = run.tools.iter().find(|t| t.name() == tool_call.name);
 				let result = match tool {
 					Some(tool) => {
-						let on_update: Option<ToolUpdate> = None; // wired with streaming tool output
-						tool.execute(
-							&tool_call.id,
-							tool_call.arguments.clone(),
-							signal.clone(),
-							on_update,
-						)
-						.await
+						let tool_call_id = tool_call.id.clone();
+						let tool_name = tool_call.name.clone();
+						let args = tool_call.arguments.clone();
+						let event_tx = run.event_tx.clone();
+						// A retained callback must not emit after execute has settled. The
+						// lock also orders an in-flight update before tool_execution_end.
+						let accepting = Arc::new(std::sync::Mutex::new(true));
+						let callback_accepting = accepting.clone();
+						let on_update: Option<ToolUpdate> =
+							Some(Arc::new(move |partial: AgentToolResult| {
+								let guard =
+									callback_accepting.lock().unwrap_or_else(|e| e.into_inner());
+								if !*guard {
+									return;
+								}
+								let mut result = serde_json::json!({"content": partial.content});
+								let object = result.as_object_mut().expect("object");
+								if let Some(details) = partial.details {
+									object.insert("details".into(), details);
+								}
+								if let Some(content) = partial.structured_content {
+									object.insert("structuredContent".into(), content);
+								}
+								if let Some(usage) = partial.usage {
+									object.insert("usage".into(), serde_json::json!(usage));
+								}
+								if partial.is_error {
+									object.insert("isError".into(), true.into());
+								}
+								if partial.terminate {
+									object.insert("terminate".into(), true.into());
+								}
+								emit(
+									&event_tx,
+									AgentEvent::ToolExecutionUpdate {
+										tool_call_id: tool_call_id.clone(),
+										tool_name: tool_name.clone(),
+										args: args.clone(),
+										partial_result: result,
+									},
+								);
+							}));
+						let result = tool
+							.execute(
+								&tool_call.id,
+								tool_call.arguments.clone(),
+								signal.clone(),
+								on_update,
+							)
+							.await;
+						*accepting.lock().unwrap_or_else(|e| e.into_inner()) = false;
+						result
 					}
 					None => AgentToolResult::error(format!(
 						"unknown tool: {} (not in the active tool set)",

@@ -18,7 +18,7 @@ use clap::Parser;
 use pi_agent::{Agent, AgentOptions};
 use pi_ai::ThinkingLevel;
 
-use crate::core::agent_session::{restore_initial_messages, spawn_agent_session};
+use crate::core::agent_session::{restore_initial_messages, spawn_agent_session_with_settings};
 use crate::core::mcp_config;
 use crate::core::model_registry::ModelRegistry;
 use crate::core::session_manager::{
@@ -164,7 +164,12 @@ async fn main() -> anyhow::Result<()> {
 	});
 
 	let registry = Arc::new(Mutex::new(registry));
-	let handle = spawn_agent_session(agent, session, registry.clone());
+	let handle = spawn_agent_session_with_settings(
+		agent,
+		session,
+		registry.clone(),
+		settings.compaction.unwrap_or_default(),
+	);
 
 	if cli.rpc {
 		for notice in mcp.notices.drain(..) {
