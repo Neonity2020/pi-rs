@@ -10,7 +10,8 @@ docs/
 ├── user/                              # 用户指南
 │   ├── quickstart.md                  # 构建、安装与运行模式
 │   ├── configuration.md               # 环境变量、模型与设置配置
-│   └── tools.md                       # 内置 7 大工具规格与安全边界
+│   ├── tools.md                       # 内置 7 大工具规格与安全边界
+│   └── tutorial-series.md             # 系列教程（9 章，跟着构建进度由用到改）
 ├── internals/                         # 架构与内部设计
 │   ├── overview.md                    # 整体架构、分层与数据流
 │   ├── agent-loop.md                  # 代理循环、消息流与 Steering 机制
@@ -25,5 +26,6 @@ docs/
 ## 阅读路径
 
 1. **快速上手**：阅读 [user/quickstart.md](./user/quickstart.md) 与 [user/configuration.md](./user/configuration.md)。
-2. **理解架构**：从 [internals/overview.md](./internals/overview.md) 开始，依次阅读 [internals/agent-loop.md](./internals/agent-loop.md) 和 [internals/session-and-persistence.md](./internals/session-and-persistence.md)。
-3. **贡献代码**：参考 [operations/development.md](./operations/development.md) 了解代码格式化、Clippy 严格门禁与测试要求。
+2. **系统学习**：跟随 [user/tutorial-series.md](./user/tutorial-series.md) 的 9 章系列教程，从零配置演练一路到 RPC 集成与架构漫游。
+3. **理解架构**：从 [internals/overview.md](./internals/overview.md) 开始，依次阅读 [internals/agent-loop.md](./internals/agent-loop.md) 和 [internals/session-and-persistence.md](./internals/session-and-persistence.md)。
+4. **贡献代码**：参考 [operations/development.md](./operations/development.md) 了解代码格式化、Clippy 严格门禁与测试要求。
