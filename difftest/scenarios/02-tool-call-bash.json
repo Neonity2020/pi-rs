@@ -1,0 +1,70 @@
+{
+	"name": "02-tool-call-bash",
+	"description": "Assistant requests a bash tool call (split across deltas), agent executes it against the fixture cwd, result is sent back and a final text reply is streamed.",
+	"model": "difftest/difftest-model",
+	"prompt": "Show me hello.txt",
+	"fixtureFiles": { "hello.txt": "hello world\n" },
+	"turns": [
+		{
+			"assertRequest": {
+				"model": "difftest-model",
+				"stream": true,
+				"lastMessageRole": "user"
+			},
+			"sse": [
+				{
+					"choices": [
+						{
+							"index": 0,
+							"delta": {
+								"role": "assistant",
+								"tool_calls": [
+									{ "index": 0, "id": "call_diff_1", "type": "function", "function": { "name": "bash", "arguments": "" } }
+								]
+							},
+							"finish_reason": null
+						}
+					]
+				},
+				{
+					"choices": [
+						{
+							"index": 0,
+							"delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"comma" } }] },
+							"finish_reason": null
+						}
+					]
+				},
+				{
+					"choices": [
+						{
+							"index": 0,
+							"delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "nd\":\"cat hello.txt\"}" } }] },
+							"finish_reason": null
+						}
+					]
+				},
+				{
+					"choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+					"usage": { "prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30 }
+				}
+			]
+		},
+		{
+			"assertRequest": {
+				"model": "difftest-model",
+				"stream": true,
+				"lastMessageRole": "toolResult"
+			},
+			"sse": [
+				{ "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }] },
+				{ "choices": [{ "index": 0, "delta": { "content": "FILE CONTENT: hello world" }, "finish_reason": null }] },
+				{
+					"choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+					"usage": { "prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48 }
+				}
+			]
+		}
+	],
+	"expect": { "exitCode": 0, "finalText": "FILE CONTENT: hello world" }
+}
