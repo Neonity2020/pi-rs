@@ -18,18 +18,20 @@ Rust 基线：`4106a9c`（第五轮冲刺已推送，远程 CI 三 job 全过）
 
 源码盘点之外，差分测试（见下）提供了 wire 级行为证据。
 
-## 差分测试首轮发现（2026-10-28）
+## 差分测试发现（P1 后收敛，2026-10-28）
 
-框架：`difftest/`（场景脚本 + 回放服务器 + 归一化对比），上游 bundle `1.4.0`（快照 SHA 构建）vs `target/debug/pi-rs`。两个场景（单轮文本、bash 工具往返）双侧均跑通：exit 0、最终文本一致、轮数一致。规范视图（剥 id/时间戳/系统提示）下共 **31 处差异**，按类别归并：
+框架：`difftest/`（场景脚本 + 回放服务器 + 归一化对比），上游 bundle `1.4.0`（快照 SHA 构建）vs `target/debug/pi-rs`。**四个场景全部双侧通过**（单轮文本、bash 工具往返、多轮工具三请求、阈值压缩→压缩请求→压缩后第二条 prompt）。
 
-| # | 差异 | 证据（artifacts/report.json） | 定性 |
+P0 首轮 31 处差异 → P1 集成后 **39 处，且全部收敛为两个已记录的结构性类别**；语义级差异（消息序列、事件顺序、退出码、最终文本、压缩流程）清零：
+
+| # | 剩余差异 | 处数 | 归属 |
 |---|---|---|---|
-| 1 | **默认工具集不同**：TS 请求带 4 个工具（bash/edit/read/write），Rust 带 7 个（另有 find/grep/ls） | `$.requests[0].toolNames` | 行为差异——上游默认只暴露 4 件套，`--tools` 才扩；Rust 固定全量 |
-| 2 | **user 消息 wire 形状**：TS 发块数组 `[{"type":"text","text":…}]`，Rust 发纯字符串 | `$.requests[0].messages[1].content` | provider wire 差异（对多数 OpenAI 兼容后端等价，但与上游请求不可逐字节对齐） |
-| 3 | **工具结果 wire 形状**：TS 发裸字符串（保留尾换行 `"hello world\n"`），Rust 发 `[{"type":"text","text":"hello world"}]`（剥尾换行） | `$.requests[1].messages[3].content` | 同上，且尾换行处理不同 |
-| 4 | **会话文件结构完全不兼容**：TS 首行 `{type:"session",version:3,id,…}` + `model_change`/`thinking_level_change`/system checkpoint entry（6–8 entries）；Rust `{type:"header",version:1,…}` 扁平 message log（3–5 entries） | `$.session[*]` | 证实矩阵「会话格式整体不兼容」：双向互读不可行 |
+| 1 | **默认工具集**：TS 默认 4 工具（bash/edit/read/write），Rust 固定 7 个 | 24 | P2：CLI `--tools` 参数 |
+| 2 | **user/toolResult 消息 content 形状**：TS 块数组（toolResult 保留尾换行），Rust 纯字符串 | 15 | P2：pi-ai UserMessage/ToolResultMessage wire 形状对齐 |
 
-意义：#1–#3 是 provider 请求形状/默认配置差异（修正成本中低），#4 是结构差异（需要实现上游 session 格式 + 迁移管线）。每轮扩面后更新本表与明细文档。
+P1 交付在差分中的实证：SUMMARIZATION_PROMPT 与压缩 summary 前缀**逐字一致**；会话格式 v3 树互通后 `type:"session"`/entry 链对齐（含启动时 `model_change`/`thinking_level_change`）；归一化规则中两项等价处理有据：system entry 不持久化（Rust 恢复时重建 system prompt，已知差异）与 usage.reasoning 缺省视为 0（TS 恒序列化 0）。
+
+历史首轮发现（P0 时点，现已修复的不再列出）：默认工具集（上表 #1）、消息 content 形状（上表 #2）、会话文件完全不兼容（已由会话格式 v3 落地修复）。
 
 ## 源码盘点发现的高风险项（P1 候选，按风险排序）
 

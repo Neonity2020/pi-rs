@@ -61,7 +61,8 @@ export function canonicalSession(text) {
 			out.push({ type: "<unparseable>" });
 			continue;
 		}
-		out.push(canonicalEntry(entry));
+		const canonical = canonicalEntry(entry);
+		if (canonical !== null) out.push(canonical);
 	}
 	return out;
 }
@@ -70,6 +71,12 @@ function canonicalEntry(entry) {
 	const type = entry.type || (entry.role ? "message" : "<unknown>");
 	if (type === "header") return { type: "header" };
 	if (type === "message" && entry.message) {
+		// System messages are an implementation detail at P0: the TS pi
+		// persists them (with sections), pi-rs re-seeds the system prompt on
+		// resume instead (recorded divergence). Drop them entirely so
+		// transcript alignment is not shifted by their presence; the
+		// persistence divergence is tracked in the compat matrix.
+		if (entry.message.role === "system") return null;
 		return { type: "message", message: canonicalMessage(entry.message) };
 	}
 	if (entry.message && (entry.message.role === "user" || entry.message.role === "assistant")) {
@@ -92,7 +99,13 @@ export function canonicalMessage(message) {
 			.sort((a, b) => a.name.localeCompare(b.name) || JSON.stringify(a.arguments).localeCompare(JSON.stringify(b.arguments)));
 	}
 	if (message.stopReason !== undefined) out.stopReason = message.stopReason;
-	if (message.usage) out.usage = canonicalize(message.usage);
+	if (message.usage) {
+		const usage = canonicalize(message.usage);
+		// The TS pi always serializes reasoning tokens (0 when unreported);
+		// pi-rs omits the field when the provider sends none. Missing = 0.
+		if (usage.reasoning === undefined) usage.reasoning = 0;
+		out.usage = usage;
+	}
 	if (message.providerId !== undefined) out.providerId = message.providerId;
 	if (message.modelId !== undefined) out.modelId = message.modelId;
 	return out;

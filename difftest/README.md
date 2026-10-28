@@ -62,3 +62,22 @@ PI_RS_BIN=/path/to/pi-rs node run.mjs   # 指定 Rust 二进制
 ## 首轮结果（2026-10-28）
 
 两个场景双侧均可跑通（exit 0、最终文本一致、轮数一致），规范视图下共 31 处差异，已录入 `docs/operations/compatibility-v1.4.md` 的「差分发现」。新增场景即可扩充覆盖面；每轮扩面后更新兼容矩阵对应行。
+
+## 场景清单（P1 扩面）
+
+| 场景 | 覆盖 | 状态（2026-10-28） |
+|---|---|---|
+| 01-single-turn-echo | 单轮文本流、usage 解析、print 输出、会话落盘 | 双侧跑通，差异已录矩阵 |
+| 02-tool-call-bash | 工具调用分片、工具执行、二轮请求 | 双侧跑通，差异已录矩阵 |
+| 03-multi-turn-tools | 三请求两工具顺序往返、toolResult 累积顺序 | TS 侧验证通过；Rust 侧随 P1 集成验证 |
+| 04-compaction-continues | 阈值自动压缩（大回复+高 usage 触发）、压缩请求、压缩后第二条 prompt | TS 侧验证通过；Rust 侧依赖 print 多 prompt 对齐与 models.json context_window，集成时验证 |
+
+### 场景 04 调试挖出的上游语义（P1 审计备注）
+
+1. **models.json 条目必须显式写 `contextWindow`**：上游对自定义条目取 `contextWindow ?? 0`（agent-session.ts:3025），0 意味着阈值压缩永不触发（128000 默认只适用于 provider 定义，provider-composer.ts:244）。
+2. **阈值触发的 contextTokens 优先用 usage**（`calculateContextTokens = totalTokens || input+output+cacheRead+cacheWrite`，compaction.ts:140）；估算器只在 error/零 usage 分支使用。
+3. **触发 ≠ 可压缩**：`prepareCompaction` 还要能在转录里找到切点（keepRecentTokens=20000 估算 token 的实体量）——小转录即使 usage 报 120k 也压不动。场景 04 用 160KB 回复 + usage 120000 同时满足两者。
+
+### print 模式输出语义（上游 print-mode.ts:139-159，集成对齐依据）
+
+所有 prompt 顺序执行完**之后**，只打印最后一条 assistant 消息的 text 块（各带换行）；error/aborted → stderr + exit 1；length → stderr 截断提示 + exit 1。Rust 现状（每条 assistant 都打印、aborted→0）在 P1 集成时对齐。

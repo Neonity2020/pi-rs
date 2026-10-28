@@ -120,19 +120,21 @@ async function runSide(side, scenario) {
 
 		const baseUrl = `http://127.0.0.1:${port}/v1`;
 		if (side === "rust") {
-			// Rust models.json: providers array (current pi-rs format)
+			// Rust models.json: upstream object format (providers keyed by id)
 			writeFileSync(
 				join(agentDir, "models.json"),
 				JSON.stringify(
 					{
-						providers: [
-							{
-								name: "difftest",
+						providers: {
+							difftest: {
+								baseUrl,
 								api: "openai-completions",
-								base_url: baseUrl,
-								models: [{ id: "difftest-model", name: "Difftest Model" }],
+								apiKey: "difftest-dummy",
+								models: [
+									{ id: "difftest-model", name: "Difftest Model", contextWindow: 128000 },
+								],
 							},
-						],
+						},
 					},
 					null,
 					"\t",
@@ -149,7 +151,9 @@ async function runSide(side, scenario) {
 								baseUrl,
 								api: "openai-completions",
 								apiKey: "difftest-dummy",
-								models: [{ id: "difftest-model", name: "Difftest Model" }],
+								models: [
+									{ id: "difftest-model", name: "Difftest Model", contextWindow: 128000 },
+								],
 							},
 						},
 					},
@@ -168,16 +172,19 @@ async function runSide(side, scenario) {
 			TERM: "dumb",
 			OPENAI_API_KEY: "difftest-dummy",
 		};
+		const prompts = scenario.prompts ?? [scenario.prompt];
 		let bin;
 		let args;
 		if (side === "rust") {
 			env.PI_RS_AGENT_DIR = agentDir;
 			bin = RUST_BIN;
-			args = ["-p", scenario.prompt, "-m", scenario.model];
+			// `-p` is a boolean flag in the Rust CLI; each prompt is one
+			// quoted positional (kept separate for the multi-prompt loop).
+			args = ["-p", ...prompts, "-m", scenario.model];
 		} else {
 			env.PI_CODING_AGENT_DIR = agentDir;
 			bin = process.execPath;
-			args = [TS_BIN, "--print", scenario.prompt, "--model", scenario.model];
+			args = [TS_BIN, "--print", ...prompts, "--model", scenario.model];
 		}
 
 		const started = Date.now();

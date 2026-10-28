@@ -90,3 +90,18 @@ cargo fmt --all -- --check
 ```
 
 不要读取或复制 `.env` 中的凭据到交接材料、日志或测试。后续提交、推送和部署需遵循用户指令；本次没有执行这些操作。
+
+## 第六轮：P1 核心运行时与持久化（2026-10-28，主会话预置 + 4 个子 agent 并行 + 主会话集成）
+
+基线 `08dddc3`（P0 审计已推送，远程 CI 三 job 全过）。按 build-plan-v1.4 的 P1 执行：主会话先预置跨包接口（pi-agent 的 async `PrepareNextTurnFn` + `Agent::set_prepare_next_turn` + `queue_modes()`；agent_session 的 `SessionEvent::Settled` + `SessionHandle.compacting`），再派 4 个按领地并行的子 agent：
+
+- **A（pi-agent + pi-ai）**：4 钩子接线（prepare_request/finish_turn/before-after_tool_call，类型此前只有定义）、并行工具执行（JoinSet：start 源序→end 完成序→result 源序、terminate 语义）、工具检测放宽（content 过滤替代 stop_reason==ToolUse）、length 整批失败（上游文案）、set_tools 公告（toolsAdded/toolsRemoved system 消息）、per-queue clear/peek、`duration_ms` 单调钟盖章、`ThinkingEnd.content` 字段（pi-ai 类型 + 两 provider 发送点，顺带修 openai 路径丢弃 finish() 事件的真 bug）。测试 56→75。
+- **B（session/compaction/agent_session）**：**会话格式上游 v3 兼容**——header `type:"session"` + uuidv7 + parentId 树 + 11 种 entry（custom 字段名改 customType）+ `buildContextEntries` 投影 + **读上游文件**（v3 直读、v1→v2→v3 迁移管线逐字移植）；旧 Rust 格式明确报错不迁移；`--continue` cwd 过滤；split-turn 压缩（findProjectedCutPoint + TURN_PREFIX_SUMMARIZATION_PROMPT + 双摘要合并，移除 user 边界钳制）；mid-run 压缩（MidRunHook 装在预置钩子上：阈值→压缩→entry 先落盘→abort→transcript 交换→continue_run，`SharedLog` Arc<Mutex> 防竞争、EventBusWeak 防泄漏）；溢出恢复改"先省略后选切点"（等价上游 suffix advancement，顺带修掉恢复永不触发的真 bug）。测试 50→72，modes/main.rs 零适配行。
+- **C（tools + model_registry）**：七工具参数面对齐上游——edit 改 `edits:[{oldText,newText}]` 数组（prepareEditArguments 三形态兼容、BOM/CRLF、diff/patch details）、bash `timeout` 秒（无默认）+ 尾部 2000 行/50KB 截断 + structuredContent 1MB、grep（ignore crate + globset：gitignore-aware、glob/ignoreCase/literal/context/limit 默认 100）、find（fd 语义 full-path/limit 1000）、ls（limit 500/排序）、read（50KB + 续读/bash fallback 提示）；models.json 改**上游对象格式**（键=provider id、apiKey `$ENV`/`!cmd` 展开、modelOverrides、maxTokens 默认 16384，旧数组过渡兼容）；新增依赖 ignore/globset/uuid。测试 149→230。
+- **D（pi-mcp + rpc.rs）**：MCP 协议版本协商（LATEST 2025-11-25 + SUPPORTED 表 + 校验）、30s 请求超时 + `notifications/cancelled`、ping 双向（TransportEvent 拆 Request/Notification）、Tool 透传建模（annotations/title/outputSchema/_meta）；RPC get_state 补 isCompacting/steeringMode/followUpMode、clear_queue 接 per-queue API、thinking 级别按模型能力裁剪、**发现并修复预置 agent_settled 的时序缺陷**（settle 需等 agent_rx 排空，避免先于 agent_end/插入下一 run）。测试 pi-mcp 30→39、rpc 24→31。
+
+**主会话集成**：print 模式对齐上游（多 prompt 顺序执行、管道 stdin 前置、只打最后一条 assistant、error/aborted/length→exit 1、模式选择含 stdout 非 TTY）；新会话启动写初始 `model_change`/`thinking_level_change` entry；差分框架扩到 4 场景（多轮工具、阈值压缩，runner 支持 prompts 数组 + models.json 对象格式），归一化规则新增 system entry 丢弃与 usage.reasoning 缺省=0（均有据）。
+
+**验证（本轮实测）**：`cargo test --workspace --locked` **426 项全绿**（288→426）、fmt/clippy -D warnings 干净；差分四场景双侧通过，规范视图差异 88→**39 且全部为两个 P2 结构类别**（默认工具集 4v7、user/toolResult content 形状），压缩 SUMMARIZATION_PROMPT 逐字一致、会话格式互通实证。
+
+**交接事项（明确推迟）**：user/toolResult 消息 content 块数组化（pi-ai 类型层 wire 对齐，P2 首选）；CLI `--tools`/`--mode json`/`@file`；RPC session-tree 族与 bash 透传；MCP OAuth；扩展系统；assistant thinking_end 帧的 `content` 现含完整思考文本（wire additive 变化）。改动未提交，等用户指令。

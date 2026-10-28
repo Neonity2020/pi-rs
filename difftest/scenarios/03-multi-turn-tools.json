@@ -1,0 +1,89 @@
+{
+	"name": "03-multi-turn-tools",
+	"description": "Two sequential bash tool calls across three provider requests. Verifies multi-turn tool ordering: toolResult messages accumulate in transcript order and each turn's last message role matches.",
+	"model": "difftest/difftest-model",
+	"prompt": "Run the two steps",
+	"fixtureFiles": {},
+	"turns": [
+		{
+			"assertRequest": {
+				"model": "difftest-model",
+				"stream": true,
+				"lastMessageRole": "user"
+			},
+			"sse": [
+				{
+					"choices": [
+						{
+							"index": 0,
+							"delta": {
+								"role": "assistant",
+								"tool_calls": [
+									{
+										"index": 0,
+										"id": "call_step1",
+										"type": "function",
+										"function": { "name": "bash", "arguments": "{\"command\":\"echo step-one\"}" }
+									}
+								]
+							},
+							"finish_reason": null
+						}
+					]
+				},
+				{
+					"choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+					"usage": { "prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30 }
+				}
+			]
+		},
+		{
+			"assertRequest": {
+				"model": "difftest-model",
+				"stream": true,
+				"lastMessageRole": "toolResult"
+			},
+			"sse": [
+				{
+					"choices": [
+						{
+							"index": 0,
+							"delta": {
+								"role": "assistant",
+								"tool_calls": [
+									{
+										"index": 0,
+										"id": "call_step2",
+										"type": "function",
+										"function": { "name": "bash", "arguments": "{\"command\":\"echo step-two\"}" }
+									}
+								]
+							},
+							"finish_reason": null
+						}
+					]
+				},
+				{
+					"choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+					"usage": { "prompt_tokens": 45, "completion_tokens": 10, "total_tokens": 55 }
+				}
+			]
+		},
+		{
+			"assertRequest": {
+				"model": "difftest-model",
+				"stream": true,
+				"lastMessageRole": "toolResult"
+			},
+			"sse": [
+				{ "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }] },
+				{ "choices": [{ "index": 0, "delta": { "content": "DONE BOTH" }, "finish_reason": null }] },
+				{
+					"choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+					"usage": { "prompt_tokens": 70, "completion_tokens": 5, "total_tokens": 75 }
+				}
+			]
+		}
+	],
+	"expect": { "exitCode": 0, "finalText": "DONE BOTH" }
+}

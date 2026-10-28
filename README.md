@@ -8,14 +8,16 @@
 
 | 能力 | 当前状态 |
 |---|---|
-| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录、`--continue`/`--resume` 会话恢复、`/compact` 与阈值自动压缩、溢出自动恢复 |
+| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录（上游 v3 树格式，与 TS pi 会话文件双向互通）、`--continue`（cwd 过滤）/`--resume`、`/compact` 与阈值自动压缩、溢出自动恢复；print 支持多 prompt 顺序执行、管道 stdin 前置、上游退出码语义 |
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
 | 其他 HTTP provider | mock provider 可用于本地演示 |
-| 会话压缩 | `/compact`、阈值自动压缩（保留最近 20k token，可关）与上下文溢出自动恢复（剔除失败轮→压缩→重试一次）；split-turn 与 mid-run 检查尚未实现 |
-| MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，env `${VAR}`/`!cmd` 展开；失败隔离、退出清理；OAuth 未实现 |
+| 会话压缩 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次） |
+| agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek） |
+| 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
+| MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，协议版本协商（LATEST 2025-11-25 + 旧版接受表）、30s 请求超时 + notifications/cancelled、ping；OAuth 未实现 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
-| `--rpc` | 19 个命令与事件帧（上游 33 命令，缺 session-tree 族、bash 透传等 14 个；`agent_settled` 事件缺失）；逐条偏差见 rpc.rs 模块文档与 docs/operations/compat/cli-rpc-sdk.md |
+| `--rpc` | 19 个命令与事件帧含 `agent_settled` 生命周期锚点；get_state 补齐 isCompacting/steeringMode/followUpMode；thinking 级别按模型能力裁剪；上游 33 命令缺 session-tree 族、bash 透传等 14 个，逐条偏差见 rpc.rs 模块文档与 docs/operations/compat/cli-rpc-sdk.md |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
 
@@ -40,7 +42,22 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 
 默认模型为 `mimo/mimo-v2.6-pro`。在 `.env` 中设置 `MIMO_API_KEY=你的Token Plan密钥` 后即可运行。默认地址为 `https://token-plan-cn.xiaomimimo.com/v1`；如订阅页面提供不同地址，可设置 `MIMO_BASE_URL`。Token Plan 密钥和按量付费密钥不可混用，请以订阅页面的凭证为准。
 
-设置 `OPENAI_API_KEY` 后运行 `cargo run -p pi-coding-agent -- -p "你好" -m openai/gpt-5.2`。也可在 `~/.pi-rs/agent/models.json` 中使用 `providers` 数组配置 `name`、`api`（`openai-completions`）、`base_url` 和 `models`（含 `id`），再通过 `-m provider/model-id` 选择。自定义接口当前同样读取 `OPENAI_API_KEY`。响应支持增量流式输出。
+设置 `OPENAI_API_KEY` 后运行 `cargo run -p pi-coding-agent -- -p "你好" -m openai/gpt-5.2`。也可在 `~/.pi-rs/agent/models.json` 中按上游格式配置自定义 provider（`providers` 为对象，键是 provider id；`apiKey` 支持 `$ENV` 展开与 `!cmd` 命令），再通过 `-m provider/model-id` 选择：
+
+```json
+{
+	"providers": {
+		"my-proxy": {
+			"baseUrl": "https://example.com/v1",
+			"api": "openai-completions",
+			"apiKey": "$MY_PROXY_KEY",
+			"models": [{ "id": "my-model", "contextWindow": 128000 }]
+		}
+	}
+}
+```
+
+旧版 Rust 数组格式仍可读取（过渡期）；`maxTokens` 默认 16384，`contextWindow` 默认 128000。响应支持增量流式输出。
 
 也可在当前目录或其父目录的 `.env` 中设置 `OPENAI_API_KEY=你的密钥`。启动时自动加载，已有环境变量优先；`.env` 已加入 Git 忽略列表。
 
