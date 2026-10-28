@@ -149,7 +149,12 @@ async fn run_stream(
 		done = decoder.is_done();
 	}
 
-	session.finish();
+	// The synthesized end events (text/thinking/toolcall) must reach the
+	// consumer before Done; finish() closes any blocks still open.
+	let finished_events = session.finish();
+	if !forward(tx, finished_events).await {
+		return Ok(());
+	}
 	if session.message.stop_reason == StopReason::Error {
 		return Err(StreamFailure {
 			reason: StopReason::Error,
@@ -670,9 +675,10 @@ impl StreamSession {
 						partial: self.message.clone(),
 					});
 				}
-				AssistantContent::Thinking(_) => {
+				AssistantContent::Thinking(thinking) => {
 					events.push(Event::ThinkingEnd {
 						content_index: index,
+						content: thinking.thinking.clone(),
 						partial: self.message.clone(),
 					});
 				}

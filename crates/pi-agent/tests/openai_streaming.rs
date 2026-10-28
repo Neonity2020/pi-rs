@@ -317,3 +317,50 @@ async fn abort_mid_stream_releases_agent_with_aborted_reason() {
 	};
 	assert_eq!(reply.stop_reason, StopReason::Aborted);
 }
+
+#[tokio::test]
+async fn thinking_end_event_carries_the_final_thinking_content() {
+	// reasoning_content deltas fold into a thinking block; the loop's
+	// message_update frame for thinking_end must carry its final content.
+	let turn = sse_response(&[
+		frame(
+			r#"{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"ponder"}}]}"#,
+		),
+		frame(
+			r#"{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"ing"}}]}"#,
+		),
+		frame(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+		"[DONE]\n\n".to_string(),
+	]);
+	let base = serve_turns(vec![turn]).await;
+
+	let agent = agent_at(&base, vec![]);
+	let mut events = agent.subscribe();
+	agent.prompt("think".into()).await.unwrap();
+
+	let snapshot = agent.snapshot();
+	let Message::Assistant(reply) = snapshot.messages.last().unwrap() else {
+		panic!("expected assistant")
+	};
+	assert_eq!(reply.thinking(), "pondering");
+
+	let mut thinking_end_content = None;
+	while let Ok(event) = events.try_recv() {
+		if let AgentEvent::MessageUpdate {
+			assistant_message_event,
+			..
+		} = event
+		{
+			if assistant_message_event["type"] != "thinking_end" {
+				continue;
+			}
+			thinking_end_content = Some(
+				assistant_message_event["content"]
+					.as_str()
+					.unwrap_or("")
+					.to_string(),
+			);
+		}
+	}
+	assert_eq!(thinking_end_content.as_deref(), Some("pondering"));
+}

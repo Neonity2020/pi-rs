@@ -11,8 +11,12 @@ pub mod agent_loop;
 pub mod types;
 
 pub use agent::{Agent, AgentOptions, AgentSnapshot};
-pub use agent_loop::{AgentLoopRun, LoopOptions, run_agent_loop};
+pub use agent_loop::{
+	AgentLoopRun, AgentRequestUpdate, AgentTurnContext, AgentTurnUpdate, FinishTurnFn, LoopOptions,
+	PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn, run_agent_loop,
+};
 pub use types::{
-	AfterToolCallFn, AgentEvent, AgentTool, AgentToolResult, BeforeToolCallFn,
-	DEFAULT_TOOL_EXECUTION, PromptInput, QueueMode, ToolExecutionMode, ToolUpdate,
+	AfterToolCallFn, AfterToolCallResult, AgentEvent, AgentTool, AgentToolResult,
+	AgentTurnDecision, BeforeToolCallFn, BeforeToolCallResult, DEFAULT_TOOL_EXECUTION, PromptInput,
+	QueueMode, ToolExecutionMode, ToolUpdate,
 };

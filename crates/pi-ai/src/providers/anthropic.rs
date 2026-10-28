@@ -1003,9 +1003,10 @@ impl StreamSession {
 					partial: self.message.clone(),
 				});
 			}
-			Some(AssistantContent::Thinking(_)) => {
+			Some(AssistantContent::Thinking(thinking)) => {
 				events.push(Event::ThinkingEnd {
 					content_index,
+					content: thinking.thinking.clone(),
 					partial: self.message.clone(),
 				});
 			}

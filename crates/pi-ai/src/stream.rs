@@ -93,6 +93,8 @@ pub enum AssistantMessageEvent {
 	},
 	ThinkingEnd {
 		content_index: usize,
+		/// Final content of the thinking block (upstream `thinking_end.content`).
+		content: String,
 		partial: AssistantMessage,
 	},
 	ToolCallStart {

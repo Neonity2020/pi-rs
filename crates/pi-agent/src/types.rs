@@ -140,10 +140,19 @@ pub struct BeforeToolCallContext<'a> {
 }
 
 /// Partial override returned from `after_tool_call` hooks — field-by-field
-/// merge semantics as in the TS pi.
+/// merge semantics as in the TS pi (`types.ts:92-104`): provided fields replace
+/// the executed result's fields in full; omitted fields keep the original
+/// values. No deep merge. If `content` is provided without
+/// `structured_content`, the structured content is dropped (it may no longer
+/// match the content); return both to keep it.
 #[derive(Debug, Clone, Default)]
 pub struct AfterToolCallResult {
-	pub result: Option<AgentToolResult>,
+	pub content: Option<Vec<TextOrImage>>,
+	pub details: Option<Value>,
+	pub structured_content: Option<Value>,
+	pub is_error: Option<bool>,
+	pub usage: Option<Usage>,
+	/// Hint that the agent should stop after the current tool batch.
 	pub terminate: Option<bool>,
 }
 

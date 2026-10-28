@@ -439,3 +439,53 @@ async fn abort_mid_stream_releases_agent_with_aborted_reason() {
 	};
 	assert_eq!(reply.stop_reason, StopReason::Aborted);
 }
+
+#[tokio::test]
+async fn thinking_end_event_carries_the_final_thinking_content() {
+	let turn = sse_response(&[
+		message_start(),
+		event(
+			"content_block_start",
+			r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+		),
+		event(
+			"content_block_delta",
+			r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ponder"}}"#,
+		),
+		event(
+			"content_block_delta",
+			r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ing"}}"#,
+		),
+		block_stop(0),
+		message_delta("end_turn"),
+		message_stop(),
+	]);
+	let base = serve_turns(vec![turn]).await;
+
+	let agent = agent_at(&base, vec![]);
+	let mut events = agent.subscribe();
+	agent.prompt("think".into()).await.unwrap();
+
+	let mut thinking_end_content = None;
+	while let Ok(event) = events.try_recv() {
+		if let AgentEvent::MessageUpdate {
+			assistant_message_event,
+			..
+		} = event
+		{
+			if assistant_message_event["type"] != "thinking_end" {
+				continue;
+			}
+			assert_eq!(assistant_message_event["contentIndex"], 0);
+			// The wire frame carries the authoritative final content of the
+			// thinking block (upstream thinking_end.content).
+			thinking_end_content = Some(
+				assistant_message_event["content"]
+					.as_str()
+					.unwrap_or("")
+					.to_string(),
+			);
+		}
+	}
+	assert_eq!(thinking_end_content.as_deref(), Some("pondering"));
+}

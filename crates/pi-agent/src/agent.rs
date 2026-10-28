@@ -14,12 +14,14 @@ use std::sync::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use pi_ai::{Message, Model, StreamFn, ThinkingLevel};
+use pi_ai::{Message, Model, StreamFn, ThinkingLevel, Tool, ToolReference};
 
-use crate::agent_loop::{AgentLoopRun, LoopOptions, run_agent_loop};
+use crate::agent_loop::{
+	AgentLoopRun, FinishTurnFn, LoopOptions, PrepareNextTurnFn, PrepareRequestFn, run_agent_loop,
+};
 use crate::types::{
-	AgentEvent, AgentTool, DEFAULT_TOOL_EXECUTION, EMPTY_USAGE, PendingMessageQueue, PromptInput,
-	QueueMode, ToolExecutionMode, default_model,
+	AfterToolCallFn, AgentEvent, AgentTool, BeforeToolCallFn, DEFAULT_TOOL_EXECUTION, EMPTY_USAGE,
+	PendingMessageQueue, PromptInput, QueueMode, ToolExecutionMode, default_model,
 };
 
 /// Options for constructing an [`Agent`] — mirrors `AgentOptions`.
@@ -81,6 +83,12 @@ struct AgentInner {
 	steering: Arc<Mutex<PendingMessageQueue>>,
 	follow_up: Arc<Mutex<PendingMessageQueue>>,
 	stream_fn: RwLock<StreamFn>,
+	prepare_next_turn: RwLock<Option<PrepareNextTurnFn>>,
+	prepare_request: RwLock<Option<PrepareRequestFn>>,
+	finish_turn: RwLock<Option<FinishTurnFn>>,
+	before_tool_call: RwLock<Option<BeforeToolCallFn>>,
+	after_tool_call: RwLock<Option<AfterToolCallFn>>,
+	tool_execution: ToolExecutionMode,
 	session_id: RwLock<Option<String>>,
 	event_tx: broadcast::Sender<AgentEvent>,
 	/// Cancellation token of the active run; `None` when idle. Std mutex:
@@ -133,6 +141,12 @@ impl Agent {
 			steering: Arc::new(Mutex::new(PendingMessageQueue::new(options.steering_mode))),
 			follow_up: Arc::new(Mutex::new(PendingMessageQueue::new(options.follow_up_mode))),
 			stream_fn: RwLock::new(stream_fn),
+			prepare_next_turn: RwLock::new(None),
+			prepare_request: RwLock::new(None),
+			finish_turn: RwLock::new(None),
+			before_tool_call: RwLock::new(None),
+			after_tool_call: RwLock::new(None),
+			tool_execution: options.tool_execution,
 			session_id: RwLock::new(options.session_id),
 			event_tx,
 			active_run: Mutex::new(None),
@@ -290,14 +304,34 @@ impl Agent {
 		self.inner.follow_up.lock().unwrap().peek()
 	}
 
+	/// Preview the queued steering messages without consuming them.
+	pub fn peek_steering_queue(&self) -> Vec<Message> {
+		self.inner.steering.lock().unwrap().peek()
+	}
+
+	/// Preview the queued follow-up messages without consuming them.
+	pub fn peek_follow_up_queue(&self) -> Vec<Message> {
+		self.inner.follow_up.lock().unwrap().peek()
+	}
+
 	pub fn has_queued_messages(&self) -> bool {
 		self.inner.steering.lock().unwrap().has_items()
 			|| self.inner.follow_up.lock().unwrap().has_items()
 	}
 
-	pub fn clear_all_queues(&self) {
+	/// Remove all queued steering messages.
+	pub fn clear_steering_queue(&self) {
 		self.inner.steering.lock().unwrap().clear();
+	}
+
+	/// Remove all queued follow-up messages.
+	pub fn clear_follow_up_queue(&self) {
 		self.inner.follow_up.lock().unwrap().clear();
+	}
+
+	pub fn clear_all_queues(&self) {
+		self.clear_steering_queue();
+		self.clear_follow_up_queue();
 	}
 
 	pub fn set_steering_mode(&self, mode: QueueMode) {
@@ -306,6 +340,15 @@ impl Agent {
 
 	pub fn set_follow_up_mode(&self, mode: QueueMode) {
 		self.inner.follow_up.lock().unwrap().mode = mode;
+	}
+
+	/// Current queue modes, for status probes (RPC `get_state`'s
+	/// `steeringMode`/`followUpMode`).
+	pub fn queue_modes(&self) -> (QueueMode, QueueMode) {
+		(
+			self.inner.steering.lock().unwrap().mode,
+			self.inner.follow_up.lock().unwrap().mode,
+		)
 	}
 
 	// -- configuration ---------------------------------------------------------
@@ -383,10 +426,73 @@ impl Agent {
 	}
 
 	/// Replace the executable tool set. Differences from the tools declared in
-	/// the transcript are announced to the model with a system message before
-	/// the next request (TODO(pi): announcement message).
+	/// the transcript are announced to the model with a system message
+	/// appended to the transcript (with lifecycle events) before the next
+	/// request — the port of `declareToolChanges` for the stateful agent. A
+	/// changed definition counts as a removal followed by an addition. While a
+	/// run is active only the executable set is swapped (the active loop
+	/// already holds a snapshot); the announcement is skipped, matching
+	/// upstream where the difference is (re)computed at the next run start.
 	pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
+		let declarations: Vec<Tool> = tools.iter().map(|tool| tool.to_declaration()).collect();
 		*self.inner.tools.write().unwrap() = tools;
+
+		let declared = replay_declared_tools(&self.inner.messages.read().unwrap());
+		let changes = tool_state_changes(&declared, &declarations);
+		if changes.tools_added.is_empty() && changes.tools_removed.is_empty() {
+			return;
+		}
+		if self.inner.active_run.lock().unwrap().is_some() {
+			return;
+		}
+
+		// Upstream announcement format: a system message with empty content and
+		// only the non-empty change lists set (`withToolChanges`).
+		let mut announcement = pi_ai::SystemMessage::prompt("");
+		if !changes.tools_added.is_empty() {
+			announcement.tools_added = Some(changes.tools_added);
+		}
+		if !changes.tools_removed.is_empty() {
+			announcement.tools_removed = Some(changes.tools_removed);
+		}
+		let message = Message::System(announcement);
+		self.inner.messages.write().unwrap().push(message.clone());
+		let _ = self.inner.event_tx.send(AgentEvent::MessageStart {
+			message: message.clone(),
+		});
+		let _ = self.inner.event_tx.send(AgentEvent::MessageEnd { message });
+	}
+
+	/// Install the `prepare_next_turn` hook (mid-run compaction lives behind
+	/// this in the coding-agent session). The loop swaps model/thinking and
+	/// appends the returned messages before the next request.
+	pub fn set_prepare_next_turn(&self, hook: PrepareNextTurnFn) {
+		*self.inner.prepare_next_turn.write().unwrap() = Some(hook);
+	}
+
+	/// Install the `prepare_request` hook: runs immediately before every
+	/// provider request, including the first, and may swap model/thinking.
+	pub fn set_prepare_request(&self, hook: PrepareRequestFn) {
+		*self.inner.prepare_request.write().unwrap() = Some(hook);
+	}
+
+	/// Install the `finish_turn` hook: runs after each completed turn (and the
+	/// steering poll); `End` forces the run to end, `Continue` guarantees one
+	/// more provider request.
+	pub fn set_finish_turn(&self, hook: FinishTurnFn) {
+		*self.inner.finish_turn.write().unwrap() = Some(hook);
+	}
+
+	/// Install the `before_tool_call` hook: runs before a tool executes;
+	/// `block: true` replaces the execution with an error tool result.
+	pub fn set_before_tool_call(&self, hook: BeforeToolCallFn) {
+		*self.inner.before_tool_call.write().unwrap() = Some(hook);
+	}
+
+	/// Install the `after_tool_call` hook: runs after a tool executed, before
+	/// `tool_execution_end`; provided fields replace the executed result's.
+	pub fn set_after_tool_call(&self, hook: AfterToolCallFn) {
+		*self.inner.after_tool_call.write().unwrap() = Some(hook);
 	}
 
 	pub fn tool_names(&self) -> Vec<String> {
@@ -441,6 +547,12 @@ impl Agent {
 			follow_up: self.inner.follow_up.clone(),
 			event_tx: self.inner.event_tx.clone(),
 			convert_to_llm: None,
+			prepare_next_turn: self.inner.prepare_next_turn.read().unwrap().clone(),
+			tool_execution: self.inner.tool_execution,
+			prepare_request: self.inner.prepare_request.read().unwrap().clone(),
+			finish_turn: self.inner.finish_turn.read().unwrap().clone(),
+			before_tool_call: self.inner.before_tool_call.read().unwrap().clone(),
+			after_tool_call: self.inner.after_tool_call.read().unwrap().clone(),
 		}
 	}
 
@@ -449,9 +561,9 @@ impl Agent {
 		prompt_messages: Vec<Message>,
 		opts: LoopOptions,
 	) -> anyhow::Result<()> {
-		let run = self.build_run();
+		let mut run = self.build_run();
 		let token = opts.signal.clone();
-		let result = run_agent_loop(&run, prompt_messages, opts).await;
+		let result = run_agent_loop(&mut run, prompt_messages, opts).await;
 		if let Err(error) = &result {
 			self.handle_run_failure(error, token.is_cancelled()).await;
 		}
@@ -526,6 +638,63 @@ fn replay_system_prompt(messages: &[Message]) -> String {
 		}
 	}
 	prompt
+}
+
+/// Port of `getCurrentTools` (`ai/src/utils/transcript.ts`): resolve the tool
+/// declarations of the transcript's system messages, preserving declaration
+/// order. A removed name drops the tool; a re-added name replaces it in place.
+fn replay_declared_tools(messages: &[Message]) -> Vec<Tool> {
+	let mut tools: Vec<Tool> = Vec::new();
+	for message in messages {
+		let Message::System(system) = message else {
+			continue;
+		};
+		for removed in system.tools_removed.iter().flatten() {
+			tools.retain(|tool| tool.name != removed.name);
+		}
+		for added in system.tools_added.iter().flatten() {
+			match tools.iter_mut().find(|tool| tool.name == added.name) {
+				Some(existing) => *existing = added.clone(),
+				None => tools.push(added.clone()),
+			}
+		}
+	}
+	tools
+}
+
+/// Port of `getToolStateChanges`: compare two complete tool states. A changed
+/// definition is a removal followed by an addition.
+fn tool_state_changes(previous: &[Tool], current: &[Tool]) -> ToolStateChanges {
+	ToolStateChanges {
+		tools_added: current
+			.iter()
+			.filter(|tool| {
+				previous
+					.iter()
+					.find(|candidate| candidate.name == tool.name)
+					.is_none_or(|candidate| candidate != *tool)
+			})
+			.cloned()
+			.collect(),
+		tools_removed: previous
+			.iter()
+			.filter(|tool| {
+				current
+					.iter()
+					.find(|candidate| candidate.name == tool.name)
+					.is_none_or(|candidate| candidate != *tool)
+			})
+			.map(|tool| ToolReference {
+				name: tool.name.clone(),
+			})
+			.collect(),
+	}
+}
+
+/// Port of the upstream `ToolStateChanges`.
+struct ToolStateChanges {
+	tools_added: Vec<Tool>,
+	tools_removed: Vec<ToolReference>,
 }
 
 #[cfg(test)]
