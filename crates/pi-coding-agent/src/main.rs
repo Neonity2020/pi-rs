@@ -21,7 +21,7 @@ use pi_agent::{Agent, AgentOptions};
 use pi_ai::ThinkingLevel;
 
 use crate::core::agent_session::{restore_initial_messages, spawn_agent_session_with_settings};
-use crate::core::model_registry::ModelRegistry;
+use crate::core::model_registry::{ModelRegistry, authed_stream_fn};
 use crate::core::session_manager::{
 	SessionManager, SessionSelector, resolve_session, validate_session_dir,
 };
@@ -187,16 +187,17 @@ async fn main() -> anyhow::Result<()> {
 		tools[index] = Arc::new(BashTool::new(cwd.clone()).with_session_context(context));
 	}
 
+	let registry = Arc::new(Mutex::new(registry));
 	let agent = Agent::new(AgentOptions {
 		model,
 		thinking_level,
 		tools,
 		system_prompt: Some(system_prompt),
 		initial_messages,
+		stream_fn: Some(authed_stream_fn(registry.clone())),
 		..AgentOptions::default()
 	});
 
-	let registry = Arc::new(Mutex::new(registry));
 	let handle = spawn_agent_session_with_settings(
 		agent,
 		session,

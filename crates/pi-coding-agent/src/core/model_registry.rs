@@ -28,12 +28,13 @@
 //! composer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
 
-use pi_ai::{Api, Model, ModelCost};
+use pi_ai::{Api, Model, ModelCost, StreamFn};
 
 use crate::config;
 
@@ -87,6 +88,14 @@ impl ModelRegistry {
 		self.provider_auth.get(provider)
 	}
 
+	/// Resolve the provider's models.json `apiKey` — literal, `$ENV` template,
+	/// or `!command` (shared command cache). `None` when the provider or key
+	/// is absent or the value fails to resolve.
+	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
+		let key = self.provider_auth.get(provider)?.api_key.as_deref()?;
+		resolve_config_value(key, None)
+	}
+
 	pub fn default_model(&self) -> Model {
 		if let Some(model) = self.models.iter().find(|m| m.name.ends_with("(default)")) {
 			return model.clone();
@@ -130,6 +139,22 @@ impl ModelRegistry {
 fn matches_key(model: &Model, key: &str) -> bool {
 	let key = key.replace(" (default)", "");
 	model.key() == key || (model.id == key) || format!("{}/{}", model.provider, model.id) == key
+}
+
+/// Stream fn that dispatches to the provider adapter with the models.json
+/// `apiKey` injected (`agent-loop.ts` leaves `StreamOptions.api_key` empty and
+/// lets the request build resolve provider auth). An explicit
+/// `options.api_key` wins; a provider without a resolvable key falls through
+/// to the adapter's env-var fallback.
+pub fn authed_stream_fn(registry: Arc<Mutex<ModelRegistry>>) -> StreamFn {
+	Arc::new(move |model, context, mut options| {
+		if options.api_key.is_none()
+			&& let Some(key) = registry.lock().unwrap().resolve_api_key(&model.provider)
+		{
+			options.api_key = Some(key);
+		}
+		pi_ai::providers::stream_fn_for(model)(model, context, options)
+	})
 }
 
 // -------------------------------------------------------------------------------------------
@@ -662,6 +687,32 @@ mod tests {
 			.iter()
 			.find(|m| m.provider == provider && m.id == id)
 			.unwrap_or_else(|| panic!("missing model {provider}/{id}"))
+	}
+
+	fn registry(text: &str) -> ModelRegistry {
+		let (models, provider_auth) = apply(text);
+		ModelRegistry {
+			models,
+			provider_auth,
+		}
+	}
+
+	#[test]
+	fn resolve_api_key_reads_literal_and_command_forms() {
+		let registry = registry(
+			r#"{"providers":{"a":{"apiKey":"sk-literal"},"b":{"apiKey":"!echo from-cmd"}}}"#,
+		);
+		assert_eq!(registry.resolve_api_key("a").as_deref(), Some("sk-literal"));
+		assert_eq!(registry.resolve_api_key("b").as_deref(), Some("from-cmd"));
+		assert_eq!(registry.resolve_api_key("missing"), None);
+	}
+
+	#[test]
+	fn resolve_api_key_returns_none_without_auth_entry() {
+		// A provider with models but no apiKey has no auth to inject; the
+		// request falls back to the adapter's env-var lookup.
+		let registry = registry(r#"{"providers":{"a":{"models":[{"id":"x"}]}}}"#);
+		assert_eq!(registry.resolve_api_key("a"), None);
 	}
 
 	#[test]
