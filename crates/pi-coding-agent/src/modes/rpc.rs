@@ -31,16 +31,28 @@
 //!   `compact` answers with the same disposition inference instead of the
 //!   upstream `CompactionResult` — the session task reports compaction
 //!   progress through notices.
-//! - `clear_queue` returns `{steering, followUp}` like upstream, but pi-agent
-//!   exposes only a combined steering-first peek, so the drained texts cannot
-//!   be attributed per queue; they are reported under `steering` (the
-//!   drain-priority queue) and `followUp` stays empty until a per-queue
-//!   accessor lands.
-//! - `get_state` omits `isCompacting` (the state lives inside the session
-//!   task; a shared flag lands with the session-event surface) and
-//!   `sessionName` (no naming support yet). `cycle_model` reuses the
-//!   `set_model` response shape (the model object) instead of upstream's
-//!   `{model, thinkingLevel, isScoped}`.
+//! - `clear_queue` returns the drained texts split per queue
+//!   (`{steering, followUp}`), peeked and cleared through pi-agent's
+//!   per-queue accessors (`peek_steering_queue`/`peek_follow_up_queue` +
+//!   `clear_*_queue`), like upstream `session.clearQueue()`. One divergence:
+//!   upstream reports every queued text, while pi-agent's peek reports what
+//!   the current queue mode would deliver next (`one-at-a-time` peeks only
+//!   the oldest message per queue); everything queued is cleared either way.
+//! - `get_state` omits `sessionName` (no session naming support in this port
+//!   yet); `isCompacting` mirrors the session task's in-flight compaction
+//!   flag, and `steeringMode`/`followUpMode` come from the agent's queue
+//!   modes. `cycle_model` reuses the `set_model` response shape (the model
+//!   object) instead of upstream's `{model, thinkingLevel, isScoped}`.
+//! - `agent_settled` is the bare `{"type": "agent_settled"}` frame — upstream
+//!   carries an `aborted` field, which the session layer does not track; the
+//!   settle timing (only when no run, compaction, or queued prompt remains —
+//!   i.e. no auto-continuation pending) matches upstream.
+//! - Thinking-level commands are trimmed to the model's capabilities:
+//!   `get_available_thinking_levels` returns `["off"]` for models without
+//!   reasoning support, and `cycle_thinking_level` answers with a null data
+//!   field for those models (upstream `cycleThinkingLevel` → undefined).
+//!   Per-model `thinkingLevelMap` filtering is not modeled — the Rust `Model`
+//!   has no level map, so reasoning models report all seven levels.
 //! - Event frame field names follow the upstream camelCase convention.
 //!   Session notices — which upstream routes
 //!   through extensions — are emitted as `{"type": "notice", "message": ...}`.
@@ -134,6 +146,9 @@ pub struct RpcSession {
 	/// Mirrors the session task's auto-compaction toggle (lock-free probe for
 	/// `get_state`; the session task owns the authoritative state).
 	auto_compaction: Arc<std::sync::atomic::AtomicBool>,
+	/// True while a compaction summarization is in flight (`get_state`'s
+	/// `isCompacting`; the session task owns the authoritative state).
+	compacting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RpcSession {
@@ -144,6 +159,7 @@ impl RpcSession {
 			agent,
 			session_dir,
 			auto_compaction,
+			compacting,
 			..
 		} = handle;
 		Self {
@@ -153,6 +169,7 @@ impl RpcSession {
 			registry,
 			events,
 			auto_compaction,
+			compacting,
 		}
 	}
 
@@ -206,6 +223,9 @@ impl RpcSession {
 				Ok(SessionEvent::Notice(text)) => {
 					return Some(json!({"type": "notice", "message": text}).to_string());
 				}
+				Ok(SessionEvent::Settled) => {
+					return Some(json!({"type": "agent_settled"}).to_string());
+				}
 				// Internal bookkeeping; not part of the wire protocol.
 				Ok(SessionEvent::Persisted { .. }) => continue,
 				Err(broadcast::error::RecvError::Lagged(count)) => {
@@ -258,24 +278,16 @@ impl RpcSession {
 				success_frame(&id, "abort", Value::Null)
 			}
 			RpcCommand::ClearQueue => {
-				// Upstream returns the drained texts split per queue
-				// (`{steering, followUp}`); pi-agent exposes only a combined
-				// steering-first peek, so the texts are reported under
-				// `steering` (see the module doc deviation note).
-				let texts: Vec<String> = self
-					.agent
-					.peek_queued_messages()
-					.iter()
-					.map(|message| match message {
-						pi_ai::Message::User(user) => user.content.as_text(),
-						_ => String::new(),
-					})
-					.collect();
-				self.agent.clear_all_queues();
+				// Upstream `clearQueue()`: snapshot both queues, clear them,
+				// report the drained texts split per queue.
+				let steering = queued_texts(self.agent.peek_steering_queue());
+				let follow_up = queued_texts(self.agent.peek_follow_up_queue());
+				self.agent.clear_steering_queue();
+				self.agent.clear_follow_up_queue();
 				success_frame(
 					&id,
 					"clear_queue",
-					json!({"steering": texts, "followUp": []}),
+					json!({"steering": steering, "followUp": follow_up}),
 				)
 			}
 			RpcCommand::SetModel { provider, model_id } => {
@@ -333,11 +345,18 @@ impl RpcSession {
 				success_frame(&id, "set_thinking_level", Value::Null)
 			}
 			RpcCommand::CycleThinkingLevel => {
-				let next = next_thinking_level(self.agent.thinking_level());
-				let _ = self
-					.cmd_tx
-					.send(SessionCommand::SetThinking { level: next });
-				success_frame(&id, "cycle_thinking_level", json!({ "level": next }))
+				// Upstream `cycleThinkingLevel`: undefined (no change) for
+				// models without reasoning support, otherwise the next level
+				// of the model's supported ladder, wrapping around.
+				if !self.agent.model().reasoning {
+					success_frame(&id, "cycle_thinking_level", Value::Null)
+				} else {
+					let next = next_thinking_level(self.agent.thinking_level());
+					let _ = self
+						.cmd_tx
+						.send(SessionCommand::SetThinking { level: next });
+					success_frame(&id, "cycle_thinking_level", json!({ "level": next }))
+				}
 			}
 			RpcCommand::GetState => success_frame(&id, "get_state", self.state_value()),
 			RpcCommand::GetMessages => {
@@ -348,11 +367,17 @@ impl RpcSession {
 				let models: Vec<Model> = self.registry.lock().unwrap().models().to_vec();
 				success_frame(&id, "get_available_models", json!({ "models": models }))
 			}
-			RpcCommand::GetAvailableThinkingLevels => success_frame(
-				&id,
-				"get_available_thinking_levels",
-				json!({ "levels": all_thinking_levels() }),
-			),
+			RpcCommand::GetAvailableThinkingLevels => {
+				let levels: Vec<&str> = supported_thinking_levels(&self.agent.model())
+					.iter()
+					.map(|level| thinking_level_wire(*level))
+					.collect();
+				success_frame(
+					&id,
+					"get_available_thinking_levels",
+					json!({ "levels": levels }),
+				)
+			}
 			RpcCommand::SetSteeringMode { mode } => {
 				self.agent.set_steering_mode(mode.into());
 				success_frame(&id, "set_steering_mode", Value::Null)
@@ -427,10 +452,16 @@ impl RpcSession {
 
 	fn state_value(&self) -> Value {
 		let snapshot = self.agent.snapshot();
+		let (steering_mode, follow_up_mode) = self.agent.queue_modes();
 		json!({
 			"model": snapshot.model,
 			"thinkingLevel": snapshot.thinking_level,
 			"isStreaming": self.agent.is_streaming(),
+			"isCompacting": self
+				.compacting
+				.load(std::sync::atomic::Ordering::Relaxed),
+			"steeringMode": queue_mode_wire(steering_mode),
+			"followUpMode": queue_mode_wire(follow_up_mode),
 			"sessionFile": self
 				.session_dir
 				.as_ref()
@@ -487,24 +518,73 @@ fn agent_event_frame(event: &pi_agent::AgentEvent) -> String {
 	value.to_string()
 }
 
-fn all_thinking_levels() -> [&'static str; 7] {
-	["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+/// The seven extended thinking levels in cycle order (upstream
+/// `EXTENDED_THINKING_LEVELS`).
+const ALL_THINKING_LEVELS: [ThinkingLevel; 7] = [
+	ThinkingLevel::Off,
+	ThinkingLevel::Minimal,
+	ThinkingLevel::Low,
+	ThinkingLevel::Medium,
+	ThinkingLevel::High,
+	ThinkingLevel::Xhigh,
+	ThinkingLevel::Max,
+];
+
+/// Levels the current model supports — port of upstream
+/// `getSupportedThinkingLevels` (`packages/ai/src/models.ts`): models without
+/// reasoning support only get `off`. The upstream also filters `xhigh`/`max`
+/// through the model's `thinkingLevelMap`; the Rust `Model` has no level map,
+/// so reasoning models report every level.
+fn supported_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
+	if model.reasoning {
+		ALL_THINKING_LEVELS.to_vec()
+	} else {
+		vec![ThinkingLevel::Off]
+	}
+}
+
+/// Wire string for a thinking level (upstream kebab/camel style: `off`,
+/// `xhigh`, … — matches `ThinkingLevel`'s camelCase serde renaming).
+fn thinking_level_wire(level: ThinkingLevel) -> &'static str {
+	match level {
+		ThinkingLevel::Off => "off",
+		ThinkingLevel::Minimal => "minimal",
+		ThinkingLevel::Low => "low",
+		ThinkingLevel::Medium => "medium",
+		ThinkingLevel::High => "high",
+		ThinkingLevel::Xhigh => "xhigh",
+		ThinkingLevel::Max => "max",
+	}
+}
+
+/// Wire string for a queue mode (`rpc-types.ts`: `"all" | "one-at-a-time"`).
+fn queue_mode_wire(mode: pi_agent::QueueMode) -> &'static str {
+	match mode {
+		pi_agent::QueueMode::All => "all",
+		pi_agent::QueueMode::OneAtATime => "one-at-a-time",
+	}
+}
+
+/// Texts of queued user messages, for `clear_queue`'s response.
+fn queued_texts(messages: Vec<pi_ai::Message>) -> Vec<String> {
+	messages
+		.iter()
+		.map(|message| match message {
+			pi_ai::Message::User(user) => user.content.as_text(),
+			_ => String::new(),
+		})
+		.collect()
 }
 
 /// Cycle order for `cycle_thinking_level` — mirrors the private
 /// `next_thinking_level` in `core/agent_session.rs` (upstream
 /// `cycleThinkingLevel` walks `THINKING_LEVEL_OPTIONS` and wraps).
 fn next_thinking_level(current: ThinkingLevel) -> ThinkingLevel {
-	use ThinkingLevel::*;
-	match current {
-		Off => Minimal,
-		Minimal => Low,
-		Low => Medium,
-		Medium => High,
-		High => Xhigh,
-		Xhigh => Max,
-		Max => Off,
-	}
+	let index = ALL_THINKING_LEVELS
+		.iter()
+		.position(|level| *level == current)
+		.unwrap_or(0);
+	ALL_THINKING_LEVELS[(index + 1) % ALL_THINKING_LEVELS.len()]
 }
 
 fn success_frame(id: &Option<Value>, command: &str, data: Value) -> String {
@@ -596,6 +676,12 @@ mod tests {
 	use std::time::Duration;
 
 	fn mock_handle() -> (SessionHandle, Arc<Mutex<ModelRegistry>>) {
+		mock_handle_with_reasoning(false)
+	}
+
+	/// Harness with a mock model; `reasoning` toggles the model's reasoning
+	/// capability, which thinking-level commands trim against.
+	fn mock_handle_with_reasoning(reasoning: bool) -> (SessionHandle, Arc<Mutex<ModelRegistry>>) {
 		let stream: pi_ai::StreamFn = Arc::new(
 			|model: &pi_ai::Model,
 			 context: &pi_ai::TranscriptContext,
@@ -603,8 +689,10 @@ mod tests {
 				pi_ai::providers::mock::stream(model, context, options)
 			},
 		);
+		let mut model = Model::new("mock-echo", "Mock", "mock", "mock", "");
+		model.reasoning = reasoning;
 		let agent = Agent::new(AgentOptions {
-			model: Model::new("mock-echo", "Mock", "mock", "mock", ""),
+			model,
 			stream_fn: Some(stream),
 			..AgentOptions::default()
 		});
@@ -639,6 +727,45 @@ mod tests {
 		})
 		.await
 		.expect("run should finish in time")
+	}
+
+	/// Collect event frame types until `agent_settled`, returning them in
+	/// order (the trailing entry is always `agent_settled`).
+	async fn until_settled(session: &mut RpcSession) -> Vec<String> {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			let mut kinds = Vec::new();
+			loop {
+				let frame = session
+					.next_event_frame()
+					.await
+					.expect("session stays open until settle");
+				let kind = parse_frame(&frame)["type"]
+					.as_str()
+					.unwrap_or_default()
+					.to_string();
+				let settled = kind == "agent_settled";
+				kinds.push(kind);
+				if settled {
+					return kinds;
+				}
+			}
+		})
+		.await
+		.expect("settle should arrive in time")
+	}
+
+	/// Wait until the run is streaming (first `message_start`).
+	async fn until_message_start(session: &mut RpcSession) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let frame = session.next_event_frame().await.unwrap();
+				if frame.contains("message_start") {
+					break;
+				}
+			}
+		})
+		.await
+		.expect("run should start in time");
 	}
 
 	#[tokio::test]
@@ -706,11 +833,28 @@ mod tests {
 		assert_eq!(frame["id"], "s1");
 		let data = &frame["data"];
 		assert_eq!(data["isStreaming"], false);
+		assert_eq!(data["isCompacting"], false);
+		// Both queues default to "one-at-a-time" (upstream agent.ts).
+		assert_eq!(data["steeringMode"], "one-at-a-time");
+		assert_eq!(data["followUpMode"], "one-at-a-time");
 		assert_eq!(data["thinkingLevel"], "off");
 		assert_eq!(data["messageCount"], 1); // leading system message
 		assert_eq!(data["pendingMessageCount"], 0);
 		assert_eq!(data["autoCompactionEnabled"], true);
 		assert!(data["model"]["provider"].is_string());
+	}
+
+	#[tokio::test]
+	async fn queue_modes_roundtrip_through_get_state() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		let frames = session.handle_line(r#"{"type":"set_steering_mode","mode":"all"}"#);
+		assert_eq!(parse_frame(&frames[0])["success"], true);
+		let frames = session.handle_line(r#"{"type":"set_follow_up_mode","mode":"all"}"#);
+		assert_eq!(parse_frame(&frames[0])["success"], true);
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
+		assert_eq!(frame["data"]["steeringMode"], "all");
+		assert_eq!(frame["data"]["followUpMode"], "all");
 	}
 
 	#[tokio::test]
@@ -791,13 +935,27 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn get_available_models_and_thinking_levels() {
+	async fn get_available_models_lists_the_registry() {
 		let (handle, registry) = mock_handle();
 		let session = RpcSession::new(handle, registry);
 		let frame = parse_frame(&session.handle_line(r#"{"type":"get_available_models"}"#)[0]);
 		assert_eq!(frame["success"], true);
 		assert!(!frame["data"]["models"].as_array().unwrap().is_empty());
+	}
 
+	#[tokio::test]
+	async fn available_thinking_levels_follow_the_model_reasoning_capability() {
+		// A model without reasoning support only ever gets `off`.
+		let (handle, registry) = mock_handle_with_reasoning(false);
+		let session = RpcSession::new(handle, registry);
+		let frame =
+			parse_frame(&session.handle_line(r#"{"type":"get_available_thinking_levels"}"#)[0]);
+		assert_eq!(frame["data"]["levels"], json!(["off"]));
+
+		// Reasoning models report the full extended ladder (the Rust `Model`
+		// has no `thinkingLevelMap`, so nothing further is filtered).
+		let (handle, registry) = mock_handle_with_reasoning(true);
+		let session = RpcSession::new(handle, registry);
 		let frame =
 			parse_frame(&session.handle_line(r#"{"type":"get_available_thinking_levels"}"#)[0]);
 		assert_eq!(
@@ -859,15 +1017,42 @@ mod tests {
 	async fn clear_queue_drains_and_reports_the_queued_texts() {
 		let (handle, registry) = mock_handle();
 		let session = RpcSession::new(handle, registry);
+		// `all` mode makes the per-queue peek report every queued text; the
+		// default `one-at-a-time` peek below shows the mode limit.
+		session.agent.set_steering_mode(pi_agent::QueueMode::All);
+		session.agent.set_follow_up_mode(pi_agent::QueueMode::All);
 		session.agent.steer("one");
-		session.agent.follow_up("two");
+		session.agent.steer("two");
+		session.agent.follow_up("later-1");
+		session.agent.follow_up("later-2");
 		let frame = parse_frame(&session.handle_line(r#"{"type":"clear_queue","id":"c1"}"#)[0]);
 		assert_eq!(frame["id"], "c1");
 		assert_eq!(frame["success"], true);
-		// pi-agent peeks steering-first; see the module doc deviation note.
-		assert_eq!(frame["data"]["steering"], json!(["one"]));
-		assert_eq!(frame["data"]["followUp"], json!([]));
+		// The drained texts are attributed per queue, like upstream
+		// `session.clearQueue()`.
+		assert_eq!(frame["data"]["steering"], json!(["one", "two"]));
+		assert_eq!(frame["data"]["followUp"], json!(["later-1", "later-2"]));
 		assert!(session.agent.peek_queued_messages().is_empty());
+		assert!(session.agent.peek_steering_queue().is_empty());
+		assert!(session.agent.peek_follow_up_queue().is_empty());
+	}
+
+	#[tokio::test]
+	async fn clear_queue_attributes_the_next_message_per_queue_in_one_at_a_time_mode() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		session.agent.steer("first steering");
+		session.agent.steer("second steering");
+		session.agent.follow_up("first follow-up");
+		let frame = parse_frame(&session.handle_line(r#"{"type":"clear_queue"}"#)[0]);
+		// The per-queue peek reports what the current queue mode would deliver
+		// next (upstream reports the whole queue; see the module doc note).
+		assert_eq!(frame["data"]["steering"], json!(["first steering"]));
+		assert_eq!(frame["data"]["followUp"], json!(["first follow-up"]));
+		// Everything queued is cleared either way.
+		assert!(session.agent.peek_queued_messages().is_empty());
+		assert_eq!(session.agent.snapshot().queued_steering, 0);
+		assert_eq!(session.agent.snapshot().queued_follow_up, 0);
 	}
 
 	#[tokio::test]
@@ -898,7 +1083,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn cycle_thinking_level_walks_the_ladder_and_wraps() {
-		let (handle, registry) = mock_handle();
+		let (handle, registry) = mock_handle_with_reasoning(true);
 		let mut session = RpcSession::new(handle, registry);
 		assert_eq!(session.agent.thinking_level(), ThinkingLevel::Off);
 		// Each cycle reads the level the session task last applied, so the
@@ -919,6 +1104,22 @@ mod tests {
 			.expect("thinking notice should arrive in time");
 		}
 		assert_eq!(session.agent.thinking_level(), ThinkingLevel::Off);
+	}
+
+	#[tokio::test]
+	async fn cycle_thinking_level_is_a_noop_for_models_without_reasoning() {
+		let (handle, registry) = mock_handle_with_reasoning(false);
+		let session = RpcSession::new(handle, registry);
+		// Upstream `cycleThinkingLevel` returns undefined → success with a
+		// null data field, and the level stays where it was.
+		let frame = parse_frame(&session.handle_line(r#"{"type":"cycle_thinking_level"}"#)[0]);
+		assert_eq!(frame["command"], "cycle_thinking_level");
+		assert_eq!(frame["success"], true);
+		assert!(frame.get("data").is_none() || frame["data"].is_null());
+		assert_eq!(session.agent.thinking_level(), ThinkingLevel::Off);
+		// No thinking notice is emitted (nothing changed); the drain helper
+		// would hang, so only the agent state is asserted.
+		session.shutdown();
 	}
 
 	#[tokio::test]
@@ -1117,5 +1318,99 @@ mod tests {
 		let frame = parse_frame(&frames[0]);
 		assert_eq!(frame["command"], "follow_up");
 		assert_eq!(frame["data"]["disposition"], "queued");
+	}
+
+	#[tokio::test]
+	async fn agent_settled_arrives_after_an_idle_run_completes() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		session.handle_line(r#"{"type":"prompt","message":"hello"}"#);
+
+		let kinds = until_settled(&mut session).await;
+		assert_eq!(kinds.last().map(String::as_str), Some("agent_settled"));
+		assert_eq!(kinds.iter().filter(|k| *k == "agent_settled").count(), 1);
+		assert!(kinds.contains(&"agent_end".to_string()));
+		assert_eq!(
+			kinds.iter().rev().nth(1).map(String::as_str),
+			Some("agent_end"),
+			"settle directly follows the run that went idle"
+		);
+
+		// The next run settles again — the event marks each busy→idle edge.
+		session.handle_line(r#"{"type":"prompt","message":"again"}"#);
+		let kinds = until_settled(&mut session).await;
+		assert_eq!(kinds.last().map(String::as_str), Some("agent_settled"));
+	}
+
+	#[tokio::test]
+	async fn agent_settled_waits_for_a_queued_follow_up_to_finish() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		session.handle_line(r#"{"type":"prompt","message":"first"}"#);
+		// Queue the follow-up while the first turn is still streaming.
+		until_message_start(&mut session).await;
+		let frames = session.handle_line(r#"{"type":"follow_up","message":"second"}"#);
+		assert_eq!(parse_frame(&frames[0])["data"]["disposition"], "queued");
+
+		let kinds = until_settled(&mut session).await;
+		// Exactly one settle, only after the follow-up turn completed: the
+		// frames since queueing contain the follow-up's own assistant turn
+		// and the run end — never a settle in between.
+		assert_eq!(kinds.iter().filter(|k| *k == "agent_settled").count(), 1);
+		assert!(kinds.contains(&"message_start".to_string()));
+		assert_eq!(
+			kinds.iter().rev().nth(1).map(String::as_str),
+			Some("agent_end")
+		);
+
+		// The transcript confirms the follow-up turn ran to completion.
+		let users: Vec<String> = session
+			.agent
+			.snapshot()
+			.messages
+			.iter()
+			.filter_map(|m| match m {
+				pi_ai::Message::User(u) => Some(u.content.as_text().to_string()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(users, ["first", "second"]);
+	}
+
+	#[tokio::test]
+	async fn agent_settled_waits_for_queued_prompts_too() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		session.handle_line(r#"{"type":"prompt","message":"first"}"#);
+		until_message_start(&mut session).await;
+		let frames = session.handle_line(r#"{"type":"prompt","message":"second"}"#);
+		assert_eq!(parse_frame(&frames[0])["data"]["disposition"], "queued");
+
+		// The first run ends, but the queued prompt starts immediately: the
+		// second run's frames contain no settle.
+		let first = until_agent_end(&mut session).await;
+		assert!(
+			first.iter().all(|f| f["type"] != "agent_settled"),
+			"no settle while a queued prompt is pending: {:?}",
+			first.iter().map(|f| f["type"].clone()).collect::<Vec<_>>()
+		);
+		let second = until_agent_end(&mut session).await;
+		assert!(
+			second.iter().all(|f| f["type"] != "agent_settled"),
+			"no settle before the queued prompt's run ends: {:?}",
+			second.iter().map(|f| f["type"].clone()).collect::<Vec<_>>()
+		);
+		// With both runs done and nothing queued, the session settles.
+		let frame = parse_frame(
+			&session
+				.next_event_frame()
+				.await
+				.expect("settle follows the last run"),
+		);
+		assert_eq!(
+			frame,
+			json!({"type": "agent_settled"}),
+			"the settle frame carries exactly the upstream type field"
+		);
 	}
 }

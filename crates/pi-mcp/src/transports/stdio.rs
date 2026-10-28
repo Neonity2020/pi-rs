@@ -22,7 +22,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 use super::{Transport, TransportEvent};
-use crate::protocol::jsonrpc::JsonRpcRequest;
+use crate::protocol::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
 /// Cap on one JSON-RPC line — mirrors upstream `DEFAULT_MAX_MESSAGE_BYTES`.
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -115,6 +115,32 @@ impl StdioTransport {
 		self
 	}
 
+	/// Write one serialized frame followed by a newline to the server's stdin.
+	async fn write_line(&mut self, frame: String) -> crate::Result<()> {
+		let Some(stdin) = self.stdin.as_mut() else {
+			return Err(crate::Error::Closed);
+		};
+		let mut payload = frame.into_bytes();
+		payload.push(b'\n');
+		let outcome = match stdin.write_all(&payload).await {
+			Ok(()) => stdin.flush().await,
+			Err(error) => Err(error),
+		};
+		match outcome {
+			Ok(()) => Ok(()),
+			// The read end is gone: the server exited or closed its pipes.
+			Err(error)
+				if matches!(
+					error.kind(),
+					std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+				) =>
+			{
+				Err(crate::Error::Closed)
+			}
+			Err(error) => Err(crate::Error::Transport(error.to_string())),
+		}
+	}
+
 	/// PID of the spawned server process, if any — mirrors upstream `pid`.
 	pub fn pid(&self) -> Option<u32> {
 		self.pid
@@ -202,28 +228,11 @@ impl Transport for StdioTransport {
 	}
 
 	async fn send(&mut self, request: &JsonRpcRequest) -> crate::Result<()> {
-		let Some(stdin) = self.stdin.as_mut() else {
-			return Err(crate::Error::Closed);
-		};
-		let mut payload = super::encode_frame(request).into_bytes();
-		payload.push(b'\n');
-		let outcome = match stdin.write_all(&payload).await {
-			Ok(()) => stdin.flush().await,
-			Err(error) => Err(error),
-		};
-		match outcome {
-			Ok(()) => Ok(()),
-			// The read end is gone: the server exited or closed its pipes.
-			Err(error)
-				if matches!(
-					error.kind(),
-					std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-				) =>
-			{
-				Err(crate::Error::Closed)
-			}
-			Err(error) => Err(crate::Error::Transport(error.to_string())),
-		}
+		self.write_line(super::encode_frame(request)).await
+	}
+
+	async fn send_response(&mut self, response: &JsonRpcResponse) -> crate::Result<()> {
+		self.write_line(super::encode_response(response)).await
 	}
 
 	async fn recv(&mut self) -> crate::Result<Option<TransportEvent>> {
@@ -326,7 +335,7 @@ async fn pump_stdout(stdout: ChildStdout, events: mpsc::UnboundedSender<Transpor
 					continue;
 				}
 				let event = match super::parse_frame(&line) {
-					Ok(frame) => TransportEvent::Message(Box::new(frame)),
+					Ok(event) => event,
 					Err(error) => TransportEvent::Error(error.to_string()),
 				};
 				if events.send(event).is_err() {

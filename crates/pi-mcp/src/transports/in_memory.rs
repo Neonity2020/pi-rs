@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use super::{Transport, TransportEvent};
-use crate::protocol::jsonrpc::JsonRpcRequest;
+use crate::protocol::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
 /// One end of a connected in-memory pair carrying newline-free JSON frames.
 pub struct InMemoryTransport {
@@ -60,13 +60,19 @@ impl Transport for InMemoryTransport {
 			.map_err(|_| crate::Error::Closed)
 	}
 
+	async fn send_response(&mut self, response: &JsonRpcResponse) -> crate::Result<()> {
+		self.outbound
+			.send(super::encode_response(response))
+			.map_err(|_| crate::Error::Closed)
+	}
+
 	async fn recv(&mut self) -> crate::Result<Option<TransportEvent>> {
 		if self.closed {
 			return Ok(None);
 		}
 		match self.inbound.recv().await {
 			Some(line) => match super::parse_frame(&line) {
-				Ok(frame) => Ok(Some(TransportEvent::Message(Box::new(frame)))),
+				Ok(event) => Ok(Some(event)),
 				Err(e) => Ok(Some(TransportEvent::Error(e.to_string()))),
 			},
 			None => {

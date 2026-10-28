@@ -9,10 +9,11 @@ pub mod protocol;
 pub mod tool;
 pub mod transports;
 
-pub use client::{McpClient, McpServerConfig, McpToolInfo};
+pub use client::{DEFAULT_REQUEST_TIMEOUT_MS, McpClient, McpServerConfig, McpToolInfo};
 pub use protocol::jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use protocol::types::{
-	CallToolParams, CallToolResult, InitializeParams, InitializeResult, ListToolsResult, ServerInfo,
+	CallToolParams, CallToolResult, InitializeParams, InitializeResult, LATEST_PROTOCOL_VERSION,
+	ListToolsResult, SUPPORTED_PROTOCOL_VERSIONS, ServerInfo, ToolAnnotations, ToolExecution,
 };
 pub use tool::{McpTool, SharedMcpClient, create_mcp_tool_name};
 pub use transports::{Transport, TransportEvent};
@@ -26,6 +27,8 @@ pub enum Error {
 	Transport(String),
 	#[error("protocol error: {0}")]
 	Protocol(String),
+	#[error("request timed out after {0} ms")]
+	Timeout(u64),
 	#[error(transparent)]
 	Json(#[from] serde_json::Error),
 	#[error("unsupported transport for this operation: {0}")]

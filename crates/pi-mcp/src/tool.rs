@@ -304,6 +304,7 @@ mod tests {
 			qualified_name: format!("mcp__srv__{name}"),
 			description: None,
 			input_schema,
+			..McpToolInfo::default()
 		}
 	}
 

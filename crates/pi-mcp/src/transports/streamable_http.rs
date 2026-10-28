@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use super::{Transport, TransportEvent, parse_frame};
-use crate::protocol::jsonrpc::JsonRpcRequest;
+use crate::protocol::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
 pub struct StreamableHttpTransport {
 	pub url: String,
@@ -133,12 +133,18 @@ async fn emit_frame(
 	expected_id: Option<&serde_json::Value>,
 ) -> bool {
 	match parse_frame(text) {
-		Ok(frame) => {
+		Ok(TransportEvent::Message(frame)) => {
 			let has_id = expected_id.is_some()
 				&& frame.id.as_ref() == expected_id
 				&& (frame.result.is_some() || frame.error.is_some());
-			let _ = tx.send(TransportEvent::Message(Box::new(frame))).await;
+			let _ = tx.send(TransportEvent::Message(frame)).await;
 			has_id
+		}
+		// Server → client frames on the response/GET stream are forwarded as
+		//-is; answering them is the client's job.
+		Ok(event) => {
+			let _ = tx.send(event).await;
+			false
 		}
 		Err(error) => {
 			let _ = tx.send(TransportEvent::Error(error.to_string())).await;
@@ -402,6 +408,39 @@ impl Transport for StreamableHttpTransport {
 		}
 		if request.method == "notifications/initialized" {
 			self.start_get();
+		}
+		Ok(())
+	}
+
+	/// Answer a server → client request: POST the response frame to the
+	/// endpoint (the server replies `202 Accepted`, which carries nothing to
+	/// forward). Mirrors upstream posting a `JsonRpcResponse` through
+	/// `transport.send`.
+	async fn send_response(&mut self, response: &JsonRpcResponse) -> crate::Result<()> {
+		if self.closed {
+			return Err(crate::Error::Closed);
+		}
+		if let Some(error) = self.fatal_rx.borrow().clone() {
+			return Err(crate::Error::Transport(error));
+		}
+		let post = self
+			.request(reqwest::Method::POST)
+			.header("Accept", "application/json, text/event-stream")
+			.json(response)
+			.send();
+		let response = tokio::select! { biased;
+			changed = self.fatal_rx.changed() => {
+				if changed.is_ok() && let Some(error) = self.fatal_rx.borrow().clone() { return Err(crate::Error::Transport(error)); }
+				return Err(crate::Error::Closed);
+			}
+			result = post => result.map_err(|e| crate::Error::Transport(e.to_string()))?,
+		};
+		let status = response.status();
+		if !status.is_success() {
+			let body = response.text().await.unwrap_or_default();
+			return Err(crate::Error::Transport(format!(
+				"MCP POST failed: {status}: {body}"
+			)));
 		}
 		Ok(())
 	}
