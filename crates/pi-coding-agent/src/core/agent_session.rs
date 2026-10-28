@@ -8,29 +8,36 @@
 //! (prompt/steer/follow-up/abort/model/thinking). Compaction is wired end to
 //! end: manual `/compact` and the automatic triggers share
 //! `core/compaction.rs` — threshold checks run when a prompt is accepted
-//! while idle and after a run completes, and a context-overflow or
-//! recoverable-length tail attempt is omitted (see [`omit_failed_attempt`]),
+//! while idle, after a run completes, and between the turns of a multi-turn
+//! run (the `prepare_next_turn` hook), and a context-overflow or
+//! recoverable-length tail is omitted (see [`omit_failed_attempt`]),
 //! compacted, and retried exactly once.
 //!
+//! Mid-run compaction deviation (against upstream `prepareNextTurn`): the
+//! upstream session layer rewrites `agent.state.messages` directly between
+//! turns; pi-agent refuses transcript replacements while a run is active
+//! (`Agent::replace_messages*` guards on the active run), so the hook
+//! commits the compaction entry to the log and aborts the run at the loop
+//! boundary — the session task then swaps the transcript (now legal) and
+//! resumes the interrupted work with `continue_run`. The log stays
+//! authoritative: the entry is written before the swap, so a crash or a
+//! failed swap still reconciles through the session projection on resume.
+//!
 //! Not ported yet (listed against the upstream source):
-//! - mid-run compaction checks before the next assistant request
-//!   (`agent.ts` `prepareNextTurn` hook — pi-agent has no such hook), listed
-//!   as follow-up;
 //! - bash passthrough, session switch/fork, and the extension hook surface.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use pi_agent::{Agent, AgentEvent, PromptInput};
 use pi_ai::{AssistantMessage, Message, StopReason, ThinkingLevel};
 
 use super::compaction::{self, CompactionOutcome};
-use super::event_bus::EventBus;
+use super::event_bus::{EventBus, EventBusWeak};
 use super::model_registry::ModelRegistry;
-use super::session_manager::{SessionEntry, SessionManager};
+use super::session_manager::{self, EntryKind, SessionEntry, SessionManager};
 use super::settings_manager::CompactionSettings;
 
 /// Commands a mode sends to the session task.
@@ -80,6 +87,10 @@ pub enum SessionEvent {
 	Persisted {
 		kind: &'static str,
 	},
+	/// The session reached a quiescent state: no active run, no in-flight
+	/// compaction, empty prompt queue (upstream `agent_settled` — the RPC
+	/// client's lifecycle anchor for "no auto-continuation is pending").
+	Settled,
 }
 
 /// Handle held by modes; the session task runs in the background.
@@ -92,7 +103,31 @@ pub struct SessionHandle {
 	/// Mirrors the auto-compaction toggle for lock-free status probes (TUI
 	/// footer indicator); the session task owns the authoritative state.
 	pub auto_compaction: Arc<std::sync::atomic::AtomicBool>,
+	/// True while a compaction summarization is in flight (RPC `get_state`'s
+	/// `isCompacting`); the session task owns the authoritative state.
+	pub compacting: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Session log plus the persist cursor, shared between the session task and
+/// the mid-run compaction hook. Every append goes through one lock, which is
+/// never held across an `await` (appends are synchronous fsync'd writes).
+struct SharedLog {
+	session: SessionManager,
+	/// Transcript prefix already written to the log (the agent transcript
+	/// index; the leading system message is never logged, so the cursor
+	/// starts past it).
+	persisted: usize,
+	/// Compaction summarized + committed to the log by the mid-run hook,
+	/// waiting for the run to end so the transcript swap becomes legal.
+	pending_mid_run: Option<PendingMidRunCompaction>,
+}
+
+/// See [`SharedLog::pending_mid_run`].
+struct PendingMidRunCompaction {
+	outcome: CompactionOutcome,
+}
+
+type SharedLogRef = Arc<std::sync::Mutex<SharedLog>>;
 
 /// Build and spawn the session task.
 pub fn spawn_agent_session(
@@ -105,7 +140,7 @@ pub fn spawn_agent_session(
 
 pub fn spawn_agent_session_with_settings(
 	agent: Agent,
-	session: SessionManager,
+	mut session: SessionManager,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 	settings: CompactionSettings,
 ) -> SessionHandle {
@@ -114,37 +149,84 @@ pub fn spawn_agent_session_with_settings(
 
 	let session_dir = session.session_dir().map(|dir| dir.to_path_buf());
 	if let Some(dir) = session.session_dir() {
-		let (projection, floor) = read_session_projection(dir);
-		if floor > 0 {
+		let projection = session_manager::project_file(dir);
+		if projection.usage_valid_from > 0 {
 			let snapshot = agent.snapshot();
 			let ordinary: Vec<_> = snapshot
 				.messages
 				.iter()
 				.filter(|m| !matches!(m, Message::System(_)))
 				.collect();
-			if ordinary.len() == projection.len()
+			if ordinary.len() == projection.messages.len()
 				&& ordinary
 					.iter()
-					.zip(&projection)
+					.zip(&projection.messages)
 					.all(|(a, (_, b))| message_projection_eq(a, b))
 			{
 				let leading_systems = snapshot.messages.len() - ordinary.len();
-				agent.set_usage_valid_from(leading_systems + floor);
+				agent.set_usage_valid_from(leading_systems + projection.usage_valid_from);
 			}
 		}
 	}
 	agent.set_session_id(session.session_id());
+	// Upstream records the session's initial model/thinking as entries right
+	// after the header (agent-session startup); without them a fresh Rust
+	// session lacks the `model_change`/`thinking_level_change` chain the TS
+	// pi always writes. Restored sessions keep their existing chain.
+	if session.entries().is_empty() {
+		let model = agent.model();
+		let thinking = serde_json::to_value(agent.thinking_level())
+			.ok()
+			.and_then(|v| v.as_str().map(str::to_string))
+			.unwrap_or_else(|| "off".to_string());
+		if let Err(error) = session
+			.append(SessionEntry::model_change(
+				model.provider.clone(),
+				model.id.clone(),
+			))
+			.and_then(|_| session.append(SessionEntry::thinking_level_change(thinking)))
+		{
+			eprintln!("warning: failed to record session model/thinking entries: {error}");
+		}
+	}
 	let auto_compaction = Arc::new(std::sync::atomic::AtomicBool::new(
 		settings.enabled.unwrap_or(true),
 	));
+	let compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+	let log: SharedLogRef = Arc::new(std::sync::Mutex::new(SharedLog {
+		persisted: agent.snapshot().messages.len(),
+		session,
+		pending_mid_run: None,
+	}));
+
+	// Mid-run compaction (upstream `prepareNextTurn` between-turn check):
+	// installed before the task starts so every run of this session carries
+	// it. The closure clones the shared state; see [`MidRunHook::check`].
+	let hook = Arc::new(MidRunHook {
+		agent: agent.clone(),
+		log: log.clone(),
+		auto_compaction: auto_compaction.clone(),
+		compacting: compacting.clone(),
+		settings: settings.clone(),
+		bus: event_bus.downgrade(),
+	});
+	agent.set_prepare_next_turn(Arc::new(move |_messages| {
+		let hook = hook.clone();
+		Box::pin(async move {
+			hook.check().await;
+			None
+		})
+	}));
 
 	tokio::spawn(session_task(
 		agent.clone(),
-		session,
+		log,
 		registry,
 		cmd_rx,
 		event_bus.clone(),
 		auto_compaction.clone(),
+		compacting.clone(),
 		settings,
 	));
 
@@ -154,20 +236,134 @@ pub fn spawn_agent_session_with_settings(
 		agent,
 		session_dir,
 		auto_compaction,
+		compacting,
 	}
 }
 
+/// The `prepare_next_turn` hook: upstream's between-turn compaction check
+/// (`_compactBeforeNextAssistantResponse` — after tools finish and their
+/// results are appended, before the next assistant request; skipped when the
+/// batch terminated the run, which the loop expresses by simply not calling
+/// the hook). Threshold formula matches the idle paths:
+/// `context_tokens > window - reserve`.
+struct MidRunHook {
+	agent: Agent,
+	log: SharedLogRef,
+	auto_compaction: Arc<std::sync::atomic::AtomicBool>,
+	compacting: Arc<std::sync::atomic::AtomicBool>,
+	settings: CompactionSettings,
+	/// Weak so the hook — which lives as long as the agent — never keeps the
+	/// session-event channel (and with it the session task's lifecycle) open.
+	bus: EventBusWeak<SessionEvent>,
+}
+
+impl MidRunHook {
+	/// Notice through the bus while the session task is alive; a closed bus
+	/// (task exited) drops the notice.
+	fn emit(&self, event: SessionEvent) {
+		if let Some(bus) = self.bus.upgrade() {
+			bus.emit(event);
+		}
+	}
+
+	async fn check(&self) {
+		if !self
+			.auto_compaction
+			.load(std::sync::atomic::Ordering::Relaxed)
+		{
+			return;
+		}
+		let Some((tokens, window)) = super::context_usage::compute(&self.agent) else {
+			return;
+		};
+		if tokens <= window.saturating_sub(self.settings.reserve_tokens.unwrap_or(16_384)) {
+			return;
+		}
+		if self.log.lock().unwrap().pending_mid_run.is_some() {
+			return;
+		}
+		self.compacting
+			.store(true, std::sync::atomic::Ordering::Relaxed);
+		self.compact().await;
+		// The flag stays raised while a committed compaction waits for its
+		// swap; the session task clears it after applying (the loop-top
+		// refresh may also clear it — the flag is a status probe only).
+		let pending = self.log.lock().unwrap().pending_mid_run.is_some();
+		if !pending {
+			self.compacting
+				.store(false, std::sync::atomic::Ordering::Relaxed);
+		}
+	}
+
+	/// Summarize past the threshold and commit the compaction entry to the
+	/// log. The transcript swap itself must wait for the run to end
+	/// (pi-agent refuses replacements mid-run), so the hook marks the log
+	/// pending and aborts the run — the session task applies the swap at the
+	/// run boundary and resumes with `continue_run`.
+	async fn compact(&self) {
+		let keep_recent = self.settings.keep_recent_tokens.unwrap_or(20_000);
+		// Persist whatever the run already produced and select the cut under
+		// one lock; no awaits while it is held.
+		let cut = {
+			let mut guard = self.log.lock().unwrap();
+			if let Some(bus) = self.bus.upgrade() {
+				persist_messages(&self.agent, &mut guard, &bus);
+			}
+			auto_compaction_cut(&self.agent, &mut guard, keep_recent)
+		};
+		let Some(cut) = cut else {
+			return;
+		};
+		self.emit(SessionEvent::Notice("auto-compaction (mid-run)…".into()));
+		match compaction::compact_prefix(&self.agent, Some(cut)).await {
+			Ok(outcome) => {
+				let mut guard = self.log.lock().unwrap();
+				// The log entry leads the swap (upstream
+				// `SessionManager.appendCompaction`): a crash between entry
+				// and swap still reconciles through the projection.
+				let mut entry =
+					SessionEntry::compaction(outcome.summary.clone(), outcome.tokens_before);
+				if let (
+					Some(id),
+					EntryKind::Compaction {
+						first_kept_entry_id,
+						..
+					},
+				) = (&outcome.first_kept_id, &mut entry.kind)
+				{
+					*first_kept_entry_id = id.clone();
+				}
+				match guard.session.append(entry) {
+					Ok(_) => {
+						guard.pending_mid_run = Some(PendingMidRunCompaction { outcome });
+					}
+					Err(error) => self.emit(SessionEvent::Notice(format!(
+						"session write failed: {error}"
+					))),
+				}
+			}
+			Err(error) => self.emit(SessionEvent::Notice(format!("compaction failed: {error}"))),
+		}
+		if self.log.lock().unwrap().pending_mid_run.is_some() {
+			// End the run at the loop boundary; the task applies the swap and
+			// continues the interrupted work.
+			self.agent.abort();
+		}
+	}
+}
+
+#[allow(clippy::too_many_arguments)] // the flag pair and settings are distinct inputs
 async fn session_task(
 	agent: Agent,
-	mut session: SessionManager,
+	log: SharedLogRef,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 	mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
 	event_bus: EventBus<SessionEvent>,
 	auto_compaction: Arc<std::sync::atomic::AtomicBool>,
+	compacting_flag: Arc<std::sync::atomic::AtomicBool>,
 	settings: CompactionSettings,
 ) {
 	let mut agent_rx = agent.subscribe();
-	let mut persisted = agent.snapshot().messages.len();
 	let mut pending = VecDeque::new();
 	let mut run: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
 	// In-flight compaction summarization; the agent is idle while this runs.
@@ -175,12 +371,40 @@ async fn session_task(
 	let mut compaction_commit_failed = false;
 	let mut recovery_compaction = false;
 	let mut overflow_attempted = false;
+	// Settle tracking: `agent_settled` fires on each busy→idle transition;
+	// the initial idle state does not emit (nothing has settled yet).
+	let mut was_idle = true;
+	let mut first_loop = true;
 
 	let notice = |bus: &EventBus<SessionEvent>, text: String| {
 		bus.emit(SessionEvent::Notice(text));
 	};
 
 	loop {
+		// Derived probes, refreshed each iteration before awaiting: the flag
+		// updates lag a spawn by one loop pass at most (microseconds — the
+		// select re-loops immediately after an arm runs).
+		let mid_run_pending = log.lock().unwrap().pending_mid_run.is_some();
+		compacting_flag.store(
+			compacting.is_some() || mid_run_pending,
+			std::sync::atomic::Ordering::Relaxed,
+		);
+		let idle = run.is_none() && compacting.is_none() && pending.is_empty();
+		if first_loop {
+			first_loop = false;
+		}
+		// (rpc-mode P1, agent D) `agent_settled` must follow the finished
+		// run's buffered agent events on the wire (upstream emits it only
+		// after the run loop fully unwound), so the settle is deferred until
+		// agent_rx has been drained. The run-completion branch itself still
+		// runs ahead of the buffered events — recovery triggers fire before
+		// they are re-emitted — only the settle waits for the drain.
+		let settled = idle && agent_rx.is_empty();
+		if settled && !was_idle {
+			event_bus.emit(SessionEvent::Settled);
+		}
+		was_idle = settled;
+
 		tokio::select! {
 			biased;
 
@@ -198,7 +422,7 @@ async fn session_task(
 						} else if auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
 							&& let Some((tokens, window)) = super::context_usage::compute(&agent)
 							&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
-							&& let Some(cut) = auto_compaction_cut(&agent, &session, persisted, settings.keep_recent_tokens.unwrap_or(20_000)) {
+							&& let Some(cut) = auto_compaction_cut(&agent, &mut log.lock().unwrap(), settings.keep_recent_tokens.unwrap_or(20_000)) {
 							pending.push_back(text);
 							notice(&event_bus, "auto-compaction (threshold)…".into());
 							let agent = agent.clone();
@@ -242,7 +466,12 @@ async fn session_task(
 								agent.set_stream_fn(pi_ai::providers::stream_fn_for(&model));
 								agent.set_model(model.clone());
 								registry.lock().unwrap().set_default(&model);
-								if let Err(e) = session.append(&SessionEntry::ModelChange { model: model.key() }) {
+								let change = SessionEntry::model_change(
+									model.provider.clone(),
+									model.id.clone(),
+								);
+								let write = log.lock().unwrap().session.append(change);
+								if let Err(e) = write {
 									notice(&event_bus, format!("session write failed: {e}"));
 								}
 								notice(&event_bus, format!("model → {}", model.key()));
@@ -252,11 +481,13 @@ async fn session_task(
 					}
 					SessionCommand::SetThinking { level } => {
 						agent.set_thinking_level(level);
+						persist_thinking_level(&log, level, &event_bus);
 						notice(&event_bus, format!("thinking → {level:?}"));
 					}
 					SessionCommand::CycleThinking => {
 						let next = next_thinking_level(agent.thinking_level());
 						agent.set_thinking_level(next);
+						persist_thinking_level(&log, next, &event_bus);
 						notice(&event_bus, format!("thinking → {next:?}"));
 					}
 					SessionCommand::Compact => {
@@ -271,7 +502,8 @@ async fn session_task(
 								}
 							}
 							run = None;
-							persist_messages(&agent, &mut session, &mut persisted, &event_bus);
+							let mut guard = log.lock().unwrap();
+							persist_messages(&agent, &mut guard, &event_bus);
 						}
 						if run.is_some() || agent.is_streaming() {
 							// Upstream aborts the run before compacting; this port
@@ -281,8 +513,12 @@ async fn session_task(
 						} else if compacting.is_some() {
 							notice(&event_bus, "compaction already running".into());
 						} else {
-							persist_messages(&agent, &mut session, &mut persisted, &event_bus);
-							if persisted != agent.snapshot().messages.len() {
+							let fully_persisted = {
+								let mut guard = log.lock().unwrap();
+								persist_messages(&agent, &mut guard, &event_bus);
+								guard.persisted == agent.snapshot().messages.len()
+							};
+							if !fully_persisted {
 								notice(&event_bus, "cannot compact: transcript is not fully persisted".into());
 								continue;
 							}
@@ -307,7 +543,6 @@ async fn session_task(
 					SessionCommand::Exit => break,
 				}
 			}
-
 			result = async { run.as_mut().expect("guarded run").await }, if run.is_some() => {
 				run = None;
 				match result {
@@ -316,28 +551,60 @@ async fn session_task(
 					Err(e) => notice(&event_bus, format!("prompt task failed: {e}")),
 				}
 				// Persist the completed turn before selecting a durable cut.
-				persist_messages(&agent, &mut session, &mut persisted, &event_bus);
+				let mut guard = log.lock().unwrap();
+				persist_messages(&agent, &mut guard, &event_bus);
+				drop(guard);
+
+				// Mid-run compaction committed by the hook: the run was cut
+				// short so the transcript swap could happen (pi-agent refuses
+				// replacements while a run is active). Apply it now and resume
+				// the interrupted work.
+				if log.lock().unwrap().pending_mid_run.is_some() {
+					if apply_mid_run_compaction(&agent, &log, &event_bus) {
+						let last_is_assistant = agent
+							.snapshot()
+							.messages
+							.last()
+							.is_some_and(|m| m.role() == "assistant");
+						if !last_is_assistant && !agent.is_streaming() {
+							let agent = agent.clone();
+							run = Some(tokio::spawn(async move { agent.continue_run().await }));
+						}
+					} else {
+						compaction_commit_failed = true;
+						notice(&event_bus, "session stopped after compaction commit failure; reopen to recover".into());
+						break;
+					}
+				}
+
 				let snapshot = agent.snapshot();
 				let recover = auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
 					&& snapshot.messages.last().is_some_and(|m| matches!(m, Message::Assistant(a) if recoverable_overflow(a, &agent.model())));
 				if recover && !overflow_attempted {
-					if let Some(cut) = auto_compaction_cut(&agent, &session, persisted, settings.keep_recent_tokens.unwrap_or(20_000)) {
-						match omit_failed_attempt(&agent, &mut session, &mut persisted) {
-							Ok(()) => {
+					// Omit first, then select the cut: the failed attempt is
+					// already context-invisible, so the boundary reflects the
+					// post-omission transcript — the port's form of upstream's
+					// recovery-omission suffix advancement
+					// (`findProjectedCutPoint` skips entries the omission made
+					// invisible; here they are gone from the array entirely).
+					match omit_failed_attempt(&agent, &log) {
+						Ok(()) => {
+							let cut = auto_compaction_cut(&agent, &mut log.lock().unwrap(), settings.keep_recent_tokens.unwrap_or(20_000));
+							if let Some(cut) = cut {
 								overflow_attempted = true;
 								recovery_compaction = true;
 								notice(&event_bus, "context overflow: compacting before one retry".into());
 								let agent = agent.clone();
 								compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
-							}
-							Err(error) => {
-								compaction_commit_failed = true;
-								notice(&event_bus, format!("overflow recovery commit failed: {error}; reopen to recover"));
-								break;
+							} else {
+								notice(&event_bus, "overflow recovery unavailable: no durable compaction boundary".into());
 							}
 						}
-					} else {
-						notice(&event_bus, "overflow recovery unavailable: no durable compaction boundary".into());
+						Err(error) => {
+							compaction_commit_failed = true;
+							notice(&event_bus, format!("overflow recovery commit failed: {error}; reopen to recover"));
+							break;
+						}
 					}
 				} else if recover && overflow_attempted {
 					notice(&event_bus, "overflow recovery failed after one compact-and-retry attempt".into());
@@ -345,13 +612,13 @@ async fn session_task(
 				if !recover && auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
 					&& let Some((tokens, window)) = super::context_usage::compute(&agent)
 					&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
-					&& let Some(cut) = auto_compaction_cut(&agent, &session, persisted, settings.keep_recent_tokens.unwrap_or(20_000))
+					&& let Some(cut) = auto_compaction_cut(&agent, &mut log.lock().unwrap(), settings.keep_recent_tokens.unwrap_or(20_000))
 				{
 					notice(&event_bus, "auto-compaction (threshold)…".into());
 					let agent = agent.clone();
 					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
 				}
-				if compacting.is_none() && let Some(text) = pending.pop_front() {
+				if compacting.is_none() && run.is_none() && !agent.is_streaming() && let Some(text) = pending.pop_front() {
 					overflow_attempted = false;
 					let agent = agent.clone();
 					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
@@ -363,12 +630,13 @@ async fn session_task(
 				let mut committed = false;
 				match result {
 					Ok(Ok(outcome)) => {
-						if !apply_compaction(&agent, &mut session, &mut persisted, &event_bus, outcome) {
+						if apply_compaction(&agent, &log, &event_bus, outcome) {
+							committed = true;
+						} else {
 							compaction_commit_failed = true;
 							notice(&event_bus, "session stopped after compaction commit failure; reopen to recover".into());
 							break;
 						}
-						committed = true;
 					}
 					Ok(Err(e)) => notice(&event_bus, format!("compaction failed: {e}")),
 					Err(e) => notice(&event_bus, format!("compaction task failed: {e}")),
@@ -389,22 +657,24 @@ async fn session_task(
 					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
 				}
 			}
-
 			event = agent_rx.recv() => {
 				match event {
 					Ok(agent_event) => {
 						if matches!(&agent_event, AgentEvent::MessageEnd { .. } | AgentEvent::AgentEnd { .. }) {
-							persist_messages(&agent, &mut session, &mut persisted, &event_bus);
+							let mut guard = log.lock().unwrap();
+							persist_messages(&agent, &mut guard, &event_bus);
 						}
 						event_bus.emit(SessionEvent::Agent(Box::new(agent_event)));
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
 						notice(&event_bus, format!("event lag: dropped {count} events"));
-								persist_messages(&agent, &mut session, &mut persisted, &event_bus);
+								let mut guard = log.lock().unwrap();
+								persist_messages(&agent, &mut guard, &event_bus);
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
 				}
 			}
+
 		}
 	}
 	if let Some(task) = compacting {
@@ -428,30 +698,37 @@ async fn session_task(
 		}
 	}
 	if !compaction_commit_failed {
-		persist_messages(&agent, &mut session, &mut persisted, &event_bus);
+		let mut guard = log.lock().unwrap();
+		persist_messages(&agent, &mut guard, &event_bus);
+	}
+}
+
+/// Persist a `thinking_level_change` entry (upstream `appendThinkingLevelChange`)
+/// — best effort: a failed write surfaces as a notice, never blocks the toggle.
+fn persist_thinking_level(log: &SharedLogRef, level: ThinkingLevel, bus: &EventBus<SessionEvent>) {
+	let entry = SessionEntry::thinking_level_change(format!("{level:?}").to_lowercase());
+	if let Err(error) = log.lock().unwrap().session.append(entry) {
+		bus.emit(SessionEvent::Notice(format!(
+			"session write failed: {error}"
+		)));
 	}
 }
 
 // The broadcast channel is lossy; the transcript is the authoritative source.
 // Advance only after a successful append so a later event can retry a failed write.
-fn persist_messages(
-	agent: &Agent,
-	session: &mut SessionManager,
-	persisted: &mut usize,
-	bus: &EventBus<SessionEvent>,
-) {
-	if let Err(error) = session.sync_pending_metadata() {
+fn persist_messages(agent: &Agent, log: &mut SharedLog, bus: &EventBus<SessionEvent>) {
+	if let Err(error) = log.session.sync_pending_metadata() {
 		bus.emit(SessionEvent::Notice(format!(
 			"session write failed: {error}"
 		)));
 		return;
 	}
 	let snapshot = agent.snapshot();
-	for message in snapshot.messages.iter().skip(*persisted) {
-		match session.append_message(message) {
-			Ok(()) => {
-				*persisted += 1;
-				if session.session_dir().is_some() {
+	for message in snapshot.messages.iter().skip(log.persisted) {
+		match log.session.append_message(message) {
+			Ok(_) => {
+				log.persisted += 1;
+				if log.session.session_dir().is_some() {
 					bus.emit(SessionEvent::Persisted { kind: "message" });
 				}
 			}
@@ -474,17 +751,18 @@ fn message_projection_eq(a: &Message, b: &Message) -> bool {
 	left == right
 }
 
-/// Select a whole-turn boundary and verify it is durably addressable. Old
-/// logs without message IDs are left untouched until they have enough newer
-/// ID-bearing messages to form a safe boundary.
+/// Select a compaction boundary and verify it is durably addressable. The
+/// cut may split an oversized single turn (upstream `findProjectedCutPoint`):
+/// `cut.turn_start` names the turn's leading user message for the dual
+/// summary. Old logs without entry ids are left untouched until they have
+/// enough newer ID-bearing entries to form a safe boundary.
 fn auto_compaction_cut(
 	agent: &Agent,
-	session: &SessionManager,
-	persisted: usize,
+	log: &mut SharedLog,
 	keep_tokens: u64,
-) -> Option<(usize, Option<String>)> {
+) -> Option<compaction::Cut> {
 	let snapshot = agent.snapshot();
-	if persisted != snapshot.messages.len() {
+	if log.persisted != snapshot.messages.len() {
 		return None;
 	}
 	let messages: Vec<Message> = snapshot
@@ -493,35 +771,32 @@ fn auto_compaction_cut(
 		.filter(|m| !matches!(m, Message::System(_)))
 		.cloned()
 		.collect();
-	// Upstream also cuts at assistant messages; this pipeline omits a failed
-	// tail assistant before summarizing, so a cut landing on that tail would
-	// dangle after the omission — clamp to the closest user boundary, which
-	// starts the turn where the budget was exceeded (conservative because
-	// split-turn cuts are not ported).
-	let target = compaction::find_cut_point(&messages, keep_tokens);
-	let cut = (0..=target)
-		.rev()
-		.find(|&index| matches!(messages[index], Message::User(_)))?;
-	if cut == 0 {
+	let target = compaction::find_cut_point_detailed(&messages, keep_tokens);
+	if target.first_kept == 0 {
 		return None;
 	}
-	let id = if let Some(dir) = session.session_dir() {
-		let (projection, _) = read_session_projection(dir);
-		if projection.len() != messages.len() {
+	let id = if log.session.session_dir().is_some() {
+		let projection = log.session.projection();
+		if projection.messages.len() != messages.len() {
 			return None;
 		}
 		if !projection
+			.messages
 			.iter()
 			.zip(messages.iter())
 			.all(|((_, a), b)| message_projection_eq(a, b))
 		{
 			return None;
 		}
-		Some(projection[cut].0.clone()?)
+		projection.messages[target.first_kept].0.clone()
 	} else {
 		None
 	};
-	Some((cut, id))
+	Some(compaction::Cut {
+		first_kept: target.first_kept,
+		turn_start: target.turn_start,
+		first_kept_id: id,
+	})
 }
 
 /// Case-insensitive fragments identifying context-overflow errors — port of
@@ -639,46 +914,91 @@ fn recoverable_overflow(message: &AssistantMessage, model: &pi_ai::Model) -> boo
 /// [`apply_compaction`]): the omitted entry stays in the log for audit, the
 /// tombstone keeps resumed sessions from replaying it, and the persist cursor
 /// is rebased so the removed message is never written twice.
-fn omit_failed_attempt(
-	agent: &Agent,
-	session: &mut SessionManager,
-	persisted: &mut usize,
-) -> anyhow::Result<()> {
+fn omit_failed_attempt(agent: &Agent, log: &std::sync::Mutex<SharedLog>) -> anyhow::Result<()> {
 	let snapshot = agent.snapshot();
-	if *persisted != snapshot.messages.len() {
-		anyhow::bail!("transcript is not fully persisted");
-	}
 	let Some(Message::Assistant(_)) = snapshot.messages.last() else {
 		anyhow::bail!("transcript does not end with the failed assistant");
 	};
-	let Some(dir) = session.session_dir() else {
-		anyhow::bail!("overflow recovery needs a session log");
+	// Verify the durable boundary under the log lock (released before the
+	// transaction: its commit closure re-locks to append the tombstone).
+	let target_id = {
+		let guard = log.lock().unwrap();
+		if guard.persisted != snapshot.messages.len() {
+			anyhow::bail!("transcript is not fully persisted");
+		}
+		if guard.session.session_dir().is_none() {
+			anyhow::bail!("overflow recovery needs a session log");
+		}
+		let projection = guard.session.projection();
+		let Some((entry_id, logged)) = projection.messages.last() else {
+			anyhow::bail!("session log is empty");
+		};
+		let Some(target_id) = entry_id.clone() else {
+			anyhow::bail!("failed attempt has no log entry id");
+		};
+		if !message_projection_eq(logged, snapshot.messages.last().unwrap()) {
+			anyhow::bail!("session log tail is not the failed attempt");
+		}
+		target_id
 	};
-	let (projection, _) = read_session_projection(dir);
-	let Some((entry_id, logged)) = projection.last() else {
-		anyhow::bail!("session log is empty");
-	};
-	let Some(target_id) = entry_id.clone() else {
-		anyhow::bail!("failed attempt has no log entry id");
-	};
-	if !message_projection_eq(logged, snapshot.messages.last().unwrap()) {
-		anyhow::bail!("session log tail is not the failed attempt");
-	}
 	let mut without_attempt = snapshot.messages.clone();
 	without_attempt.pop();
-	let tombstone = SessionEntry::ContextEdit {
-		target_id,
-		replacement: None,
-	};
+	let tombstone = SessionEntry::context_edit(target_id);
 	agent.replace_messages_transactionally(&snapshot.messages, without_attempt, || {
-		session.append(&tombstone)?;
+		log.lock().unwrap().session.append(tombstone)?;
 		Ok(())
 	})?;
 	// The failed attempt was persisted behind the old cursor; everything that
 	// remains was persisted before it, so rebasing keeps the log append-only
 	// without duplicating any of them.
-	*persisted = agent.snapshot().messages.len();
+	log.lock().unwrap().persisted = agent.snapshot().messages.len();
 	Ok(())
+}
+
+/// Apply a mid-run compaction committed by the `prepare_next_turn` hook: the
+/// log entry is already written, so this only swaps the transcript — now
+/// legal because the run has ended — extending the kept tail with whatever
+/// the loop appended after the hook (drained steering/follow-ups). The
+/// expected-transcript check requires the hook-time transcript to be a
+/// prefix of the current one; on any mismatch the log entry still wins on
+/// resume (the projection reconciles), so this only reports and moves on.
+fn apply_mid_run_compaction(
+	agent: &Agent,
+	log: &std::sync::Mutex<SharedLog>,
+	bus: &EventBus<SessionEvent>,
+) -> bool {
+	let mut guard = log.lock().unwrap();
+	let Some(pending) = guard.pending_mid_run.take() else {
+		return true;
+	};
+	let outcome = pending.outcome;
+	let current = agent.snapshot().messages;
+	let source = &outcome.source_messages;
+	let prefix_matches = current.len() >= source.len() && current[..source.len()] == source[..];
+	if !prefix_matches {
+		bus.emit(SessionEvent::Notice(
+			"mid-run compaction skipped: the transcript changed after the summary; reopen to reconcile".into(),
+		));
+		return true;
+	}
+	let mut history = compaction::replacement_history(source, &outcome.summary);
+	history.extend(outcome.kept.iter().cloned());
+	history.extend(current[source.len()..].iter().cloned());
+	let result = agent.replace_messages_transactionally(&current, history, || Ok(()));
+	if let Err(error) = result {
+		bus.emit(SessionEvent::Notice(format!(
+			"compaction commit failed: {error}"
+		)));
+		return false;
+	}
+	// The summary reached the log through the compaction entry; rebase the
+	// persist cursor onto the replaced transcript so nothing is double-written.
+	guard.persisted = agent.snapshot().messages.len();
+	bus.emit(SessionEvent::Notice(format!(
+		"compacted: {} tokens summarized",
+		outcome.tokens_before
+	)));
+	true
 }
 
 /// Commit a finished compaction: write the log entry first — it is the
@@ -687,26 +1007,25 @@ fn omit_failed_attempt(
 /// the log never claims a compaction the agent did not apply.
 fn apply_compaction(
 	agent: &Agent,
-	session: &mut SessionManager,
-	persisted: &mut usize,
+	log: &std::sync::Mutex<SharedLog>,
 	bus: &EventBus<SessionEvent>,
 	outcome: CompactionOutcome,
 ) -> bool {
 	let mut entry = SessionEntry::compaction(outcome.summary.clone(), outcome.tokens_before);
 	if let (
 		Some(id),
-		SessionEntry::Compaction {
+		EntryKind::Compaction {
 			first_kept_entry_id,
 			..
 		},
-	) = (&outcome.first_kept_id, &mut entry)
+	) = (&outcome.first_kept_id, &mut entry.kind)
 	{
 		*first_kept_entry_id = id.clone();
 	}
 	let mut history = compaction::replacement_history(&outcome.source_messages, &outcome.summary);
 	history.extend(outcome.kept);
 	let result = agent.replace_messages_transactionally(&outcome.source_messages, history, || {
-		session.append(&entry)?;
+		log.lock().unwrap().session.append(entry)?;
 		Ok(())
 	});
 	if let Err(error) = result {
@@ -715,14 +1034,14 @@ fn apply_compaction(
 		)));
 		return false;
 	}
-	if session.session_dir().is_some() {
+	if log.lock().unwrap().session.session_dir().is_some() {
 		bus.emit(SessionEvent::Persisted { kind: "compaction" });
 	}
 
 	// The summary reached the log through the compaction entry, never as a
 	// message entry: rebase the persist cursor onto the replaced transcript so
 	// it is not double-persisted.
-	*persisted = agent.snapshot().messages.len();
+	log.lock().unwrap().persisted = agent.snapshot().messages.len();
 	bus.emit(SessionEvent::Notice(format!(
 		"compacted: {} tokens summarized",
 		outcome.tokens_before
@@ -743,83 +1062,18 @@ fn next_thinking_level(current: ThinkingLevel) -> ThinkingLevel {
 	}
 }
 
-/// Rebuild a transcript from a session file (resume support).
-///
-/// Compaction entries replay as their summary message: this port summarizes
-/// the whole non-system transcript ("keep nothing" cut), so everything
-/// accumulated before the entry was compacted into it and is replaced by the
-/// rebuilt summary — the flat-log equivalent of upstream's
-/// `buildContextEntries` (`pi/packages/coding-agent/src/core/session-manager.ts`),
-/// where a compaction entry contributes
-/// `[systemMessage?, compactionSummary]` and the summarized older entries are
-/// omitted. A compaction entry without a parsable summary cannot be rebuilt
-/// and is skipped, keeping the accumulated prefix.
+/// Rebuild a transcript from a session file (resume support) — the tree
+/// projection from `session-manager.rs` (`buildContextEntries` +
+/// `buildSessionProjection` upstream): the leaf-to-root path with the newest
+/// compaction applied (its summary replays as a message, older summarized
+/// entries omitted, the kept range from `firstKeptEntryId`) and the latest
+/// `context_edit` per target honored.
 pub fn read_session_messages(dir: &std::path::Path) -> Vec<Message> {
-	read_session_projection(dir)
-		.0
+	session_manager::project_file(dir)
+		.messages
 		.into_iter()
 		.map(|(_, message)| message)
 		.collect()
-}
-
-fn read_session_projection(dir: &std::path::Path) -> (Vec<(Option<String>, Message)>, usize) {
-	let Ok(text) = std::fs::read_to_string(dir.join("session.jsonl")) else {
-		return (Vec::new(), 0);
-	};
-	let mut messages: Vec<(Option<String>, Message)> = Vec::new();
-	let mut usage_valid_from = 0;
-	for line in text.lines() {
-		let Ok(value) = serde_json::from_str::<Value>(line) else {
-			continue;
-		};
-		match value.get("type").and_then(Value::as_str) {
-			Some("message") => {
-				if let Some(value_message) = value.get("message")
-					&& let Ok(message) = serde_json::from_value::<Message>(value_message.clone())
-				{
-					messages.push((
-						value.get("id").and_then(Value::as_str).map(str::to_owned),
-						message,
-					));
-				}
-			}
-			Some("context_edit") if value.get("replacement").is_some_and(Value::is_null) => {
-				if let Some(target) = value.get("targetId").and_then(Value::as_str)
-					&& let Some(index) = messages
-						.iter()
-						.position(|(id, _)| id.as_deref() == Some(target))
-				{
-					messages.remove(index);
-					usage_valid_from = usage_valid_from.min(messages.len());
-				}
-			}
-			Some("compaction") => {
-				if let Some(summary) = value.get("summary").and_then(Value::as_str) {
-					let id = value.get("id").and_then(Value::as_str);
-					let first = value.get("firstKeptEntryId").and_then(Value::as_str);
-					let kept = if let Some(first) = first.filter(|first| Some(*first) != id) {
-						let Some(index) = messages
-							.iter()
-							.position(|(id, _)| id.as_deref() == Some(first))
-						else {
-							continue;
-						};
-						messages.split_off(index)
-					} else {
-						Vec::new()
-					};
-					messages = vec![(
-						id.map(str::to_owned),
-						compaction::compaction_summary_message(summary),
-					)];
-					messages.extend(kept);
-					usage_valid_from = messages.len();
-				}
-			}
-			_ => {}
-		}
-	}
-	(messages, usage_valid_from)
 }
 
 /// Messages to seed a resumed agent (`--continue` / `--resume`): the persisted
@@ -842,6 +1096,7 @@ pub fn restore_initial_messages(dir: &std::path::Path) -> Vec<Message> {
 mod tests {
 	use super::*;
 	use pi_agent::AgentOptions;
+	use serde_json::Value;
 	use std::time::Duration;
 
 	fn mock_agent() -> Agent {
@@ -991,6 +1246,237 @@ mod tests {
 			// keeping the newest turn (the cut lands on its user message).
 			keep_recent_tokens: Some(0),
 		}
+	}
+
+	/// Mid-run compaction (the `prepare_next_turn` between-turn check): turn
+	/// 1 reports usage past the threshold while a steering message keeps the
+	/// run going; the hook compacts before the next request. The mock
+	/// records every ordinary request's role sequence, so the test can
+	/// assert the second request already carries the compacted context.
+	#[tokio::test]
+	async fn mid_run_threshold_compacts_before_the_next_request() {
+		let dir = temp_session_dir("mid-run");
+		let request_roles = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+		let ordinary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let roles = request_roles.clone();
+		let stream: pi_ai::StreamFn = Arc::new(move |model, context, _| {
+			let roles = roles.clone();
+			if is_summarization_request(context) {
+				let model = model.clone();
+				let text = format!("[mock summary] {}", last_user_text(context));
+				return Box::pin(futures::stream::once(async move {
+					pi_ai::AssistantMessageEvent::Done {
+						reason: StopReason::Stop,
+						message: echo_assistant_message(&model, text),
+					}
+				})) as pi_ai::AssistantMessageEventStream;
+			}
+			roles.lock().unwrap().push(
+				context
+					.messages
+					.iter()
+					.map(|message| {
+						let role = message.role().to_string();
+						match message {
+							Message::User(user) if user.content.as_text().contains("summary") => {
+								format!("{role}:summary")
+							}
+							Message::User(user) => {
+								format!("{role}:{}", user.content.as_text())
+							}
+							_ => role,
+						}
+					})
+					.collect(),
+			);
+			// Only turn 1 crosses the threshold (window 30_000, reserve
+			// 16_384); later replies report no usage so exactly one mid-run
+			// compaction happens.
+			let first = ordinary_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+			let model = model.clone();
+			Box::pin(futures::stream::once(async move {
+				let mut reply = echo_assistant_message(&model, "answer".into());
+				if first {
+					reply.usage.total_tokens = 20_000;
+				}
+				pi_ai::AssistantMessageEvent::Done {
+					reason: StopReason::Stop,
+					message: reply,
+				}
+			})) as pi_ai::AssistantMessageEventStream
+		});
+		let agent = Agent::new(AgentOptions {
+			model: recovery_model(),
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session_with_settings(
+			agent.clone(),
+			SessionManager::open(&dir).unwrap(),
+			registry,
+			recovery_settings(),
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "first".into(),
+			})
+			.unwrap();
+		// Steer while the run is active so the loop continues after turn 1
+		// and the between-turn hook fires before the second request.
+		handle
+			.cmd_tx
+			.send(SessionCommand::Steer {
+				text: "second".into(),
+			})
+			.unwrap();
+		let notices = notices_until_agent_ends(&mut handle, 2).await;
+		assert!(
+			notices
+				.iter()
+				.any(|text| text == "auto-compaction (mid-run)…"),
+			"hook notice missing: {notices:?}"
+		);
+		assert!(notices.iter().any(|text| text.starts_with("compacted:")));
+
+		// Two ordinary requests: the second already carries the compaction
+		// summary (upstream compacts during prepareNextTurn, before the next
+		// assistant response).
+		// Clone out of the guard: asserts below await.
+		let requests = request_roles.lock().unwrap().clone();
+		assert_eq!(requests.len(), 2, "two ordinary requests");
+		assert_eq!(requests[0], vec!["system", "user:first"]);
+		assert_eq!(
+			requests[1],
+			vec![
+				"system",
+				"user:summary", // the compaction summary message
+				"assistant",    // turn 1's reply (kept tail)
+				"user:second",  // the steering message
+			]
+		);
+
+		// The transcript was swapped to summary + kept + steering.
+		let roles: Vec<&str> = agent
+			.snapshot()
+			.messages
+			.iter()
+			.map(Message::role)
+			.collect();
+		assert_eq!(roles, ["system", "user", "assistant", "user", "assistant"]);
+		let snapshot = agent.snapshot();
+		let Message::User(summary) = &snapshot.messages[1] else {
+			panic!("expected the compaction summary")
+		};
+		let summary_text = summary.content.as_text();
+		assert!(summary_text.contains(compaction::COMPACTION_SUMMARY_PREFIX));
+		assert!(summary_text.contains("[mock summary]"));
+		assert!(summary_text.contains("first"));
+
+		// Log: exactly one compaction entry, and the log replays to the live
+		// transcript (the entry led the swap; steering appended after it).
+		assert_eq!(compaction_entry_values(&dir).len(), 1);
+		wait_for_log_len(&dir, snapshot.messages.len() - 1).await;
+		let restored = read_session_messages(&dir);
+		let restored_roles: Vec<&str> = restored.iter().map(Message::role).collect();
+		assert_eq!(restored_roles, ["user", "assistant", "user", "assistant"]);
+		assert!(
+			restored
+				.iter()
+				.zip(agent.snapshot().messages.iter().skip(1))
+				.all(|(a, b)| message_projection_eq(a, b))
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// Wait until the log holds at least `count` projected messages (the task
+	/// persists concurrently with the run).
+	async fn wait_for_log_len(dir: &std::path::Path, count: usize) {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while read_session_messages(dir).len() < count {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("log should reach the expected length");
+	}
+
+	/// A single oversized turn is compacted (split turn, upstream
+	/// `findProjectedCutPoint`): the cut lands on the turn's assistant reply,
+	/// the turn's head gets the turn-prefix summary, and the merged summary
+	/// lands in the log behind the upstream split-turn label.
+	#[tokio::test]
+	async fn oversized_single_turn_is_split_and_compacted() {
+		let dir = temp_session_dir("split-turn");
+		// Instant echo provider: the raw mock streams one delta per 24 chars
+		// with a 12ms pause each, which no test run can afford at 85k chars.
+		let stream: pi_ai::StreamFn = Arc::new(|model, context, _| {
+			let model = model.clone();
+			let text = if is_summarization_request(context) {
+				format!("[mock summary] {}", last_user_text(context))
+			} else {
+				"reply".to_string()
+			};
+			Box::pin(futures::stream::once(async move {
+				pi_ai::AssistantMessageEvent::Done {
+					reason: StopReason::Stop,
+					message: echo_assistant_message(&model, text),
+				}
+			})) as pi_ai::AssistantMessageEventStream
+		});
+		let agent = Agent::new(AgentOptions {
+			model: recovery_model(),
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let session = SessionManager::open(&dir).unwrap();
+		let mut handle = spawn_agent_session_with_settings(
+			agent.clone(),
+			session,
+			registry,
+			recovery_settings(),
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "x".repeat(85_000),
+			})
+			.unwrap();
+		notices_until_agent_ends(&mut handle, 1).await;
+
+		let entries = compaction_entry_values(&dir);
+		assert_eq!(entries.len(), 1, "one split-turn compaction");
+		let summary = entries[0]["summary"].as_str().unwrap();
+		assert!(
+			summary.contains("\n\n---\n\n**Turn Context (split turn):**\n\n"),
+			"merged split-turn summary: {summary}"
+		);
+		assert!(summary.starts_with("No prior history."));
+		assert!(summary.contains("[mock summary]"), "{summary}");
+		// The kept tail starts at the turn's assistant reply (the entry is
+		// not the compaction itself), and the projection replays
+		// summary + kept reply.
+		assert_ne!(entries[0]["firstKeptEntryId"], entries[0]["id"]);
+		wait_for_log_len(&dir, 2).await;
+		let restored = read_session_messages(&dir);
+		assert_eq!(restored.len(), 2);
+		assert!(
+			matches!(&restored[0], Message::User(user) if user.content.as_text().contains("summary"))
+		);
+		assert!(matches!(restored[1], Message::Assistant(_)));
+		// The live transcript was swapped to [system, summary, kept reply].
+		let roles: Vec<&str> = agent
+			.snapshot()
+			.messages
+			.iter()
+			.map(Message::role)
+			.collect();
+		assert_eq!(roles, ["system", "user", "assistant"]);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
 	}
 
 	/// Collects every notice emitted while `ends` more runs finish. Notices
@@ -1252,12 +1738,19 @@ mod tests {
 			stream_fn: Some(compaction_test_stream_fn()),
 			..Default::default()
 		});
-		let mut persisted = agent.snapshot().messages.len();
-		let cut = auto_compaction_cut(&agent, &session, persisted, 20_000).expect("safe boundary");
-		assert_eq!(cut.0, 1);
+		let log = std::sync::Mutex::new(SharedLog {
+			session,
+			persisted: agent.snapshot().messages.len(),
+			pending_mid_run: None,
+		});
+		let cut = {
+			let mut guard = log.lock().unwrap();
+			auto_compaction_cut(&agent, &mut guard, 20_000).expect("safe boundary")
+		};
+		assert_eq!(cut.first_kept, 1);
 		let outcome = compaction::compact_prefix(&agent, Some(cut)).await.unwrap();
 		let bus = EventBus::new();
-		apply_compaction(&agent, &mut session, &mut persisted, &bus, outcome);
+		apply_compaction(&agent, &log, &bus, outcome);
 		let actual: Vec<_> = agent
 			.snapshot()
 			.messages
@@ -1358,18 +1851,20 @@ mod tests {
 		let dir = temp_session_dir("compact-write-fail");
 		let path = dir.join("readonly.jsonl");
 		std::fs::write(&path, "").unwrap();
-		let mut session =
-			SessionManager::with_file(dir.clone(), std::fs::File::open(path).unwrap());
+		let session = SessionManager::with_file(dir.clone(), std::fs::File::open(path).unwrap());
 		let agent = Agent::new(AgentOptions {
 			initial_messages: vec![Message::user("original")],
 			..Default::default()
 		});
 		let before = agent.snapshot().messages;
-		let mut persisted = before.len();
+		let log = std::sync::Mutex::new(SharedLog {
+			session,
+			persisted: before.len(),
+			pending_mid_run: None,
+		});
 		apply_compaction(
 			&agent,
-			&mut session,
-			&mut persisted,
+			&log,
 			&EventBus::new(),
 			CompactionOutcome {
 				summary: "summary".into(),
@@ -1547,17 +2042,16 @@ mod tests {
 			first_kept_id: None,
 			source_messages: before.clone(),
 		};
-		let mut persisted = before.len();
+		let persisted = before.len();
 		session.fail_next_sync();
-		assert!(!apply_compaction(
-			&agent,
-			&mut session,
-			&mut persisted,
-			&EventBus::new(),
-			outcome
-		));
+		let log = std::sync::Mutex::new(SharedLog {
+			session,
+			persisted,
+			pending_mid_run: None,
+		});
+		assert!(!apply_compaction(&agent, &log, &EventBus::new(), outcome));
 		assert_eq!(agent.snapshot().messages, before);
-		assert_eq!(persisted, before.len());
+		assert_eq!(log.lock().unwrap().persisted, before.len());
 		// A written but unsynced compaction may be recovered on reopen; the
 		// session task must stop rather than append a divergent continuation.
 		assert_eq!(read_session_messages(&dir).len(), 1);
@@ -1580,16 +2074,16 @@ mod tests {
 		session.append_message(&Message::user("old")).unwrap();
 		session.append_message(&Message::user("keep")).unwrap();
 		session.append_message(&Message::Assistant(prior)).unwrap();
-		let projection = read_session_projection(&dir).0;
+		let projection = session_manager::project_file(&dir);
 		let mut entry = SessionEntry::compaction("summary", 100);
-		if let SessionEntry::Compaction {
+		if let EntryKind::Compaction {
 			first_kept_entry_id,
 			..
-		} = &mut entry
+		} = &mut entry.kind
 		{
-			*first_kept_entry_id = projection[1].0.clone().unwrap();
+			*first_kept_entry_id = projection.messages[1].0.clone().unwrap();
 		}
-		session.append(&entry).unwrap();
+		session.append(entry).unwrap();
 		let agent = Agent::new(AgentOptions {
 			initial_messages: restore_initial_messages(&dir),
 			..Default::default()
@@ -1606,26 +2100,30 @@ mod tests {
 	}
 
 	#[test]
-	fn missing_cut_id_does_not_discard_history() {
+	fn dangling_first_kept_entry_drops_older_entries() {
+		// Upstream `buildContextEntries` semantics: the compaction entry
+		// claims everything before `firstKeptEntryId`; a dangling id retains
+		// nothing (the raw entries stay on disk — the log is append-only).
 		let dir = temp_session_dir("missing-cut");
 		let mut session = SessionManager::open(&dir).unwrap();
 		session
 			.append_message(&Message::user("safe history"))
 			.unwrap();
 		let mut entry = SessionEntry::compaction("summary", 1);
-		if let SessionEntry::Compaction {
+		if let EntryKind::Compaction {
 			first_kept_entry_id,
 			..
-		} = &mut entry
+		} = &mut entry.kind
 		{
 			*first_kept_entry_id = "missing".into();
 		}
-		session.append(&entry).unwrap();
+		session.append(entry).unwrap();
 		let restored = read_session_messages(&dir);
 		assert_eq!(restored.len(), 1);
-		assert!(
-			matches!(&restored[0], Message::User(user) if user.content.as_text() == "safe history")
-		);
+		let Message::User(summary) = &restored[0] else {
+			panic!("expected the summary message")
+		};
+		assert!(summary.content.as_text().contains("summary"));
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 
@@ -1677,9 +2175,13 @@ mod tests {
 			pi_ai::types::now_ms()
 		));
 		std::fs::create_dir_all(&dir).unwrap();
-		let mut session = SessionManager::open(&dir).unwrap();
+		let session = SessionManager::open(&dir).unwrap();
 		let agent = mock_agent();
-		let mut persisted = agent.snapshot().messages.len();
+		let mut log = SharedLog {
+			session,
+			persisted: agent.snapshot().messages.len(),
+			pending_mid_run: None,
+		};
 		agent
 			.prompt(PromptInput::Text {
 				text: "hello".into(),
@@ -1687,8 +2189,8 @@ mod tests {
 			.await
 			.unwrap();
 		let bus = EventBus::new();
-		persist_messages(&agent, &mut session, &mut persisted, &bus);
-		persist_messages(&agent, &mut session, &mut persisted, &bus);
+		persist_messages(&agent, &mut log, &bus);
+		persist_messages(&agent, &mut log, &bus);
 		let messages = read_session_messages(&dir);
 		assert_eq!(messages.len(), 2);
 		assert_eq!(messages[0].role(), "user");
@@ -1739,11 +2241,16 @@ mod tests {
 		let bus = EventBus::new();
 		let task = tokio::spawn(session_task(
 			agent.clone(),
-			SessionManager::open(&dir).unwrap(),
+			Arc::new(std::sync::Mutex::new(SharedLog {
+				session: SessionManager::open(&dir).unwrap(),
+				persisted: 1,
+				pending_mid_run: None,
+			})),
 			registry,
 			rx,
 			bus,
 			Arc::new(std::sync::atomic::AtomicBool::new(true)),
+			Arc::new(std::sync::atomic::AtomicBool::new(false)),
 			CompactionSettings::default(),
 		));
 		tx.send(SessionCommand::Prompt {

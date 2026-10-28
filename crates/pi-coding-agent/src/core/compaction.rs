@@ -14,10 +14,6 @@
 //! and [`UPDATE_SUMMARIZATION_PROMPT`] merges it with the new range.
 //!
 //! Not ported yet (listed against the upstream source):
-//! - split turns (`findTurnStartIndex`,
-//!   `TURN_PREFIX_SUMMARIZATION_PROMPT`): a cut point in the middle of a
-//!   multi-assistant turn currently falls back to the turn's leading user
-//!   message, so the whole turn is summarized or kept as a unit;
 //! - per-model compaction settings (`CompactionSettings.modelOverrides`);
 //! - branch summarization (`compaction/branch-summarization.ts`);
 //! - file-operation tracking appended to summaries (`utils.ts`
@@ -54,6 +50,19 @@ pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 /// which upstream templates from `UPDATE_SUMMARIZATION_INSTRUCTIONS`; kept as
 /// one literal because `concat!` accepts no consts).
 pub const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact file paths, function names, and error messages\n- If something is no longer relevant, you may remove it\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// Verbatim from `compaction/compaction.ts`
+/// (`TURN_PREFIX_SUMMARIZATION_PROMPT`): the second summary of a split turn,
+/// covering the head of an oversized single turn.
+pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.\n\nCreate a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.\n\n## Original Request\n[What did the user ask for?]\n\n## Progress So Far\n- [Key decisions and work completed in these messages]\n\n## Context Needed to Continue\n- [Information from these messages needed to understand the later work]\n\nOnly summarize information explicitly present above. Do not infer or recreate later messages.";
+
+/// Markdown boundary merging the two summaries of a split turn
+/// (`compaction.ts` `compact()` merge template).
+pub const SPLIT_TURN_HISTORY_SEPARATOR: &str = "\n\n---\n\n";
+pub const SPLIT_TURN_LABEL: &str = "**Turn Context (split turn):**\n\n";
+/// Stand-in history text when a split turn has nothing before it
+/// (`compaction.ts`: `previousSummary ?? "No prior history."`).
+pub const NO_PRIOR_HISTORY_TEXT: &str = "No prior history.";
 
 /// Maximum characters for a tool result in serialized summaries
 /// (`TOOL_RESULT_MAX_CHARS` in `compaction/utils.ts`).
@@ -102,20 +111,52 @@ pub fn is_cut_point_message(message: &Message) -> bool {
 	matches!(message, Message::User(_) | Message::Assistant(_))
 }
 
-/// First kept index of the keep-recent tail (`findCutPoint` upstream, over
-/// the flat non-system message array this port compacts). Walks backwards
-/// accumulating `estimate_tokens` until `keep_recent_tokens` is reached and
-/// cuts at the closest valid cut point at or after that message; when
-/// trailing tool results exceed the budget by themselves, their preceding
-/// assistant tool call is kept instead of falling back to the first message.
-/// Returns 0 when nothing can be summarized (no valid cut point, or the
-/// budget is never reached before the first message).
-pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
+/// Whether a message starts a turn (`isTurnStartMessage` upstream, reduced to
+/// the roles this port's flat transcript holds): only user messages do.
+/// The compaction-summary message rides as a user message, matching
+/// upstream's `compactionSummary` turn-start role.
+fn is_turn_start_message(message: &Message) -> bool {
+	matches!(message, Message::User(_))
+}
+
+/// Where a compaction cut lands (`CutPointResult` upstream, over the flat
+/// non-system transcript this port compacts): the first kept index, plus —
+/// when the cut splits an oversized single turn — the index of the user
+/// message that started that turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutPoint {
+	pub first_kept: usize,
+	/// `Some(index)` when `first_kept` is not a turn start: the leading user
+	/// message of the turn being split (upstream `turnStartIndex`).
+	pub turn_start: Option<usize>,
+}
+
+/// First kept index of the keep-recent tail (`findProjectedCutPoint`
+/// upstream, over the flat non-system message array this port compacts).
+/// Walks backwards accumulating `estimate_tokens` until `keep_recent_tokens`
+/// is reached and cuts at the closest valid cut point at or after that
+/// message; when trailing tool results exceed the budget by themselves, their
+/// preceding assistant tool call is kept instead of falling back to the first
+/// message. A cut landing inside a multi-assistant turn reports the turn's
+/// leading user message as `turn_start` (split turn — upstream
+/// `findTurnStartIndex`). Returns first_kept 0 when nothing can be
+/// summarized (no valid cut point, or the budget is never reached before the
+/// first message).
+///
+/// Upstream's two entry-level adjustments do not apply on the flat message
+/// array: there are no metadata-only entries to skip backwards over, and the
+/// recovery-omission suffix advancement is structurally unnecessary — the
+/// port omits the failed attempt from the live transcript before computing
+/// the cut, so no phantom entries exist.
+pub fn find_cut_point_detailed(messages: &[Message], keep_recent_tokens: u64) -> CutPoint {
 	let cut_points: Vec<usize> = (0..messages.len())
 		.filter(|&index| is_cut_point_message(&messages[index]))
 		.collect();
 	if cut_points.is_empty() {
-		return 0;
+		return CutPoint {
+			first_kept: 0,
+			turn_start: None,
+		};
 	}
 	let mut accumulated = 0u64;
 	let mut cut = cut_points[0];
@@ -134,7 +175,25 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
 			break;
 		}
 	}
-	cut
+	// Split-turn detection: a cut on an assistant message inside a turn
+	// reports the turn's leading user message.
+	let turn_start = if is_turn_start_message(&messages[cut]) {
+		None
+	} else {
+		(0..=cut)
+			.rev()
+			.find(|&index| is_turn_start_message(&messages[index]))
+	};
+	CutPoint {
+		first_kept: cut,
+		turn_start,
+	}
+}
+
+/// First kept index only — the pre-split-turn signature, kept for callers
+/// that do not split turns.
+pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
+	find_cut_point_detailed(messages, keep_recent_tokens).first_kept
 }
 
 /// Raw summary text carried by the transcript's last compaction-summary
@@ -160,14 +219,23 @@ fn previous_summary(messages: &[Message]) -> Option<(usize, String)> {
 /// messages) with one standalone LLM call. Errors mirror upstream's
 /// `getSummarizationFailure`: error/length stop reasons and tool calls in the
 /// response refuse to become a checkpoint.
+/// Explicit compaction boundary for [`compact_prefix`]: the first kept
+/// transcript index (its durable log entry id when known), plus the turn
+/// start when the cut splits an oversized single turn.
+#[derive(Debug, Clone, Default)]
+pub struct Cut {
+	pub first_kept: usize,
+	/// Leading user message of the split turn (`None` when the cut lands on
+	/// a turn boundary).
+	pub turn_start: Option<usize>,
+	pub first_kept_id: Option<String>,
+}
+
 pub async fn compact_agent(agent: &Agent) -> anyhow::Result<CompactionOutcome> {
 	compact_prefix(agent, None).await
 }
 
-pub async fn compact_prefix(
-	agent: &Agent,
-	cut: Option<(usize, Option<String>)>,
-) -> anyhow::Result<CompactionOutcome> {
+pub async fn compact_prefix(agent: &Agent, cut: Option<Cut>) -> anyhow::Result<CompactionOutcome> {
 	let snapshot = agent.snapshot();
 	let transcript: Vec<Message> = snapshot
 		.messages
@@ -180,14 +248,20 @@ pub async fn compact_prefix(
 	}
 
 	let tokens_before: u64 = snapshot.messages.iter().map(estimate_tokens).sum();
-	let (prefix, kept, first_kept_id) = if let Some((index, id)) = cut {
-		if index == 0 || index >= transcript.len() {
+	let (prefix, kept, first_kept_id) = if let Some(cut) = cut {
+		if cut.first_kept == 0 || cut.first_kept >= transcript.len() {
 			anyhow::bail!("invalid compaction boundary");
 		}
-		(&transcript[..index], transcript[index..].to_vec(), id)
+		let turn_start = cut.turn_start.filter(|&start| start < cut.first_kept);
+		(
+			&transcript[..cut.first_kept],
+			transcript[cut.first_kept..].to_vec(),
+			(cut.first_kept_id, turn_start),
+		)
 	} else {
-		(&transcript[..], Vec::new(), None)
+		(&transcript[..], Vec::new(), (None, None))
 	};
+	let (first_kept_id, turn_start) = first_kept_id;
 	// A prior summary inside the summarized range is merged, not re-summarized:
 	// it rides as <previous-summary> context (upstream `generateSummaryWithUsage`
 	// passes `previousSummary` and switches to the update prompt), so the new
@@ -196,23 +270,86 @@ pub async fn compact_prefix(
 		Some((index, summary)) => (Some(summary), Some(index)),
 		None => (None, None),
 	};
-	let to_summarize: Vec<Message> = prefix
-		.iter()
-		.enumerate()
-		.filter(|&(index, _)| Some(index) != previous_index)
-		.map(|(_, message)| message.clone())
-		.collect();
-	if to_summarize.is_empty() && kept.is_empty() {
-		// Only an (already merged) summary is left — upstream prepareCompaction
-		// returns undefined right after a compaction and `compact()` reports
-		// "Already compacted".
-		anyhow::bail!("Nothing to compact (session too small)");
-	}
+
+	let model = agent.model();
+	let stream_fn = agent.stream_fn();
+	let summary = if let Some(turn_start) = turn_start {
+		// Split turn (upstream `compact()`): the messages before the turn and
+		// the turn's own prefix are summarized separately, then merged behind
+		// a clear Markdown boundary.
+		let (history, turn_prefix) = (&prefix[..turn_start], &prefix[turn_start..]);
+		let history_text = if history.is_empty() && previous.is_none() {
+			None
+		} else {
+			let history_to_summarize: Vec<Message> = history
+				.iter()
+				.enumerate()
+				.filter(|&(index, _)| Some(index) != previous_index)
+				.map(|(_, message)| message.clone())
+				.collect();
+			Some(if history_to_summarize.is_empty() {
+				// Only the (already merged) previous summary remains.
+				previous.clone().expect("guarded above")
+			} else {
+				complete_history_summary(&model, &stream_fn, history_to_summarize, previous.clone())
+					.await?
+			})
+		};
+		let history_text = history_text.unwrap_or_else(|| NO_PRIOR_HISTORY_TEXT.to_string());
+		let turn_prefix_text =
+			complete_turn_prefix_summary(&model, &stream_fn, turn_prefix).await?;
+		format!("{history_text}{SPLIT_TURN_HISTORY_SEPARATOR}{SPLIT_TURN_LABEL}{turn_prefix_text}")
+	} else {
+		let to_summarize: Vec<Message> = prefix
+			.iter()
+			.enumerate()
+			.filter(|&(index, _)| Some(index) != previous_index)
+			.map(|(_, message)| message.clone())
+			.collect();
+		if to_summarize.is_empty() && kept.is_empty() {
+			// Only an (already merged) summary is left — upstream prepareCompaction
+			// returns undefined right after a compaction and `compact()` reports
+			// "Already compacted".
+			anyhow::bail!("Nothing to compact (session too small)");
+		}
+		let conversation = serialize_conversation(&to_summarize);
+		// Wrap the serialized conversation in tags so the model treats it as data,
+		// not as a conversation to continue (`buildSummarizationContext` upstream);
+		// the base prompt follows upstream's ordering: conversation, previous
+		// summary, then the instructions.
+		let mut prompt_text = format!("<conversation>\n{conversation}\n</conversation>\n\n");
+		if let Some(summary) = &previous {
+			prompt_text.push_str(&format!(
+				"<previous-summary>\n{summary}\n</previous-summary>\n\n"
+			));
+		}
+		prompt_text.push_str(match &previous {
+			Some(_) => UPDATE_SUMMARIZATION_PROMPT,
+			None => SUMMARIZATION_PROMPT,
+		});
+		let response = complete_summarization(&model, &stream_fn, prompt_text).await?;
+		check_summary_response(&response, "Summarization")?;
+		response.text()
+	};
+
+	Ok(CompactionOutcome {
+		summary,
+		tokens_before,
+		kept,
+		first_kept_id,
+		source_messages: snapshot.messages,
+	})
+}
+
+/// History-range summary of a split turn (the ordinary summarization request,
+/// with previous-summary merging).
+async fn complete_history_summary(
+	model: &Model,
+	stream_fn: &StreamFn,
+	to_summarize: Vec<Message>,
+	previous: Option<String>,
+) -> anyhow::Result<String> {
 	let conversation = serialize_conversation(&to_summarize);
-	// Wrap the serialized conversation in tags so the model treats it as data,
-	// not as a conversation to continue (`buildSummarizationContext` upstream);
-	// the base prompt follows upstream's ordering: conversation, previous
-	// summary, then the instructions.
 	let mut prompt_text = format!("<conversation>\n{conversation}\n</conversation>\n\n");
 	if let Some(summary) = &previous {
 		prompt_text.push_str(&format!(
@@ -223,23 +360,38 @@ pub async fn compact_prefix(
 		Some(_) => UPDATE_SUMMARIZATION_PROMPT,
 		None => SUMMARIZATION_PROMPT,
 	});
+	let response = complete_summarization(model, stream_fn, prompt_text).await?;
+	check_summary_response(&response, "Summarization")?;
+	Ok(response.text())
+}
 
-	let model = agent.model();
-	let stream_fn = agent.stream_fn();
-	let response = complete_summarization(&model, &stream_fn, prompt_text).await?;
-	if let Some(failure) = summarization_failure(&response) {
+/// Turn-prefix summary of a split turn — upstream `generateTurnPrefixSummary`:
+/// `# Conversation` framing instead of `<conversation>` tags, and the
+/// dedicated turn-prefix instructions.
+async fn complete_turn_prefix_summary(
+	model: &Model,
+	stream_fn: &StreamFn,
+	turn_prefix: &[Message],
+) -> anyhow::Result<String> {
+	let conversation = serialize_conversation(turn_prefix);
+	let prompt_text = format!(
+		"# Conversation\n{conversation}\n\n# Instructions\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+	);
+	let response = complete_summarization(model, stream_fn, prompt_text).await?;
+	check_summary_response(&response, "Turn prefix summarization")?;
+	Ok(response.text())
+}
+
+/// Shared post-response checks (`getSummarizationFailure` + the tool-call
+/// guard): error/length stops and tool calls must not become checkpoints.
+fn check_summary_response(response: &AssistantMessage, label: &str) -> anyhow::Result<()> {
+	if let Some(failure) = summarization_failure(response, label) {
 		anyhow::bail!("{failure}");
 	}
 	if !response.tool_calls().is_empty() {
-		anyhow::bail!("Summarization attempted to call a tool");
+		anyhow::bail!("{label} attempted to call a tool");
 	}
-	Ok(CompactionOutcome {
-		summary: response.text(),
-		tokens_before,
-		kept,
-		first_kept_id,
-		source_messages: snapshot.messages,
-	})
+	Ok(())
 }
 
 /// Run the single summarization request to completion
@@ -273,16 +425,15 @@ async fn complete_summarization(
 
 /// Port of `getSummarizationFailure`: a length stop holds partial text and
 /// must not become a session checkpoint.
-fn summarization_failure(response: &AssistantMessage) -> Option<String> {
+fn summarization_failure(response: &AssistantMessage, label: &str) -> Option<String> {
 	match response.stop_reason {
 		StopReason::Error => Some(format!(
-			"Summarization failed: {}",
+			"{label} failed: {}",
 			response.error_message.as_deref().unwrap_or("Unknown error")
 		)),
-		StopReason::Length => Some(
-			"Summarization failed: generation hit the token cap and the summary is incomplete"
-				.to_string(),
-		),
+		StopReason::Length => Some(format!(
+			"{label} failed: generation hit the token cap and the summary is incomplete"
+		)),
 		_ => None,
 	}
 }
@@ -531,6 +682,160 @@ mod tests {
 	fn cut_point_without_valid_boundaries_keeps_everything() {
 		let messages = vec![tool_result(1600), tool_result(1600)];
 		assert_eq!(find_cut_point(&messages, 1), 0);
+	}
+
+	#[test]
+	fn cut_point_inside_a_turn_reports_the_turn_start() {
+		// Budget exceeded while walking the trailing tool result: the cut
+		// falls back to the assistant (a valid cut point that is not a turn
+		// start), so the turn's leading user message is reported for
+		// split-turn handling.
+		let big_assistant = "x".repeat(1600);
+		let messages = vec![
+			heavy_user(),
+			assistant_with_text(&big_assistant),
+			tool_result(1600),
+		];
+		let cut = find_cut_point_detailed(&messages, 600);
+		assert_eq!(cut.first_kept, 1);
+		assert_eq!(cut.turn_start, Some(0));
+		// A cut that lands on a user message never reports a split.
+		let messages = vec![
+			heavy_user(),
+			assistant_with_text(&big_assistant),
+			tool_result(1600),
+			heavy_user(),
+		];
+		let cut = find_cut_point_detailed(&messages, 500);
+		assert_eq!(cut.first_kept, 3);
+		assert_eq!(cut.turn_start, None);
+	}
+
+	/// Capturing summarizer: history-range requests echo "[history summary]",
+	/// turn-prefix requests echo "[turn-prefix summary]".
+	fn split_turn_stream_fn(prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> StreamFn {
+		std::sync::Arc::new(move |_model, context, _| {
+			let prompt = match context.messages.last() {
+				Some(Message::User(user)) => user.content.as_text(),
+				_ => String::new(),
+			};
+			let reply = if prompt.starts_with("# Conversation\n") {
+				"[turn-prefix summary]"
+			} else {
+				"[history summary]"
+			};
+			prompts.lock().unwrap().push(prompt);
+			let Message::Assistant(message) = assistant_with_text(reply) else {
+				unreachable!("assistant_with_text builds an assistant message")
+			};
+			Box::pin(futures::stream::once(async move {
+				pi_ai::AssistantMessageEvent::Done {
+					reason: StopReason::Stop,
+					message,
+				}
+			})) as pi_ai::AssistantMessageEventStream
+		})
+	}
+
+	#[tokio::test]
+	async fn split_turn_compaction_merges_two_summaries() {
+		use std::sync::Arc;
+		let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let agent = Agent::new(pi_agent::AgentOptions {
+			stream_fn: Some(split_turn_stream_fn(prompts.clone())),
+			..Default::default()
+		});
+		agent
+			.replace_messages(vec![
+				Message::System(pi_ai::SystemMessage::prompt("prompt")),
+				Message::user("old work"),
+				assistant_with_text("old reply"),
+				// One oversized turn: user request, two assistant steps.
+				Message::user("big single-turn request"),
+				assistant_with_text("step one"),
+				tool_result(1600),
+				assistant_with_text("step two"),
+				tool_result(1600),
+			])
+			.unwrap();
+		// The cut lands inside the turn: keeping starts at "step two", the
+		// turn's head (from its leading user message) is summarized too.
+		let outcome = compact_prefix(
+			&agent,
+			Some(Cut {
+				first_kept: 5,
+				turn_start: Some(2),
+				first_kept_id: Some("kept-entry".into()),
+			}),
+		)
+		.await
+		.unwrap();
+		let captured = prompts.lock().unwrap();
+		assert_eq!(captured.len(), 2, "one summary per range");
+
+		let history = &captured[0];
+		assert!(history.contains("[User]: old work"));
+		assert!(!history.contains("big single-turn request"));
+		assert!(history.ends_with(SUMMARIZATION_PROMPT));
+
+		let turn_prefix = &captured[1];
+		assert!(
+			turn_prefix.starts_with("# Conversation\n"),
+			"turn-prefix requests use the # Conversation framing: {turn_prefix}"
+		);
+		assert!(turn_prefix.contains("[User]: big single-turn request"));
+		assert!(turn_prefix.contains("[Assistant]: step one"));
+		assert!(turn_prefix.ends_with(TURN_PREFIX_SUMMARIZATION_PROMPT));
+
+		// Upstream merge template: `{history}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}`.
+		assert_eq!(
+			outcome.summary,
+			"[history summary]\n\n---\n\n**Turn Context (split turn):**\n\n[turn-prefix summary]"
+		);
+		// The kept tail and the durable boundary ride through untouched.
+		assert_eq!(outcome.kept.len(), 2); // "step two" + its tool result
+		assert_eq!(outcome.first_kept_id.as_deref(), Some("kept-entry"));
+	}
+
+	#[tokio::test]
+	async fn split_turn_with_no_prior_history_says_so() {
+		use std::sync::Arc;
+		let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let agent = Agent::new(pi_agent::AgentOptions {
+			stream_fn: Some(split_turn_stream_fn(prompts.clone())),
+			..Default::default()
+		});
+		agent
+			.replace_messages(vec![
+				Message::System(pi_ai::SystemMessage::prompt("prompt")),
+				Message::user("big single-turn request"),
+				assistant_with_text("turn progress"),
+				tool_result(100),
+			])
+			.unwrap();
+		let outcome = compact_prefix(
+			&agent,
+			Some(Cut {
+				first_kept: 2,
+				turn_start: Some(0),
+				first_kept_id: None,
+			}),
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			prompts.lock().unwrap().len(),
+			1,
+			"no history range to summarize"
+		);
+		assert!(
+			outcome
+				.summary
+				.starts_with("No prior history.\n\n---\n\n**Turn Context (split turn):**\n\n"),
+			"{}",
+			outcome.summary
+		);
+		assert!(outcome.summary.contains("[turn-prefix summary]"));
 	}
 
 	#[tokio::test]

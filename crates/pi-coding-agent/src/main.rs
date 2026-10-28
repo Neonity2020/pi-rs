@@ -12,6 +12,7 @@ mod config;
 mod core;
 mod modes;
 
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -221,17 +222,36 @@ async fn main() -> anyhow::Result<()> {
 		(!joined.trim().is_empty()).then_some(joined)
 	};
 
-	// Print mode: --print, or a prompt given while stdin is not a TTY.
+	// Print mode selection mirrors upstream main.ts:112-123: `--print`, or
+	// either stream redirected. Piped stdin is read and prepended to the
+	// prompts (upstream readPipedStdin), so `echo x | pi-rs -p "summarize"`
+	// works like `pi`.
 	let stdin_is_tty = is_tty();
-	if cli.print || (initial_prompt.is_some() && !stdin_is_tty) {
+	let stdout_is_tty = std::io::stdout().is_terminal();
+	let piped_prompt = if stdin_is_tty {
+		None
+	} else {
+		let mut piped = String::new();
+		std::io::stdin()
+			.read_to_string(&mut piped)
+			.ok()
+			.filter(|_| !piped.trim().is_empty())
+			.map(|_| piped)
+	};
+	let mut print_prompts: Vec<String> = Vec::new();
+	if let Some(piped) = piped_prompt {
+		print_prompts.push(piped);
+	}
+	print_prompts.extend(cli.prompt.iter().filter(|p| !p.trim().is_empty()).cloned());
+
+	if cli.print || !stdin_is_tty || !stdout_is_tty {
 		for notice in mcp.notices.drain(..) {
 			eprintln!("mcp: {notice}");
 		}
 		for notice in startup_notices.drain(..) {
 			eprintln!("{notice}");
 		}
-		let prompt = initial_prompt.unwrap_or_default();
-		let code = modes::print::run_print(handle, prompt).await?;
+		let code = modes::print::run_print(handle, print_prompts).await?;
 		// Close the MCP transports before the forced exit —
 		// std::process::exit skips destructors, so the graceful close ladder
 		// (and the orphan guard's SIGKILL) must run explicitly here.
