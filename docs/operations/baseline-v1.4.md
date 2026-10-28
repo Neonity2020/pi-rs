@@ -1,13 +1,25 @@
 # Pi 1.4 基线记录
 
-审计时间：2026-10-28。上游本地快照 `f9daca3480732d0042b1df3a6e27221f597a620d`，各包版本 1.4.0；本地没有与 HEAD 对应的 tag，因此未证明它与发行 tag 完全一致。Rust 起点 `c26d4b461caaf22b5c0310d10b050d0ba82913cb`，工作区包含阶段五的未提交预置改动。逐项范围和未验证部分见 [兼容矩阵](compatibility-v1.4.md)。
+更新：2026-10-28（P0 审计完成）。上游本地快照 `f9daca3480732d0042b1df3a6e27221f597a620d`，各包版本 1.4.0。
 
-macOS 本地 Rust `1.98.0`、Cargo `1.98.0`，在上述工作区加工具更新事件改动后，`cargo test --workspace --locked`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 和 `git diff --check` 均通过。此结果不证明上游兼容，也不证明其他平台、真实 provider 或远程 CI 通过。
+**tag 核实（本轮完成）**：上游存在 `v1.4.0` tag（`4a080252f06caf63a525d7873c5d94d3c23887e0`），快照 SHA 领先该 tag 72 个提交、落后 0（tag 后下一开发周期的起点）。结论：以快照 SHA 为冻结基线；不宣称与 v1.4.0 发布构建完全兼容。
 
-未提交预置包含自动压缩命令和状态的骨架、context usage 占位，以及工具更新事件接线。自动压缩和端到端工具实时输出在审计时尚未完成，不能按已交付能力宣传。实施中保留这些工作并按行为测试逐步完善。
+Rust 基线：`4106a9c`（第五轮冲刺 + 文档，已推送，远程 CI 三 job 全过），工作区干净。前几轮的"未提交改动"事项已闭环：阶段五改动已作为 `d8938e1` 提交并经 CI 验证。
 
-## 本轮实现与限制
+## 门禁记录（2026-10-28 实测，macOS 26.6.2 arm64，rustc/cargo 1.98.0）
 
-已增加自动阈值压缩、保留尾部和恢复、压缩提交的并发与失败保护；溢出自动重试和上游完整压缩语义仍待实现。工具更新经 agent 传递至交互界面，bash 提供节流的实时输出和取消时的部分输出。RPC 已补增量事件及部分字段对齐，命令确认语义仍有差异。MCP HTTP 支持 JSON/SSE POST、GET 重连和会话管理，并有本地端到端测试；POST SSE 续传、OAuth、服务端请求及完整 conformance 尚未完成，GET 致命错误目前不能中断正在等待响应的 POST。各能力仍属部分兼容，需继续对照固定上游验证。
+- `cargo test --workspace --locked`：288 通过 / 0 失败
+- `cargo fmt --all -- --check`：通过
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`：通过
+- GitHub Actions（`4106a9c` push）：fmt 8s / clippy 31s / test 59s 三 job 全过
+- 上游构建演练：快照副本（`difftest/upstream/pi/`，仓库内 `pi/` 保持只读）`npm ci` → `node packages/ai/scripts/generate-models.ts --data-only` → `npm run build:offline`，产出 coding-agent bundle `--version` = 1.4.0。注意 `build:offline` 依赖模型目录数据文件（gitignore 的生成物），fresh clone 必须先跑 generate-models。
 
-2026-10-28 集成门禁：`cargo test --workspace --locked`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 本地通过；未验证真实服务及所有目标平台。
+## P0 交付物
+
+1. **兼容矩阵**：[compatibility-v1.4.md](compatibility-v1.4.md)（索引 + 差分发现）+ [compat/](compat/) 四份明细（providers/agent、CLI/RPC/SDK、会话/工具/配置、TUI/MCP/env/外围），逐项链接上游与 Rust 源码及测试。
+2. **差分测试框架**：[difftest/](../../difftest/)（构建配方、场景格式、归一化口径见其 README）；首轮两场景双侧跑通，31 处 wire/会话差异已录入矩阵。
+3. **风险清单与 P1 候选**：见 compatibility-v1.4.md「高风险项」节。
+
+## 定位更正
+
+差分与盘点证实此前"框架后期/核心完成"的口径偏乐观：agent loop 钩子未接线、并行工具未实现、会话格式与上游不互通、models.json shape 不同、MCP 无版本协商/超时。当前诚实定位：**单 provider 工作流可用（实验级）；与上游 wire 兼容性处于已审计、未对齐状态**。逐项状态以兼容矩阵为准，不再维护相互矛盾的进度表（TASKS.md 保留为历史记录）。

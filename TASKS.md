@@ -1,6 +1,6 @@
 # 下一阶段计划与任务认领清单
 
-基线：2026-10-27 验收扫描 `main`，HEAD `b4df566`；后续修复状态以 `git status` 为准。已提交 agent 测试、格式化、进程管理、会话持久化和 CI 门禁。当前本地 `cargo test --workspace --locked`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 均通过；GitHub 远程 CI 状态未验证。
+> **历史记录（2026-10-28）**：本清单对应第三轮（2026-10-27）的任务认领，全部条目已完结或被后续冲刺超越。当前有效进度以 [docs/operations/compatibility-v1.4.md](docs/operations/compatibility-v1.4.md)（P0 兼容矩阵 + 差分发现 + P1 候选清单）与 [docs/operations/baseline-v1.4.md](docs/operations/baseline-v1.4.md) 为准，不再在此维护并行进度表。以下内容保留原样。
 
 目标：先保证会话和进程的生命周期可靠，再交付一个可恢复会话、可验证的 OpenAI 兼容工作流。MCP、RPC 和其他 provider 保持后续阶段，避免同时扩大接口与风险面。
 

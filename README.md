@@ -15,7 +15,7 @@
 | 会话压缩 | `/compact`、阈值自动压缩（保留最近 20k token，可关）与上下文溢出自动恢复（剔除失败轮→压缩→重试一次）；split-turn 与 mid-run 检查尚未实现 |
 | MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，env `${VAR}`/`!cmd` 展开；失败隔离、退出清理；OAuth 未实现 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
-| `--rpc` | 16 个命令与事件帧（prompt/steer/follow_up/abort/set_model/cycle_model/set_thinking/cycle_thinking_level/set_steering_mode/set_follow_up_mode/clear_queue/compact/set_auto_compaction/get_state/get_messages/get_available_models/get_available_thinking_levels/get_last_assistant_text/get_commands）；session-tree 族与 bash 透传推迟，偏差见 rpc.rs 模块文档 |
+| `--rpc` | 19 个命令与事件帧（上游 33 命令，缺 session-tree 族、bash 透传等 14 个；`agent_settled` 事件缺失）；逐条偏差见 rpc.rs 模块文档与 docs/operations/compat/cli-rpc-sdk.md |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
 
@@ -55,10 +55,10 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 | `pi-tui` | `packages/tui` | **核心可用** | ratatui + crossterm 上的组件体系：`Component` trait、多行 emacs 风格 `Editor`（词导航/kill/`\` 续行）、`ScrollView`、pulldown-cmark `Markdown`（对照 markdown.ts）、fuzzy 匹配 + `SelectList`、`Theme`（含 md 配色）、终端生命周期 |
 | `pi-codemode` | `packages/codemode` | 占位 | 沙箱脚本执行，仅能调用注入的工具 |
 | `pi-mcp` | `packages/mcp` | 骨架 | MCP 客户端：JSON-RPC 协议类型、transport trait（stdio、streamable-http 和 in-memory 实现）、client |
-| `pi-ai` | `packages/ai` | **核心完成** | 归一化消息模型、`AssistantMessageEvent` 流协议、模型目录、provider 适配器注册（OpenAI Chat Completions、Anthropic Messages 和 mock） |
+| `pi-ai` | `packages/ai` | **部分（2 provider 已验证）** | 归一化消息模型、`AssistantMessageEvent` 流协议、provider 适配器注册（OpenAI Chat Completions、Anthropic Messages 和 mock）；上游 10+ 个 API 与模型目录/认证未实现 |
 | `pi-durable` | `packages/durable` | 占位 | 持久会话 / 任务 / 文档运行时 |
 | `pi-env` | `packages/env` | **本地实现** | `EnvConnection` 抽象（exec/read/write/list/watch），本地实现完整，SSH 远程为桩 |
-| `pi-agent` | `packages/agent` | **核心完成** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent` |
+| `pi-agent` | `packages/agent` | **核心可用（钩子未接线）** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent`；prepare_request/finish_turn 等 hook 仅有类型定义，loop 未调用；并行工具执行未实现 |
 | `pi-coding-agent` | `packages/coding-agent` | **框架完成** | bin `pi-rs`：cli/config、core（session/settings/system-prompt/model-registry/event-bus/slash-commands）、7 个内置工具、interactive（ratatui）/print/rpc 三种模式 |
 
 ## 数据流
