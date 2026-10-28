@@ -1,6 +1,6 @@
 # pi-rs
 
-[pi](https://pi.dev)（[earendil-works/pi](https://github.com/earendil-works/pi)）coding agent 的 Rust 移植。当前为**框架阶段**：分层结构、核心类型、agent loop、内置工具与 ratatui TUI 已就位；默认使用 MiMo Token Plan 国内接口，OpenAI 兼容 Chat Completions 支持请求和工具调用，其他 HTTP provider 仍在开发中。
+[pi](https://pi.dev)（[earendil-works/pi](https://github.com/earendil-works/pi)）coding agent 的 Rust 移植。当前为**框架后期**：分层结构、核心类型、agent loop、内置工具与 ratatui TUI 已就位；默认使用 MiMo Token Plan 国内接口，OpenAI 兼容与 Anthropic 两大 HTTP provider 均支持增量流式。
 
 上游 TS 源码浅克隆在 `./pi/`（.gitignore 已排除），所有模块注释均标注对应的 TS 文件路径。
 
@@ -8,15 +8,16 @@
 
 | 能力 | 当前状态 |
 |---|---|
-| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录、`--continue`/`--resume` 会话恢复、`/compact` 会话压缩 |
+| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录、`--continue`/`--resume` 会话恢复、`/compact` 与阈值自动压缩、溢出自动恢复 |
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
 | 其他 HTTP provider | mock provider 可用于本地演示 |
-| 会话压缩 | `/compact` 和按配置阈值自动压缩：保留最近整轮、日志记录与恢复；溢出后的自动重试尚未实现 |
-| MCP | 已接入 CLI：`~/.pi-rs/agent/mcp.json` 装配 stdio 和 HTTP server，工具以 `mcp__<server>__<tool>` 进入工具表；失败隔离、退出清理 |
+| 会话压缩 | `/compact`、阈值自动压缩（保留最近 20k token，可关）与上下文溢出自动恢复（剔除失败轮→压缩→重试一次）；split-turn 与 mid-run 检查尚未实现 |
+| MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，env `${VAR}`/`!cmd` 展开；失败隔离、退出清理；OAuth 未实现 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
-| `--rpc` | 已实现 prompt/steer/follow_up/abort/set_model/set_thinking/get_state/get_messages 等命令与事件帧；与上游 wire 形态的偏差见 rpc.rs 模块文档 |
-| TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示 |
+| `--rpc` | 16 个命令与事件帧（prompt/steer/follow_up/abort/set_model/cycle_model/set_thinking/cycle_thinking_level/set_steering_mode/set_follow_up_mode/clear_queue/compact/set_auto_compaction/get_state/get_messages/get_available_models/get_available_thinking_levels/get_last_assistant_text/get_commands）；session-tree 族与 bash 透传推迟，偏差见 rpc.rs 模块文档 |
+| bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
+| TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
 
 本项目仍在开发中，运行模型生成的 shell 命令和文件修改时，请在可信环境中使用并检查结果。
 

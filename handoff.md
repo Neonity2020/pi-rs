@@ -58,12 +58,25 @@ pi-rs 是 pi coding agent 的 Rust 移植，README 定位为框架阶段。第�
 
 **交接事项**：`bash-executor.ts`/`powershell.ts`（上游 bash 工具的 stdin transport 与 Windows 路径）未移植；MCP 剩余：streamable HTTP/OAuth、项目级 `.pi/mcp.json`、env 展开；压缩剩余：自动阈值、branch-summarization。
 
+## 第五轮：阶段五冲刺（2026-10-28，4 个子 agent 并行：压缩完整化/MCP 完整化/RPC 补齐/TUI 渲染）
+
+基线 `c26d4b4`（第四轮已推送，远程 CI 三 job 全过）。主会话先预置跨包接口（`SessionCommand::SetAutoCompaction`、`SessionHandle.auto_compaction`、`core/context_usage.rs`、agent_loop 的 `ToolExecutionUpdate` 接线——此前 on_update 恒 None），再并行派出。注：上一轮派出时因并发限额看似失败的任务实际已启动，与本轮新批次在同一批文件相遇；两批 agent 均按"不覆盖、在现状之上补齐"收敛，最终由新批次收尾（见 A/B 报告的协作记录）。
+
+- **压缩完整化**（pi-ai types + core/{compaction,agent_session,settings_manager,context_usage}.rs）：`Usage::context_tokens()`（totalTokens 优先）；`find_cut_point`（对照 findCutPoint：user/assistant 边界、预算回退、尾部 toolResult 保护）+ `UPDATE_SUMMARIZATION_PROMPT` 增量合并 previous-summary；阈值自动压缩（默认 reserve 16384/keep 20000，settings.compaction 可配）挂钩 prompt 接受前与 agent_end 后；**溢出恢复**——`is_context_overflow`（27 个 provider 超限片段 + HTTP 413 + 静默超窗）与 `is_recoverable_length` 移植，error/length 结尾 run → ContextEdit 墓碑 + `replace_messages` 剔除失败轮 → 压缩 → 重试恰一次（日志不重复持久化）；`context_usage::compute` 统一（usage 优先 + trailing 估算，压缩后无新 usage 返回 None）。mid-run 检查与 split-turn 推迟（模块注释列明）。
+- **MCP 完整化**（pi-mcp + core/{mcp_config,trust}.rs + tools/mod.rs + main.rs）：streamable HTTP transport（POST JSON/SSE 双分支、批量数组、`notifications/initialized` 后 GET 流经 mpsc 喂 pull 模型、Mcp-Session-Id 捕获回带 + MCP-Protocol-Version 自学习、404 会话过期、1s/×2/30s/5 次重连 + Last-Event-ID + retry: 字段、close DELETE）；env 展开（`${VAR}`/`$VAR`/`$$`/`$!`/`!cmd` 10s 超时 + per-load 缓存，fail-fast 应用到 stdio env 与 HTTP headers）；项目级 `.pi/mcp.json` + 信任机制（core/trust.rs：trust.json 规范化路径记录、向上就近查找、TUI y/n 提示持久化、print/rpc 非 TTY 跳过 + notice）；合并规则照上游（整体替换/仅 enabled 覆盖/无基座报错/命名冲突跨文件）。
+- **RPC 补齐 + bash 增强**（modes/rpc.rs + core/tools/bash.rs + pi-env）：新命令 clear_queue/cycle_model/cycle_thinking_level/compact/set_auto_compaction/get_commands，get_state 补 autoCompactionEnabled（现有 22 个 RPC 测试）；bash 注入 `PI_RS_SESSION_ID/SESSION_FILE/PROVIDER/MODEL/REASONING_LEVEL`（main.rs 已接线 SessionToolContext）、信号退出码 128+n、超限全量输出 spill 到临时文件（修掉尾部切片写错 chunk[keep..] 的真 bug）、pi-env 增 `exec_streaming`（stdout 逐 chunk）驱动 bash 500ms 节播（首 chunk 立即）→ TUI 实时预览；现有 exec 语义（宽限/超时/进程组/60k）全保持。
+- **TUI 渲染**（modes/interactive.rs）：footer 分子改调 `context_usage::compute`（None → `?/{window}`），`(auto)` 指示符，纯函数化带 5 个单测；`ToolExecutionUpdate` 追加到 running 块 output（兼容旧 content 形态），running 预览 20 行尾 + live 时长（对照上游 PREVIEW_LINES）。
+
+**跨 agent 集成（主会话）**：main.rs 接线 BashTool 会话上下文；全工作区门禁 fmt/clippy -D warnings/test 全过，**288 项测试**（199 → 288）。冒烟：print 模式、RPC 新命令（get_state/set_auto_compaction/get_commands）端到端帧往返。第五轮改动未提交，等用户指令。README 能力表已同步（框架后期定位）。
+
+**交接事项（明确推迟）**：扩展系统（建议换形为外部进程 + JSONL 协议，RPC 面已较全，可作下一阶段）；MCP OAuth（上游约 1900 行 TS 且依赖 pi.dev 端点）；RPC session-tree 族（fork/clone/get_tree/get_entries/switch/new_session）、bash/abort_bash 透传、export_html/get_session_stats、prompt images/streamingBehavior；压缩 split-turn 与 mid-run 检查；bash stdin transport 与 powershell（仅 Windows/legacy WSL）；clear_queue 的 per-queue 归属与 isCompacting（待 pi-agent 暴露 per-queue peek / compacting 标志）。
+
 ## 未完成与建议分工
 
-1. **提交状态**：第二轮已推送至 `49d9ded`；第三轮已提交至 `b4df566` 并推送；**第四轮（Anthropic/压缩/MCP 接入/TUI 接线）改动在工作区未提交**，建议按 crate 分批提交，遵循用户指令执行。
-2. **CI 远程验证**：第三轮三 job 已在 GitHub Actions 全过。第四轮改动 push 后需再确认。
-3. **产品能力剩余**（README 路线图）：扩展系统、bash stdin transport/powershell、MCP streamable HTTP 与项目级配置、压缩自动阈值、RPC 与上游剩余命令对齐。
-4. **持久化下一步**：事务性同步持久化（崩溃安全）仍是有意不做；若产品需要，设计 WAL 或 double-buffer 方案。会话恢复 `read_session_messages` 已能跳过撕裂行与 compaction entry。
+1. **提交状态**：第二轮 `49d9ded`、第三轮 `b4df566`、第四轮 `c26d4b4` 均已推送；**第五轮（压缩完整化/MCP 完整化/RPC 补齐/TUI 渲染）改动在工作区未提交**，建议按任务包分批提交，遵循用户指令执行。
+2. **CI 远程验证**：第四轮三 job 已全过。第五轮改动 push 后需再确认。
+3. **产品能力剩余**（README 路线图）：扩展系统（外部进程 + JSONL 协议形态）、MCP OAuth、RPC session-tree 族与 bash 透传、压缩 split-turn/mid-run 检查、SSH 远程环境。
+4. **持久化下一步**：事务性同步持久化（崩溃安全）仍是有意不做；若产品需要，设计 WAL 或 double-buffer 方案。会话恢复 `read_session_messages` 已能跳过撕裂行、处理 compaction 与 ContextEdit 墓碑 entry。
 5. **进程生命周期边界**：setsid 脱离组的后代不会被清理（已文档化）；若产品需要，可考虑退出后扫描 reap。`ExecResult.timed_out` 恒为 false（超时走 `Err(Error::Timeout)`），bash 工具里的 `timed_out` 分支是防御性死代码，可在超时改为携带部分输出时一并清理。
 
 ## 恢复命令

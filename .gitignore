@@ -6,3 +6,4 @@ Cargo.lock.orig
 .DS_Store
 .env
 .pi/
+.zcode/
