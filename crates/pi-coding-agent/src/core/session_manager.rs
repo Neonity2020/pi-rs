@@ -140,6 +140,11 @@ pub struct ContextReplacement {
 /// (`session-manager.ts:57-194`); the `type` tag and the camelCase field
 /// names match the wire format exactly. `Unknown` preserves entries from
 /// newer upstream versions or extensions verbatim (append-only passthrough).
+///
+/// [`EntryKind::BashExecution`] is the twelfth shape pi-rs writes itself: it
+/// serializes to the upstream *message* entry with `message.role ==
+/// "bashExecution"` (`BashExecutionMessage` in `core/messages.ts`), which our
+/// [`Message`] union cannot represent as a variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
 	/// `message`: an `AgentMessage`. Messages our `Message` union cannot
@@ -202,6 +207,19 @@ pub enum EntryKind {
 	},
 	/// `session_info`: display name metadata.
 	SessionInfo { name: Option<String> },
+	/// Upstream `bashExecution` message (`core/messages.ts:29`), persisted as
+	/// a *message* entry — `{"type":"message","message":{"role":
+	/// "bashExecution", ...}}`. `exit_code` is `None` when the command was
+	/// killed/cancelled; `exclude_from_context` mirrors the `!!` prefix.
+	BashExecution {
+		command: String,
+		output: String,
+		exit_code: Option<i64>,
+		cancelled: bool,
+		truncated: bool,
+		full_output_path: Option<String>,
+		exclude_from_context: bool,
+	},
 	/// Unrecognized entry (newer upstream, extension, or a known type whose
 	/// fields failed to parse). Preserved verbatim; contributes no context.
 	Unknown(Value),
@@ -221,6 +239,9 @@ impl EntryKind {
 			EntryKind::ContextEdit { .. } => "context_edit",
 			EntryKind::Label { .. } => "label",
 			EntryKind::SessionInfo { .. } => "session_info",
+			// Upstream wire type is `message` (a message entry whose role is
+			// `bashExecution`), not a distinct `type` tag.
+			EntryKind::BashExecution { .. } => "message",
 			EntryKind::Unknown(_) => "unknown",
 		}
 	}
@@ -423,6 +444,32 @@ impl SessionEntry {
 					value["name"] = Value::String(name.clone());
 				}
 			}
+			EntryKind::BashExecution {
+				command,
+				output,
+				exit_code,
+				cancelled,
+				truncated,
+				full_output_path,
+				exclude_from_context,
+			} => {
+				let mut message = json!({
+					"role": "bashExecution",
+					"command": command,
+					"output": output,
+					"exitCode": exit_code,
+					"cancelled": cancelled,
+					"truncated": truncated,
+					"timestamp": pi_ai::types::now_ms(),
+				});
+				if let Some(path) = full_output_path {
+					message["fullOutputPath"] = Value::String(path.clone());
+				}
+				if *exclude_from_context {
+					message["excludeFromContext"] = json!(true);
+				}
+				value["message"] = message;
+			}
 			EntryKind::Unknown(raw) => return raw.clone(),
 		}
 		value
@@ -432,15 +479,21 @@ impl SessionEntry {
 	pub fn from_value(value: &Value) -> Option<Self> {
 		let kind = match value.get("type").and_then(Value::as_str)? {
 			"session" => return None,
-			"message" => match value
-				.get("message")
-				.map(|message| serde_json::from_value::<Message>(message.clone()))
-			{
-				Some(Ok(message)) => EntryKind::Message {
-					message: Box::new(message),
-				},
-				_ => EntryKind::Unknown(value.clone()),
-			},
+			"message" => {
+				match value
+					.get("message")
+					.map(|message| serde_json::from_value::<Message>(message.clone()))
+				{
+					Some(Ok(message)) => EntryKind::Message {
+						message: Box::new(message),
+					},
+					// Our Message union cannot represent the upstream
+					// `bashExecution` role; parse it into the typed variant
+					// (round-trips the exact upstream field names).
+					_ => parse_bash_execution_message(value)
+						.unwrap_or_else(|| EntryKind::Unknown(value.clone())),
+				}
+			}
 			"model_change" => match (
 				value.get("provider").and_then(Value::as_str),
 				value.get("modelId").and_then(Value::as_str),
@@ -586,6 +639,92 @@ fn parse_context_replacement(value: Option<&Value>) -> Option<ContextReplacement
 					content: value.clone(),
 				})
 			}),
+	}
+}
+
+/// Parse an upstream `bashExecution` message entry (`BashExecutionMessage` in
+/// `core/messages.ts`): required `command`/`output`; everything else follows
+/// the upstream optionality (`exitCode` null, missing `fullOutputPath`).
+fn parse_bash_execution_message(value: &Value) -> Option<EntryKind> {
+	let message = value.get("message")?;
+	if message.get("role").and_then(Value::as_str) != Some("bashExecution") {
+		return None;
+	}
+	let command = message.get("command").and_then(Value::as_str)?;
+	let output = message.get("output").and_then(Value::as_str)?;
+	Some(EntryKind::BashExecution {
+		command: command.to_string(),
+		output: output.to_string(),
+		exit_code: message.get("exitCode").and_then(Value::as_i64),
+		cancelled: message
+			.get("cancelled")
+			.and_then(Value::as_bool)
+			.unwrap_or(false),
+		truncated: message
+			.get("truncated")
+			.and_then(Value::as_bool)
+			.unwrap_or(false),
+		full_output_path: message
+			.get("fullOutputPath")
+			.and_then(Value::as_str)
+			.map(str::to_owned),
+		exclude_from_context: message
+			.get("excludeFromContext")
+			.and_then(Value::as_bool)
+			.unwrap_or(false),
+	})
+}
+
+/// `bashExecutionToText` (`core/messages.ts:82`): the user-message text a
+/// non-excluded bash execution contributes to the model context.
+pub fn bash_execution_to_text(
+	command: &str,
+	output: &str,
+	exit_code: Option<i64>,
+	cancelled: bool,
+	truncated: bool,
+	full_output_path: Option<&str>,
+) -> String {
+	let mut text = format!("Ran `{command}`\n");
+	if output.is_empty() {
+		text.push_str("(no output)");
+	} else {
+		text.push_str(&format!("```\n{output}\n```"));
+	}
+	if cancelled {
+		text.push_str("\n\n(command cancelled)");
+	} else if let Some(code) = exit_code
+		&& code != 0
+	{
+		text.push_str(&format!("\n\nCommand exited with code {code}"));
+	}
+	if truncated && let Some(path) = full_output_path {
+		text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+	}
+	text
+}
+
+// ---------------------------------------------------------------------------
+// Tree traversal (`getTree` / `getEntry` / `getChildren`)
+// ---------------------------------------------------------------------------
+
+/// `SessionTreeNode` upstream (`session-manager.ts:198`): one entry plus its
+/// children in the session tree. Deviation: the upstream `label`/
+/// `labelTimestamp` fields are omitted — pi-rs parses `label` entries but
+/// keeps no resolved-label map, so there is nothing to resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTreeNode {
+	pub entry: SessionEntry,
+	pub children: Vec<SessionTreeNode>,
+}
+
+impl SessionTreeNode {
+	/// Serialize to the upstream wire shape (`{entry, children}`).
+	pub fn to_value(&self) -> Value {
+		json!({
+			"entry": self.entry.to_value(),
+			"children": self.children.iter().map(|node| node.to_value()).collect::<Vec<_>>(),
+		})
 	}
 }
 
@@ -933,6 +1072,27 @@ pub fn project_entries_with_leaf(
 fn entry_to_context_messages(entry: &SessionEntry) -> Vec<Message> {
 	match &entry.kind {
 		EntryKind::Message { message } => vec![(**message).clone()],
+		// Upstream `convertToLlm` (`core/messages.ts:152`): bash executions
+		// replay as user text unless the `!!` exclusion flag is set.
+		EntryKind::BashExecution {
+			command,
+			output,
+			exit_code,
+			cancelled,
+			truncated,
+			full_output_path,
+			exclude_from_context,
+		} => match exclude_from_context {
+			true => Vec::new(),
+			false => vec![Message::user(bash_execution_to_text(
+				command,
+				output,
+				*exit_code,
+				*cancelled,
+				*truncated,
+				full_output_path.as_deref(),
+			))],
+		},
 		EntryKind::Compaction {
 			summary,
 			system_message,
@@ -1068,13 +1228,45 @@ pub enum SessionError {
 	/// A non-empty log without a valid upstream session header.
 	#[error("{0}")]
 	InvalidFormat(String),
+	/// Tree navigation named an entry the log does not carry
+	/// (upstream `branch`/`createBranchedSession` throw).
+	#[error("entry {0} not found")]
+	EntryNotFound(String),
 }
 
 impl SessionManager {
 	/// Create a fresh timestamped session under the sessions root.
 	pub fn create(cwd: &Path) -> Result<Self, SessionError> {
-		let root = config::sessions_dir();
-		let id = format!("{}-{}", chrono_like_timestamp(), std::process::id());
+		Self::create_with_parent(cwd, None)
+	}
+
+	/// [`SessionManager::create`] with an optional `parentSession` lineage in
+	/// the header (upstream `SessionManager.create(cwd, dir, {parentSession})`
+	/// for `/new`/fork-before-first-entry). The directory name gains a short
+	/// random segment so several sessions created within the same second
+	/// (new → fork) never collide.
+	pub fn create_with_parent(
+		cwd: &Path,
+		parent_session: Option<String>,
+	) -> Result<Self, SessionError> {
+		Self::create_with_parent_in(&config::sessions_dir(), cwd, parent_session)
+	}
+
+	/// Root-parameterized [`SessionManager::create_with_parent`] — replacement
+	/// flows place the new session next to the current one (upstream passes
+	/// `getSessionDir()`); tests inject a temporary root.
+	pub fn create_with_parent_in(
+		root: &Path,
+		cwd: &Path,
+		parent_session: Option<String>,
+	) -> Result<Self, SessionError> {
+		// Random v4 segment: a v7's leading hex is timestamp-derived, so two
+		// sessions created in the same millisecond would collide on the name.
+		let id = format!(
+			"{}-{}",
+			chrono_like_timestamp(),
+			&uuid::Uuid::new_v4().simple().to_string()[..8]
+		);
 		let dir = root.join(id);
 		std::fs::create_dir_all(&dir)?;
 		let header = SessionHeader {
@@ -1082,9 +1274,9 @@ impl SessionManager {
 			id: uuid::Uuid::now_v7().to_string(),
 			timestamp: iso_timestamp(pi_ai::types::now_ms()),
 			cwd: cwd.to_string_lossy().into_owned(),
-			parent_session: None,
+			parent_session,
 		};
-		let mut manager = Self::empty(dir, None);
+		let mut manager = Self::empty(dir, Some(header.clone()));
 		manager.open_file()?;
 		manager.write_header(&header)?;
 		Ok(manager)
@@ -1166,6 +1358,20 @@ impl SessionManager {
 		let mut manager = Self::empty(dir, None);
 		manager.file = Some(file);
 		manager
+	}
+
+	/// Open a session by path (upstream `SessionManager.open(sessionPath)`,
+	/// used by `switch_session`). Layout deviation (accepted, pre-existing):
+	/// pi-rs stores one `session.jsonl` per session *directory*, so `path`
+	/// may name the directory or any file inside it — the directory's log is
+	/// opened either way.
+	pub fn open_session_path(path: &Path) -> Result<Self, SessionError> {
+		let dir = if path.is_dir() {
+			path
+		} else {
+			path.parent().unwrap_or(path)
+		};
+		Self::open(dir)
 	}
 
 	fn empty(session_dir: PathBuf, header: Option<SessionHeader>) -> Self {
@@ -1273,6 +1479,102 @@ impl SessionManager {
 
 	pub fn leaf_id(&self) -> Option<&str> {
 		self.leaf_id.as_deref()
+	}
+
+	/// `getEntry(id)` upstream: one entry by id.
+	pub fn get_entry(&self, id: &str) -> Option<SessionEntry> {
+		self.by_id.get(id).map(|index| self.entries[*index].clone())
+	}
+
+	/// `getChildren(parentId)` upstream: direct children in file order.
+	pub fn get_children(&self, parent_id: &str) -> Vec<SessionEntry> {
+		self.entries
+			.iter()
+			.filter(|entry| entry.parent_id() == Some(parent_id))
+			.cloned()
+			.collect()
+	}
+
+	/// `getTree()` upstream: the whole entry forest. Roots are entries whose
+	/// `parentId` is null or self-referencing, plus orphans (broken parent
+	/// chain); children are sorted by timestamp ascending. Builds bottom-up in
+	/// reverse file order — every child is written after its parent, so all
+	/// subtrees are assembled before their parents — which is iterative and
+	/// cannot overflow the stack on deep trees.
+	pub fn get_tree(&self) -> Vec<SessionTreeNode> {
+		let mut pending_children: HashMap<String, Vec<SessionTreeNode>> = HashMap::new();
+		let mut roots = Vec::new();
+		for entry in self.entries.iter().rev() {
+			let Some(id) = entry.id().map(str::to_owned) else {
+				continue;
+			};
+			let mut children = pending_children.remove(&id).unwrap_or_default();
+			children.sort_by(|a, b| a.entry.base.timestamp.cmp(&b.entry.base.timestamp));
+			let node = SessionTreeNode {
+				entry: entry.clone(),
+				children,
+			};
+			match entry.parent_id() {
+				None => roots.push(node),
+				Some(parent) if parent == id => roots.push(node), // self-referencing root
+				Some(parent) if self.by_id.contains_key(parent) => {
+					match pending_children.get_mut(parent) {
+						Some(siblings) => siblings.push(node),
+						None => {
+							pending_children.insert(parent.to_string(), vec![node]);
+						}
+					}
+				}
+				// Orphans (broken parent chain) become roots, like upstream's
+				// failed nodeMap lookup.
+				Some(_) => roots.push(node),
+			}
+		}
+		// Reverse file order collected the roots latest-first; restore the
+		// file order upstream iterates in.
+		roots.reverse();
+		roots
+	}
+
+	/// `branch(branchFromId)` upstream: move the leaf pointer to an existing
+	/// entry. The next append becomes a child of it, forming a new branch.
+	pub fn branch(&mut self, branch_from_id: &str) -> Result<(), SessionError> {
+		if !self.by_id.contains_key(branch_from_id) {
+			return Err(SessionError::EntryNotFound(branch_from_id.to_string()));
+		}
+		self.leaf_id = Some(branch_from_id.to_string());
+		Ok(())
+	}
+
+	/// `resetLeaf()` upstream: move the leaf pointer before any entry, so the
+	/// next append starts a new root.
+	pub fn reset_leaf(&mut self) {
+		self.leaf_id = None;
+	}
+
+	/// `appendSessionInfo(name)` upstream: sanitize `[\r\n]+ → space`, trim,
+	/// and append a `session_info` entry.
+	pub fn append_session_info(&mut self, name: &str) -> Result<Option<String>, SessionError> {
+		let sanitized = sanitize_session_name(name);
+		let entry = SessionEntry::new(EntryKind::SessionInfo {
+			name: Some(sanitized),
+		});
+		self.append(entry)
+	}
+
+	/// `getSessionName()` upstream: the latest `session_info` name in reverse
+	/// file order; an empty name (after trim) clears the title.
+	pub fn session_name(&self) -> Option<String> {
+		self.entries
+			.iter()
+			.rev()
+			.find_map(|entry| match &entry.kind {
+				EntryKind::SessionInfo { name } => {
+					Some(name.as_deref().unwrap_or_default().trim().to_string())
+				}
+				_ => None,
+			})
+			.filter(|name| !name.is_empty())
 	}
 
 	/// Compaction-aware, edit-aware model context of the current log.
@@ -1415,6 +1717,89 @@ impl SessionManager {
 	pub fn list_recent(limit: usize) -> Vec<(PathBuf, u64)> {
 		list_recent_in(&config::sessions_dir(), limit)
 	}
+
+	/// `createBranchedSession(leafId)` upstream (`session-manager.ts:1632`):
+	/// write a new session file containing only the root-to-`leaf_id` path
+	/// with `parentId` links re-chained along it, and return the new session
+	/// path.
+	///
+	/// Layout deviation (see the module docs): the branched session becomes a
+	/// new sibling *directory* next to the current one (upstream writes a
+	/// `<timestamp>_<id>.jsonl` file into the same `getSessionDir()`); the
+	/// header's `parentSession` points at the source `session.jsonl`,
+	/// matching upstream's field semantics. The upstream label re-chaining
+	/// (`replacementByLabelId`) is skipped: labels are kept as ordinary path
+	/// entries, so no id on the path changes and `firstKeptEntryId` on
+	/// compaction entries passes through unmodified (it can only reference
+	/// entries on the retained path).
+	pub fn create_branched_session(&self, leaf_id: &str) -> Result<PathBuf, SessionError> {
+		// Sibling of the current session (upstream writes into
+		// `getSessionDir()`); the sessions root when unpersisted.
+		let root = self
+			.session_dir()
+			.and_then(Path::parent)
+			.map(Path::to_path_buf)
+			.unwrap_or_else(config::sessions_dir);
+		self.create_branched_session_in(&root, leaf_id)
+	}
+
+	/// Root-parameterized [`SessionManager::create_branched_session`] (tests
+	/// inject a temporary sessions root).
+	pub fn create_branched_session_in(
+		&self,
+		root: &Path,
+		leaf_id: &str,
+	) -> Result<PathBuf, SessionError> {
+		let path = build_session_path(&self.entries, Some(leaf_id));
+		if path.is_empty() {
+			return Err(SessionError::EntryNotFound(leaf_id.to_string()));
+		}
+		let cwd = self
+			.header
+			.as_ref()
+			.map(|header| header.cwd.clone())
+			.unwrap_or_default();
+		let parent_file = self.session_dir().map(|dir| dir.join("session.jsonl"));
+
+		let new_session_id = uuid::Uuid::now_v7().to_string();
+		// Random v4 segment — see create_with_parent (v7's leading hex is
+		// timestamp-derived and would collide within the same millisecond).
+		let dir_name = format!(
+			"{}-{}",
+			chrono_like_timestamp(),
+			&uuid::Uuid::new_v4().simple().to_string()[..8]
+		);
+		let dir = root.join(dir_name);
+		std::fs::create_dir_all(&dir)?;
+
+		let mut manager = {
+			let header = SessionHeader {
+				version: Some(CURRENT_SESSION_VERSION),
+				id: new_session_id,
+				timestamp: iso_timestamp(pi_ai::types::now_ms()),
+				cwd,
+				parent_session: parent_file.map(|path| path.to_string_lossy().into_owned()),
+			};
+			let mut manager = Self::empty(dir, Some(header));
+			manager.open_file()?;
+			let header = manager.header.clone().expect("just set");
+			manager.write_header(&header)?;
+			manager
+		};
+		// Re-chain the retained path: the first entry roots at null, every
+		// later entry follows its path predecessor.
+		let mut path_parent: Option<String> = None;
+		for mut entry in path {
+			entry.base.parent_id = path_parent.clone();
+			let id = entry.base.id.clone();
+			manager.append(entry)?;
+			path_parent = id;
+		}
+		Ok(manager
+			.session_dir()
+			.expect("branched session is persisted")
+			.to_path_buf())
+	}
 }
 
 /// Which session a resume flag names — mirrors the `--continue`/`--resume`
@@ -1518,6 +1903,25 @@ pub fn validate_session_dir(dir: &Path) -> Result<(), String> {
 		"{} is not a valid session directory (no session header)",
 		dir.display()
 	))
+}
+
+/// `[\r\n]+ → space`, then trim — the `appendSessionInfo` sanitization
+/// (`session-manager.ts:1304`).
+fn sanitize_session_name(name: &str) -> String {
+	let mut sanitized = String::with_capacity(name.len());
+	let mut previous_newline = false;
+	for character in name.chars() {
+		if character == '\r' || character == '\n' {
+			if !previous_newline {
+				sanitized.push(' ');
+			}
+			previous_newline = true;
+		} else {
+			previous_newline = false;
+			sanitized.push(character);
+		}
+	}
+	sanitized.trim().to_string()
 }
 
 fn list_recent_in(root: &Path, limit: usize) -> Vec<(PathBuf, u64)> {
@@ -2197,6 +2601,462 @@ mod tests {
 		entry.base.timestamp = Some("2024-12-03T14:00:00.000Z".into());
 		manager.index_entry(entry.clone());
 		entry
+	}
+
+	// -- tree navigation -----------------------------------------------------
+
+	fn linked_with_stamp(
+		manager: &mut SessionManager,
+		kind: EntryKind,
+		id: &str,
+		timestamp: &str,
+	) -> SessionEntry {
+		let mut entry = SessionEntry::new(kind);
+		entry.base.parent_id = manager.leaf_id.clone();
+		entry.base.id = Some(id.to_string());
+		entry.base.timestamp = Some(timestamp.to_string());
+		manager.index_entry(entry.clone());
+		entry
+	}
+
+	fn user_text_of(entry: &SessionEntry) -> String {
+		match &entry.kind {
+			EntryKind::Message { message } => match message.as_ref() {
+				Message::User(user) => user.content.as_text(),
+				_ => String::new(),
+			},
+			_ => String::new(),
+		}
+	}
+
+	#[test]
+	fn branch_moves_the_leaf_and_append_forks() {
+		let mut manager = SessionManager::in_memory();
+		let m1 = linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("root")),
+			},
+			"aaa10000",
+			"2024-12-03T14:00:00.000Z",
+		);
+		let m2 = linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("first branch")),
+			},
+			"aaa20000",
+			"2024-12-03T14:01:00.000Z",
+		);
+		// Fork from the root: the next append becomes its second child.
+		manager.branch(m1.id().unwrap()).unwrap();
+		assert_eq!(manager.leaf_id(), m1.id());
+		let appended = manager
+			.append(SessionEntry::new(EntryKind::Message {
+				message: Box::new(user_message("second branch")),
+			}))
+			.unwrap()
+			.expect("in-memory appends still assign ids");
+		let child = manager.get_entry(&appended).unwrap();
+		assert_eq!(child.parent_id(), m1.id(), "branches from the fork point");
+		// Both children share the parent (the fork exists in one file).
+		let children = manager.get_children(m1.id().unwrap());
+		assert_eq!(children.len(), 2);
+		assert_eq!(children[0].id(), m2.id());
+		assert_eq!(children[1].id(), Some(appended.as_str()));
+		// Unknown ids fail like upstream's thrown Error.
+		assert!(matches!(
+			manager.branch("nosuchid"),
+			Err(SessionError::EntryNotFound(_))
+		));
+	}
+
+	#[test]
+	fn reset_leaf_starts_a_new_root() {
+		let mut manager = SessionManager::in_memory();
+		linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("old root")),
+			},
+			"bbb10000",
+			"2024-12-03T14:00:00.000Z",
+		);
+		manager.reset_leaf();
+		assert_eq!(manager.leaf_id(), None);
+		let appended = manager
+			.append(SessionEntry::new(EntryKind::Message {
+				message: Box::new(user_message("new root")),
+			}))
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			manager.get_entry(&appended).unwrap().parent_id(),
+			None,
+			"the next append is a root"
+		);
+	}
+
+	#[test]
+	fn get_tree_builds_the_forest_with_sorted_children() {
+		let mut manager = SessionManager::in_memory();
+		let root = linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("root")),
+			},
+			"ccc10000",
+			"2024-12-03T14:00:00.000Z",
+		);
+		// Children appended out of timestamp order to exercise the sort.
+		let late = linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("late")),
+			},
+			"ccc30000",
+			"2024-12-03T14:03:00.000Z",
+		);
+		// Branch back to the root so `early` becomes a second child, appended
+		// after `late` in file order with an earlier timestamp.
+		manager.branch(root.id().unwrap()).unwrap();
+		let early = linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("early")),
+			},
+			"ccc20000",
+			"2024-12-03T14:01:00.000Z",
+		);
+		// A second root (parentId null) and an orphan (broken parent chain).
+		manager.reset_leaf();
+		let sibling_root = linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("sibling")),
+			},
+			"ccc40000",
+			"2024-12-03T14:04:00.000Z",
+		);
+		manager.reset_leaf();
+		linked_with_stamp(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("second root")),
+			},
+			"ccc50000",
+			"2024-12-03T14:05:00.000Z",
+		);
+		let orphan = {
+			let mut entry = SessionEntry::new(EntryKind::Message {
+				message: Box::new(user_message("orphan")),
+			});
+			entry.base.parent_id = Some("missing".into());
+			entry.base.id = Some("ccc60000".into());
+			entry.base.timestamp = Some("2024-12-03T14:06:00.000Z".into());
+			manager.index_entry(entry.clone());
+			entry
+		};
+		let _ = &orphan;
+
+		let tree = manager.get_tree();
+		assert_eq!(tree.len(), 4, "three deliberate roots plus the orphan");
+		let texts: Vec<String> = tree.iter().map(|node| user_text_of(&node.entry)).collect();
+		assert_eq!(texts, vec!["root", "sibling", "second root", "orphan"]);
+		// Children sort by timestamp ascending even when appended out of order.
+		let root_node = &tree[0];
+		let child_texts: Vec<String> = root_node
+			.children
+			.iter()
+			.map(|node| user_text_of(&node.entry))
+			.collect();
+		assert_eq!(child_texts, vec!["early", "late"]);
+		assert_eq!(root_node.children[0].entry.id(), early.id());
+		assert_eq!(root_node.children[1].entry.id(), late.id());
+		// The wire shape nests entries and children.
+		let value = root_node.to_value();
+		assert_eq!(value["entry"]["id"], root.id().unwrap());
+		assert_eq!(value["children"].as_array().unwrap().len(), 2);
+		assert_eq!(value["children"][0]["entry"]["id"], early.id().unwrap());
+		// Tree entries round-trip through the wire parser.
+		assert_eq!(
+			SessionEntry::from_value(&value["children"][0]["entry"]).unwrap(),
+			early.clone()
+		);
+		let _ = sibling_root;
+	}
+
+	#[test]
+	fn get_tree_handles_self_referencing_roots() {
+		let mut manager = SessionManager::in_memory();
+		let mut entry = SessionEntry::new(EntryKind::Message {
+			message: Box::new(user_message("self")),
+		});
+		entry.base.parent_id = Some("ddd10000".into());
+		entry.base.id = Some("ddd10000".into());
+		entry.base.timestamp = Some("2024-12-03T14:00:00.000Z".into());
+		manager.index_entry(entry);
+		let tree = manager.get_tree();
+		assert_eq!(tree.len(), 1, "a self-referencing entry is a root");
+	}
+
+	// -- branched sessions ---------------------------------------------------
+
+	#[test]
+	fn create_branched_session_writes_the_relabeled_path() {
+		let dir = temp_session_dir("branched");
+		let mut manager = create_in(&dir, Path::new("/project"));
+		let source_file = dir.join("session.jsonl");
+		let m1 = manager
+			.append_message(&user_message("summarized"))
+			.unwrap()
+			.unwrap();
+		let m2 = manager
+			.append_message(&user_message("kept"))
+			.unwrap()
+			.unwrap();
+		let m3 = manager
+			.append_message(&user_message("also kept"))
+			.unwrap()
+			.unwrap();
+		// A compaction on the main branch: its firstKeptEntryId references m2.
+		let mut compaction = SessionEntry::compaction("summary", 10);
+		if let EntryKind::Compaction {
+			first_kept_entry_id,
+			..
+		} = &mut compaction.kind
+		{
+			*first_kept_entry_id = m2.clone();
+		}
+		let compaction_id = manager.append(compaction).unwrap().unwrap();
+		manager
+			.append_message(&user_message("after compaction"))
+			.unwrap();
+
+		// Fork from m1 and add a branch turn: the branched file carries the
+		// m1 → branch-turn path with re-chained parent links.
+		manager.branch(&m1).unwrap();
+		let branch_child = manager
+			.append_message(&user_message("branch turn"))
+			.unwrap()
+			.unwrap();
+		let root = temp_session_dir("branched-root");
+		let new_dir = manager
+			.create_branched_session_in(&root, &branch_child)
+			.unwrap();
+		assert_ne!(new_dir, dir, "a sibling session directory");
+
+		let lines = read_lines(&new_dir);
+		assert_eq!(lines[0]["type"], "session");
+		assert_eq!(lines[0]["version"], 3);
+		assert_eq!(
+			lines[0]["parentSession"],
+			source_file.display().to_string(),
+			"the header names the source session file"
+		);
+		assert!(
+			!lines[0]["id"].as_str().unwrap().is_empty(),
+			"uuidv7 session id"
+		);
+		assert_eq!(lines.len(), 3, "header plus the two path entries");
+		// The path re-chains: m1 roots at null, the branch child follows it.
+		assert_eq!(lines[1]["id"], m1);
+		assert_eq!(lines[1]["parentId"], Value::Null);
+		assert_eq!(lines[2]["parentId"], m1);
+		assert_eq!(lines[2]["id"], branch_child);
+		let branch_text = lines[2]["message"]["content"][0]["text"].as_str().unwrap();
+		assert_eq!(branch_text, "branch turn");
+
+		// Entry ids survive the re-chain, so a compaction's firstKeptEntryId
+		// still references the same (re-linked) id when it is on the path —
+		// fork at the compaction leaf to exercise it.
+		let compaction_leaf = manager
+			.create_branched_session_in(&root, &compaction_id)
+			.unwrap();
+		let lines = read_lines(&compaction_leaf);
+		let compaction_position = lines
+			.iter()
+			.position(|line| line["type"] == "compaction")
+			.unwrap();
+		let compaction_line = &lines[compaction_position];
+		assert_eq!(
+			compaction_line["firstKeptEntryId"], m2,
+			"firstKeptEntryId passes through the re-chain unchanged"
+		);
+		assert_eq!(
+			compaction_line["parentId"],
+			lines[compaction_position - 1]["id"],
+			"the compaction re-chains to its path predecessor"
+		);
+		// The branched log replays through the standard projection.
+		let projection = project_file(&compaction_leaf);
+		let texts: Vec<String> = projection
+			.messages
+			.iter()
+			.map(|(_, message)| match message {
+				Message::User(user) => user.content.as_text(),
+				_ => String::new(),
+			})
+			.collect();
+		assert_eq!(texts.len(), 3);
+		assert!(texts[0].contains("summary"));
+		assert_eq!(texts[1], "kept", "the firstKeptEntryId range replays");
+		assert_eq!(
+			texts[2], "also kept",
+			"entries between the cut and the compaction replay"
+		);
+		let _ = m3;
+		std::fs::remove_dir_all(dir).unwrap();
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn create_branched_session_rejects_unknown_leaves() {
+		let manager = SessionManager::in_memory();
+		assert!(matches!(
+			manager.create_branched_session("nosuchid"),
+			Err(SessionError::EntryNotFound(_))
+		));
+	}
+
+	// -- session names -------------------------------------------------------
+
+	#[test]
+	fn session_info_sanitizes_and_the_name_clears() {
+		let mut manager = SessionManager::in_memory();
+		assert_eq!(manager.session_name(), None);
+		manager
+			.append_session_info("refactor\r\nthe\n\nauth module")
+			.unwrap();
+		assert_eq!(
+			manager.session_name().as_deref(),
+			Some("refactor the auth module")
+		);
+		// An empty (after-trim) name clears the title.
+		manager.append_session_info("  ").unwrap();
+		assert_eq!(manager.session_name(), None);
+		// Wire shape: {type:"session_info", name}.
+		let named = manager
+			.entries()
+			.iter()
+			.find(|entry| matches!(entry.kind, EntryKind::SessionInfo { name: Some(_) }))
+			.unwrap()
+			.to_value();
+		assert_eq!(named["type"], "session_info");
+		assert_eq!(named["name"], "refactor the auth module");
+	}
+
+	// -- bash execution entries ----------------------------------------------
+
+	fn bash_entry(exclude: bool) -> EntryKind {
+		EntryKind::BashExecution {
+			command: "echo hi".into(),
+			output: "hi".into(),
+			exit_code: Some(0),
+			cancelled: false,
+			truncated: false,
+			full_output_path: None,
+			exclude_from_context: exclude,
+		}
+	}
+
+	#[test]
+	fn bash_execution_entry_round_trips_the_upstream_message_shape() {
+		let mut manager = SessionManager::in_memory();
+		manager
+			.append(SessionEntry::new(bash_entry(false)))
+			.unwrap();
+		let entry = manager
+			.entries()
+			.iter()
+			.find(|entry| matches!(entry.kind, EntryKind::BashExecution { .. }))
+			.unwrap()
+			.clone();
+		let value = entry.to_value();
+		assert_eq!(
+			value["type"], "message",
+			"upstream persists it as a message"
+		);
+		assert_eq!(value["message"]["role"], "bashExecution");
+		assert_eq!(value["message"]["command"], "echo hi");
+		assert_eq!(value["message"]["exitCode"], 0);
+		assert!(value["message"].get("fullOutputPath").is_none());
+		assert!(value["message"].get("excludeFromContext").is_none());
+		let parsed = SessionEntry::from_value(&value).unwrap();
+		assert_eq!(parsed, entry, "typed round-trip");
+		// The excluded form carries the flag; a null exitCode stays null.
+		let excluded = SessionEntry::new(EntryKind::BashExecution {
+			command: "c".into(),
+			output: "o".into(),
+			exit_code: None,
+			cancelled: false,
+			truncated: false,
+			full_output_path: None,
+			exclude_from_context: true,
+		});
+		let value = excluded.to_value();
+		assert_eq!(value["message"]["excludeFromContext"], true);
+		assert_eq!(value["message"]["exitCode"], Value::Null);
+		assert!(matches!(
+			SessionEntry::from_value(&value).unwrap().kind,
+			EntryKind::BashExecution { .. }
+		));
+	}
+
+	#[test]
+	fn bash_execution_replays_as_user_text_unless_excluded() {
+		let mut manager = SessionManager::in_memory();
+		manager
+			.append(SessionEntry::new(bash_entry(false)))
+			.unwrap();
+		let mut excluded = SessionEntry::new(EntryKind::BashExecution {
+			command: "echo secret".into(),
+			output: "secret".into(),
+			exit_code: None,
+			cancelled: true,
+			truncated: false,
+			full_output_path: None,
+			exclude_from_context: true,
+		});
+		excluded.base.id = Some("bash0001".into());
+		manager.append(excluded).unwrap();
+		let projection = project_entries(manager.entries());
+		assert_eq!(
+			projection.messages.len(),
+			1,
+			"excluded entries skip context"
+		);
+		let Message::User(user) = &projection.messages[0].1 else {
+			panic!("expected the user-form replay")
+		};
+		assert_eq!(user.content.as_text(), "Ran `echo hi`\n```\nhi\n```");
+		// Upstream bashExecutionToText's non-zero-exit and truncated notes.
+		assert_eq!(
+			bash_execution_to_text("cmd", "out", Some(3), false, true, Some("/tmp/full")),
+			"Ran `cmd`\n```\nout\n```\n\nCommand exited with code 3\n\n[Output truncated. Full output: /tmp/full]"
+		);
+		assert_eq!(
+			bash_execution_to_text("cmd", "", None, true, false, None),
+			"Ran `cmd`\n(no output)\n\n(command cancelled)"
+		);
+	}
+
+	#[test]
+	fn session_file_persistence_round_trips_bash_entries() {
+		let dir = temp_session_dir("bash-persist");
+		let mut manager = open_bare(&dir);
+		manager
+			.append(SessionEntry::new(bash_entry(false)))
+			.unwrap();
+		drop(manager);
+		let (header, entries) = load_session_file(&dir.join("session.jsonl"));
+		assert!(header.is_some());
+		assert!(matches!(entries[0].kind, EntryKind::BashExecution { .. }));
+		assert_eq!(
+			super::super::agent_session::read_session_messages(&dir).len(),
+			1
+		);
+		std::fs::remove_dir_all(dir).unwrap();
 	}
 
 	#[test]

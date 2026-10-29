@@ -599,7 +599,7 @@ impl InteractiveMode {
 			SessionEvent::Notice(text) => self.push_notice(text),
 			SessionEvent::Persisted { .. } => {}
 			// Quiescence marker; the TUI derives busy/idle from agent events.
-			SessionEvent::Settled => {}
+			SessionEvent::Settled { .. } => {}
 		}
 	}
 
