@@ -1664,7 +1664,10 @@ mod tests {
 		assert_eq!(value["id"], "a0b1c2d3");
 		assert_eq!(value["parentId"], Value::Null);
 		assert_eq!(value["message"]["role"], "user");
-		assert_eq!(value["message"]["content"], "hi");
+		assert_eq!(
+			value["message"]["content"],
+			serde_json::json!([{"type":"text","text":"hi"}])
+		);
 		// Round-trips through the typed parser.
 		let parsed = SessionEntry::from_value(&value).unwrap();
 		assert_eq!(parsed, entry);
@@ -1835,7 +1838,12 @@ mod tests {
 		assert_eq!(lines[0]["version"], 3);
 		let texts: Vec<String> = lines[1..]
 			.iter()
-			.map(|v| v["message"]["content"].as_str().unwrap().to_string())
+			.map(|v| {
+				v["message"]["content"].as_array().unwrap()[0]["text"]
+					.as_str()
+					.unwrap()
+					.to_string()
+			})
 			.collect();
 		assert_eq!(texts, vec!["one", "two", "three"]);
 		// Tree: each entry chains to its parent; leaf is the last one.

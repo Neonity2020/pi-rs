@@ -300,7 +300,23 @@ pub struct UserMessage {
 }
 
 impl UserMessage {
+	/// The upstream CLI's shape for every user-originated message (prompt,
+	/// steer, follow-up, compaction summary): a single text block
+	/// (`agent-session.ts` `_queueSteer`/`_queueFollowUp`, `prompt()` message
+	/// assembly). The bare-string variant of `UserContent` stays reachable via
+	/// [`UserMessage::raw`] for upstream-file round-trip fidelity.
 	pub fn text(s: impl Into<String>) -> Self {
+		Self {
+			content: UserContent::Blocks(vec![TextOrImage::text(s)]),
+			timestamp: now_ms(),
+		}
+	}
+
+	/// Bare-string content, the other half of the upstream `string |
+	/// (TextContent | ImageContent)[]` union. Not produced by any pi-rs
+	/// prompt path; kept so sessions written with string content round-trip
+	/// unchanged.
+	pub fn raw(s: impl Into<String>) -> Self {
 		Self {
 			content: UserContent::text(s),
 			timestamp: now_ms(),
@@ -529,5 +545,32 @@ mod tests {
 	#[test]
 	fn context_tokens_of_default_usage_is_zero() {
 		assert_eq!(Usage::default().context_tokens(), 0);
+	}
+
+	#[test]
+	fn user_message_text_serializes_as_single_text_block() {
+		// Upstream CLI shape (agent-session.ts prompt/steer/followUp): content
+		// is `[{type:"text",text}]`, not the bare string.
+		let message = UserMessage::text("Say hi");
+		let json = serde_json::to_value(&message).unwrap();
+		assert_eq!(
+			json["content"],
+			serde_json::json!([{"type":"text","text":"Say hi"}])
+		);
+		assert_eq!(message.content.as_text(), "Say hi");
+	}
+
+	#[test]
+	fn user_content_round_trips_both_union_halves() {
+		// Upstream `content: string | (TextContent | ImageContent)[]` —
+		// upstream-written sessions may carry either half.
+		let blocks: UserMessage =
+			serde_json::from_str(r#"{"content":[{"type":"text","text":"hi"}],"timestamp":1}"#)
+				.unwrap();
+		assert_eq!(blocks.content, UserMessage::text("hi").content);
+		let string: UserMessage =
+			serde_json::from_str(r#"{"content":"hi","timestamp":1}"#).unwrap();
+		assert_eq!(string.content, UserContent::text("hi"));
+		assert_eq!(serde_json::to_value(&string).unwrap()["content"], "hi");
 	}
 }
