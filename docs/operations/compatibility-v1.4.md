@@ -18,18 +18,16 @@ Rust 基线：`4106a9c`（第五轮冲刺已推送，远程 CI 三 job 全过）
 
 源码盘点之外，差分测试（见下）提供了 wire 级行为证据。
 
-## 差分测试发现（P1 后收敛，2026-10-28）
+## 差分测试发现（P2 收敛，2026-10-29）
 
-框架：`difftest/`（场景脚本 + 回放服务器 + 归一化对比），上游 bundle `1.4.0`（快照 SHA 构建）vs `target/debug/pi-rs`。**四个场景全部双侧通过**（单轮文本、bash 工具往返、多轮工具三请求、阈值压缩→压缩请求→压缩后第二条 prompt）。
+框架：`difftest/`（场景脚本 + 回放服务器 + 归一化对比），上游 bundle `1.4.0`（快照 SHA 构建）vs `target/debug/pi-rs`。**四个场景全部双侧通过，且规范视图逐字节一致（4/4 IDENTICAL）**——P0 首轮 31 处 → P1 集成 39 处（两类结构差异）→ **P2 清零**：
 
-P0 首轮 31 处差异 → P1 集成后 **39 处，且全部收敛为两个已记录的结构性类别**；语义级差异（消息序列、事件顺序、退出码、最终文本、压缩流程）清零：
-
-| # | 剩余差异 | 处数 | 归属 |
+| # | 原差异 | 处数 | P2 修复 |
 |---|---|---|---|
-| 1 | **默认工具集**：TS 默认 4 工具（bash/edit/read/write），Rust 固定 7 个 | 24 | P2：CLI `--tools` 参数 |
-| 2 | **user/toolResult 消息 content 形状**：TS 块数组（toolResult 保留尾换行），Rust 纯字符串 | 15 | P2：pi-ai UserMessage/ToolResultMessage wire 形状对齐 |
+| 1 | 默认工具集：TS 默认 4 工具（bash/edit/read/write），Rust 固定 7 个 | 24 | 默认激活集对齐上游 `DEFAULT_TOOL_NAMES`（`core/tool_selection.rs` 移植 `settings-manager.ts` + `sdk.ts` 解析）；`-t/--tools`（裸名单替换 / `+name/-name` 修饰，不可混用、修饰符禁通配）、`-xt/--exclude-tools`（`*` 通配）、`-nt/--no-tools`（连 MCP 一并过滤）、`-nbt/--no-builtin-tools`（仅清内置）、settings `defaultTools`（两层合并：裸名单替换、纯修饰追加）全部按上游语义落地 |
+| 2 | user/toolResult 消息 content 形状：TS 块数组（toolResult 保留尾换行），Rust 纯字符串 | 15 | `UserMessage::text` 改产上游 CLI 形状 `[{type:"text",text}]`（prompt/steer/follow-up/压缩摘要全部覆盖，对照 `agent-session.ts` `_queueSteer`/`_queueFollowUp` 与 prompt 组装）；`UserContent` 保持上游 `string \| blocks` 联合（untagged 双向反序列化，`UserMessage::raw` 保留字符串半边），会话条目与 provider 请求自然对齐 |
 
-P1 交付在差分中的实证：SUMMARIZATION_PROMPT 与压缩 summary 前缀**逐字一致**；会话格式 v3 树互通后 `type:"session"`/entry 链对齐（含启动时 `model_change`/`thinking_level_change`）；归一化规则中两项等价处理有据：system entry 不持久化（Rust 恢复时重建 system prompt，已知差异）与 usage.reasoning 缺省视为 0（TS 恒序列化 0）。
+P1 交付在差分中的实证（保留）：SUMMARIZATION_PROMPT 与压缩 summary 前缀**逐字一致**；会话格式 v3 树互通后 `type:"session"`/entry 链对齐（含启动时 `model_change`/`thinking_level_change`）；归一化规则中两项等价处理有据：system entry 不持久化（Rust 恢复时重建 system prompt，已知差异）与 usage.reasoning 缺省视为 0（TS 恒序列化 0）。toolResult 的 content 形状在 P1 时已一致（Rust `ToolResultMessage.content` 本就是 `Vec<TextOrImage>`）。
 
 历史首轮发现（P0 时点，现已修复的不再列出）：默认工具集（上表 #1）、消息 content 形状（上表 #2）、会话文件完全不兼容（已由会话格式 v3 落地修复）。
 

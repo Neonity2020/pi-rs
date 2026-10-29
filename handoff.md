@@ -105,3 +105,15 @@ cargo fmt --all -- --check
 **验证（本轮实测）**：`cargo test --workspace --locked` **426 项全绿**（288→426）、fmt/clippy -D warnings 干净；差分四场景双侧通过，规范视图差异 88→**39 且全部为两个 P2 结构类别**（默认工具集 4v7、user/toolResult content 形状），压缩 SUMMARIZATION_PROMPT 逐字一致、会话格式互通实证。
 
 **交接事项（明确推迟）**：user/toolResult 消息 content 块数组化（pi-ai 类型层 wire 对齐，P2 首选）；CLI `--tools`/`--mode json`/`@file`；RPC session-tree 族与 bash 透传；MCP OAuth；扩展系统；assistant thinking_end 帧的 `content` 现含完整思考文本（wire additive 变化）。改动未提交，等用户指令。
+
+## 第七轮：P2 wire 对齐清零（2026-10-29，主会话单线，worktree 分支 `p2-wire-cli`）
+
+基线 `fdadd3e`（docs 提交，P1 已推送）。本轮在独立 worktree `/Users/andi/Documents/ChatGPT/pi-rs-p2`（分支 `p2-wire-cli`）执行，目标是清掉差分报告中仅剩的两个结构性差异类别（24 处工具集 + 15 处 content 形状 = 39 处）：
+
+- **bash 截断 spill 文件名防碰撞**（`core/tools/bash.rs`，带入主工作区一个未提交修复）：`pid + 纳秒时间戳 + 进程内计数器` 取代 `pid + now_ms`——并行工具执行下两笔截断同毫秒落盘会互相覆盖「Full output」路径。
+- **user 消息 content 块数组化**（`crates/pi-ai/src/types.rs`）：`UserMessage::text` 改产 `[{type:"text",text}]`（上游 CLI 的 prompt/steer/follow-up/压缩摘要统一形状，`agent-session.ts` 实证）；`UserContent` 保持上游 `string | blocks` untagged 联合，新增 `UserMessage::raw` 承接字符串半边（上游文件往返）。会话条目序列化与两个 provider 的请求体随类型自然对齐；toolResult 本就是 `Vec<TextOrImage>` 无需动。差分 15 处 content 差异清零。顺带修正 anthropic wire 测试旧断言（user content 裸字符串 → 块数组，上游 Messages API 本要求块数组）。
+- **工具集选择**（`core/tool_selection.rs` 新模块 + `settings_manager.rs` + `main.rs`）：默认激活集改上游 `DEFAULT_TOOL_NAMES = ["read","bash","edit","write"]`（7 件套定义保留、按选择激活）；移植 `isToolModifier`/`getToolListError`/`applyToolModifiers`/`mergeDefaultTools`/`resolveDefaultTools`/`createToolNameMatcher`（`*` 通配、其余字面量）与 `createAgentSession` 的解析块；CLI 新增 `-t/--tools`、`-xt/--exclude-tools`、`-nt/--no-tools`、`-nbt/--no-builtin-tools`（三个上游组合短旗标经 argv 预处理接 clap），settings 新增 `defaultTools`（两层合并）；无效 `--tools` → 诊断错误 exit 1。MCP 侧按上游 `_allowlistFiltersMcp` 语义：allowlist 为空或含 `mcp__` 条目时才过滤 MCP 工具，`-xt` 恒作用于 MCP。差分 24 处 toolNames 差异清零。
+
+**验证（本轮实测）**：`cargo test --workspace --locked` **444 项全绿**（426→444，+18）、fmt/clippy -D warnings 干净；`difftest` 四场景（单轮/ bash 往返/多轮工具/阈值压缩）规范视图 **4/4 IDENTICAL**——与上游快照 `f9daca34` 的 wire 级语义差异清零（system entry 不持久化与 usage.reasoning 缺省两项归一化等价处理保留在案）。CLI 冒烟：`-t "bash,+grep"` 报错 exit 1、`-nt` 别名生效、`--help` 旗标齐。注意：`cargo test` 不刷新 `target/debug/pi-rs`，跑差分前先 `cargo build -p pi-coding-agent`。
+
+**交接事项（明确推迟）**：CLI `--mode json`/`@file`；RPC session-tree 族与 bash 透传、export_html/get_session_stats；MCP OAuth；扩展系统；SSH 远程。worktree 分支 `p2-wire-cli` 未合并、未推送，等用户指令。主工作区 `main` 上同款 bash.rs 修复仍以未提交状态存在——合并或 rebase 前先处理（内容与本轮 `094826d` 相同，可 stash drop）。

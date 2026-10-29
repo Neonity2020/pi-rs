@@ -813,6 +813,28 @@ mod tests {
 		assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
 	}
 
+	#[test]
+	fn user_content_goes_on_the_wire_as_text_blocks() {
+		// Upstream sends every prompt-created user message as a content-part
+		// array (`convertMessages` receives block content from the CLI); the
+		// difftest pins requests[0].messages[1].content to this exact shape.
+		let model = Model::new("test", "test", "openai-completions", "openai", "");
+		let ctx = TranscriptContext {
+			messages: vec![Message::user("Say hi")],
+		};
+		let body = request_body(&model, &ctx, &StreamOptions::default());
+		assert_eq!(
+			body["messages"][0],
+			json!({"role":"user","content":[{"type":"text","text":"Say hi"}]})
+		);
+		// The bare-string union half is preserved when a session carries it.
+		let ctx = TranscriptContext {
+			messages: vec![Message::User(crate::types::UserMessage::raw("legacy"))],
+		};
+		let body = request_body(&model, &ctx, &StreamOptions::default());
+		assert_eq!(body["messages"][0]["content"], "legacy");
+	}
+
 	fn assistant_with_tool_call() -> AssistantMessage {
 		let mut message = AssistantMessage::error(
 			&Model::new("test", "test", "openai-completions", "openai", ""),

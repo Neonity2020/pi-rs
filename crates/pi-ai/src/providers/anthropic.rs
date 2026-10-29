@@ -1183,7 +1183,8 @@ mod tests {
 		let messages = body["messages"].as_array().unwrap();
 		assert_eq!(messages.len(), 3, "system message stays top-level");
 		assert_eq!(messages[0]["role"], "user");
-		assert_eq!(messages[0]["content"], "list");
+		assert_eq!(messages[0]["content"][0]["type"], "text");
+		assert_eq!(messages[0]["content"][0]["text"], "list");
 		assert_eq!(messages[1]["role"], "assistant");
 		assert_eq!(messages[1]["content"][0]["type"], "text");
 		assert_eq!(messages[1]["content"][1]["type"], "tool_use");
