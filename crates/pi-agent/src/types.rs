@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use pi_ai::{
 	AssistantContent, AssistantMessage, Message, Model, StopReason, TextOrImage, Tool, ToolCall,
-	ToolResultMessage, Usage,
+	Usage,
 };
 
 /// How tool calls from a single assistant message are executed.
@@ -213,7 +213,9 @@ pub enum AgentEvent {
 	TurnStart,
 	TurnEnd {
 		message: Message,
-		tool_results: Vec<ToolResultMessage>,
+		/// The turn's tool results as role-tagged messages (upstream
+		/// `turn_end.toolResults` is an array of `toolResult` messages).
+		tool_results: Vec<Message>,
 	},
 	MessageStart {
 		message: Message,

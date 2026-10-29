@@ -201,10 +201,7 @@ fn emit(tx: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
 }
 
 fn append_with_events(run: &AgentLoopRun, message: Message) {
-	{
-		let mut messages = run.messages.write().unwrap();
-		messages.push(message.clone());
-	}
+	push_message(run, message.clone());
 	emit(
 		&run.event_tx,
 		AgentEvent::MessageStart {
@@ -212,6 +209,13 @@ fn append_with_events(run: &AgentLoopRun, message: Message) {
 		},
 	);
 	emit(&run.event_tx, AgentEvent::MessageEnd { message });
+}
+
+/// Push into the transcript without lifecycle events — used when the
+/// announcement is deferred past the next `turn_start` (queued messages).
+fn push_message(run: &AgentLoopRun, message: Message) {
+	let mut messages = run.messages.write().unwrap();
+	messages.push(message);
 }
 
 /// Run the agent loop to completion. Appends `prompt_messages` to the
@@ -267,7 +271,9 @@ fn assistant_event_json(event: &AssistantMessageEvent) -> serde_json::Value {
 			tool_call,
 			..
 		} => {
-			serde_json::json!({"type":"toolcall_end", "contentIndex": content_index, "toolCall":tool_call})
+			// Upstream wires the tool call as a tagged content block
+			// (`{"type":"toolCall",...}`, agent-loop.ts spreads the block).
+			serde_json::json!({"type":"toolcall_end", "contentIndex": content_index, "toolCall":pi_ai::AssistantContent::ToolCall(tool_call.clone())})
 		}
 		_ => unreachable!("only non-terminal update events are forwarded"),
 	};
@@ -283,9 +289,21 @@ pub async fn run_agent_loop(
 	let start_len = run.messages.read().unwrap().len();
 
 	emit(&run.event_tx, AgentEvent::AgentStart);
+	// Upstream agent-loop.ts:126-133: the entry function emits the first
+	// `turn_start` and THEN announces each prompt message; continuation turns
+	// re-emit `turn_start` inside runLoop (agent-loop.ts:216) before the
+	// queued messages are announced (agent-loop.ts:221-227). pi-rs used to
+	// announce prompt messages before `turn_start`, which the JSON/RPC event
+	// diff pinned as an ordering divergence.
+	emit(&run.event_tx, AgentEvent::TurnStart);
 	for message in prompt_messages {
 		append_with_events(run, message);
 	}
+	let mut first_turn = true;
+	// Messages drained from the steering/follow-up queues in the previous
+	// iteration; announced after the continuation `turn_start`, like
+	// upstream's `pendingMessages` (agent-loop.ts:217-227).
+	let mut queued: Vec<Message> = Vec::new();
 
 	let mut skip_initial_steering_poll = opts.skip_initial_steering_poll;
 	let signal = opts.signal;
@@ -295,11 +313,29 @@ pub async fn run_agent_loop(
 	let mut explicit_continuation = false;
 
 	loop {
+		if first_turn {
+			// `agent_start` + first `turn_start` + prompt announcements
+			// already happened before the loop (upstream entry function).
+			first_turn = false;
+		} else {
+			emit(&run.event_tx, AgentEvent::TurnStart);
+			// Queued messages were already pushed into the transcript when
+			// their queue drained (so a mid-run compaction swap keeps them);
+			// only their announcement waits for this `turn_start`, matching
+			// upstream's announce-after-turn_start (agent-loop.ts:221-227).
+			for message in std::mem::take(&mut queued) {
+				emit(
+					&run.event_tx,
+					AgentEvent::MessageStart {
+						message: message.clone(),
+					},
+				);
+				emit(&run.event_tx, AgentEvent::MessageEnd { message });
+			}
+		}
 		if signal.is_cancelled() {
 			break;
 		}
-
-		emit(&run.event_tx, AgentEvent::TurnStart);
 
 		// --- prepare_request hook (upstream: pending messages are already
 		// appended; may swap model/thinking for this and later requests) -----
@@ -409,6 +445,9 @@ pub async fn run_agent_loop(
 		if assistant.duration_ms.is_none() && assistant.timestamp >= turn_started_ms {
 			assistant.duration_ms = Some(turn_started.elapsed().as_millis() as u64);
 		}
+		// Upstream stamps the requested level on the final message
+		// (agent-loop.ts:419 `thinkingLevel: config.reasoning ?? "off"`).
+		assistant.thinking_level = Some(run.thinking_level);
 		*run.streaming.write().unwrap() = None;
 
 		let hard_exit = is_hard_exit(assistant.stop_reason);
@@ -480,7 +519,10 @@ pub async fn run_agent_loop(
 			&run.event_tx,
 			AgentEvent::TurnEnd {
 				message: Message::Assistant(assistant.clone()),
-				tool_results: tool_results.clone(),
+				tool_results: tool_results
+					.iter()
+					.map(|result| Message::ToolResult(result.clone()))
+					.collect(),
 			},
 		);
 
@@ -514,8 +556,13 @@ pub async fn run_agent_loop(
 			run.steering.lock().unwrap().drain()
 		};
 		if !steering.is_empty() {
+			// Push now — a mid-run compaction swap keeps the transcript
+			// suffix, so deferring the push would drop the message on the
+			// hook's abort — but announce after the next `turn_start`
+			// (upstream agent-loop.ts:217-227).
 			for message in steering {
-				append_with_events(run, message);
+				push_message(run, message.clone());
+				queued.push(message);
 			}
 			// Injected steering already satisfies the next request.
 			explicit_continuation = false;
@@ -556,7 +603,8 @@ pub async fn run_agent_loop(
 			}
 			explicit_continuation = false;
 			for message in follow_ups {
-				append_with_events(run, message);
+				push_message(run, message.clone());
+				queued.push(message);
 			}
 		}
 	}
