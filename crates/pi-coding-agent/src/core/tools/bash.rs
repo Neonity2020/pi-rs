@@ -298,11 +298,24 @@ fn truncation_notice(
 /// Write the complete output to a temp file for the truncation notice when
 /// pi-env did not spill either stream (output between the 50KB display cap
 /// and pi-env's 60KB capture cap).
+///
+/// The name is `pid + nanosecond timestamp + per-process counter` rather than
+/// `pid + now_ms()`: two truncations landing in the same millisecond (the
+/// parallel test suite, or a future concurrent tool call) would otherwise
+/// collide and one archive would silently overwrite the other's "Full output"
+/// path.
 fn write_full_output_file(text: &str) -> Option<String> {
+	static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+	let nanos = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_nanos())
+		.unwrap_or(0);
+	let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let path = std::env::temp_dir().join(format!(
-		"pi-rs-bash-{}-{}.log",
+		"pi-rs-bash-{}-{}{:04}.log",
 		std::process::id(),
-		pi_ai::types::now_ms()
+		nanos,
+		seq
 	));
 	std::fs::write(&path, text).ok()?;
 	Some(path.to_string_lossy().into_owned())
