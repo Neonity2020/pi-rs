@@ -26,6 +26,7 @@ use crate::core::session_manager::{
 	SessionManager, SessionSelector, resolve_session, validate_session_dir,
 };
 use crate::core::settings_manager::SettingsManager;
+use crate::core::tool_selection::{NoTools, ToolSelectionInput, resolve_tool_selection};
 use crate::core::tools::bash::{BashTool, SessionToolContext};
 use crate::core::tools::{connect_mcp_servers, create_tools};
 use crate::core::ui_config;
@@ -68,6 +69,27 @@ struct Cli {
 	#[arg(long)]
 	no_context_files: bool,
 
+	/// Tool selection: an allowlist of builtin names/patterns, or only
+	/// `+name`/`-name` entries editing the default set (read, bash, edit,
+	/// write). Comma-separated.
+	#[arg(short = 't', long, value_name = "LIST")]
+	tools: Option<String>,
+
+	/// Builtin or `mcp__<server>__<tool>` names/patterns to exclude.
+	/// Comma-separated (`-xt` is the upstream short form).
+	#[arg(long, value_name = "LIST")]
+	exclude_tools: Option<String>,
+
+	/// Run with no tools at all (builtins emptied, MCP bridges filtered).
+	/// (`-nt` is the upstream short form.)
+	#[arg(long)]
+	no_tools: bool,
+
+	/// Empty the builtin tool set but keep MCP tools available.
+	/// (`-nbt` is the upstream short form.)
+	#[arg(long)]
+	no_builtin_tools: bool,
+
 	/// Light theme.
 	#[arg(long)]
 	light: bool,
@@ -88,6 +110,29 @@ fn parse_thinking(value: Option<&str>) -> ThinkingLevel {
 	}
 }
 
+/// Upstream combined short flags (`args.ts` `-nt`, `-nbt`, `-xt`) that
+/// clap cannot express as single tokens; rewritten to their long forms
+/// before parsing.
+fn rewrite_combined_short_args(args: Vec<String>) -> Vec<String> {
+	args.into_iter()
+		.map(|arg| match arg.as_str() {
+			"-nt" => "--no-tools".into(),
+			"-nbt" => "--no-builtin-tools".into(),
+			"-xt" => "--exclude-tools".into(),
+			other => other.to_string(),
+		})
+		.collect()
+}
+
+/// Comma-split a tool list argument: trim, drop empties (`args.ts`).
+fn split_tool_list(value: &str) -> Vec<String> {
+	value
+		.split(',')
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	match dotenvy::dotenv() {
@@ -95,12 +140,39 @@ async fn main() -> anyhow::Result<()> {
 		Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
 		Err(error) => return Err(error.into()),
 	}
-	let cli = Cli::parse();
+	let cli = {
+		let argv: Vec<String> = std::env::args().collect();
+		Cli::parse_from(rewrite_combined_short_args(argv))
+	};
 	let cwd = std::env::current_dir()?;
 
 	// Settings (global + project merge).
 	let settings_manager = SettingsManager::load(Some(&cwd));
 	let settings = settings_manager.effective();
+
+	// Tool selection (upstream `createAgentSession` resolution): settings
+	// `defaultTools` folded with `--tools`/`-xt`/`-nt`/`-nbt`. An invalid
+	// `--tools` list is a diagnostics error → exit 1.
+	let no_tools = if cli.no_tools {
+		Some(NoTools::All)
+	} else if cli.no_builtin_tools {
+		Some(NoTools::Builtin)
+	} else {
+		None
+	};
+	let tools_flag = cli.tools.as_deref().map(split_tool_list);
+	let exclude_flag = cli
+		.exclude_tools
+		.as_deref()
+		.map(split_tool_list)
+		.unwrap_or_default();
+	let selection = resolve_tool_selection(ToolSelectionInput {
+		tools: tools_flag.as_deref(),
+		exclude_tools: &exclude_flag,
+		no_tools,
+		settings_default_tools: settings.default_tools.as_deref(),
+	})
+	.map_err(|error| anyhow::anyhow!("{error}"))?;
 
 	// Model resolution.
 	let mut registry = ModelRegistry::load(settings.default_model.as_deref());
@@ -113,8 +185,18 @@ async fn main() -> anyhow::Result<()> {
 	registry.set_default(&model);
 	let models: Vec<pi_ai::Model> = registry.models().to_vec();
 
-	// Tools + agent + system prompt.
-	let mut tools = create_tools(&cwd);
+	// Tools + agent + system prompt. All builtin definitions are built, then
+	// only the resolved selection is declared (`AgentSession._buildRuntime`
+	// keeps every definition and activates a subset).
+	let mut tools: Vec<Arc<dyn pi_agent::AgentTool>> = create_tools(&cwd)
+		.into_iter()
+		.filter(|tool| {
+			selection
+				.builtin_active
+				.iter()
+				.any(|name| name == tool.name())
+		})
+		.collect();
 	// MCP servers — startup assembly mirroring the upstream MCP extension's
 	// session_start wiring (`pi/packages/coding-agent/src/extensions/mcp/
 	// index.ts`): connect every enabled server (stdio and streamable HTTP),
@@ -137,6 +219,26 @@ async fn main() -> anyhow::Result<()> {
 		assembly
 	};
 	tools.extend(std::mem::take(&mut mcp.tools));
+	// MCP tools face the allowlist only when it reaches MCP (upstream
+	// `_allowlistFiltersMcp`); the exclude matcher always applies to them.
+	let exclude_matcher = (!exclude_flag.is_empty())
+		.then(|| crate::core::tool_selection::ToolMatcher::new(&exclude_flag));
+	tools.retain(|tool| {
+		let name = tool.name();
+		if !name.starts_with("mcp__") {
+			return true;
+		}
+		if selection
+			.mcp_filter
+			.as_ref()
+			.is_some_and(|filter| !filter.matches(name))
+		{
+			return false;
+		}
+		!exclude_matcher
+			.as_ref()
+			.is_some_and(|matcher| matcher.matches(name))
+	});
 	let system_prompt =
 		crate::core::system_prompt::build_system_prompt(&cwd, &tools, !cli.no_context_files);
 

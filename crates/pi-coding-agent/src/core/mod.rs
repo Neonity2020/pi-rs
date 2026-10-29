@@ -11,6 +11,7 @@ pub mod session_manager;
 pub mod settings_manager;
 pub mod slash_commands;
 pub mod system_prompt;
+pub mod tool_selection;
 pub mod tools;
 pub mod trust;
 pub mod ui_config;

@@ -21,6 +21,9 @@ pub struct Settings {
 	pub external_editor: Option<String>,
 	pub shell_path: Option<String>,
 	pub compaction: Option<CompactionSettings>,
+	/// Raw `defaultTools` selection: plain names/patterns or `+name`/`-name`
+	/// modifiers, resolved by `tool_selection::resolve_default_tools`.
+	pub default_tools: Option<Vec<String>>,
 }
 
 /// `compaction` settings — upstream `CompactionSettings`
@@ -92,6 +95,7 @@ impl SettingsManager {
 
 	/// Effective settings: project over global, `None`s fall through.
 	pub fn effective(&self) -> Settings {
+		use crate::core::tool_selection::merge_default_tools;
 		Settings {
 			compaction: Some(CompactionSettings::merged(
 				self.project.compaction.as_ref(),
@@ -123,6 +127,10 @@ impl SettingsManager {
 				.shell_path
 				.clone()
 				.or(self.global.shell_path.clone()),
+			default_tools: merge_default_tools(
+				self.global.default_tools.clone(),
+				self.project.default_tools.clone(),
+			),
 		}
 	}
 
@@ -166,5 +174,25 @@ mod tests {
 			),
 			(Some(false), Some(50), Some(200))
 		);
+	}
+
+	#[test]
+	fn default_tools_merge_across_settings_layers() {
+		use crate::core::tool_selection::{merge_default_tools, resolve_default_tools};
+		// Project modifier-only entries append to the global selection; plain
+		// names replace it outright (upstream `mergeDefaultTools`).
+		let global: Settings =
+			serde_json::from_str(r#"{"defaultTools":["read","bash","edit","write"]}"#).unwrap();
+		let project: Settings = serde_json::from_str(r#"{"defaultTools":["+grep"]}"#).unwrap();
+		let merged =
+			merge_default_tools(global.default_tools.clone(), project.default_tools.clone())
+				.unwrap();
+		assert_eq!(
+			resolve_default_tools(&merged),
+			vec!["read", "bash", "edit", "write", "grep"]
+		);
+		let plain: Settings = serde_json::from_str(r#"{"defaultTools":["bash","grep"]}"#).unwrap();
+		let merged = merge_default_tools(global.default_tools, plain.default_tools).unwrap();
+		assert_eq!(merged, vec!["bash", "grep"]);
 	}
 }
