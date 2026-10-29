@@ -9,6 +9,7 @@
 | 能力 | 当前状态 |
 |---|---|
 | 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录（上游 v3 树格式，与 TS pi 会话文件双向互通）、`--continue`（cwd 过滤）/`--resume`、`/compact` 与阈值自动压缩、溢出自动恢复；print 支持多 prompt 顺序执行、管道 stdin 前置、上游退出码语义 |
+| 工具集选择 | 与上游同语义：默认激活 read/bash/edit/write（grep/find/ls 内置可选）、`-t/--tools`（裸名单替换或 `+name/-name` 修饰）、`-xt/--exclude-tools`（含 `mcp__*` 模式）、`-nt/--no-tools`、`-nbt/--no-builtin-tools`、settings `defaultTools`（两层合并）；消息 wire 与上游差分全场景一致（user/toolResult content 块数组） |
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
 | 其他 HTTP provider | mock provider 可用于本地演示 |
@@ -75,8 +76,8 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 | `pi-ai` | `packages/ai` | **部分（2 provider 已验证）** | 归一化消息模型、`AssistantMessageEvent` 流协议、provider 适配器注册（OpenAI Chat Completions、Anthropic Messages 和 mock）；上游 10+ 个 API 与模型目录/认证未实现 |
 | `pi-durable` | `packages/durable` | 占位 | 持久会话 / 任务 / 文档运行时 |
 | `pi-env` | `packages/env` | **本地实现** | `EnvConnection` 抽象（exec/read/write/list/watch），本地实现完整，SSH 远程为桩 |
-| `pi-agent` | `packages/agent` | **核心可用（钩子未接线）** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent`；prepare_request/finish_turn 等 hook 仅有类型定义，loop 未调用；并行工具执行未实现 |
-| `pi-coding-agent` | `packages/coding-agent` | **框架完成** | bin `pi-rs`：cli/config、core（session/settings/system-prompt/model-registry/event-bus/slash-commands）、7 个内置工具、interactive（ratatui）/print/rpc 三种模式 |
+| `pi-agent` | `packages/agent` | **核心可用** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent`；钩子全接线、并行工具执行、content 工具检测 |
+| `pi-coding-agent` | `packages/coding-agent` | **框架完成** | bin `pi-rs`：cli/config、core（session/settings/system-prompt/model-registry/event-bus/slash-commands/tool-selection）、7 个内置工具（默认激活 4，`--tools` 可选全量）、interactive（ratatui）/print/rpc 三种模式 |
 
 ## 数据流
 
@@ -97,14 +98,13 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 与 pi 相同的 7 件套：`read`（行号+截断）、`write`、`edit`（精确串替换+唯一性检查）、`bash`（经 pi-env，超时+abort 感知）、`grep`（regex，跳过 .git/node_modules/target）、`find`（glob）、`ls`。每个工具实现 `pi_agent::AgentTool` trait；后续 before/after hook 接上权限门禁。
 
+默认激活上游同款 4 件（`read`/`bash`/`edit`/`write`，`tool_selection.rs` 对照 `settings-manager.ts` + `sdk.ts`）；grep/find/ls 随 `-t bash,grep`（裸名单替换）、`-t +grep`（修饰默认集）、`-xt`（排除，支持 `mcp__*` 模式）、`-nt`/`-nbt` 或 settings `defaultTools` 激活。
+
 ## 路线图
 
-1. **providers** — anthropic-messages（SSE）、openai-completions/responses（工具调用增量、reasoning content、compat 覆盖）、google-generative-ai；models 目录 hydrate 与 pi models.json 完全互通；auth.json/OAuth。
-2. **agent loop 完整化** — 并行工具执行（JoinSet 预检/并发）、`prepare_request`/`finish_turn`/`prepare_next_turn`/`after_tool_call` hook、错误自动重试。
-3. **session/compaction** — resume（`--continue`/`--session`）、分支树投影（`/tree`）、compaction（token 预算 + 摘要）、HTML 导出。
-4. **MCP** — streamable-http 的 POST SSE 续传、OAuth、`mcp__<server>__<tool>` 注册进 agent、`/mcp` UI。
-5. **TUI 完善** — 已完成 markdown+cmark 渲染、模型选择器浮层、footer、工具展开；剩余：keybindings.json、主题文件（theme.schema.json）、语法高亮、外部编辑器（ctrl+g）、图片粘贴、会话/设置选择器。
-6. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。
+已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
+
+剩余：1. **providers** — openai-responses、google-generative-ai 等 8 个 API；模型目录/认证（auth.json/OAuth）。2. **RPC/SDK** — session-tree 族（fork/clone/get_tree/get_entries）、bash 透传、export_html、SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、外部编辑器（ctrl+g）、图片粘贴、会话/设置选择器。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 
