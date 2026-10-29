@@ -8,17 +8,17 @@
 
 | 能力 | 当前状态 |
 |---|---|
-| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录（上游 v3 树格式，与 TS pi 会话文件双向互通）、`--continue`（cwd 过滤）/`--resume`、`/compact` 与阈值自动压缩、溢出自动恢复；print 支持多 prompt 顺序执行、管道 stdin 前置、上游退出码语义 |
+| 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录（上游 v3 树格式，与 TS pi 会话文件双向互通）、`--continue`（cwd 过滤）/`--resume`、`/compact` 与阈值自动压缩、溢出自动恢复；print 支持多 prompt 顺序执行、管道 stdin 前置、`@file` 参数注入（文本文件包 `<file>` 标签）、上游退出码语义；`--mode text\|json`（json 事件流与上游逐事件对齐，差分场景验证） |
 | 工具集选择 | 与上游同语义：默认激活 read/bash/edit/write（grep/find/ls 内置可选）、`-t/--tools`（裸名单替换或 `+name/-name` 修饰）、`-xt/--exclude-tools`（含 `mcp__*` 模式）、`-nt/--no-tools`、`-nbt/--no-builtin-tools`、settings `defaultTools`（两层合并）；消息 wire 与上游差分全场景一致（user/toolResult content 块数组） |
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
 | 其他 HTTP provider | mock provider 可用于本地演示 |
-| 会话压缩 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次） |
-| agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek） |
+| 会话压缩与重试 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次）；错误自动重试（可重试错误判定 + 指数退避 + `auto_retry_start/end` 事件 + `agent_end.willRetry`，RPC 可开关/中止；settings 键待接入） |
+| agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek）；事件顺序对齐上游（turn_start 先于消息公告、assistant 盖 thinkingLevel、turn_end.toolResults 带 role） |
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
 | MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，协议版本协商（LATEST 2025-11-25 + 旧版接受表）、30s 请求超时 + notifications/cancelled、ping；OAuth 未实现 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
-| `--rpc` | 19 个命令与事件帧含 `agent_settled` 生命周期锚点；get_state 补齐 isCompacting/steeringMode/followUpMode；thinking 级别按模型能力裁剪；上游 33 命令缺 session-tree 族、bash 透传等 14 个，逐条偏差见 rpc.rs 模块文档与 docs/operations/compat/cli-rpc-sdk.md |
+| `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false、MCP 工具不随会话替换重建（已声明偏差），逐条见 rpc.rs 模块文档 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
 

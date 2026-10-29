@@ -117,3 +117,16 @@ cargo fmt --all -- --check
 **验证（本轮实测）**：`cargo test --workspace --locked` **444 项全绿**（426→444，+18）、fmt/clippy -D warnings 干净；`difftest` 四场景（单轮/ bash 往返/多轮工具/阈值压缩）规范视图 **4/4 IDENTICAL**——与上游快照 `f9daca34` 的 wire 级语义差异清零（system entry 不持久化与 usage.reasoning 缺省两项归一化等价处理保留在案）。CLI 冒烟：`-t "bash,+grep"` 报错 exit 1、`-nt` 别名生效、`--help` 旗标齐。注意：`cargo test` 不刷新 `target/debug/pi-rs`，跑差分前先 `cargo build -p pi-coding-agent`。
 
 **交接事项（明确推迟）**：CLI `--mode json`/`@file`；RPC session-tree 族与 bash 透传、export_html/get_session_stats；MCP OAuth；扩展系统；SSH 远程。worktree 分支 `p2-wire-cli` 未合并、未推送，等用户指令。主工作区 `main` 上同款 bash.rs 修复仍以未提交状态存在——合并或 rebase 前先处理（内容与本轮 `094826d` 相同，可 stash drop）。
+
+## 第八轮：RPC 33/33 + CLI json 模式（2026-10-29，主会话预研 + 2 个子 agent 并行 + 主会话集成）
+
+基线 `b0a1ede`（P2 已推送，远程 CI 三 job 全过）。目标：RPC 补齐到上游 33 命令全集、CLI `--mode json`/`@file`、HTML 导出。
+
+- **A（session_manager/agent_session/rpc.rs）**：会话树写入模型（叶指针 branch/reset_leaf、get_tree 森林投影、create_branched_session 重链 parentSession——新会话为同级目录属声明偏差）；会话替换命令（new_session/switch_session/fork/clone，任务内 abort→重建工具与 system prompt→原位换 SharedLog，rpc 探针自动跟随；cancelled 恒 false、MCP 不重建为声明偏差）；bash/abort_bash 透传（pi-env 执行、bash_execution_update 流帧、bashExecution message entry 对齐上游 messages.ts、excludeFromContext 只落盘不进上下文）；auto-retry（可重试错误判定移植、指数退避、auto_retry_start/end、agent_end.willRetry 经共享队列配对、与溢出恢复互斥）；get_session_stats/set_session_name/get_entries{since}/get_fork_messages/get_tree/get_state 12 字段。修掉真 bug：uuidv7 前缀目录名同毫秒碰撞→随机 v4 段。
+- **B（json_event/export_html/print.rs/main.rs）**：`--mode json`（json-event.ts 逐字移植：message_update 剥 partial、toolcall_start 补 id/toolName；session header 首行；退出码 json 恒 0 照上游）；resolveAppMode 移植（--mode rpc/json/text、--rpc 保留旧入口）；`@file` 注入（file-processor.ts 文本分支、stdin→@file→prompt 单消息拼接、缺失 exit 1、图片走上游失败文本形态）；export_html.rs（上游实为客户端渲染——按同 DOM 结构服务端化：ansi-to-html 全移植 SGR/256/RGB、工具折叠块按 template.js 行数、HTML 转义防注入；dark 主题离线求值硬编码）。
+- **主会话集成**：export_html 接 RPC（export_html 响应帧 `{path}`）；`SessionEvent::Settled{aborted}` 补上游 agent_settled.aborted；json 路径补 agent_end.willRetry；assistant 消息盖 `thinkingLevel`（agent-loop.ts:419）；toolcall_end 的 toolCall 加 `"type":"toolCall"` 标签；TurnEnd.toolResults 改带 role 的消息数组；**事件顺序对齐上游**——`agent_start → turn_start → 消息公告`（原先公告在 turn_start 前，steering/follow-up 消息入栈即时但公告推迟到续轮 turn_start 后，保证 mid-run 压缩 abort 时消息不丢）；`SessionManager::create` 丢失 header 字段导致 json 模式无 header 行的真 bug。
+- **difftest 扩面**：新增 05-json-single-turn / 06-json-tool-call 两场景（canonicalJsonEvents 归一化：system 消息对丢弃同会话视图规则、message_start 内容为活引用时序伪影故只比 role、流中 usage 为本地单包回放伪影故只在 message_end/agent_end 比、agent_end 滤 system）。**六场景全部 IDENTICAL**（4 print + 2 json）。
+
+**验证（本轮实测）**：`cargo test --workspace --locked` **521 项全绿**（444→521）、fmt/clippy -D warnings 干净；difftest 6/6 IDENTICAL。已知推迟：RPC session 替换后 MCP 工具表不重建（待扩展阶段）；retry 的 maxRetries/baseDelay 待 settings 扩键；RPC 模式差分场景（事件顺序已由 json 场景覆盖主要面）；`--mode json` 的 stdout 背压/信号处理；@file 图片附件。
+
+改动已分批提交至 main（等用户指令推送）。

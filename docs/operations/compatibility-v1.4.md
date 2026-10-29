@@ -31,6 +31,12 @@ P1 交付在差分中的实证（保留）：SUMMARIZATION_PROMPT 与压缩 summ
 
 历史首轮发现（P0 时点，现已修复的不再列出）：默认工具集（上表 #1）、消息 content 形状（上表 #2）、会话文件完全不兼容（已由会话格式 v3 落地修复）。
 
+## 第八轮扩面（2026-10-29）：json 模式差分 + RPC 33/33
+
+差分框架扩到 **6 场景全部 IDENTICAL**（原 4 个 print 场景 + 新增 `05-json-single-turn`/`06-json-tool-call`，对比 `--mode json` 的逐事件流）。归一化新增规则（均有据）：system 消息 start/end 对与 agent_end.messages 中的 system 丢弃（同会话视图规则）；`message_start` 只比 role（上游 spread 活引用、内容为消费时序伪影）；流中 `message_update.usage` 不比（本地单包回放下上游解析器跑在消费者前面，真实网络两侧一致于末帧）；`agent_settled.aborted`、`agent_end.willRetry`、`thinkingLevel`、`turn_end.toolResults` role 标签、`toolcall_end.toolCall` type 标签已按上游形状补齐。事件顺序对齐：`agent_start → turn_start → 消息公告`（steering/follow-up 入栈即时、公告随续轮 turn_start）。
+
+RPC 补齐到 **33/33**：session 树族（new_session/switch_session/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name，底层叶指针写入模型 + create_branched_session 重链）、bash/abort_bash 透传（bash_execution_update 流帧 + bashExecution entry）、get_session_stats、export_html、set/abort_auto_retry（错误重试引擎：可重试判定 + 指数退避 + willRetry，与溢出恢复互斥）。声明偏差：无扩展取消钩子故 cancelled 恒 false；MCP 工具表不随会话替换重建；新分支会话目录布局为同级目录（上游平铺同目录）。CLI 补 `--mode text|json|rpc` 与 `@file` 注入。
+
 ## 源码盘点发现的高风险项（P1 候选，按风险排序）
 
 1. **agent loop 钩子未接线**：prepare_request/finish_turn/prepare_next_turn/before-after_tool_call 只有类型定义，loop 零调用；parallel 工具执行未实现；工具检测比上游窄（`stop_reason==ToolUse` vs content 过滤）。README/handoff 的「核心完成」表述需修正。

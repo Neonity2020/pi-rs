@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonicalSession, canonicalRequest } from "./lib/normalize.mjs";
+import { canonicalSession, canonicalRequest, canonicalJsonEvents } from "./lib/normalize.mjs";
 import { diff } from "./lib/compare.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -173,6 +173,7 @@ async function runSide(side, scenario) {
 			OPENAI_API_KEY: "difftest-dummy",
 		};
 		const prompts = scenario.prompts ?? [scenario.prompt];
+		const jsonMode = scenario.outputMode === "json";
 		let bin;
 		let args;
 		if (side === "rust") {
@@ -180,11 +181,15 @@ async function runSide(side, scenario) {
 			bin = RUST_BIN;
 			// `-p` is a boolean flag in the Rust CLI; each prompt is one
 			// quoted positional (kept separate for the multi-prompt loop).
-			args = ["-p", ...prompts, "-m", scenario.model];
+			args = jsonMode
+				? ["--mode", "json", ...prompts, "-m", scenario.model]
+				: ["-p", ...prompts, "-m", scenario.model];
 		} else {
 			env.PI_CODING_AGENT_DIR = agentDir;
 			bin = process.execPath;
-			args = [TS_BIN, "--print", ...prompts, "--model", scenario.model];
+			args = jsonMode
+				? [TS_BIN, "--mode", "json", ...prompts, "--model", scenario.model]
+				: [TS_BIN, "--print", ...prompts, "--model", scenario.model];
 		}
 
 		const started = Date.now();
@@ -213,7 +218,9 @@ async function runSide(side, scenario) {
 			exitCode: res.status,
 			signal: res.signal ?? null,
 			finalText: stdout,
-			finalTextMatches: stdout === scenario.expect.finalText,
+			// json mode streams the event protocol on stdout; text equality is
+			// not meaningful there (the canonical event comparison covers it).
+			finalTextMatches: jsonMode ? true : stdout === scenario.expect.finalText,
 			serverFailures: failures,
 			turnsSeen: countRequests(artDir),
 			elapsedMs: elapsed,
@@ -255,12 +262,19 @@ async function main() {
 			const diffs = [];
 			const tsArt = join(artifactsRoot, scenario.name, "ts");
 			const rsArt = join(artifactsRoot, scenario.name, "rust");
+			const jsonMode = scenario.outputMode === "json";
 
 			if (report.sides.ts.exitCode !== report.sides.rust.exitCode) {
 				diffs.push({ path: "$.exitCode", ts: report.sides.ts.exitCode, rust: report.sides.rust.exitCode });
 			}
-			if (report.sides.ts.finalText !== report.sides.rust.finalText) {
+			if (!jsonMode && report.sides.ts.finalText !== report.sides.rust.finalText) {
 				diffs.push({ path: "$.finalText", ts: JSON.stringify(report.sides.ts.finalText), rust: JSON.stringify(report.sides.rust.finalText) });
+			}
+			if (jsonMode) {
+				const tsEvents = canonicalJsonEvents(readFileSync(join(tsArt, "stdout.txt"), "utf8"));
+				const rsEvents = canonicalJsonEvents(readFileSync(join(rsArt, "stdout.txt"), "utf8"));
+				const d = diff(tsEvents, rsEvents);
+				diffs.push(...d.map((x) => ({ ...x, path: `$.events${x.path.slice(1)}` })));
 			}
 			for (const name of ["requests", "session"]) {
 				const readSide = (art, key) => {

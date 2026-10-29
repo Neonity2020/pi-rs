@@ -161,6 +161,103 @@ function sortKeys(value) {
 	return value;
 }
 
+// ---- --mode json stdout → canonical event list -----------------------------
+// Both sides stream session events as JSONL after the leading session header
+// line (print-mode.ts json branch / pi-rs print.rs Json mode). The canonical
+// view keeps the event-type sequence and semantic payloads, dropping volatile
+// metadata (ids, timestamps, cwd, cost). Two deliberate collapsions:
+// - consecutive `tool_execution_update` frames collapse to one marker (tools
+//   may chunk streamed output differently between implementations);
+// - `message_update` keeps the stripped assistantMessageEvent (no `partial`)
+//   and the cumulative usage, exactly like the wire shape.
+
+export function canonicalJsonEvents(text) {
+	const events = [];
+	for (const line of text.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let e;
+		try {
+			e = JSON.parse(trimmed);
+		} catch {
+			events.push({ type: "<unparseable>" });
+			continue;
+		}
+		if (e.type === "session") {
+			events.push({ type: "session", version: e.version });
+			continue;
+		}
+		if (e.type === "agent_end" && Array.isArray(e.messages)) {
+			const end = {
+				type: "agent_end",
+				// The TS transcript includes the system message; pi-rs re-seeds
+				// the system prompt on resume (same rule as the session view).
+				messages: e.messages.filter((m) => m.role !== "system").map(canonicalMessage),
+			};
+			if (e.willRetry !== undefined) end.willRetry = e.willRetry;
+			events.push(end);
+			continue;
+		}
+		// System messages are an implementation detail (the TS pi announces
+		// and persists them; pi-rs re-seeds the system prompt on resume) —
+		// same rule as the session-view canonicalization above.
+		if ((e.type === "message_start" || e.type === "message_end") && e.message?.role === "system") {
+			continue;
+		}
+		if ((e.type === "message_start" || e.type === "message_end") && e.message) {
+			if (e.type === "message_start") {
+				// The start snapshot races the stream: upstream spreads a live
+				// message reference, so what content it shows depends on how
+				// far the provider parser ran before the consumer resumed
+				// (locally it shows the first chunk's tool call; pi-rs
+				// snapshots per event and shows none). The authoritative
+				// content lands at message_end.
+				events.push({
+					type: "message_start",
+					message: { role: e.message.role },
+				});
+				continue;
+			}
+			events.push({ type: e.type, message: canonicalMessage(e.message) });
+			continue;
+		}
+		if (e.type === "turn_end" && e.message) {
+			const end = { type: "turn_end", message: canonicalMessage(e.message) };
+			if (e.toolResults !== undefined) end.toolResults = canonicalize(e.toolResults);
+			events.push(end);
+			continue;
+		}
+		if (e.type === "message_update" && e.assistantMessageEvent) {
+			// `usage` on streaming updates is a timing artifact of the local
+			// replay: upstream's provider stream hands the consumer a live
+			// message reference, so when the scripted SSE arrives in one TCP
+			// segment the parser drains before the consumer spreads it and
+			// every delta already shows the final usage. Over a real network
+			// (and in pi-rs, which snapshots per event) usage lands with the
+			// terminal chunk on both sides. Compare deltas, not mid-stream
+			// usage; message_end / agent_end carry the authoritative totals.
+			events.push({
+				type: "message_update",
+				assistantMessageEvent: canonicalize(e.assistantMessageEvent),
+			});
+			continue;
+		}
+		if (e.type === "tool_execution_update") {
+			collapseInto(events, { type: "tool_execution_update" }, (prev) => prev.type === "tool_execution_update");
+			continue;
+		}
+		events.push(canonicalize(e));
+	}
+	return events;
+}
+
+/** Push an event unless the previous event is the same collapsed kind. */
+function collapseInto(events, event, sameAsPrevious) {
+	const prev = events[events.length - 1];
+	if (prev && sameAsPrevious(prev)) return;
+	events.push(event);
+}
+
 // ---- captured provider requests → canonical request list ------------------
 // System prompts are implementation-defined at P0 (they legitimately differ);
 // everything else in the message transcript must match.
