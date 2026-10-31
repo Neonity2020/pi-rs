@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::Value;
 
-use pi_ai::{Api, Model, ModelCost, StreamFn};
+use pi_ai::{Api, Model, ModelCost, StreamFn, ThinkingLevel};
 
 use crate::config;
 
@@ -139,11 +139,25 @@ pub fn add_provider(
 
 pub struct ModelRegistry {
 	models: Vec<Model>,
+	/// `--models` scope (upstream `scopedModels`): when set, [`ModelRegistry::models`]
+	/// reports only these; `--list-models` and `--model` keep using the full
+	/// catalog via [`ModelRegistry::all_models`] (upstream `resolveCliModel`:
+	/// "use *all* models").
+	scope: Option<Vec<Model>>,
 	runtime_api_key: Option<(String, String)>,
 	/// Raw `apiKey`/`headers` config per provider id (models.json object
 	/// format), as written. Values go through [`resolve_config_value`] at
 	/// request-build time; request plumbing consumes them later.
 	provider_auth: BTreeMap<String, ProviderAuth>,
+}
+
+/// One resolved scope entry — upstream `ScopedModel`
+/// (`model-resolver.ts:64`): the model plus a thinking level parsed from an
+/// explicit `:<level>` pattern suffix.
+#[derive(Debug, Clone)]
+pub struct ScopedModel {
+	pub model: Model,
+	pub thinking: Option<ThinkingLevel>,
 }
 
 /// Raw provider auth configuration from models.json.
@@ -174,6 +188,7 @@ impl ModelRegistry {
 
 		Self {
 			models,
+			scope: None,
 			provider_auth,
 			runtime_api_key: None,
 		}
@@ -185,12 +200,123 @@ impl ModelRegistry {
 
 	pub fn reload(&mut self, default_model: Option<&str>) {
 		let runtime_api_key = self.runtime_api_key.take();
+		let scope = self.scope.take();
 		*self = Self::load(default_model);
 		self.runtime_api_key = runtime_api_key;
+		self.scope = scope;
 	}
 
+	/// The visible catalog: the `--models` scope when set, everything
+	/// otherwise. Callers (interactive picker, rpc `get_available_models`,
+	/// model cycling) pick the scope up without changes.
 	pub fn models(&self) -> &[Model] {
+		match &self.scope {
+			Some(scope) => scope,
+			None => &self.models,
+		}
+	}
+
+	/// The full catalog, scope or not (`--list-models`, `--model` lookups —
+	/// upstream `resolveCliModel` deliberately uses *all* models).
+	pub fn all_models(&self) -> &[Model] {
 		&self.models
+	}
+
+	/// Activate the `--models` scope. An empty scope is a no-op (upstream
+	/// treats an empty scopedModels list as "no scoping").
+	pub fn set_model_scope(&mut self, scope: Vec<Model>) {
+		self.scope = (!scope.is_empty()).then_some(scope);
+	}
+
+	/// Resolve `--models` scope patterns against the full catalog — port of
+	/// `resolveModelScopeFromModels` (`model-resolver.ts:332`). Patterns with
+	/// glob characters (`*`, `?`, `[`) get an exact-reference first pass
+	/// (ids like `bracketed-model[1m]` are not globs) and then match
+	/// case-insensitively against `provider/id` and bare `id` (upstream
+	/// minimatch nocase; here globset). Everything else resolves as a model
+	/// reference — exact key/provider/id, then fuzzy — with a lenient
+	/// `:<thinking>` suffix. Warnings come back for the caller to print
+	/// (upstream logs them chalk-yellow to stderr): `No models match pattern`
+	/// and the lenient invalid-suffix notice. Declared difference: upstream
+	/// also warns when a pattern matches models across several providers; the
+	/// pi-rs `find` resolves first-match instead of reporting ambiguity.
+	pub fn resolve_scope(&self, patterns: &[String]) -> (Vec<ScopedModel>, Vec<String>) {
+		let mut scoped: Vec<ScopedModel> = Vec::new();
+		let mut warnings = Vec::new();
+		let push =
+			|scoped: &mut Vec<ScopedModel>, model: Model, thinking: Option<ThinkingLevel>| {
+				if !scoped.iter().any(|entry| {
+					entry.model.provider == model.provider && entry.model.id == model.id
+				}) {
+					scoped.push(ScopedModel { model, thinking });
+				}
+			};
+		for pattern in patterns {
+			let pattern = pattern.trim();
+			if pattern.is_empty() {
+				continue;
+			}
+			// Glob pattern (with an optional `:<level>` suffix, e.g.
+			// `provider/*:high`).
+			if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+				let (glob_pattern, thinking) = split_thinking_suffix(pattern);
+				if let Some(model) = find_exact(&self.models, glob_pattern) {
+					push(&mut scoped, model, thinking);
+					continue;
+				}
+				let matcher = match globset::GlobBuilder::new(glob_pattern)
+					.case_insensitive(true)
+					.build()
+				{
+					Ok(glob) => glob.compile_matcher(),
+					Err(_) => {
+						warnings.push(format!("No models match pattern \"{pattern}\""));
+						continue;
+					}
+				};
+				let matches: Vec<Model> = self
+					.models
+					.iter()
+					.filter(|model| {
+						matcher.is_match(format!("{}/{}", model.provider, model.id))
+							|| matcher.is_match(&model.id)
+					})
+					.cloned()
+					.collect();
+				if matches.is_empty() {
+					warnings.push(format!("No models match pattern \"{pattern}\""));
+				}
+				for model in matches {
+					push(&mut scoped, model, thinking);
+				}
+				continue;
+			}
+			// Reference pattern: the full text first (ids may contain `:`),
+			// then a lenient `:<thinking>` suffix (upstream `resolveText`
+			// lenient branch).
+			if let Some(model) = self.find(pattern) {
+				push(&mut scoped, model, None);
+				continue;
+			}
+			match pattern.rsplit_once(':') {
+				Some((base, suffix)) if !base.is_empty() => {
+					let thinking = parse_thinking_level(suffix);
+					match self.find(base) {
+						Some(model) => {
+							if thinking.is_none() {
+								warnings.push(format!(
+									"Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead."
+								));
+							}
+							push(&mut scoped, model, thinking);
+						}
+						None => warnings.push(format!("No models match pattern \"{pattern}\"")),
+					}
+				}
+				_ => warnings.push(format!("No models match pattern \"{pattern}\"")),
+			}
+		}
+		(scoped, warnings)
 	}
 
 	/// Raw per-provider auth config from models.json (empty when the file is
@@ -275,6 +401,45 @@ impl ModelRegistry {
 fn matches_key(model: &Model, key: &str) -> bool {
 	let key = key.replace(" (default)", "");
 	model.key() == key || (model.id == key) || format!("{}/{}", model.provider, model.id) == key
+}
+
+/// Exact reference match without fuzzy fallback — case-insensitive like
+/// upstream `selectReference`'s raw pass (`resolveModelReference` with
+/// `fuzzy: false`).
+fn find_exact(models: &[Model], text: &str) -> Option<Model> {
+	let lower = text.to_lowercase();
+	models
+		.iter()
+		.find(|model| model.id.to_lowercase() == lower || model.key().to_lowercase() == lower)
+		.cloned()
+}
+
+/// `off/minimal/low/medium/high/xhigh/max` → [`ThinkingLevel`] (upstream
+/// `isValidThinkingLevel` in `args.ts`).
+fn parse_thinking_level(level: &str) -> Option<ThinkingLevel> {
+	match level.to_lowercase().as_str() {
+		"off" => Some(ThinkingLevel::Off),
+		"minimal" => Some(ThinkingLevel::Minimal),
+		"low" => Some(ThinkingLevel::Low),
+		"medium" => Some(ThinkingLevel::Medium),
+		"high" => Some(ThinkingLevel::High),
+		"xhigh" => Some(ThinkingLevel::Xhigh),
+		"max" => Some(ThinkingLevel::Max),
+		_ => None,
+	}
+}
+
+/// `provider/*:high` → (`provider/*`, Some(High)). Only a valid thinking
+/// suffix splits (upstream `splitThinkingSuffix`); anything else stays part
+/// of the pattern so the glob simply fails to match.
+fn split_thinking_suffix(pattern: &str) -> (&str, Option<ThinkingLevel>) {
+	match pattern.rsplit_once(':') {
+		Some((base, suffix)) if !base.is_empty() => match parse_thinking_level(suffix) {
+			Some(level) => (base, Some(level)),
+			None => (pattern, None),
+		},
+		_ => (pattern, None),
+	}
 }
 
 /// Stream fn that dispatches to the provider adapter with the models.json
@@ -913,6 +1078,7 @@ mod tests {
 		let (models, provider_auth) = apply(text);
 		ModelRegistry {
 			models,
+			scope: None,
 			provider_auth,
 			runtime_api_key: None,
 		}
@@ -1244,5 +1410,166 @@ mod tests {
 		assert_eq!(gpt.provider, "openai");
 		registry.set_default(&gpt);
 		assert!(registry.default_model().name.contains("(default)"));
+	}
+
+	// -- --models scope (resolveModelScopeFromModels) -------------------------
+
+	use std::collections::BTreeMap;
+
+	use super::ScopedModel;
+	use pi_ai::{Api, Model, ThinkingLevel};
+
+	use super::ModelRegistry;
+
+	/// A registry with just the built-ins, no models.json interference.
+	fn scope_registry() -> ModelRegistry {
+		ModelRegistry {
+			models: builtin_models(),
+			scope: None,
+			provider_auth: BTreeMap::new(),
+			runtime_api_key: None,
+		}
+	}
+
+	fn keys(scoped: &[ScopedModel]) -> Vec<String> {
+		scoped
+			.iter()
+			.map(|entry| entry.model.key())
+			.collect::<Vec<_>>()
+	}
+
+	#[test]
+	fn scope_glob_patterns_match_provider_and_id_case_insensitively() {
+		let registry = scope_registry();
+		// provider/* glob.
+		let (scoped, warnings) = registry.resolve_scope(&["mock/*".into()]);
+		assert!(warnings.is_empty(), "{warnings:?}");
+		assert_eq!(keys(&scoped), vec!["mock/mock-echo".to_string()]);
+		// Case-insensitive bare-id glob (upstream minimatch nocase).
+		let (scoped, warnings) = registry.resolve_scope(&["*SONNET*".into()]);
+		assert!(warnings.is_empty(), "{warnings:?}");
+		assert_eq!(
+			keys(&scoped),
+			vec!["anthropic/claude-sonnet-4-6".to_string()]
+		);
+		// `?` wildcard.
+		let (scoped, _) = registry.resolve_scope(&["gpt-?.2".into()]);
+		assert_eq!(keys(&scoped), vec!["openai/gpt-5.2".to_string()]);
+	}
+
+	#[test]
+	fn scope_glob_no_match_warns_like_upstream_nomatch() {
+		let registry = scope_registry();
+		let (scoped, warnings) = registry.resolve_scope(&["gemini/*".into()]);
+		assert!(scoped.is_empty());
+		assert_eq!(
+			warnings,
+			vec!["No models match pattern \"gemini/*\"".to_string()]
+		);
+	}
+
+	#[test]
+	fn scope_bracketed_ids_resolve_exactly_before_globbing() {
+		let mut registry = scope_registry();
+		// `bracketed-model[1m]`-shaped id: an exact reference beats the glob
+		// character class (upstream resolveModelScopeFromModels exact pass).
+		let mut bracketed = Model::new("sonnet[1m]", "Bracketed", Api::new("mock"), "mock", "");
+		bracketed.context_window = 1;
+		registry.models.push(bracketed);
+		let (scoped, warnings) = registry.resolve_scope(&["mock/sonnet[1m]".into()]);
+		assert!(warnings.is_empty(), "{warnings:?}");
+		assert_eq!(keys(&scoped), vec!["mock/sonnet[1m]".to_string()]);
+		// A glob with wildcards that matches the bracketed id.
+		let (scoped, _) = registry.resolve_scope(&["sonnet?1m?".into()]);
+		assert_eq!(keys(&scoped), vec!["mock/sonnet[1m]".to_string()]);
+	}
+
+	#[test]
+	fn scope_reference_patterns_use_exact_then_fuzzy_with_lenient_suffix() {
+		let registry = scope_registry();
+		// Exact key, exact id, fuzzy substring.
+		let (scoped, warnings) = registry.resolve_scope(&[
+			"mimo/mimo-v2.6-pro".into(),
+			"gpt-5.2".into(),
+			"sonnet".into(),
+		]);
+		assert!(warnings.is_empty(), "{warnings:?}");
+		assert_eq!(
+			keys(&scoped),
+			vec![
+				"mimo/mimo-v2.6-pro".to_string(),
+				"openai/gpt-5.2".to_string(),
+				"anthropic/claude-sonnet-4-6".to_string(),
+			]
+		);
+		// Valid `:<thinking>` suffix rides along; duplicates collapse.
+		let (scoped, warnings) =
+			registry.resolve_scope(&["gpt-5.2:high".into(), "openai/gpt-5.2".into()]);
+		assert!(warnings.is_empty(), "{warnings:?}");
+		assert_eq!(keys(&scoped), vec!["openai/gpt-5.2".to_string()]);
+		assert!(matches!(scoped[0].thinking, Some(ThinkingLevel::High)));
+		// Invalid suffix is dropped with the upstream warning text.
+		let (scoped, warnings) = registry.resolve_scope(&["gpt-5.2:whatever".into()]);
+		assert_eq!(keys(&scoped), vec!["openai/gpt-5.2".to_string()]);
+		assert!(scoped[0].thinking.is_none());
+		assert_eq!(
+			warnings,
+			vec![
+				"Invalid thinking level \"whatever\" in pattern \"gpt-5.2:whatever\". Using default instead."
+					.to_string()
+			]
+		);
+		// Unknown reference warns without a match.
+		let (scoped, warnings) = registry.resolve_scope(&["nope".into()]);
+		assert!(scoped.is_empty());
+		assert_eq!(
+			warnings,
+			vec!["No models match pattern \"nope\"".to_string()]
+		);
+	}
+
+	#[test]
+	fn scope_glob_thinking_suffix_applies_to_every_match() {
+		let registry = scope_registry();
+		let (scoped, warnings) = registry.resolve_scope(&["*:low".into()]);
+		assert!(warnings.is_empty(), "{warnings:?}");
+		assert_eq!(scoped.len(), registry.all_models().len());
+		assert!(
+			scoped
+				.iter()
+				.all(|entry| matches!(entry.thinking, Some(ThinkingLevel::Low)))
+		);
+	}
+
+	#[test]
+	fn set_model_scope_filters_models_but_all_models_stays_full() {
+		let mut registry = scope_registry();
+		let full = registry.all_models().len();
+		let (scoped, _) = registry.resolve_scope(&["mock/*".into()]);
+		registry.set_model_scope(scoped.iter().map(|entry| entry.model.clone()).collect());
+		assert_eq!(registry.models().len(), 1);
+		assert_eq!(registry.models()[0].provider, "mock");
+		assert_eq!(registry.all_models().len(), full);
+		// find still sees the full catalog (upstream resolveCliModel).
+		assert!(registry.find("gpt-5.2").is_some());
+		// An empty scope clears back to the full catalog.
+		registry.set_model_scope(Vec::new());
+		assert_eq!(registry.models().len(), full);
+		// reload keeps the scope alive (interactive model-save flow).
+		let (scoped, _) = registry.resolve_scope(&["mock/*".into()]);
+		registry.set_model_scope(scoped.iter().map(|entry| entry.model.clone()).collect());
+		registry.reload(None);
+		assert_eq!(registry.models().len(), 1);
+		assert_eq!(registry.models()[0].provider, "mock");
+	}
+
+	#[test]
+	fn session_id_validation_matches_the_upstream_regex() {
+		assert!(super::super::session_manager::assert_valid_session_id("a").is_ok());
+		assert!(super::super::session_manager::assert_valid_session_id("0198ab-cd.ef_gh").is_ok());
+		assert!(super::super::session_manager::assert_valid_session_id("-lead").is_err());
+		assert!(super::super::session_manager::assert_valid_session_id("trail-").is_err());
+		assert!(super::super::session_manager::assert_valid_session_id("has space").is_err());
+		assert!(super::super::session_manager::assert_valid_session_id("").is_err());
 	}
 }

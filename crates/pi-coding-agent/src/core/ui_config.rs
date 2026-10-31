@@ -313,6 +313,79 @@ fn load_from(
 	}
 }
 
+/// CLI theme-flag entry point (`--theme`, `--use-theme`, `--no-themes`) —
+/// upstream passes `additionalThemePaths`/`noThemes` into the resource
+/// loader and applies `--use-theme` as a runtime settings override
+/// (`applyOverrides({ theme })`, not persisted). `theme_files` are additional
+/// theme files whose themes join the selection by their `name` field;
+/// `discover = false` skips the user themes directory (built-ins and the
+/// additional files only). Resolution order mirrors upstream `loadThemeJson`:
+/// built-ins shadow file themes of the same name; an unresolvable custom
+/// name notices and falls back to the built-in `dark`/`light` theme.
+/// With no flags set this behaves exactly like [`load`].
+pub fn load_with_cli_themes(
+	theme_setting: Option<&str>,
+	light: bool,
+	theme_files: &[std::path::PathBuf],
+	discover: bool,
+) -> UiConfig {
+	let agent_dir = config::agent_dir();
+	let (overrides, mut notices) = load_keybinding_overrides(&agent_dir.join("keybindings.json"));
+	let mut keybindings = new_keybindings_manager();
+	if let Err(error) = keybindings.set_user_bindings(overrides) {
+		// `set_user_bindings` is atomic: the manager keeps pure defaults.
+		notices.push(format!(
+			"keybindings.json: {error}; using default keybindings"
+		));
+	}
+	let fallback = || if light { Theme::light() } else { Theme::dark() };
+	let mut theme = None;
+	if let Some(name) = theme_setting {
+		if name == "dark" {
+			theme = Some(Theme::dark());
+		} else if name == "light" {
+			theme = Some(Theme::light());
+		} else if !name.is_empty() && !name.contains('/') {
+			// Additional `--theme` files first, then the user themes
+			// directory when discovery is on.
+			for file in theme_files {
+				match std::fs::read_to_string(file)
+					.map_err(|error| error.to_string())
+					.and_then(|content| {
+						Theme::from_json_str(&content).map_err(|error| error.to_string())
+					}) {
+					Ok(loaded) => {
+						if loaded.name == name {
+							theme = Some(loaded);
+							break;
+						}
+					}
+					Err(error) => notices.push(format!("theme file {}: {error}", file.display())),
+				}
+			}
+			if theme.is_none() && discover {
+				theme = Some(load_theme(
+					&config::themes_dir(),
+					theme_setting,
+					light,
+					&mut notices,
+				));
+			}
+			if theme.is_none() {
+				notices.push(format!(
+					"theme \"{name}\" not found; using built-in {} theme",
+					if light { "light" } else { "dark" }
+				));
+			}
+		}
+	}
+	UiConfig {
+		theme: theme.unwrap_or_else(fallback),
+		keybindings,
+		notices,
+	}
+}
+
 /// Read user keybinding overrides (upstream `KeybindingsManager.loadFromFile`
 /// plus `toKeybindingsConfig`). Missing file → no overrides, no notice
 /// (upstream parity). Every other problem becomes a notice.

@@ -21,9 +21,11 @@ use pi_agent::{Agent, AgentOptions};
 use pi_ai::ThinkingLevel;
 
 use crate::core::agent_session::{restore_initial_messages, spawn_agent_session_with_options};
+use crate::core::export_html;
 use crate::core::model_registry::{ModelRegistry, authed_stream_fn};
+use crate::core::session_manager;
 use crate::core::session_manager::{
-	SessionManager, SessionSelector, resolve_session, validate_session_dir,
+	SessionManager, SessionSelector, resolve_session_in, validate_session_dir,
 };
 use crate::core::settings_manager::SettingsManager;
 use crate::core::tool_selection::{NoTools, ToolSelectionInput, resolve_tool_selection};
@@ -89,6 +91,34 @@ struct Cli {
 	)]
 	resume: Option<String>,
 
+	/// Use an exact project session id (header UUIDv7), creating the session
+	/// when missing (`main.ts` `--session-id`; conflicts with `--session`/
+	/// `--continue`/`--resume` are validated after parsing for the upstream
+	/// message).
+	#[arg(long, value_name = "ID")]
+	session_id: Option<String>,
+
+	/// Fork a session by id (header UUIDv7 or directory name) or path into
+	/// the current project (upstream `--fork` + `SessionManager.forkFrom`).
+	#[arg(long, value_name = "ID|PATH")]
+	fork: Option<String>,
+
+	/// Directory for session storage and lookup — overrides `PI_RS_SESSION_DIR`/
+	/// `PI_SESSION_DIR` and the settings `sessionDir` (upstream `--session-dir`).
+	#[arg(long, value_name = "DIR")]
+	session_dir: Option<String>,
+
+	/// Export a session (id or path) to HTML and exit; an optional first
+	/// positional is the output path (upstream `--export <file> [output]`).
+	#[arg(long, value_name = "ID|PATH")]
+	export: Option<String>,
+
+	/// Comma-separated model patterns for Ctrl+P cycling: globs
+	/// (`anthropic/*`, `*sonnet*`) or model references with an optional
+	/// `:<thinking>` suffix (upstream `--models`).
+	#[arg(long, value_name = "PATTERNS")]
+	models: Option<String>,
+
 	/// Set the session display name.
 	#[arg(short = 'n', long, value_name = "NAME")]
 	name: Option<String>,
@@ -137,6 +167,35 @@ struct Cli {
 	/// Light theme.
 	#[arg(long)]
 	light: bool,
+
+	/// Load an additional theme file (can be repeated; upstream `--theme`).
+	#[arg(long, value_name = "PATH")]
+	theme: Vec<String>,
+
+	/// Use the named theme for this run — upstream `applyOverrides({ theme })`
+	/// (a runtime override, not persisted).
+	#[arg(long, value_name = "NAME")]
+	use_theme: Option<String>,
+
+	/// Disable theme discovery and loading; built-in themes only
+	/// (upstream `--no-themes`).
+	#[arg(long)]
+	no_themes: bool,
+
+	/// Trust project-local files for this run — skips the trust prompt and
+	/// loads the project `.pi/mcp.json` (upstream `--approve`, `-a`).
+	#[arg(short = 'a', long)]
+	approve: bool,
+
+	/// Ignore project-local files for this run — skips the trust prompt and
+	/// the project `.pi/mcp.json` (upstream `--no-approve`, `-na`).
+	#[arg(long)]
+	no_approve: bool,
+
+	/// Disable startup network operations, propagated as `PI_OFFLINE=1`
+	/// (upstream `--offline`).
+	#[arg(long)]
+	offline: bool,
 
 	/// Initial prompt (positional words are joined). Positional arguments
 	/// starting with `@` are read as files and injected into the first prompt
@@ -348,6 +407,9 @@ fn rewrite_combined_short_args(args: Vec<String>) -> Vec<String> {
 				"-nbt" => "--no-builtin-tools".into(),
 				"-nc" => "--no-context-files".into(),
 				"-xt" => "--exclude-tools".into(),
+				// `-na` is a distinct upstream flag (`--no-approve`), not a
+				// `-n` cluster with value `a`.
+				"-na" => "--no-approve".into(),
 				other => other.to_string(),
 			}
 		})
@@ -363,9 +425,196 @@ fn split_tool_list(value: &str) -> Vec<String> {
 		.collect()
 }
 
+/// `validateForkFlags` (`main.ts:299-313`): `--fork` rejects the session
+/// selectors (`--session` is pi-rs's merged `--resume` flag, a documented
+/// merge) with the upstream error text, exit 1.
+fn validate_fork_flags(cli: &Cli) -> anyhow::Result<()> {
+	if cli.fork.is_none() {
+		return Ok(());
+	}
+	let mut conflicting = Vec::new();
+	if cli.resume.is_some() {
+		conflicting.push("--session");
+	}
+	if cli.r#continue {
+		conflicting.push("--continue");
+	}
+	if cli.no_session {
+		conflicting.push("--no-session");
+	}
+	if !conflicting.is_empty() {
+		anyhow::bail!("--fork cannot be combined with {}", conflicting.join(", "));
+	}
+	Ok(())
+}
+
+/// `validateSessionIdFlags` (`main.ts:315-336`): `--session-id` rejects
+/// `--session`/`--continue`/`--resume` (the merge note above applies) and the
+/// id must pass `assertValidSessionId`. `--no-session` and `--fork` are
+/// allowed (in-memory session with that id / fork into that id).
+fn validate_session_id_flags(cli: &Cli) -> anyhow::Result<()> {
+	let Some(id) = &cli.session_id else {
+		return Ok(());
+	};
+	let mut conflicting = Vec::new();
+	if cli.resume.is_some() {
+		conflicting.push("--session");
+	}
+	if cli.r#continue {
+		conflicting.push("--continue");
+	}
+	if !conflicting.is_empty() {
+		anyhow::bail!(
+			"--session-id cannot be combined with {}",
+			conflicting.join(", ")
+		);
+	}
+	session_manager::assert_valid_session_id(id).map_err(anyhow::Error::msg)
+}
+
+/// `--session-dir` resolution (`main.ts:691-695`): the CLI flag wins, then
+/// `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` (tilde-expanded), then the settings
+/// `sessionDir`; all relative forms resolve against the startup cwd. Returns
+/// the sessions ROOT — in this port every session is a subdirectory of it
+/// (layout deviation, see session_manager's module docs).
+fn resolve_session_root(cli: &Cli, settings_session_dir: Option<&str>, cwd: &Path) -> PathBuf {
+	let from_flag = |dir: &str| resolve_file_argument(dir, cwd);
+	if let Some(dir) = cli
+		.session_dir
+		.as_deref()
+		.map(str::trim)
+		.filter(|dir| !dir.is_empty())
+	{
+		return from_flag(dir);
+	}
+	for var in ["PI_RS_SESSION_DIR", "PI_SESSION_DIR"] {
+		if let Ok(dir) = std::env::var(var) {
+			let dir = dir.trim();
+			if !dir.is_empty() {
+				return from_flag(dir);
+			}
+		}
+	}
+	if let Some(dir) = settings_session_dir
+		.map(str::trim)
+		.filter(|dir| !dir.is_empty())
+	{
+		return from_flag(dir);
+	}
+	config::sessions_dir()
+}
+
+/// Port of `resolveSessionPath` (`main.ts:252-283`) for `--fork`/`--export`.
+/// Path-like arguments (contain `/`, or end with `.jsonl`) resolve as paths
+/// against the cwd; otherwise exact header-id matches win over prefix
+/// matches, and the current project wins over every project in the root
+/// (upstream `findById` → `list` → `listAll`). pi-rs extension: directory
+/// names participate in exact/prefix matching after the header id, since
+/// this port's visible session ids in `sessionFile` are directory names.
+/// Returns the session directory or log path.
+fn resolve_session_reference(root: &Path, cwd: &Path, arg: &str) -> anyhow::Result<PathBuf> {
+	if arg.contains('/') || arg.ends_with(".jsonl") {
+		return Ok(resolve_file_argument(arg, cwd));
+	}
+	let matches_arg = |dir: &Path, header_id: &str| -> (bool, bool) {
+		let dir_name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+		let dir_name = dir_name.as_deref().unwrap_or_default();
+		let exact = header_id == arg || dir_name == arg;
+		let prefix = header_id.starts_with(arg) || dir_name.starts_with(arg);
+		(exact, prefix)
+	};
+	// Current project first: exact id, then newest-first prefix
+	// (upstream `findById` then `list().find(startsWith)`).
+	let project = session_manager::list_project_session_headers(root, cwd);
+	if let Some((dir, _)) = project
+		.iter()
+		.find(|(dir, header)| matches_arg(dir, &header.id).0)
+	{
+		return Ok(dir.clone());
+	}
+	if let Some((dir, _)) = project
+		.iter()
+		.find(|(dir, header)| matches_arg(dir, &header.id).1)
+	{
+		return Ok(dir.clone());
+	}
+	// Then every project in the root (upstream `listAll`, exact before
+	// prefix).
+	let all = session_manager::list_session_headers(root);
+	if let Some((dir, _)) = all
+		.iter()
+		.find(|(dir, header)| matches_arg(dir, &header.id).0)
+	{
+		return Ok(dir.clone());
+	}
+	if let Some((dir, _)) = all
+		.iter()
+		.find(|(dir, header)| matches_arg(dir, &header.id).1)
+	{
+		return Ok(dir.clone());
+	}
+	anyhow::bail!("No session found matching '{arg}'")
+}
+
+/// The session directory + default export basename for `--export`. Path
+/// arguments may name a log file (basename minus `.jsonl`, like upstream
+/// `exportFromFile`); the native layout is a session directory, whose name
+/// stands in (pi-rs logs are `<dir>/session.jsonl`).
+fn export_target(resolved: &Path) -> (PathBuf, String) {
+	if resolved.is_dir() {
+		let name = resolved
+			.file_name()
+			.map(|n| n.to_string_lossy().into_owned())
+			.unwrap_or_else(|| "session".into());
+		(resolved.to_path_buf(), name)
+	} else {
+		let name = resolved
+			.file_stem()
+			.map(|n| n.to_string_lossy().into_owned())
+			.unwrap_or_else(|| "session".into());
+		(resolved.parent().unwrap_or(resolved).to_path_buf(), name)
+	}
+}
+
+/// `--export` (`main.ts:640-652`): resolve the session like `--fork`, render
+/// it to HTML — always HTML, upstream `exportFromFile` — and exit. The first
+/// positional is the output path; the default name is
+/// `pi-rs-session-<basename>.html` in the cwd (upstream
+/// `<APP_NAME>-session-<input basename>.html`). Success prints
+/// `Exported to: <path>` and exits 0; failures print `Error: <msg>` and exit 1.
+fn export_session(arg: &str, output: Option<&str>, root: &Path, cwd: &Path) -> ! {
+	let result = (|| -> anyhow::Result<PathBuf> {
+		let resolved = resolve_session_reference(root, cwd, arg)?;
+		let (session_dir, basename) = export_target(&resolved);
+		let session_file = session_dir.join("session.jsonl");
+		if !session_file.exists() {
+			// Upstream `exportFromFile` file-missing text.
+			anyhow::bail!("File not found: {}", session_file.display());
+		}
+		let output = match output {
+			Some(path) => resolve_file_argument(path, cwd),
+			None => cwd.join(format!("{}-session-{basename}.html", config::APP_NAME)),
+		};
+		export_html::write_session_html(&session_dir, Some(&output))
+			.map_err(|error| anyhow::anyhow!("{error}"))
+	})();
+	match result {
+		Ok(path) => {
+			println!("Exported to: {}", path.display());
+			std::process::exit(0);
+		}
+		Err(error) => {
+			eprintln!("Error: {error}");
+			std::process::exit(1);
+		}
+	}
+}
+
 fn list_models(registry: &ModelRegistry, pattern: &str) -> String {
+	// `--list-models` shows the full catalog (upstream `resolveCliModel`:
+	// use *all* models — a `--models` scope only shapes cycling/picker).
 	let mut models: Vec<_> = registry
-		.models()
+		.all_models()
 		.iter()
 		.filter(|model| {
 			pattern.is_empty()
@@ -473,7 +722,46 @@ async fn main() -> anyhow::Result<()> {
 		return Ok(());
 	}
 
-	// Resolve an existing session before loading cwd-bound settings and tools.
+	// `--offline` (main.ts:579-583): flip the env before anything loads so
+	// child processes inherit it. Upstream also sets PI_SKIP_VERSION_CHECK=1
+	// here; pi-rs has no version check and no remote catalog fetch, so there
+	// is nothing further to gate (declared difference).
+	let offline = cli.offline
+		|| std::env::var("PI_OFFLINE").is_ok_and(|value| {
+			value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+		});
+	if offline {
+		// SAFETY: startup, before any task is spawned on the runtime — no
+		// other thread reads the environment concurrently.
+		unsafe { std::env::set_var("PI_OFFLINE", "1") };
+	}
+
+	// The startup settings manager provides the `sessionDir` fallback for
+	// session selection (main.ts:672, 691-695); the runtime settings manager
+	// below is cwd-bound and loads after the session cwd is known.
+	let startup_settings = SettingsManager::load(Some(&startup_cwd));
+	let session_root = resolve_session_root(
+		&cli,
+		startup_settings.effective().session_dir.as_deref(),
+		&startup_cwd,
+	);
+
+	// `--export` (main.ts:640-652) renders and exits before any session or
+	// runtime is built; the first positional is the output path.
+	if let Some(arg) = &cli.export {
+		export_session(
+			arg,
+			messages.first().map(String::as_str),
+			&session_root,
+			&startup_cwd,
+		);
+	}
+
+	// Flag-combination validation for the new session selectors
+	// (main.ts:665-666), then session selection — the port of
+	// `createSessionManager` (main.ts:358-449).
+	validate_fork_flags(&cli)?;
+	validate_session_id_flags(&cli)?;
 	let selector = if cli.r#continue {
 		Some(SessionSelector::Recent)
 	} else {
@@ -481,19 +769,63 @@ async fn main() -> anyhow::Result<()> {
 			.as_deref()
 			.map(|arg| SessionSelector::ByIdOrPath(arg.to_string()))
 	};
-	let resume_dir = selector
+	let opened: Option<PathBuf> = if let Some(source_arg) = &cli.fork {
+		// Fork with an explicit target id checks for a collision before the
+		// source is even resolved (upstream createSessionManager fork branch).
+		if let Some(target_id) = &cli.session_id
+			&& session_manager::find_by_header_id(&session_root, &startup_cwd, target_id).is_some()
+		{
+			anyhow::bail!("Session already exists with id '{target_id}'");
+		}
+		let source = resolve_session_reference(&session_root, &startup_cwd, source_arg)?;
+		let forked = SessionManager::fork_from_in(
+			&session_root,
+			&source,
+			&startup_cwd,
+			cli.session_id.as_deref(),
+		)
+		.map_err(|error| anyhow::anyhow!("{error}"))?;
+		Some(
+			forked
+				.session_dir()
+				.expect("forked session is persisted")
+				.to_path_buf(),
+		)
+	} else if cli.no_session {
+		// Upstream short-circuits to an in-memory session before the
+		// selector branches — no lookup, no warning (main.ts:364-366).
+		None
+	} else {
+		match selector.as_ref() {
+			Some(selector) => {
+				let dir = resolve_session_in(&session_root, &startup_cwd, selector)
+					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+				validate_session_dir(&dir)
+					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+				Some(dir)
+			}
+			None => {
+				// `--session-id`: open the project session with that header
+				// id, or fall through to creating one (main.ts:436-448).
+				cli.session_id.as_deref().and_then(|id| {
+					session_manager::find_by_header_id(&session_root, &startup_cwd, id)
+				})
+			}
+		}
+	};
+	if cli.fork.is_none()
+		&& !cli.no_session
+		&& opened.is_none()
+		&& let Some(id) = &cli.session_id
+	{
+		// Missing project session → the upstream yellow warning, then create.
+		eprintln!(
+			"Warning: No project session found with id '{id}'; creating a new session with that id."
+		);
+	}
+	let cwd = opened
 		.as_ref()
-		.map(|selector| {
-			let dir = resolve_session(selector)
-				.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
-			validate_session_dir(&dir)
-				.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
-			Ok::<_, anyhow::Error>(dir)
-		})
-		.transpose()?;
-	let cwd = resume_dir
-		.as_ref()
-		.and_then(|dir| crate::core::session_manager::peek_session_header(dir))
+		.and_then(|dir| session_manager::peek_session_header(dir))
 		.map(|header| std::path::PathBuf::from(header.cwd))
 		.filter(|cwd| !cwd.as_os_str().is_empty())
 		.unwrap_or_else(|| startup_cwd.clone());
@@ -542,11 +874,36 @@ async fn main() -> anyhow::Result<()> {
 		_ => None,
 	};
 	let mut registry = ModelRegistry::load(default_model.as_deref());
+	// `--models` scope (`main.ts:813-817` + `resolveModelScope`): resolved
+	// against the full catalog; unmatched patterns warn to stderr. Upstream
+	// also falls back to the settings `enabledModels`; pi-rs has no such
+	// setting yet (declared omission).
+	let scope_patterns: Vec<String> = cli
+		.models
+		.as_deref()
+		.map(|value| {
+			value
+				.split(',')
+				.map(|pattern| pattern.trim().to_string())
+				.filter(|pattern| !pattern.is_empty())
+				.collect()
+		})
+		.unwrap_or_default();
+	let (scoped, scope_warnings) = registry.resolve_scope(&scope_patterns);
+	for warning in &scope_warnings {
+		eprintln!("Warning: {warning}");
+	}
 	let (model_query, model_thinking) = cli
 		.model
 		.as_deref()
 		.map(split_model_thinking)
 		.unwrap_or(("", None));
+	// Default-model selection with a scope — upstream `buildSessionOptions`
+	// (main.ts:500-520): with a non-empty scope and no reopened history, the
+	// saved default wins when it is in scope, otherwise the first scoped
+	// model (its explicit `:<thinking>` rides along). Reopened sessions keep
+	// the saved default like upstream (`hasExistingSession`).
+	let mut scoped_thinking: Option<pi_ai::ThinkingLevel> = None;
 	let model = match &cli.model {
 		Some(_) => cli
 			.provider
@@ -556,11 +913,31 @@ async fn main() -> anyhow::Result<()> {
 				|provider| registry.find_for_provider(provider, model_query),
 			)
 			.ok_or_else(|| anyhow::anyhow!("no model matching `{model_query}`"))?,
-		None => registry.default_model(),
+		None => {
+			let saved = registry.default_model();
+			let saved_in_scope = scoped.iter().position(|entry| {
+				entry.model.provider == saved.provider && entry.model.id == saved.id
+			});
+			match (scoped.first(), saved_in_scope) {
+				(Some(_), _) if opened.is_none() => {
+					let index = saved_in_scope.unwrap_or(0);
+					scoped_thinking = scoped[index].thinking;
+					scoped[index].model.clone()
+				}
+				_ => saved,
+			}
+		}
 	};
 	registry.set_default(&model);
 	if let Some(key) = cli.api_key.as_ref() {
 		registry.set_runtime_api_key(model.provider.clone(), key.clone());
+	}
+	// Scope activation happens after the default marker so the scoped copies
+	// the picker sees carry it. Everything reading `models()` from here on —
+	// interactive picker, model cycling, rpc `get_available_models` — sees
+	// the scope with no changes on their side.
+	if !scoped.is_empty() {
+		registry.set_model_scope(scoped.iter().map(|entry| entry.model.clone()).collect());
 	}
 	let models: Vec<pi_ai::Model> = registry.models().to_vec();
 
@@ -588,11 +965,24 @@ async fn main() -> anyhow::Result<()> {
 		crate::core::tools::McpAssembly::default()
 	} else {
 		// Trust gate: a project `.pi/mcp.json` loads only for trusted
-		// projects. Interactive runs get a one-time prompt whose answer is
-		// stored; print/rpc skip project servers with a notice instead.
+		// projects. `-a`/`-na` override the decision for this run without
+		// prompting or storing (upstream `projectTrustOverride`); otherwise
+		// interactive runs get a one-time prompt whose answer is stored, and
+		// print/rpc skip project servers with a notice instead.
+		let project_trust_override = if cli.no_approve {
+			Some(false)
+		} else if cli.approve {
+			Some(true)
+		} else {
+			None
+		};
 		let mut trust_notices: Vec<String> = Vec::new();
-		resolve_project_mcp_trust(&cwd, app_mode, &mut trust_notices)?;
-		let mut config = mcp_config::load_mcp_config_with(&cwd, trust::is_trusted(&cwd)).await;
+		resolve_project_mcp_trust(&cwd, app_mode, project_trust_override, &mut trust_notices)?;
+		let mut config = mcp_config::load_mcp_config_with(
+			&cwd,
+			trust::resolve_project_trusted(&cwd, project_trust_override),
+		)
+		.await;
 		for server in &mut config.servers {
 			let server_cwd = server
 				.cwd
@@ -643,18 +1033,41 @@ async fn main() -> anyhow::Result<()> {
 	let system_prompt =
 		crate::core::system_prompt::build_system_prompt_with_options(&cwd, &tools, &prompt_options);
 
-	// Session persistence. `--continue`/`--resume` reopen an existing log and
-	// seed the agent with its transcript; failures exit before anything is
-	// written (no half-open session is left behind).
+	// Session persistence. `--continue`/`--resume`/`--fork`/`--session-id`
+	// reopen or seed from an existing log and give the agent its transcript;
+	// failures exit before anything is written (no half-open session is left
+	// behind).
 	let mut startup_notices: Vec<String> = Vec::new();
 	let (mut session, initial_messages) = if cli.no_session {
-		(SessionManager::in_memory(), Vec::new())
+		// `--no-session --session-id` keeps the id on the in-memory header
+		// (upstream `inMemory(cwd, { id })`).
+		let session = match &cli.session_id {
+			Some(id) => SessionManager::in_memory_with_id(id),
+			None => SessionManager::in_memory(),
+		};
+		(session, Vec::new())
 	} else {
-		match resume_dir {
-			None => (SessionManager::create(&cwd)?, Vec::new()),
+		match opened {
+			None => {
+				// Fresh session; `--session-id` names the header id
+				// (upstream `SessionManager.create(cwd, dir, { id })`).
+				let session = SessionManager::create_in_with_options(
+					&session_root,
+					&cwd,
+					None,
+					cli.session_id.as_deref(),
+				)
+				.map_err(|error| anyhow::anyhow!("{error}"))?;
+				(session, Vec::new())
+			}
 			Some(dir) => {
 				let restored = restore_initial_messages(&dir);
-				startup_notices.push(format!("resuming session {}", dir.display()));
+				if cli.fork.is_some() {
+					// Upstream `--fork` starts silently; the new session file
+					// already carries the `parentSession` lineage.
+				} else {
+					startup_notices.push(format!("resuming session {}", dir.display()));
+				}
 				let session = SessionManager::open(&dir)?;
 				(session, restored)
 			}
@@ -681,11 +1094,18 @@ async fn main() -> anyhow::Result<()> {
 			"Invalid thinking level \"{value}\". Valid values: off, minimal, low, medium, high, xhigh, max"
 		));
 	}
-	let thinking_level = parse_thinking(
-		cli_thinking
-			.or(model_thinking)
-			.or(settings.default_thinking_level.as_deref()),
-	);
+	// Thinking level precedence (upstream buildSessionOptions): explicit
+	// `--thinking`, then a `:<thinking>` suffix from `--model`, then the
+	// chosen scoped model's explicit level, then the settings default.
+	let thinking_level = if let Some(value) = cli_thinking {
+		parse_thinking(Some(value))
+	} else if let Some(value) = model_thinking {
+		parse_thinking(Some(value))
+	} else if let Some(level) = scoped_thinking {
+		level
+	} else {
+		parse_thinking(settings.default_thinking_level.as_deref())
+	};
 	if let Some(index) = tools.iter().position(|tool| tool.name() == "bash") {
 		let context = SessionToolContext {
 			session_id: session.session_id(),
@@ -814,18 +1234,33 @@ async fn main() -> anyhow::Result<()> {
 	};
 
 	// Theme + keybindings (ui_config.rs): user theme/keybindings from the
-	// agent dir; `--light` only picks the built-in fallback theme. MCP
+	// agent dir; `--light` only picks the built-in fallback theme. CLI theme
+	// flags: `--use-theme` overrides the settings theme for this run (upstream
+	// `applyOverrides({ theme })`, not persisted), `--theme` loads additional
+	// theme files, `--no-themes` skips theme discovery (built-ins only). MCP
 	// assembly and resume notices surface as chat notices inside the TUI.
-	let mut ui = ui_config::load(settings.theme.as_deref(), cli.light);
+	let theme_setting = cli.use_theme.clone().or_else(|| settings.theme.clone());
+	let theme_files: Vec<PathBuf> = cli
+		.theme
+		.iter()
+		.map(|path| resolve_file_argument(path, &startup_cwd))
+		.collect();
+	let mut ui = ui_config::load_with_cli_themes(
+		theme_setting.as_deref(),
+		cli.light,
+		&theme_files,
+		!cli.no_themes,
+	);
 	ui.notices
 		.extend(mcp_notices.drain(..).map(|notice| format!("mcp: {notice}")));
 	ui.notices.extend(startup_notices);
-	let mode = modes::interactive::InteractiveMode::new(
+	let mode = modes::interactive::InteractiveMode::with_session_root(
 		handle,
 		models,
 		registry,
 		cwd.display().to_string(),
 		ui,
+		session_root,
 	);
 	let result = mode.run(initial_prompt).await;
 	// Session shutdown: close the MCP server transports (graceful ladder,
@@ -843,33 +1278,48 @@ fn is_tty() -> bool {
 
 /// Trust gate for the project-level `.pi/mcp.json` — the pi-rs cut of
 /// upstream `resolveProjectTrusted` (which gates every project resource).
-/// Trusted or absent projects pass through; an interactive TTY gets a
-/// one-time prompt whose answer is stored in the trust file; print/rpc/json
-/// (non-interactive) never prompt — the project file is skipped with a
-/// notice. Ctrl+C at the prompt errors out of startup.
+/// `-a`/`-na` (`projectTrustOverride`, main.ts:741-770) decide for this run
+/// without prompting or touching the trust store. Trusted or absent projects
+/// pass through; an interactive TTY gets a one-time prompt whose answer is
+/// stored in the trust file; print/rpc/json (non-interactive) never prompt —
+/// the project file is skipped with a notice. Ctrl+C at the prompt errors
+/// out of startup.
 fn resolve_project_mcp_trust(
 	cwd: &Path,
 	app_mode: AppMode,
+	project_trust_override: Option<bool>,
 	notices: &mut Vec<String>,
 ) -> anyhow::Result<()> {
 	let project_config = cwd.join(".pi").join("mcp.json");
-	if !project_config.exists() || trust::is_trusted(cwd) {
+	if !project_config.exists() {
 		return Ok(());
 	}
-	let interactive_tty = app_mode == AppMode::Interactive;
-	if !interactive_tty {
+	let Some(trusted_override) = project_trust_override else {
+		if trust::is_trusted(cwd) {
+			return Ok(());
+		}
+		let interactive_tty = app_mode == AppMode::Interactive;
+		if !interactive_tty {
+			notices.push(format!(
+				"project {} exists but the project is not trusted; project MCP servers are skipped",
+				project_config.display()
+			));
+			return Ok(());
+		}
+		match trust::prompt_trust(&project_config)? {
+			true => trust::trust(cwd)?,
+			false => notices.push(format!(
+				"project {} was not trusted; project MCP servers are skipped",
+				project_config.display()
+			)),
+		}
+		return Ok(());
+	};
+	if !trusted_override {
 		notices.push(format!(
-			"project {} exists but the project is not trusted; project MCP servers are skipped",
+			"project {} is ignored because the project is not trusted (--no-approve); project MCP servers are skipped",
 			project_config.display()
 		));
-		return Ok(());
-	}
-	match trust::prompt_trust(&project_config)? {
-		true => trust::trust(cwd)?,
-		false => notices.push(format!(
-			"project {} was not trusted; project MCP servers are skipped",
-			project_config.display()
-		)),
 	}
 	Ok(())
 }
@@ -910,6 +1360,11 @@ mod tests {
 			thinking: None,
 			r#continue: false,
 			resume: None,
+			session_id: None,
+			fork: None,
+			session_dir: None,
+			export: None,
+			models: None,
 			name: None,
 			no_session: false,
 			no_context_files: false,
@@ -921,6 +1376,12 @@ mod tests {
 			no_tools: false,
 			no_builtin_tools: false,
 			light: false,
+			theme: Vec::new(),
+			use_theme: None,
+			no_themes: false,
+			approve: false,
+			no_approve: false,
+			offline: false,
 			prompt: Vec::new(),
 		}
 	}

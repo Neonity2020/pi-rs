@@ -65,11 +65,13 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::StreamExt;
+
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use pi_agent::{Agent, AgentEvent, AgentOptions, PromptInput};
-use pi_ai::{AssistantMessage, Message, StopReason, ThinkingLevel};
+use pi_ai::{AssistantMessage, Message, Model, StopReason, ThinkingLevel};
 use pi_env::EnvConnection;
 use tokio_util::sync::CancellationToken;
 
@@ -94,10 +96,36 @@ pub enum ForkPosition {
 
 #[derive(Debug, Clone)]
 pub enum RpcReplacement {
-	New { parent_session: Option<String> },
-	Switch { path: String },
-	Fork { entry_id: String },
+	New {
+		parent_session: Option<String>,
+	},
+	Switch {
+		path: String,
+	},
+	Fork {
+		entry_id: String,
+	},
 	Clone,
+	/// `/import <path.jsonl>`: copy the log into the session storage and
+	/// switch to it (`importFromJsonl` upstream).
+	Import {
+		path: String,
+	},
+}
+
+/// Upstream `navigateTree` outcome for the interactive mode: `editor_text`
+/// pre-fills the editor for a user-message target (upstream `editorText`);
+/// `queued_text` carries prompts that were queued when navigation aborted the
+/// active run (upstream `restoreQueuedMessagesToEditor`).
+#[derive(Debug, Clone)]
+pub enum TreeNavResult {
+	Navigated {
+		editor_text: Option<String>,
+		queued_text: Option<String>,
+	},
+	/// The branch summary was cancelled mid-generation (upstream
+	/// `result.aborted`); the session stayed at the old leaf.
+	Aborted,
 }
 
 /// Commands a mode sends to the session task.
@@ -152,6 +180,19 @@ pub enum SessionCommand {
 		operation: RpcReplacement,
 		response: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
 	},
+	/// `/tree` navigation (upstream `navigateTree`). When `summarize` is set
+	/// the abandoned branch is summarized with one LLM call before the leaf
+	/// moves; the response resolves once navigation completes (or reports
+	/// [`TreeNavResult::Aborted`]).
+	NavigateTree {
+		target_id: String,
+		summarize: bool,
+		custom_instructions: Option<String>,
+		response: tokio::sync::oneshot::Sender<Result<TreeNavResult, String>>,
+	},
+	/// Cancel an in-flight branch summary (upstream `abortBranchSummary`,
+	/// wired to Escape while the summary indicator shows).
+	AbortBranchSummary,
 	/// Run a bash command outside the agent loop (RPC `bash`).
 	ExecuteBash {
 		command: String,
@@ -357,6 +398,20 @@ impl SessionShared {
 /// See [`SharedLog::pending_mid_run`].
 pub(crate) struct PendingMidRunCompaction {
 	pub(crate) outcome: CompactionOutcome,
+}
+
+/// A `/tree` navigation whose branch summary is being generated. `plan` is
+/// the validated navigation; the mutation gains its summary on task
+/// completion, then the replacement machinery swaps the agent context.
+struct PendingNav {
+	response: tokio::sync::oneshot::Sender<Result<TreeNavResult, String>>,
+	token: CancellationToken,
+	plan: NavPlan,
+	/// The leaf the navigation leaves behind (`fromId` on the summary entry).
+	from_id: String,
+	/// Prompts drained when navigation aborted the active run
+	/// (`restoreQueuedMessagesToEditor` upstream).
+	queued: Vec<String>,
 }
 
 /// Handle held by modes; the session task runs in the background.
@@ -737,6 +792,11 @@ async fn session_task(
 	let mut run: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
 	// In-flight compaction summarization; the agent is idle while this runs.
 	let mut compacting: Option<tokio::task::JoinHandle<anyhow::Result<CompactionOutcome>>> = None;
+	// In-flight `/tree` navigation with a branch summary (`nav_task` runs the
+	// one-shot LLM summary; the log mutation and agent swap happen on
+	// completion). `nav` carries the navigation state, `nav_task` the future.
+	let mut nav: Option<PendingNav> = None;
+	let mut nav_task: Option<tokio::task::JoinHandle<Result<BranchSummaryOutcome, String>>> = None;
 	let mut compaction_commit_failed = false;
 	let mut recovery_compaction = false;
 	let mut overflow_attempted = false;
@@ -762,10 +822,10 @@ async fn session_task(
 		// select re-loops immediately after an arm runs).
 		let mid_run_pending = log.lock().unwrap().pending_mid_run.is_some();
 		compacting_flag.store(
-			compacting.is_some() || mid_run_pending,
+			compacting.is_some() || nav.is_some() || mid_run_pending,
 			std::sync::atomic::Ordering::Relaxed,
 		);
-		let idle = run.is_none() && compacting.is_none() && pending.is_empty();
+		let idle = run.is_none() && compacting.is_none() && nav.is_none() && pending.is_empty();
 		if first_loop {
 			first_loop = false;
 		}
@@ -790,9 +850,9 @@ async fn session_task(
 				let Some(command) = command else { break };
 				match command {
 					SessionCommand::Prompt { text } => {
-						if run.is_some() || agent.is_streaming() || compacting.is_some() {
+						if run.is_some() || agent.is_streaming() || compacting.is_some() || nav.is_some() {
 							pending.push_back(text);
-							if compacting.is_some() {
+							if compacting.is_some() || nav.is_some() {
 								notice(&event_bus, "compaction running — prompt queued".into());
 							} else {
 								notice(&event_bus, "run active — prompt queued".into());
@@ -970,6 +1030,7 @@ async fn session_task(
 									shared: &shared,
 									settings: &settings,
 									plan,
+									navigate: None,
 								})
 								.await;
 								agent = new_agent;
@@ -998,6 +1059,7 @@ async fn session_task(
 									shared: &shared,
 									settings: &settings,
 									plan,
+									navigate: None,
 								})
 								.await;
 								agent = new_agent;
@@ -1026,6 +1088,7 @@ async fn session_task(
 									shared: &shared,
 									settings: &settings,
 									plan,
+									navigate: None,
 								})
 								.await;
 								agent = new_agent;
@@ -1043,6 +1106,10 @@ async fn session_task(
 								let leaf = log.lock().unwrap().session.leaf_id().map(str::to_owned);
 								leaf.ok_or_else(|| "Cannot clone session: no current entry selected".to_string()).and_then(|id| plan_fork(&log, &id, ForkPosition::At))
 							}
+							RpcReplacement::Import { path } => {
+								let current_dir = log.lock().unwrap().session.session_dir().map(Path::to_path_buf);
+								plan_import_session(&path, current_dir.as_deref()).map(|plan| (plan, None))
+							}
 						};
 						let result = match planned {
 							Err(error) => Err(error),
@@ -1053,7 +1120,7 @@ async fn session_task(
 									compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
 									agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
 									overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
-									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan,
+									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan, navigate: None,
 								}).await;
 								agent = new_agent;
 								agent_rx = new_rx;
@@ -1063,6 +1130,137 @@ async fn session_task(
 							}
 						};
 						let _ = response.send(result);
+					}
+					SessionCommand::NavigateTree { target_id, summarize, custom_instructions, response } => {
+						// A finished-but-unreaped run is select-order lag, not an
+						// active run; reap it so the streaming guard reflects the agent.
+						if run.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+							if let Some(task) = run.as_mut() {
+								match task.await {
+									Ok(Ok(())) => {},
+									Ok(Err(e)) => notice(&event_bus, format!("prompt failed: {e}")),
+									Err(e) => notice(&event_bus, format!("prompt task failed: {e}")),
+								}
+							}
+							run = None;
+							let mut guard = log.lock().unwrap();
+							persist_messages(&agent, &mut guard, &event_bus);
+						}
+						if compacting.is_some() || nav.is_some() {
+							let _ = response.send(Err(
+								"Wait for the current compaction or tree navigation to finish before navigating the session tree."
+									.into(),
+							));
+							continue;
+						}
+						let nav_plan = match plan_navigate_tree(&log, &target_id) {
+							Ok(plan) => plan,
+							Err(error) if error == "__already_at_target__" => {
+								// No-op selection; the interactive layer answers
+								// "Already at this point" before sending.
+								let _ = response.send(Ok(TreeNavResult::Navigated {
+									editor_text: None,
+									queued_text: None,
+								}));
+								continue;
+							}
+							Err(error) => {
+								let _ = response.send(Err(error));
+								continue;
+							}
+						};
+						// Stop the active response first (upstream aborts the run
+						// before navigateTree); drained prompts return to the editor
+						// with the navigation outcome.
+						let mut queued: Vec<String> = Vec::new();
+						if run.is_some() || agent.is_streaming() {
+							agent.abort();
+							abort_requested = true;
+							if let Some(mut task) = run.take()
+								&& tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+									.await
+									.is_err()
+								{
+									task.abort();
+									let _ = task.await;
+								}
+							retry_cancel = None;
+							finish_cancelled_retry(&shared);
+							let drained: Vec<String> = pending.drain(..).collect();
+							let mut guard = log.lock().unwrap();
+							persist_messages(&agent, &mut guard, &event_bus);
+							drop(guard);
+							queued = drained;
+						}
+						let queued_text = (!queued.is_empty()).then(|| queued.join("\n\n"));
+						// The abandoned-branch entries must be collected before the
+						// leaf moves; summaries are wanted only when asked for.
+						let (entries, from_id) = {
+							let guard = log.lock().unwrap();
+							let old_leaf = guard.session.leaf_id().map(str::to_owned);
+							let entries = if summarize {
+								let all = guard.session.entries().to_vec();
+								collect_entries_for_branch_summary(&all, old_leaf.as_deref(), &target_id).0
+							} else {
+								Vec::new()
+							};
+							(entries, old_leaf.unwrap_or_default())
+						};
+						if !summarize || entries.is_empty() {
+							// Nothing to summarize — navigate without a summary entry
+							// (upstream would record "No content to summarize").
+							let nav_editor_text = nav_plan.editor_text.clone();
+							let planned = apply_tree_mutation(&log, nav_plan);
+							let plan = match planned {
+								Ok(plan) => plan,
+								Err(error) => {
+									let _ = response.send(Err(error));
+									continue;
+								}
+							};
+							let generation = log.lock().unwrap().generation;
+							let (new_agent, new_rx) = apply_replacement(ReplacementContext {
+								agent: &agent, log: &log, event_bus: &event_bus, auto_compaction: &auto_compaction,
+								compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
+								agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
+								overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
+								retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan, navigate: None,
+							}).await;
+							agent = new_agent;
+							agent_rx = new_rx;
+							let _ = if log.lock().unwrap().generation == generation {
+								response.send(Err("current conversation could not be saved".into()))
+							} else {
+								response.send(Ok(TreeNavResult::Navigated {
+									editor_text: nav_editor_text,
+									queued_text,
+								}))
+							};
+							continue;
+						}
+						// Summarize the abandoned branch with one LLM call; the leaf
+						// move and agent swap happen when the task completes.
+						let token = CancellationToken::new();
+						let task_token = token.clone();
+						let model = agent.model();
+						let stream_fn = agent.stream_fn();
+						let task = tokio::spawn(async move {
+							generate_branch_summary(&model, &stream_fn, &entries, custom_instructions.as_deref(), task_token).await
+						});
+						notice(&event_bus, "summarizing branch…".into());
+						nav_task = Some(task);
+						nav = Some(PendingNav {
+							response,
+							token,
+							plan: nav_plan,
+							from_id,
+							queued,
+						});
+					}
+					SessionCommand::AbortBranchSummary => {
+						if let Some(pending_nav) = nav.as_ref() {
+							pending_nav.token.cancel();
+						}
 					}
 					SessionCommand::ExecuteBash { command, exclude_from_context, id } => {
 						let (cwd, session_env, generation) = {
@@ -1321,6 +1519,67 @@ async fn session_task(
 					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
 				}
 			}
+			result = async { nav_task.as_mut().expect("guarded navigation").await }, if nav_task.is_some() => {
+				// Branch summary finished: attach it at the target position
+				// (`branchWithSummary` upstream) and swap the agent onto the new
+				// branch, or report the cancellation/failure.
+				nav_task = None;
+				let mut pending_nav = nav.take().expect("guarded navigation");
+				let queued_text = (!pending_nav.queued.is_empty()).then(|| pending_nav.queued.join("\n\n"));
+				let editor_text = pending_nav.plan.editor_text.clone();
+				match result {
+					Ok(Ok(BranchSummaryOutcome::Summary(summary))) => {
+						let target_leaf = match &pending_nav.plan.mutation {
+							TreeMutation::ResetLeaf => None,
+							TreeMutation::Branch(from) => Some(from.clone()),
+							TreeMutation::WithSummary { target_leaf, .. } => target_leaf.clone(),
+						};
+						pending_nav.plan.mutation = TreeMutation::WithSummary {
+							target_leaf,
+							from_id: std::mem::take(&mut pending_nav.from_id),
+							summary,
+						};
+						match apply_tree_mutation(&log, pending_nav.plan) {
+							Ok(plan) => {
+								let generation = log.lock().unwrap().generation;
+								let (new_agent, new_rx) = apply_replacement(ReplacementContext {
+									agent: &agent, log: &log, event_bus: &event_bus, auto_compaction: &auto_compaction,
+									compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
+									agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
+									overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
+									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan, navigate: None,
+								}).await;
+								agent = new_agent;
+								agent_rx = new_rx;
+								let _ = if log.lock().unwrap().generation == generation {
+									pending_nav.response.send(Err("current conversation could not be saved".into()))
+								} else {
+									pending_nav.response.send(Ok(TreeNavResult::Navigated {
+										editor_text,
+										queued_text,
+									}))
+								};
+							}
+							Err(error) => {
+								let _ = pending_nav.response.send(Err(error));
+							}
+						}
+					}
+					Ok(Ok(BranchSummaryOutcome::Aborted)) => {
+						notice(&event_bus, "Branch summarization cancelled".into());
+						let _ = pending_nav.response.send(Ok(TreeNavResult::Aborted));
+					}
+					Ok(Err(error)) => {
+						notice(&event_bus, error.clone());
+						let _ = pending_nav.response.send(Err(error));
+					}
+					Err(error) => {
+						let message = format!("branch summary task failed: {error}");
+						notice(&event_bus, message.clone());
+						let _ = pending_nav.response.send(Err(message));
+					}
+				}
+			}
 			event = agent_rx.recv() => {
 				match event {
 					Ok(agent_event) => {
@@ -1386,6 +1645,13 @@ async fn session_task(
 			}
 
 		}
+	}
+	if let Some(pending_nav) = nav.as_ref() {
+		pending_nav.token.cancel();
+	}
+	if let Some(task) = nav_task {
+		task.abort();
+		let _ = task.await;
 	}
 	if let Some(task) = compacting {
 		task.abort();
@@ -1696,8 +1962,16 @@ fn plan_fork(
 	let plan = match target_leaf {
 		None => {
 			// Fork before the first entry: a fresh session carrying the
-			// parent lineage (runtime.ts:296-303).
-			let new_session = SessionManager::create_with_parent(
+			// parent lineage (runtime.ts:296-303), placed next to the live
+			// session like upstream's `SessionManager.create(cwd, sessionDir)`.
+			let root = current_file
+				.as_ref()
+				.and_then(|file| file.parent())
+				.and_then(Path::parent)
+				.map(Path::to_path_buf)
+				.unwrap_or_else(crate::config::sessions_dir);
+			let new_session = SessionManager::create_with_parent_in(
+				&root,
 				&cwd,
 				Some(
 					current_file
@@ -1733,6 +2007,448 @@ fn plan_fork(
 	Ok((plan, selected_text))
 }
 
+/// The log mutation a `/tree` navigation applies once the current run has
+/// settled (upstream `navigateTree`'s `branchWithSummary` / `branch` /
+/// `resetLeaf` split).
+enum TreeMutation {
+	/// Navigate before any entry: the next append starts a new root
+	/// (`resetLeaf`).
+	ResetLeaf,
+	/// Move the leaf pointer to an existing entry (`branch`).
+	Branch(String),
+	/// Branch (or reset) and attach the branch summary entry at the target
+	/// position (`branchWithSummary`); `from_id` records the abandoned leaf.
+	WithSummary {
+		target_leaf: Option<String>,
+		from_id: String,
+		summary: String,
+	},
+}
+
+/// Validated `/tree` navigation (`navigateTree` upstream, pre-mutation).
+struct NavPlan {
+	mutation: TreeMutation,
+	/// The user-message/custom-message text that returns to the editor
+	/// (upstream `editorText`).
+	editor_text: Option<String>,
+	cwd: PathBuf,
+}
+
+/// Validate a tree navigation target and describe the log mutation. Pure
+/// with respect to the log (no writes) so the caller can run the branch
+/// summary first. Mirrors upstream's target semantics: a user message /
+/// custom message target re-runs from its parent and returns its text to the
+/// editor; any other entry becomes the new leaf itself. The
+/// `"__already_at_target__"` sentinel error reports a no-op selection (the
+/// interactive layer answers "Already at this point").
+fn plan_navigate_tree(log: &SharedLogRef, target_id: &str) -> Result<NavPlan, String> {
+	let guard = log.lock().unwrap();
+	if Some(target_id) == guard.session.leaf_id() {
+		return Err("__already_at_target__".into());
+	}
+	let entry = guard
+		.session
+		.get_entry(target_id)
+		.ok_or_else(|| format!("Entry {target_id} not found"))?;
+	let (target_leaf, editor_text) = match &entry.kind {
+		EntryKind::Message { message } => match message.as_ref() {
+			Message::User(user) => (
+				entry.parent_id().map(str::to_owned),
+				Some(user.content.as_text()),
+			),
+			_ => (
+				Some(entry.id().expect("message entries carry ids").to_string()),
+				None,
+			),
+		},
+		EntryKind::CustomMessage { content, .. } => {
+			let text = custom_message_text(content);
+			(
+				entry.parent_id().map(str::to_owned),
+				(!text.is_empty()).then_some(text),
+			)
+		}
+		_ => (
+			Some(entry.id().expect("tree entries carry ids").to_string()),
+			None,
+		),
+	};
+	let mutation = match target_leaf {
+		None => TreeMutation::ResetLeaf,
+		Some(leaf) => TreeMutation::Branch(leaf),
+	};
+	Ok(NavPlan {
+		mutation,
+		editor_text,
+		cwd: session_cwd(&guard.session),
+	})
+}
+
+/// Flatten a `custom_message` content value to the editor text a navigation
+/// target carries (mirrors session-manager's `value_as_text`).
+fn custom_message_text(value: &Value) -> String {
+	match value {
+		Value::String(text) => text.clone(),
+		Value::Array(blocks) => blocks
+			.iter()
+			.filter_map(|block| block.get("text").and_then(Value::as_str))
+			.collect::<Vec<_>>()
+			.join(" "),
+		_ => String::new(),
+	}
+}
+
+/// Apply a validated tree mutation to the live log and derive the
+/// replacement plan from the mutated projection. Runs after the current run
+/// has been torn down, so every old-branch message is already persisted and
+/// the re-pointed leaf cannot strand entries on the wrong branch.
+fn apply_tree_mutation(log: &SharedLogRef, plan: NavPlan) -> Result<ReplacementPlan, String> {
+	let mut guard = log.lock().unwrap();
+	match plan.mutation {
+		TreeMutation::ResetLeaf => guard.session.reset_leaf(),
+		TreeMutation::Branch(from) => guard
+			.session
+			.branch(&from)
+			.map_err(|error| error.to_string())?,
+		TreeMutation::WithSummary {
+			target_leaf,
+			from_id,
+			summary,
+		} => {
+			match target_leaf {
+				Some(leaf) => guard
+					.session
+					.branch(&leaf)
+					.map_err(|error| error.to_string())?,
+				None => guard.session.reset_leaf(),
+			}
+			let entry = SessionEntry::new(EntryKind::BranchSummary {
+				from_id,
+				summary,
+				details: None,
+				usage: None,
+				from_hook: None,
+			});
+			guard
+				.session
+				.append(entry)
+				.map_err(|error| format!("session write failed: {error}"))?;
+		}
+	}
+	let (leaf_id, cwd) = {
+		let leaf = guard.session.leaf_id().map(str::to_owned);
+		let cwd = session_cwd(&guard.session);
+		(leaf, cwd)
+	};
+	let initial_messages = crate::core::session_manager::project_entries_with_leaf(
+		guard.session.entries(),
+		leaf_id.as_deref(),
+	)
+	.messages
+	.into_iter()
+	.map(|(_, message)| message)
+	.collect();
+	// Take the mutated manager for the swap; the placeholder window is
+	// closed by the caller's immediate SharedLog replacement.
+	let session = std::mem::replace(&mut guard.session, SessionManager::in_memory());
+	drop(guard);
+	Ok(ReplacementPlan {
+		new_session: session,
+		initial_messages,
+		cwd,
+	})
+}
+
+/// Result of the one-shot branch summary request.
+enum BranchSummaryOutcome {
+	Summary(String),
+	/// Cancelled through the token (upstream `result.aborted`).
+	Aborted,
+}
+
+/// Verbatim from `compaction/branch-summarization.ts` (`BRANCH_SUMMARY_PREAMBLE`).
+const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
+
+/// Verbatim from `compaction/branch-summarization.ts` (`BRANCH_SUMMARY_PROMPT`).
+const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// Branch-summary generation for `/tree` navigation — port of
+/// `generateBranchSummary` (`compaction/branch-summarization.ts`), reduced:
+/// the cumulative read/modified file tracking (upstream stores
+/// `readFiles`/`modifiedFiles` in the entry `details`) is not ported and the
+/// entry `details` stay `None`; retry wiring reuses none of the compaction
+/// callbacks (one attempt). The prompt, preamble, token budgeting
+/// (context window minus `reserveTokens`, summary entries get a 90% grace)
+/// and response checks mirror upstream.
+async fn generate_branch_summary(
+	model: &Model,
+	stream_fn: &pi_ai::StreamFn,
+	entries: &[SessionEntry],
+	custom_instructions: Option<&str>,
+	token: tokio_util::sync::CancellationToken,
+) -> Result<BranchSummaryOutcome, String> {
+	let budget = model.context_window.saturating_sub(16_384);
+	let messages = prepare_branch_entries(entries, budget);
+	if messages.is_empty() {
+		return Ok(BranchSummaryOutcome::Summary(
+			"No content to summarize".into(),
+		));
+	}
+	let conversation = compaction::serialize_conversation(&messages);
+	let instructions = match custom_instructions.filter(|custom| !custom.trim().is_empty()) {
+		Some(custom) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {custom}"),
+		None => BRANCH_SUMMARY_PROMPT.to_string(),
+	};
+	let prompt_text = format!("<conversation>\n{conversation}\n</conversation>\n\n{instructions}");
+	let context = pi_ai::normalize_context(
+		Some(compaction::SUMMARIZATION_SYSTEM_PROMPT),
+		&[],
+		vec![Message::user(prompt_text)],
+	);
+	let mut stream = stream_fn(model, &context, pi_ai::StreamOptions::default());
+	let final_message = loop {
+		let event = tokio::select! {
+			_ = token.cancelled() => return Ok(BranchSummaryOutcome::Aborted),
+			event = stream.next() => event,
+		};
+		match event {
+			Some(pi_ai::AssistantMessageEvent::Done { message, .. }) => break message,
+			Some(pi_ai::AssistantMessageEvent::Error { error, .. }) => break error,
+			Some(_) => {}
+			None => return Err("branch summarization stream ended without a terminal event".into()),
+		}
+	};
+	if token.is_cancelled() {
+		return Ok(BranchSummaryOutcome::Aborted);
+	}
+	match final_message.stop_reason {
+		StopReason::Aborted => return Ok(BranchSummaryOutcome::Aborted),
+		StopReason::Error => {
+			return Err(format!(
+				"Branch summarization failed: {}",
+				final_message
+					.error_message
+					.as_deref()
+					.unwrap_or("Unknown error")
+			));
+		}
+		StopReason::Length => {
+			return Err(
+				"Branch summarization failed: generation hit the token cap and the summary is incomplete"
+					.into(),
+			);
+		}
+		_ => {}
+	}
+	if !final_message.tool_calls().is_empty() {
+		return Err("Branch summarization attempted to call a tool".into());
+	}
+	Ok(BranchSummaryOutcome::Summary(format!(
+		"{BRANCH_SUMMARY_PREAMBLE}{}",
+		final_message.text()
+	)))
+}
+
+/// Entries abandoned by a `/tree` navigation, in chronological order — port
+/// of `collectEntriesForBranchSummary`: walk from the old leaf back to the
+/// common ancestor with the target (compaction boundaries included; their
+/// summaries ride along as context).
+fn collect_entries_for_branch_summary(
+	entries: &[SessionEntry],
+	old_leaf: Option<&str>,
+	target_id: &str,
+) -> (Vec<SessionEntry>, Option<String>) {
+	let Some(old_leaf) = old_leaf else {
+		return (Vec::new(), None);
+	};
+	let old_path_entries = super::session_manager::build_session_path(entries, Some(old_leaf));
+	let old_path: std::collections::HashSet<&str> = old_path_entries
+		.iter()
+		.filter_map(|entry| entry.id())
+		.collect();
+	let target_path = super::session_manager::build_session_path(entries, Some(target_id));
+	let common_ancestor = target_path
+		.iter()
+		.rev()
+		.find(|entry| entry.id().is_some_and(|id| old_path.contains(id)))
+		.and_then(|entry| entry.id().map(str::to_owned));
+	let mut collected: Vec<SessionEntry> = Vec::new();
+	let mut current = Some(old_leaf.to_string());
+	while let Some(id) = current {
+		if Some(id.as_str()) == common_ancestor.as_deref() {
+			break;
+		}
+		let Some(entry) = entries.iter().find(|entry| entry.id() == Some(id.as_str())) else {
+			break;
+		};
+		collected.push(entry.clone());
+		current = entry.parent_id().map(str::to_owned);
+	}
+	collected.reverse();
+	(collected, common_ancestor)
+}
+
+/// Summarization input for the abandoned branch
+/// (`getMessageFromEntry` + `prepareBranchEntries` upstream): tool results
+/// drop (their context lives in the assistant tool call), summaries replay
+/// as their user-visible messages, and the newest-first walk stops at the
+/// token budget with a 90%-grace for summary entries.
+fn prepare_branch_entries(entries: &[SessionEntry], token_budget: u64) -> Vec<Message> {
+	let mut messages: Vec<Message> = Vec::new();
+	let mut total: u64 = 0;
+	for entry in entries.iter().rev() {
+		let message = match &entry.kind {
+			EntryKind::Message { message } => match message.as_ref() {
+				Message::ToolResult(_) => continue,
+				other => other.clone(),
+			},
+			EntryKind::BashExecution {
+				command,
+				output,
+				exit_code,
+				cancelled,
+				truncated,
+				full_output_path,
+				exclude_from_context,
+			} => {
+				if *exclude_from_context {
+					continue;
+				}
+				Message::user(super::session_manager::bash_execution_to_text(
+					command,
+					output,
+					*exit_code,
+					*cancelled,
+					*truncated,
+					full_output_path.as_deref(),
+				))
+			}
+			EntryKind::Compaction { summary, .. } => {
+				compaction::compaction_summary_message(summary)
+			}
+			EntryKind::BranchSummary { summary, .. } => Message::user(format!(
+				"{}{summary}{}",
+				super::session_manager::BRANCH_SUMMARY_PREFIX,
+				super::session_manager::BRANCH_SUMMARY_SUFFIX
+			)),
+			EntryKind::CustomMessage { content, .. } => Message::user(custom_message_text(content)),
+			_ => continue,
+		};
+		let tokens = compaction::estimate_tokens(&message);
+		let is_summary_entry = matches!(
+			entry.kind,
+			EntryKind::Compaction { .. } | EntryKind::BranchSummary { .. }
+		);
+		if token_budget > 0 && total + tokens > token_budget {
+			if is_summary_entry && total < token_budget * 9 / 10 {
+				messages.insert(0, message);
+			}
+			break;
+		}
+		messages.insert(0, message);
+		total += tokens;
+	}
+	messages
+}
+
+/// `/import <path.jsonl>` (`importFromJsonl` upstream): copy the log into
+/// the current session's storage and open the copy. Layout deviation
+/// (accepted, pre-existing): pi-rs stores one `session.jsonl` per directory,
+/// so the imported log becomes a new sibling directory named after the file
+/// stem — `foo.jsonl` → `<sessions-root>/foo/session.jsonl`, falling back to
+/// `foo-1`, `foo-2`, … when the directory exists (the upstream `-1`/`-2`
+/// dedup applied to the stem). `None` `current_dir` (in-memory current
+/// session) stores under the sessions root, creating it when missing. The
+/// imported header's cwd travels with the log; a stored cwd that no longer
+/// exists cancels the import (`plan_switch_session` reports it like
+/// upstream's `MissingSessionCwdError`).
+fn plan_import_session(
+	input_path: &str,
+	current_dir: Option<&Path>,
+) -> Result<ReplacementPlan, String> {
+	let resolved = resolve_input_path(input_path);
+	if !resolved.is_file() {
+		return Err(format!("File not found: {}", resolved.display()));
+	}
+	let root = current_dir
+		.and_then(Path::parent)
+		.map(Path::to_path_buf)
+		.unwrap_or_else(crate::config::sessions_dir);
+	std::fs::create_dir_all(&root)
+		.map_err(|error| format!("cannot create session storage: {error}"))?;
+	let stem = import_stem(&resolved);
+	let dir = import_destination_dir(&root, &stem);
+	std::fs::create_dir_all(&dir).map_err(|error| format!("cannot create {dir:?}: {error}"))?;
+	let target = dir.join("session.jsonl");
+	std::fs::copy(&resolved, &target)
+		.map_err(|error| format!("cannot copy {input_path}: {error}"))?;
+	plan_switch_session(&target.to_string_lossy())
+}
+
+/// The stored directory name for an imported `foo.jsonl`: the file stem,
+/// suffixed `-1`, `-2`, … on collision (upstream's dedup loop).
+fn import_destination_dir(root: &Path, stem: &str) -> PathBuf {
+	let mut suffix = 0;
+	loop {
+		let name = if suffix == 0 {
+			stem.to_string()
+		} else {
+			format!("{stem}-{suffix}")
+		};
+		let dir = root.join(&name);
+		if !dir.exists() {
+			return dir;
+		}
+		suffix += 1;
+	}
+}
+
+/// Directory-name stem for an imported log: the file stem (`foo` for
+/// `foo.jsonl`), sanitized to a safe single-line name.
+fn import_stem(path: &Path) -> String {
+	let raw = path
+		.file_stem()
+		.map(|stem| stem.to_string_lossy().into_owned())
+		.unwrap_or_else(|| "imported".into());
+	let sanitized: String = raw
+		.chars()
+		.map(|c| {
+			if c.is_whitespace() || c == '/' || c == '\\' {
+				'-'
+			} else {
+				c
+			}
+		})
+		.collect();
+	let trimmed = sanitized.trim_matches('-').trim().to_string();
+	if trimmed.is_empty() {
+		"imported".into()
+	} else {
+		trimmed
+	}
+}
+
+/// `resolvePath` upstream: relative paths resolve against the process cwd,
+/// `~` expands to the home directory.
+fn resolve_input_path(input: &str) -> PathBuf {
+	let expanded = if let Some(rest) = input.strip_prefix("~/") {
+		if let Some(home) = std::env::var_os("HOME") {
+			PathBuf::from(home).join(rest)
+		} else {
+			PathBuf::from(input)
+		}
+	} else {
+		PathBuf::from(input)
+	};
+	if expanded.is_absolute() {
+		expanded
+	} else {
+		std::env::current_dir()
+			.unwrap_or_else(|_| PathBuf::from("."))
+			.join(expanded)
+	}
+}
+
 /// Mutable task state the replacement consumes (`&mut` bundle — the command
 /// arms hold these as locals).
 struct ReplacementContext<'a> {
@@ -1752,6 +2468,9 @@ struct ReplacementContext<'a> {
 	shared: &'a Arc<SessionShared>,
 	settings: &'a CompactionSettings,
 	plan: ReplacementPlan,
+	/// `/tree` navigation: the log mutation applied after the teardown (so
+	/// the old branch is fully persisted first) replaces `plan`.
+	navigate: Option<NavPlan>,
 }
 
 /// Tear the current runtime down, build the replacement agent, and swap the
@@ -1759,7 +2478,7 @@ struct ReplacementContext<'a> {
 /// either lands whole or leaves the current session untouched. Returns the
 /// new agent and its event receiver for the caller's loop locals.
 async fn apply_replacement(
-	ctx: ReplacementContext<'_>,
+	mut ctx: ReplacementContext<'_>,
 ) -> (Agent, tokio::sync::broadcast::Receiver<AgentEvent>) {
 	// -- teardown (upstream `teardownCurrent`: abort, settle, persist) -----
 	if let Some(task) = ctx.compacting.take() {
@@ -1815,6 +2534,21 @@ async fn apply_replacement(
 		return (ctx.agent.clone(), ctx.agent.subscribe());
 	}
 
+	// -- `/tree` navigation mutation (upstream navigateTree's leaf switch) --
+	// Runs after the teardown, so every old-branch message is persisted and
+	// the re-pointed leaf cannot strand entries on the wrong branch.
+	let plan = match ctx.navigate.take() {
+		Some(nav_plan) => match apply_tree_mutation(ctx.log, nav_plan) {
+			Ok(plan) => plan,
+			Err(error) => {
+				ctx.event_bus
+					.emit(SessionEvent::Notice(format!("navigation failed: {error}")));
+				return (ctx.agent.clone(), ctx.agent.subscribe());
+			}
+		},
+		None => ctx.plan,
+	};
+
 	// -- build the replacement runtime -------------------------------------
 	let model = ctx.agent.model();
 	let thinking = ctx.agent.thinking_level();
@@ -1822,12 +2556,12 @@ async fn apply_replacement(
 	let (steering_mode, follow_up_mode) = ctx.agent.queue_modes();
 	// Rebuild cwd-bound tools. Existing MCP connections are valid only for the
 	// same project; a different cwd must not inherit its trusted project tools.
-	let same_cwd = session_cwd(&ctx.log.lock().unwrap().session) == ctx.plan.cwd;
+	let same_cwd = session_cwd(&ctx.log.lock().unwrap().session) == plan.cwd;
 	let options = ctx.shared.tool_options.lock().unwrap().clone();
 	let selection = if !same_cwd {
 		options.and_then(|options| {
 			let settings =
-				super::settings_manager::SettingsManager::load(Some(&ctx.plan.cwd)).effective();
+				super::settings_manager::SettingsManager::load(Some(&plan.cwd)).effective();
 			match super::tool_selection::resolve_tool_selection(
 				super::tool_selection::ToolSelectionInput {
 					tools: options.tools.as_deref(),
@@ -1854,7 +2588,7 @@ async fn apply_replacement(
 		.unwrap_or_else(|| ctx.agent.snapshot().tool_names)
 		.into_iter()
 		.collect();
-	let mut tools: Vec<Arc<dyn pi_agent::AgentTool>> = super::tools::create_tools(&ctx.plan.cwd)
+	let mut tools: Vec<Arc<dyn pi_agent::AgentTool>> = super::tools::create_tools(&plan.cwd)
 		.into_iter()
 		.filter(|tool| startup_names.contains(tool.name()))
 		.collect();
@@ -1872,7 +2606,7 @@ async fn apply_replacement(
 			if let Some(selection) = &selection {
 				runtime.allow = selection.mcp_filter.clone();
 			}
-			for notice in runtime.reconnect(&ctx.plan.cwd).await {
+			for notice in runtime.reconnect(&plan.cwd).await {
 				ctx.event_bus
 					.emit(SessionEvent::Notice(format!("mcp: {notice}")));
 			}
@@ -1880,7 +2614,7 @@ async fn apply_replacement(
 		}
 	}
 	if let Some(index) = tools.iter().position(|tool| tool.name() == "bash") {
-		let session = &ctx.plan.new_session;
+		let session = &plan.new_session;
 		let context = super::tools::bash::SessionToolContext {
 			session_id: session.session_id(),
 			session_file: session
@@ -1891,11 +2625,11 @@ async fn apply_replacement(
 			reasoning_level: Some(format!("{thinking:?}").to_lowercase()),
 		};
 		tools[index] = Arc::new(
-			super::tools::bash::BashTool::new(ctx.plan.cwd.clone()).with_session_context(context),
+			super::tools::bash::BashTool::new(plan.cwd.clone()).with_session_context(context),
 		);
 	}
 	let system_prompt = super::system_prompt::build_system_prompt_with_options(
-		&ctx.plan.cwd,
+		&plan.cwd,
 		&tools,
 		&ctx.shared.prompt_options,
 	);
@@ -1905,12 +2639,12 @@ async fn apply_replacement(
 		stream_fn: Some(stream_fn),
 		tools,
 		system_prompt: Some(system_prompt),
-		initial_messages: ctx.plan.initial_messages,
+		initial_messages: plan.initial_messages,
 		steering_mode,
 		follow_up_mode,
 		..AgentOptions::default()
 	});
-	let mut new_session = ctx.plan.new_session;
+	let mut new_session = plan.new_session;
 	record_initial_model_entries(&new_agent, &mut new_session);
 	new_agent.set_session_id(new_session.session_id());
 	if let Some(dir) = new_session.session_dir() {
@@ -5456,5 +6190,429 @@ mod tests {
 		// The fresh system prompt is never persisted.
 		assert!(!text.contains("resumed run"));
 		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// Two scripted turns in a saved session: user → assistant → user. The
+	/// standalone summarization request parks on `gate` until released (the
+	/// ordinary turns keep the mock's echo behavior), so branch-summary
+	/// timing is testable.
+	async fn two_turn_session(
+		tag: &str,
+		gate: Option<Arc<tokio::sync::Notify>>,
+	) -> (SessionHandle, std::path::PathBuf, String, String) {
+		let dir = temp_session_dir(tag);
+		let stream = match gate {
+			None => mock_stream_fn(),
+			Some(gate) => parked_summarization_stream_fn(gate),
+		};
+		let agent = Agent::new(AgentOptions {
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session(agent, SessionManager::open(&dir).unwrap(), registry);
+		for text in ["first question", "second question"] {
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt { text: text.into() })
+				.unwrap();
+			wait_for_agent_ends(&mut handle, 1).await;
+		}
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while read_session_messages(&dir).len() < 4 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("both turns should persist");
+		let (first_user_id, second_user_id) = {
+			let guard = handle.log.lock().unwrap();
+			let find = |needle: &str| {
+				guard
+					.session
+					.entries()
+					.iter()
+					.filter(|entry| match &entry.kind {
+						EntryKind::Message { message } => matches!(
+							message.as_ref(),
+							Message::User(user) if user.content.as_text() == needle
+						),
+						_ => false,
+					})
+					.find_map(|entry| entry.id().map(str::to_owned))
+					.expect("the user entry exists")
+			};
+			(find("first question"), find("second question"))
+		};
+		(handle, dir, first_user_id, second_user_id)
+	}
+
+	/// The mock provider stream; the standalone summarization call echoes
+	/// (upstream's verbatim `SUMMARIZATION_PROMPT` trips the mock's tool-call
+	/// path otherwise, matching `compaction_test_stream_fn`).
+	fn mock_stream_fn() -> pi_ai::StreamFn {
+		Arc::new(
+			move |model: &pi_ai::Model,
+			      context: &pi_ai::TranscriptContext,
+			      options: pi_ai::StreamOptions| {
+				if is_summarization_request(context) {
+					let model = model.clone();
+					let text = format!("[mock summary] {}", last_user_text(context));
+					return Box::pin(futures::stream::once(async move {
+						pi_ai::AssistantMessageEvent::Done {
+							reason: StopReason::Stop,
+							message: echo_assistant_message(&model, text),
+						}
+					})) as pi_ai::AssistantMessageEventStream;
+				}
+				pi_ai::providers::mock::stream(model, context, options)
+			},
+		)
+	}
+
+	/// Summarization requests park on the gate until released, then answer
+	/// with a fixed summary; ordinary turns behave like the mock.
+	fn parked_summarization_stream_fn(gate: Arc<tokio::sync::Notify>) -> pi_ai::StreamFn {
+		Arc::new(
+			move |model: &pi_ai::Model,
+			      context: &pi_ai::TranscriptContext,
+			      options: pi_ai::StreamOptions| {
+				if is_summarization_request(context) {
+					let model = model.clone();
+					let gate = gate.clone();
+					return Box::pin(async_stream_once(async move {
+						gate.notified().await;
+						pi_ai::AssistantMessageEvent::Done {
+							reason: StopReason::Stop,
+							message: echo_assistant_message(&model, "branch summary body".into()),
+						}
+					})) as pi_ai::AssistantMessageEventStream;
+				}
+				pi_ai::providers::mock::stream(model, context, options)
+			},
+		)
+	}
+
+	#[tokio::test]
+	async fn tree_navigation_moves_leaf_and_swaps_context() {
+		let (mut handle, dir, _first, second) = two_turn_session("tree-nav", None).await;
+		// Navigate to the second user message: it re-runs from its parent (the
+		// first assistant reply) and its text returns to the editor.
+		let (response, receiver) = tokio::sync::oneshot::channel();
+		handle
+			.cmd_tx
+			.send(SessionCommand::NavigateTree {
+				target_id: second,
+				summarize: false,
+				custom_instructions: None,
+				response,
+			})
+			.unwrap();
+		let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
+			.await
+			.expect("navigation completes")
+			.expect("response channel open");
+		let TreeNavResult::Navigated {
+			editor_text: Some(text),
+			queued_text: None,
+		} = outcome.expect("navigation succeeds")
+		else {
+			panic!("expected a navigation with editor text");
+		};
+		assert_eq!(text, "second question");
+		wait_for_replacement(&mut handle).await;
+		// The transcript now holds the first turn only (the seeded system
+		// message never enters the log); the live agent replaced the startup one.
+		let messages = handle.shared.live_agent.lock().unwrap().snapshot().messages;
+		let roles: Vec<&str> = messages
+			.iter()
+			.filter(|m| !matches!(m, Message::System(_)))
+			.map(Message::role)
+			.collect();
+		assert_eq!(roles, ["user", "assistant"]);
+		// The log leaf moved onto the first assistant reply; a new prompt
+		// branches from there and the original second turn stays in the file.
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "retry".into(),
+			})
+			.unwrap();
+		wait_for_agent_ends(&mut handle, 1).await;
+		tokio::time::timeout(Duration::from_secs(5), async {
+			let count = |dir: &std::path::Path| {
+				read_session_messages(dir)
+					.iter()
+					.filter(|m| matches!(m, Message::User(u) if u.content.as_text() == "retry"))
+					.count()
+			};
+			while count(&dir) == 0 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("the retry turn should persist");
+		// The retry branches off the first assistant reply; the abandoned second
+		// turn stays in the file but out of the active path.
+		let users: Vec<String> = read_session_messages(&dir)
+			.iter()
+			.filter_map(|m| match m {
+				Message::User(u) => Some(u.content.as_text().to_string()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(users, ["first question", "retry"]);
+		// The raw file keeps every entry (append-only).
+		let raw = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
+		assert!(raw.contains("second question"));
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn tree_navigation_summary_attaches_branch_summary_entry() {
+		let (mut handle, dir, _first, second) = two_turn_session("tree-summary", None).await;
+		let (response, receiver) = tokio::sync::oneshot::channel();
+		handle
+			.cmd_tx
+			.send(SessionCommand::NavigateTree {
+				target_id: second,
+				summarize: true,
+				custom_instructions: None,
+				response,
+			})
+			.unwrap();
+		let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
+			.await
+			.expect("navigation completes")
+			.expect("response channel open");
+		assert!(
+			matches!(outcome, Ok(TreeNavResult::Navigated { .. })),
+			"{outcome:?}"
+		);
+		wait_for_replacement(&mut handle).await;
+		// A branch_summary entry carries the summarizer's text with the
+		// abandoned leaf as fromId.
+		let (summary, from_id) = {
+			let guard = handle.log.lock().unwrap();
+			guard
+				.session
+				.entries()
+				.iter()
+				.find_map(|entry| match &entry.kind {
+					EntryKind::BranchSummary {
+						from_id, summary, ..
+					} => Some((summary.clone(), from_id.clone())),
+					_ => None,
+				})
+				.expect("a branch summary entry was appended")
+		};
+		assert!(
+			summary.starts_with("The user explored a different conversation branch")
+				&& summary.contains("[mock summary]"),
+			"the mock summarizer's text lands in the entry: {summary}"
+		);
+		assert!(!from_id.is_empty());
+		// The replayed context contains the branch summary user message.
+		let messages = handle.shared.live_agent.lock().unwrap().snapshot().messages;
+		assert!(
+			messages.iter().any(
+				|m| matches!(m, Message::User(u) if u.content.as_text().contains("first question"))
+			),
+			"the kept turn replays"
+		);
+		assert!(
+			messages
+				.iter()
+				.any(|m| matches!(m, Message::User(u) if u.content.as_text().contains(session_manager::BRANCH_SUMMARY_PREFIX))),
+			"the branch summary rides as its user-visible message"
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn abort_branch_summary_keeps_the_session_put() {
+		let gate = Arc::new(tokio::sync::Notify::new());
+		let (handle, dir, _first, second) =
+			two_turn_session("tree-abort", Some(gate.clone())).await;
+		let (response, receiver) = tokio::sync::oneshot::channel();
+		handle
+			.cmd_tx
+			.send(SessionCommand::NavigateTree {
+				target_id: second,
+				summarize: true,
+				custom_instructions: None,
+				response,
+			})
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		// Cancel while the summary request is parked on the gate.
+		handle
+			.cmd_tx
+			.send(SessionCommand::AbortBranchSummary)
+			.unwrap();
+		let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
+			.await
+			.expect("navigation resolves")
+			.expect("response channel open");
+		assert!(
+			matches!(outcome, Ok(TreeNavResult::Aborted)),
+			"expected the abort to surface: {outcome:?}"
+		);
+		// The leaf stayed put (no branch, no summary entry).
+		let guard = handle.log.lock().unwrap();
+		assert!(
+			guard
+				.session
+				.entries()
+				.iter()
+				.all(|entry| !matches!(entry.kind, EntryKind::BranchSummary { .. })),
+			"no summary entry was appended"
+		);
+		let users: Vec<String> = guard
+			.session
+			.entries()
+			.iter()
+			.filter_map(|entry| match &entry.kind {
+				EntryKind::Message { message } => match message.as_ref() {
+					Message::User(user) => Some(user.content.as_text().clone()),
+					_ => None,
+				},
+				_ => None,
+			})
+			.collect();
+		assert_eq!(users.len(), 2, "no retry turn joined the log");
+		drop(guard);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		gate.notify_waiters();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn navigate_tree_refuses_while_a_summary_runs() {
+		let gate = Arc::new(tokio::sync::Notify::new());
+		let (handle, dir, _first, second) = two_turn_session("tree-busy", Some(gate.clone())).await;
+		let (response, receiver) = tokio::sync::oneshot::channel();
+		handle
+			.cmd_tx
+			.send(SessionCommand::NavigateTree {
+				target_id: second.clone(),
+				summarize: true,
+				custom_instructions: None,
+				response,
+			})
+			.unwrap();
+		// The first navigation parks on its summary; the second is refused.
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		let (response2, receiver2) = tokio::sync::oneshot::channel();
+		handle
+			.cmd_tx
+			.send(SessionCommand::NavigateTree {
+				target_id: second,
+				summarize: false,
+				custom_instructions: None,
+				response: response2,
+			})
+			.unwrap();
+		let busy = tokio::time::timeout(Duration::from_secs(5), receiver2)
+			.await
+			.expect("second navigation answers")
+			.expect("response channel open");
+		let Err(busy_error) = busy else {
+			panic!("expected the busy refusal, got {busy:?}");
+		};
+		assert!(
+			busy_error.contains("Wait for the current compaction or tree navigation to finish"),
+			"{busy_error}"
+		);
+		// Release the parked summary; the first navigation still completes.
+		gate.notify_waiters();
+		let first = tokio::time::timeout(Duration::from_secs(5), receiver)
+			.await
+			.expect("first navigation resolves")
+			.expect("response channel open");
+		assert!(
+			matches!(first, Ok(TreeNavResult::Navigated { .. })),
+			"{first:?}"
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn import_copies_into_session_storage_with_dedup_suffixes() {
+		let root = std::env::temp_dir().join(format!("pi-import-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let source_dir = root.join("source");
+		std::fs::create_dir_all(&source_dir).unwrap();
+		let source = source_dir.join("my-log.jsonl");
+		std::fs::write(
+			&source,
+			format!(
+				"{}\n{}\n",
+				serde_json::json!({"type":"session","version":3,"id":"import-1","timestamp":"2026-01-01T00:00:00Z","cwd":source_dir.display().to_string()}),
+				serde_json::json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"imported question","timestamp":1}})
+			),
+		)
+		.unwrap();
+		let current = SessionManager::create_with_parent_in(&root, &source_dir, None).unwrap();
+		let current_dir = current.session_dir().unwrap().to_path_buf();
+		drop(current);
+
+		let plan = plan_import_session(&source.display().to_string(), Some(&current_dir))
+			.expect("the import copies");
+		let first_dir = plan.new_session.session_dir().unwrap().to_path_buf();
+		assert_eq!(first_dir.parent(), Some(current_dir.parent().unwrap()));
+		assert_eq!(first_dir.file_name().unwrap(), "my-log");
+		let imported = std::fs::read_to_string(first_dir.join("session.jsonl")).unwrap();
+		assert!(imported.contains("imported question"));
+
+		// A second import of the same file dedupes with the -1 suffix.
+		let plan = plan_import_session(&source.display().to_string(), Some(&current_dir))
+			.expect("the second import copies");
+		assert_eq!(
+			plan.new_session.session_dir().unwrap().file_name().unwrap(),
+			"my-log-1"
+		);
+
+		// A missing file reports the upstream error text.
+		let missing = root.join("missing.jsonl");
+		let Err(error) = plan_import_session(&missing.display().to_string(), Some(&current_dir))
+		else {
+			panic!("the missing file should fail");
+		};
+		assert_eq!(error, format!("File not found: {}", missing.display()));
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn import_cwd_validation_cancels() {
+		let root = std::env::temp_dir().join(format!("pi-import-cwd-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let source = root.join("gone-session.jsonl");
+		std::fs::write(
+			&source,
+			format!(
+				"{}\n",
+				serde_json::json!({"type":"session","version":3,"id":"gone","timestamp":"2026-01-01T00:00:00Z","cwd":root.join("vanished").display().to_string()})
+			),
+		)
+		.unwrap();
+		let Err(error) = plan_import_session(&source.display().to_string(), None) else {
+			panic!("the vanished cwd should cancel the import");
+		};
+		assert!(
+			error.contains("Stored session working directory does not exist"),
+			"{error}"
+		);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	/// A one-shot stream for parked summary requests.
+	fn async_stream_once<F: Future<Output = pi_ai::AssistantMessageEvent> + Send + 'static>(
+		produce: F,
+	) -> impl futures::Stream<Item = pi_ai::AssistantMessageEvent> + Send {
+		futures::stream::once(produce)
 	}
 }

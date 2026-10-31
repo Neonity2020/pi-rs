@@ -55,11 +55,21 @@ for choice in ("y", "n", "escape", "disabled", "missing"):
 
     def wait_for(needle):
         deadline = time.monotonic() + 10
+        # ratatui's diff renderer skips unchanged cells, so a needle can be on
+        # screen while its characters are absent from the byte stream. Nudging
+        # the window size forces a full repaint so the screen is re-emitted.
+        last_nudge = time.monotonic()
+        nudge = False
         while time.monotonic() < deadline:
             if needle in captured:
                 return
             if process.poll() is not None:
                 break
+            if time.monotonic() - last_nudge > 1.5:
+                last_nudge = time.monotonic()
+                nudge = not nudge
+                rows = 32 + (1 if nudge else 0)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, 160, 0, 0))
             if select.select([master], [], [], 0.1)[0]:
                 try:
                     captured.extend(os.read(master, 65536))

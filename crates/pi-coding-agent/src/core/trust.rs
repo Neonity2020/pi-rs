@@ -32,6 +32,18 @@ pub fn is_trusted(cwd: &Path) -> bool {
 	is_trusted_at(&trust_json_path(), cwd)
 }
 
+/// The project-trust decision point with a CLI override — the pi-rs cut of
+/// upstream `projectTrusted` (`main.ts:741-770`), where
+/// `parsed.projectTrustOverride` (from `-a`/`--approve` and
+/// `-na`/`--no-approve`) short-circuits both the recorded decision and the
+/// interactive prompt for this run: `-a` trusts the project's local files
+/// (project `.pi/mcp.json` loads), `-na` treats it as untrusted (project
+/// resources are skipped with a notice). Without an override the stored
+/// decision applies. The override never writes the trust store.
+pub fn resolve_project_trusted(cwd: &Path, project_trust_override: Option<bool>) -> bool {
+	project_trust_override.unwrap_or_else(|| is_trusted(cwd))
+}
+
 /// Record `cwd` as trusted (path normalized first) — upstream `set(cwd, true)`.
 pub fn trust(cwd: &Path) -> io::Result<()> {
 	trust_at(&trust_json_path(), cwd)

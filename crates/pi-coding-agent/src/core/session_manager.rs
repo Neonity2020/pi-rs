@@ -1292,18 +1292,37 @@ impl SessionManager {
 		cwd: &Path,
 		parent_session: Option<String>,
 	) -> Result<Self, SessionError> {
+		Self::create_in_with_options(root, cwd, parent_session, None)
+	}
+
+	/// Root-parameterized create with the full upstream `NewSessionOptions`
+	/// surface: `parentSession` lineage plus an explicit header id
+	/// (`--session-id`, upstream `SessionManager.create(cwd, dir, { id })`).
+	/// The id is validated like `newSession`; the directory name stays
+	/// timestamp-based (see the module docs on the layout deviation).
+	pub fn create_in_with_options(
+		root: &Path,
+		cwd: &Path,
+		parent_session: Option<String>,
+		id: Option<&str>,
+	) -> Result<Self, SessionError> {
+		if let Some(id) = id {
+			assert_valid_session_id(id).map_err(SessionError::InvalidFormat)?;
+		}
 		// Random v4 segment: a v7's leading hex is timestamp-derived, so two
 		// sessions created in the same millisecond would collide on the name.
-		let id = format!(
+		let id = id
+			.map(str::to_owned)
+			.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+		let dir = root.join(format!(
 			"{}-{}",
 			chrono_like_timestamp(),
 			&uuid::Uuid::new_v4().simple().to_string()[..8]
-		);
-		let dir = root.join(id);
+		));
 		std::fs::create_dir_all(&dir)?;
 		let header = SessionHeader {
 			version: Some(CURRENT_SESSION_VERSION),
-			id: uuid::Uuid::now_v7().to_string(),
+			id,
 			timestamp: iso_timestamp(pi_ai::types::now_ms()),
 			cwd: cwd.to_string_lossy().into_owned(),
 			parent_session,
@@ -1317,6 +1336,27 @@ impl SessionManager {
 	/// In-memory session (persistence disabled, `--no-session`).
 	pub fn in_memory() -> Self {
 		Self::empty(PathBuf::new(), None)
+	}
+
+	/// [`SessionManager::in_memory`] carrying a session id — upstream
+	/// `SessionManager.inMemory(cwd, { id })` for `--no-session --session-id`.
+	/// Unlike the plain in-memory session the header exists (the id has to
+	/// live somewhere), so JSON print mode opens with its header line. The
+	/// caller validates the id (`--session-id` flag validation).
+	pub fn in_memory_with_id(id: &str) -> Self {
+		Self::empty(
+			PathBuf::new(),
+			Some(SessionHeader {
+				version: Some(CURRENT_SESSION_VERSION),
+				id: id.to_string(),
+				timestamp: iso_timestamp(pi_ai::types::now_ms()),
+				cwd: std::env::current_dir()
+					.ok()
+					.map(|cwd| cwd.to_string_lossy().into_owned())
+					.unwrap_or_default(),
+				parent_session: None,
+			}),
+		)
 	}
 
 	/// Open an existing session directory for append.
@@ -1783,6 +1823,11 @@ impl SessionManager {
 		recent_session_paths(&config::sessions_dir(), limit)
 	}
 
+	/// `recent_paths` scoped to a session storage root (`--session-dir`).
+	pub fn recent_paths_in(root: &Path, limit: usize) -> Vec<PathBuf> {
+		recent_session_paths(root, limit)
+	}
+
 	/// `createBranchedSession(leafId)` upstream (`session-manager.ts:1632`):
 	/// write a new session file containing only the root-to-`leaf_id` path
 	/// with `parentId` links re-chained along it, and return the new session
@@ -1865,6 +1910,68 @@ impl SessionManager {
 			.expect("branched session is persisted")
 			.to_path_buf())
 	}
+
+	/// Fork a session into the current project — upstream
+	/// `SessionManager.forkFrom` (`session-manager.ts:1815`). The root-to-leaf
+	/// path of the source log is copied into a new session under `root`
+	/// (via [`SessionManager::create_branched_session_in`]'s re-chaining) whose
+	/// header points at `target_cwd` and carries `parentSession` = the source
+	/// log, so the fork lineage survives. `id` overrides the new header id
+	/// (upstream `{ id }` option); `source` may name the session directory or
+	/// a log file inside it. Errors carry the upstream fork failure texts.
+	pub fn fork_from_in(
+		root: &Path,
+		source: &Path,
+		target_cwd: &Path,
+		id: Option<&str>,
+	) -> Result<Self, SessionError> {
+		let source_file = if source.is_dir() {
+			source.join("session.jsonl")
+		} else {
+			source.to_path_buf()
+		};
+		let text = std::fs::read_to_string(&source_file)?;
+		if text.trim().is_empty() {
+			return Err(SessionError::InvalidFormat(format!(
+				"Cannot fork: source session file is empty or invalid: {}",
+				source_file.display()
+			)));
+		}
+		let (header, entries) = load_session_file(&source_file);
+		let Some(_) = header else {
+			return Err(SessionError::InvalidFormat(format!(
+				"Cannot fork: source session has no header: {}",
+				source_file.display()
+			)));
+		};
+		if let Some(id) = id {
+			assert_valid_session_id(id).map_err(SessionError::InvalidFormat)?;
+		}
+		// Leaf path projection (create_branched_session_in semantics). A
+		// header-only source (nothing appended yet) forks into an empty
+		// transcript — upstream copies zero non-header entries there.
+		let leaf_id = entries
+			.iter()
+			.rev()
+			.find_map(|entry| entry.id().map(str::to_owned));
+		let path = match &leaf_id {
+			Some(leaf_id) => build_session_path(&entries, Some(leaf_id)),
+			None => Vec::new(),
+		};
+
+		let mut forked = Self::create_in_with_options(
+			root,
+			target_cwd,
+			Some(source_file.to_string_lossy().into_owned()),
+			id,
+		)?;
+		// Re-chain the retained path into the fresh log (ids and timestamps
+		// are preserved; append re-parents onto the new leaf chain).
+		for entry in path {
+			forked.append(entry)?;
+		}
+		Ok(forked)
+	}
 }
 
 /// Which session a resume flag names — mirrors the `--continue`/`--resume`
@@ -1937,6 +2044,75 @@ pub fn resolve_session_in(
 			}
 		}
 	}
+}
+
+/// Upstream `assertValidSessionId` (`session-manager.ts:268`): non-empty,
+/// only `[A-Za-z0-9._-]`, starting and ending with an alphanumeric character.
+pub fn assert_valid_session_id(id: &str) -> Result<(), String> {
+	let valid = !id.is_empty()
+		&& id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+		&& id
+			.chars()
+			.next_back()
+			.is_some_and(|c| c.is_ascii_alphanumeric())
+		&& id
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+	if valid {
+		Ok(())
+	} else {
+		Err("Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character".into())
+	}
+}
+
+/// Every session directory under `root` with its parsed header, newest log
+/// first — the flat-root shape of upstream `SessionManager.list` (whose
+/// `sortSessionInfos` orders by mtime descending). Unreadable logs are
+/// skipped, like upstream's best-effort discovery.
+pub fn list_session_headers(root: &Path) -> Vec<(PathBuf, SessionHeader)> {
+	let Ok(entries) = std::fs::read_dir(root) else {
+		return Vec::new();
+	};
+	let mut sessions: Vec<(PathBuf, std::time::SystemTime, SessionHeader)> = entries
+		.flatten()
+		.map(|entry| entry.path())
+		.filter(|path| path.is_dir())
+		.filter_map(|dir| {
+			let modified = std::fs::metadata(dir.join("session.jsonl"))
+				.ok()?
+				.modified()
+				.ok()?;
+			let header = peek_session_header(&dir)?;
+			Some((dir, modified, header))
+		})
+		.collect();
+	sessions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+	sessions
+		.into_iter()
+		.map(|(dir, _, header)| (dir, header))
+		.collect()
+}
+
+/// [`list_session_headers`] limited to the current project (header `cwd`
+/// match) — upstream `list(cwd)` over the per-project default directory; the
+/// flat pi-rs root needs the explicit cwd filter instead.
+pub fn list_project_session_headers(root: &Path, cwd: &Path) -> Vec<(PathBuf, SessionHeader)> {
+	list_session_headers(root)
+		.into_iter()
+		.filter(|(_, header)| {
+			!header.cwd.is_empty() && paths_equivalent(Path::new(&header.cwd), cwd)
+		})
+		.collect()
+}
+
+/// `SessionManager.findById` (`session-manager.ts:1879`): the project session
+/// whose header id matches exactly. Exact `--session-id` lookups key on the
+/// header id (the UUIDv7), not the directory name.
+pub fn find_by_header_id(root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+	list_project_session_headers(root, cwd)
+		.into_iter()
+		.find(|(_, header)| header.id == id)
+		.map(|(dir, _)| dir)
 }
 
 /// Header-cwd matching: string equality first, then canonicalized comparison
