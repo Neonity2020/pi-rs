@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
@@ -32,7 +32,9 @@ use pi_tui::components::{Component, SelectAction, SelectItem, SelectList, markdo
 use pi_tui::keybindings::KeybindingsManager;
 use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
 
-use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle};
+use crate::core::agent_session::{
+	RpcReplacement, SessionCommand, SessionEvent, SessionHandle, WireEvent,
+};
 use crate::core::model_registry::{ModelRegistry, add_provider};
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
 use crate::core::ui_config::UiConfig;
@@ -104,6 +106,13 @@ enum ChatBlock {
 struct ModelOverlay {
 	search: String,
 	list: SelectList,
+	kind: OverlayKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayKind {
+	Model,
+	Session,
 }
 
 impl ModelOverlay {
@@ -131,6 +140,90 @@ impl ModelOverlay {
 		Self {
 			search: String::new(),
 			list,
+			kind: OverlayKind::Model,
+		}
+	}
+
+	fn sessions(sessions: Vec<std::path::PathBuf>, cancelled: impl Fn() -> bool) -> Self {
+		let (items, search_texts): (Vec<_>, Vec<_>) = sessions
+			.into_iter()
+			.take_while(|_| !cancelled())
+			.map(|path| {
+				use crate::core::session_manager::{EntryKind, load_session_file};
+				let (header, entries) = load_session_file(&path.join("session.jsonl"));
+				let count = entries.len() + usize::from(header.is_some());
+				let name = entries
+					.iter()
+					.rev()
+					.find_map(|entry| match &entry.kind {
+						EntryKind::SessionInfo { name } => {
+							Some(name.as_deref().unwrap_or_default())
+						}
+						_ => None,
+					})
+					.filter(|name| !name.trim().is_empty());
+				let first_message = entries
+					.iter()
+					.find_map(|entry| match &entry.kind {
+						EntryKind::Message { message } => match message.as_ref() {
+							Message::User(user) => Some(user.content.as_text()),
+							_ => None,
+						},
+						_ => None,
+					})
+					.filter(|text| !text.trim().is_empty());
+				let fallback = path
+					.file_name()
+					.map(|name| name.to_string_lossy().into_owned())
+					.unwrap_or_else(|| path.display().to_string());
+				let label = name
+					.map(str::to_owned)
+					.or_else(|| first_message.clone())
+					.unwrap_or(fallback);
+				let cwd = header
+					.map(|header| header.cwd)
+					.filter(|cwd| !cwd.is_empty())
+					.unwrap_or_else(|| "unknown project".into());
+				let description = match (name, first_message) {
+					(Some(_), Some(message)) => format!("{cwd} · {count} entries · {message}"),
+					_ => format!("{cwd} · {count} entries"),
+				};
+				let clean = |text: &str| {
+					text.chars()
+						.map(|c| if c.is_control() { ' ' } else { c })
+						.take(200)
+						.collect::<String>()
+				};
+				let messages = entries
+					.iter()
+					.filter_map(|entry| match &entry.kind {
+						EntryKind::Message { message } => match message.as_ref() {
+							Message::User(user) => Some(user.content.as_text()),
+							Message::Assistant(assistant) => Some(assistant.text()),
+							_ => None,
+						},
+						_ => None,
+					})
+					.collect::<Vec<_>>()
+					.join(" ");
+				let searchable = format!("{} {cwd} {messages}", name.unwrap_or_default());
+				(
+					SelectItem {
+						label: clean(&label),
+						value: path.to_string_lossy().into_owned(),
+						description: Some(clean(&description)),
+					},
+					searchable,
+				)
+			})
+			.unzip();
+		let mut list = SelectList::new(items, 10);
+		list.set_search_texts(search_texts);
+		list.set_no_match_message("No matching sessions");
+		Self {
+			search: String::new(),
+			list,
+			kind: OverlayKind::Session,
 		}
 	}
 }
@@ -140,6 +233,10 @@ pub struct InteractiveMode {
 	models: Vec<Model>,
 	registry: Arc<Mutex<ModelRegistry>>,
 	provider_wizard: Option<ProviderWizard>,
+	trust_prompt: Option<(std::path::PathBuf, std::path::PathBuf)>,
+	pending_replacement: Option<tokio::sync::oneshot::Receiver<Result<Option<String>, String>>>,
+	replacement_event_seen: bool,
+	loading_sessions: Option<tokio::sync::oneshot::Receiver<ModelOverlay>>,
 	theme: Theme,
 	// Resolved app keybindings (ui_config.rs): default table + user
 	// keybindings.json overrides.
@@ -292,11 +389,15 @@ impl InteractiveMode {
 	) -> Self {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 		let theme = ui.theme;
-		Self {
+		let mut mode = Self {
 			session,
 			models,
 			registry,
 			provider_wizard: None,
+			trust_prompt: None,
+			pending_replacement: None,
+			replacement_event_seen: false,
+			loading_sessions: None,
 			theme: theme.clone(),
 			keybindings: ui.keybindings,
 			startup_notices: ui.notices,
@@ -315,7 +416,9 @@ impl InteractiveMode {
 			overlay: None,
 			ui_rx,
 			ui_tx,
-		}
+		};
+		mode.restore_transcript();
+		mode
 	}
 
 	pub async fn run(mut self, initial_prompt: Option<String>) -> anyhow::Result<()> {
@@ -357,12 +460,6 @@ impl InteractiveMode {
 			guard.terminal.draw(|frame| self.draw(frame))?;
 
 			tokio::select! {
-				event = term_rx.recv() => {
-					match event {
-						Some(event) => self.handle_terminal_event(event),
-						None => self.quit = true, // input stream closed
-					}
-				}
 				event = self.session.events.recv() => {
 					match event {
 						Ok(event) => self.handle_session_event(event),
@@ -372,6 +469,53 @@ impl InteractiveMode {
 						Err(tokio::sync::broadcast::error::RecvError::Closed) => {
 							self.quit = true;
 						}
+					}
+				}
+				result = async {
+					match self.pending_replacement.as_mut() {
+						Some(receiver) => receiver.await,
+						None => std::future::pending().await,
+					}
+				} => {
+					match result {
+						Ok(Ok(_)) => {
+							while !self.replacement_event_seen {
+								match self.session.events.try_recv() {
+									Ok(event) => self.handle_session_event(event),
+									Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => self.push_notice(format!("event lag: dropped {count} events")),
+									Err(_) => break,
+								}
+							}
+							if !self.replacement_event_seen { self.handle_session_event(SessionEvent::SessionReplaced); }
+						}
+						Ok(Err(error)) => self.push_notice(format!("Session switch failed: {error}")),
+						Err(_) => self.push_notice("Session switch failed: session task stopped".into()),
+					}
+					self.pending_replacement = None;
+					self.replacement_event_seen = false;
+				}
+				result = async {
+					match self.loading_sessions.as_mut() {
+						Some(receiver) => receiver.await,
+						None => std::future::pending().await,
+					}
+				} => {
+					self.loading_sessions = None;
+					match result {
+						Ok(overlay) if overlay.list.is_empty() => self.push_notice("no saved sessions yet".into()),
+						Ok(overlay) => self.overlay = Some(overlay),
+						Err(_) => self.push_notice("cannot load saved sessions".into()),
+					}
+				}
+				event = term_rx.recv() => {
+					match event {
+						Some(event) => self.handle_terminal_event(event),
+						None => self.quit = true,
+					}
+				}
+				event = self.session.wire_events.recv() => {
+					if let Ok(WireEvent::SessionInfoChanged { name }) = event {
+						self.push_notice(format!("Session name: {}", name.as_deref().unwrap_or("(none)")));
 					}
 				}
 				Some(branch) = self.ui_rx.recv() => {
@@ -403,6 +547,57 @@ impl InteractiveMode {
 	// -- input handling -------------------------------------------------------
 
 	fn handle_terminal_event(&mut self, event: TermEvent) {
+		if self.loading_sessions.is_some()
+			&& let TermEvent::Key(key) = &event
+		{
+			match key.code {
+				KeyCode::Esc => {
+					self.loading_sessions = None;
+					self.push_notice("Session list loading cancelled".into());
+					return;
+				}
+				KeyCode::Enter => {
+					self.push_notice("Loading sessions; press Enter again when it finishes".into());
+					return;
+				}
+				_ => {}
+			}
+			if let Some(action) =
+				resolve_global_action(&self.keybindings, key, self.editor.is_empty())
+			{
+				if matches!(action, GlobalAction::Exit | GlobalAction::Clear) {
+					self.quit = true;
+				}
+				return;
+			}
+		}
+		if self.pending_replacement.is_some()
+			&& let TermEvent::Key(key) = &event
+		{
+			if key.code == KeyCode::Enter {
+				self.push_notice(
+					"Session switch in progress; press Enter again when it finishes".into(),
+				);
+				return;
+			}
+			if self.keybindings.matches("app.clear", key)
+				|| (self.editor.is_empty() && self.keybindings.matches("app.exit", key))
+			{
+				self.quit = true;
+				return;
+			}
+			if resolve_global_action(&self.keybindings, key, self.editor.is_empty()).is_some() {
+				return;
+			}
+		}
+		if self.trust_prompt.is_some() {
+			if let TermEvent::Key(key) = event
+				&& key.kind != crossterm::event::KeyEventKind::Release
+			{
+				self.handle_trust_key(key);
+			}
+			return;
+		}
 		if let (Some(wizard), TermEvent::Paste(text)) = (&mut self.provider_wizard, &event) {
 			if wizard.selected.is_some() {
 				wizard.input.push_str(&text.replace(['\r', '\n'], ""));
@@ -435,6 +630,33 @@ impl InteractiveMode {
 			return;
 		}
 		self.chat.handle_event(&event);
+	}
+
+	fn handle_trust_key(&mut self, key: KeyEvent) {
+		if key
+			.modifiers
+			.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+		{
+			return;
+		}
+		match key.code {
+			KeyCode::Char('y' | 'Y') => {
+				let (path, cwd) = self.trust_prompt.take().unwrap();
+				match crate::core::trust::trust(&cwd) {
+					Ok(()) => self.switch_session(path),
+					Err(error) => self.push_notice(format!("cannot save project trust: {error}")),
+				}
+			}
+			KeyCode::Char('n' | 'N') => {
+				let (path, _) = self.trust_prompt.take().unwrap();
+				self.switch_session(path);
+			}
+			KeyCode::Esc => {
+				self.trust_prompt = None;
+				self.push_notice("Session switch cancelled".into());
+			}
+			_ => {}
+		}
 	}
 
 	fn handle_provider_key(&mut self, key: KeyEvent) {
@@ -509,7 +731,7 @@ impl InteractiveMode {
 						Ok(()) => {
 							let mut registry = self.registry.lock().unwrap();
 							let default = registry.default_model();
-							*registry = ModelRegistry::load(Some(&default.key()));
+							registry.reload(Some(&default.key()));
 							self.models = registry.models().to_vec();
 							drop(registry);
 							let model = match wizard.selected {
@@ -569,20 +791,25 @@ impl InteractiveMode {
 		};
 		match action {
 			SelectAction::Select(index) => {
-				let value = match self.overlay.as_ref() {
+				let selection = match self.overlay.as_ref() {
 					Some(overlay) => overlay
 						.list
 						.filtered()
 						.get(index)
-						.map(|item| item.value.clone()),
+						.map(|item| (overlay.kind, item.value.clone())),
 					None => None,
 				};
-				if let Some(value) = value {
+				if let Some((kind, value)) = selection {
 					self.overlay = None;
-					let _ = self
-						.session
-						.cmd_tx
-						.send(SessionCommand::SetModel { query: value });
+					match kind {
+						OverlayKind::Model => {
+							let _ = self
+								.session
+								.cmd_tx
+								.send(SessionCommand::SetModel { query: value });
+						}
+						OverlayKind::Session => self.resume_session(&value),
+					}
 				}
 				// No match under the cursor: keep the overlay open (pi behavior).
 			}
@@ -684,6 +911,47 @@ impl InteractiveMode {
 				self.blocks.clear();
 				self.chat.clear();
 			}
+			"new" => {
+				self.begin_replacement(RpcReplacement::New {
+					parent_session: None,
+				});
+			}
+			"resume" => {
+				if args.is_empty() {
+					let (sender, receiver) = tokio::sync::oneshot::channel();
+					self.loading_sessions = Some(receiver);
+					std::thread::spawn(move || {
+						let sessions = crate::core::SessionManager::recent_paths(usize::MAX);
+						let overlay = ModelOverlay::sessions(sessions, || sender.is_closed());
+						let _ = sender.send(overlay);
+					});
+				} else {
+					self.resume_session(args);
+				}
+			}
+			"name" => {
+				if args.is_empty() {
+					self.push_notice("Usage: /name <name>".into());
+				} else {
+					let _ = self.session.cmd_tx.send(SessionCommand::SetSessionName {
+						name: args.to_string(),
+					});
+				}
+			}
+			"session" => {
+				let details = {
+					let guard = self.session.log.lock().unwrap();
+					let session = &guard.session;
+					let id = session.session_id().unwrap_or_else(|| "(in-memory)".into());
+					let path = session
+						.session_dir()
+						.map(|dir| dir.join("session.jsonl").display().to_string())
+						.unwrap_or_else(|| "(not saved)".into());
+					let name = session.session_name().unwrap_or_else(|| "(unnamed)".into());
+					format!("session: {name}\nid: {id}\nfile: {path}\ncwd: {}", self.cwd)
+				};
+				self.push_notice(details);
+			}
 			"model" => {
 				if args.is_empty() {
 					let current = self.session.agent.model().key();
@@ -739,12 +1007,149 @@ impl InteractiveMode {
 		}
 	}
 
+	fn resume_session(&mut self, selector: &str) {
+		use crate::core::session_manager::{
+			SessionSelector, resolve_session_in, validate_session_dir,
+		};
+		let result = resolve_session_in(
+			&crate::config::sessions_dir(),
+			std::path::Path::new(&self.cwd),
+			&SessionSelector::ByIdOrPath(selector.to_string()),
+		)
+		.and_then(|path| {
+			validate_session_dir(&path)?;
+			Ok(path)
+		});
+		match result {
+			Ok(path) => {
+				let cwd = crate::core::session_manager::peek_session_header(&path)
+					.map(|header| std::path::PathBuf::from(header.cwd));
+				if let Some(cwd) =
+					cwd.filter(|cwd| cwd.is_dir() && cwd.join(".pi/mcp.json").is_file())
+					&& self.session.mcp_enabled()
+					&& !crate::core::trust::is_trusted(&cwd)
+				{
+					self.trust_prompt = Some((path, cwd));
+				} else {
+					self.switch_session(path);
+				}
+			}
+			Err(error) => self.push_notice(format!("cannot resume session: {error}")),
+		}
+	}
+
+	fn switch_session(&mut self, path: std::path::PathBuf) {
+		self.begin_replacement(RpcReplacement::Switch {
+			path: path.to_string_lossy().into_owned(),
+		});
+	}
+
+	fn begin_replacement(&mut self, operation: RpcReplacement) {
+		let (response, received) = tokio::sync::oneshot::channel();
+		if self
+			.session
+			.cmd_tx
+			.send(SessionCommand::RpcReplacement {
+				operation,
+				response,
+			})
+			.is_ok()
+		{
+			self.pending_replacement = Some(received);
+			self.replacement_event_seen = false;
+		} else {
+			self.push_notice("Session switch failed: session task stopped".into());
+		}
+	}
+
+	fn restore_transcript(&mut self) {
+		self.blocks.clear();
+		self.chat.clear();
+		self.usage = (0, 0, 0, 0, 0.0);
+		for message in self.session.agent.snapshot().messages {
+			match &message {
+				Message::User(_) => self.handle_agent_event(AgentEvent::MessageStart { message }),
+				Message::Assistant(assistant) => {
+					let calls: Vec<_> = assistant
+						.content
+						.iter()
+						.filter_map(|content| match content {
+							pi_ai::AssistantContent::ToolCall(call) => Some(call.clone()),
+							_ => None,
+						})
+						.collect();
+					self.handle_agent_event(AgentEvent::MessageStart {
+						message: message.clone(),
+					});
+					self.handle_agent_event(AgentEvent::MessageEnd { message });
+					for call in calls {
+						self.handle_agent_event(AgentEvent::ToolExecutionStart {
+							tool_call_id: call.id,
+							tool_name: call.name,
+							args: call.arguments,
+						});
+						if let Some(ChatBlock::Tool { started, .. }) = self.blocks.last_mut() {
+							*started = None;
+						}
+					}
+				}
+				Message::ToolResult(result) => {
+					if !self.blocks.iter().any(
+						|block| matches!(block, ChatBlock::Tool { id, running: true, .. } if id == &result.tool_call_id),
+					) {
+						self.handle_agent_event(AgentEvent::ToolExecutionStart {
+							tool_call_id: result.tool_call_id.clone(),
+							tool_name: result.tool_name.clone(),
+							args: serde_json::json!({}),
+						});
+						if let Some(ChatBlock::Tool { started, .. }) = self.blocks.last_mut() {
+							*started = None;
+						}
+					}
+					self.handle_agent_event(AgentEvent::ToolExecutionEnd {
+						tool_call_id: result.tool_call_id.clone(),
+						tool_name: result.tool_name.clone(),
+						result: serde_json::to_value(result).unwrap_or_default(),
+						is_error: result.is_error,
+						duration_ms: result.duration_ms,
+					});
+				}
+				Message::System(_) => {}
+			}
+		}
+		for block in &mut self.blocks {
+			if let ChatBlock::Tool {
+				running,
+				is_error,
+				output,
+				..
+			} = block && *running
+			{
+				*running = false;
+				*is_error = true;
+				*output = "Tool result is missing from the session".into();
+			}
+		}
+	}
+
 	// -- agent events -----------------------------------------------------------
 
 	fn handle_session_event(&mut self, event: SessionEvent) {
 		match event {
 			SessionEvent::Agent(event) => self.handle_agent_event(*event),
 			SessionEvent::Notice(text) => self.push_notice(text),
+			SessionEvent::SessionReplaced => {
+				if self.pending_replacement.is_some() {
+					self.replacement_event_seen = true;
+				}
+				self.session.agent = self.session.shared.live_agent.lock().unwrap().clone();
+				if let Some(header) = self.session.log.lock().unwrap().session.header() {
+					self.cwd = header.cwd.clone();
+				}
+				self.restore_transcript();
+				self.refresh_branch();
+				self.working = false;
+			}
 			SessionEvent::Persisted { .. } => {}
 			// Quiescence marker; the TUI derives busy/idle from agent events.
 			SessionEvent::Settled { .. } => {}
@@ -883,6 +1288,7 @@ impl InteractiveMode {
 				tool_call_id,
 				result,
 				is_error: is_error_,
+				duration_ms: event_duration,
 				..
 			} => {
 				let output = tool_result_text(&result);
@@ -901,7 +1307,9 @@ impl InteractiveMode {
 					*is_error = is_error_;
 					*rendered = None;
 					*out = output;
-					*duration_ms = started.map(|s| s.elapsed().as_millis());
+					*duration_ms = event_duration
+						.map(u128::from)
+						.or_else(|| started.map(|s| s.elapsed().as_millis()));
 				}
 			}
 			AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
@@ -917,10 +1325,11 @@ impl InteractiveMode {
 
 	fn refresh_branch(&self) {
 		let tx = self.ui_tx.clone();
+		let cwd = self.cwd.clone();
 		tokio::spawn(async move {
 			let output = tokio::process::Command::new("git")
 				.args(["rev-parse", "--abbrev-ref", "HEAD"])
-				.current_dir(std::env::current_dir().unwrap_or_default())
+				.current_dir(cwd)
 				.output()
 				.await;
 			if let Ok(output) = output {
@@ -956,6 +1365,24 @@ impl InteractiveMode {
 		self.draw_editor(frame, chunks[2]);
 		self.draw_footer(frame, chunks[3]);
 		self.draw_overlay(frame, chunks[1]);
+		if let Some((_, cwd)) = &self.trust_prompt {
+			let area = chunks[1];
+			let panel = Rect {
+				height: area.height.min(8),
+				..area
+			};
+			frame.render_widget(Clear, panel);
+			let text = format!(
+				"MCP configuration can run commands. Trust this project?\nY: trust and resume · N: skip project MCP · Esc: cancel\nProject: {}",
+				cwd.display()
+			);
+			frame.render_widget(
+				Paragraph::new(text)
+					.wrap(Wrap { trim: false })
+					.block(Block::bordered().title(" Project trust ")),
+				panel,
+			);
+		}
 		if let Some(wizard) = &self.provider_wizard {
 			let area = chunks[1];
 			let height = area
@@ -1023,7 +1450,11 @@ impl InteractiveMode {
 		let block = Block::bordered()
 			.border_style(Style::new().fg(self.theme.border))
 			.title(Span::styled(
-				if self.working {
+				if self.loading_sessions.is_some() {
+					" loading sessions (esc cancels) "
+				} else if self.pending_replacement.is_some() {
+					" switching session… "
+				} else if self.working {
 					" steering/prompt (esc aborts) "
 				} else {
 					" prompt "
@@ -1140,10 +1571,9 @@ impl InteractiveMode {
 		let Some(overlay) = self.overlay.as_ref() else {
 			return;
 		};
-		let width = chat_area.width.clamp(24, 72);
-		let list_height = 10usize;
-		let height = (list_height + 6) as u16;
-		if chat_area.width < width || chat_area.height < height {
+		let width = chat_area.width.min(72);
+		let height = chat_area.height.min(16);
+		if width < 4 || height < 6 {
 			return;
 		}
 		let x = chat_area.x + (chat_area.width - width) / 2;
@@ -1159,7 +1589,11 @@ impl InteractiveMode {
 		let block = Block::bordered()
 			.border_style(Style::new().fg(self.theme.accent))
 			.title(Span::styled(
-				" Select model ",
+				if overlay.kind == OverlayKind::Model {
+					" Select model "
+				} else {
+					" Resume session "
+				},
 				Style::new()
 					.fg(self.theme.accent)
 					.add_modifier(Modifier::BOLD),
@@ -1172,7 +1606,12 @@ impl InteractiveMode {
 			Span::raw(overlay.search.clone()),
 			Span::styled("▌", Style::new().fg(self.theme.accent)),
 		]);
-		let list_lines = overlay.list.render_lines(inner.width as usize, &self.theme);
+		let list_limit = (inner.height as usize).saturating_sub(4).max(1);
+		let mut list_lines =
+			overlay
+				.list
+				.render_lines_with_limit(inner.width as usize, &self.theme, list_limit);
+		list_lines.truncate((inner.height as usize).saturating_sub(3));
 		let mut lines = vec![search_line, Line::default()];
 		lines.extend(list_lines);
 		lines.push(Line::from(Span::styled(
@@ -1610,6 +2049,401 @@ mod tests {
 	use super::*;
 	use pi_tui::keybindings::KeybindingsManager;
 	use pi_tui::parse_chord;
+
+	#[tokio::test]
+	async fn restored_messages_and_tool_results_are_visible() {
+		let mut assistant =
+			pi_ai::AssistantMessage::error(&pi_agent::types::default_model(), StopReason::Stop, "");
+		assistant.error_message = None;
+		assistant.content = vec![
+			pi_ai::AssistantContent::Text(pi_ai::TextContent {
+				text: "previous response".into(),
+				text_signature: None,
+			}),
+			pi_ai::AssistantContent::ToolCall(pi_ai::ToolCall {
+				id: "call-1".into(),
+				name: "read".into(),
+				arguments: serde_json::json!({"path":"file.txt"}),
+				thought_signature: None,
+				namespace: None,
+				arguments_error: None,
+			}),
+		];
+		let mut tool_result =
+			pi_ai::ToolResultMessage::text_result("call-1", "read", "file contents", false);
+		tool_result.duration_ms = Some(123);
+		let agent = pi_agent::Agent::new(pi_agent::AgentOptions {
+			initial_messages: vec![
+				Message::user("previous question"),
+				Message::Assistant(assistant),
+				Message::ToolResult(tool_result),
+			],
+			..Default::default()
+		});
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session(
+			agent,
+			crate::core::SessionManager::in_memory(),
+			registry.clone(),
+		);
+		let ui = UiConfig {
+			theme: Theme::dark(),
+			keybindings: crate::core::ui_config::new_keybindings_manager(),
+			notices: Vec::new(),
+		};
+		let mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
+		assert!(
+			mode.blocks
+				.iter()
+				.any(|block| matches!(block, ChatBlock::User(text) if text == "previous question"))
+		);
+		assert!(mode.blocks.iter().any(|block| matches!(block, ChatBlock::Assistant { text, streaming: false, .. } if text == "previous response")));
+		assert!(mode.blocks.iter().any(|block| matches!(block, ChatBlock::Tool { id, output, running: false, duration_ms: Some(123), .. } if id == "call-1" && output == "file contents")));
+		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+	}
+
+	#[tokio::test]
+	async fn resume_command_switches_and_renders_saved_session() {
+		let root = std::env::temp_dir().join(format!("pi-tui-resume-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let mut saved =
+			crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+		saved
+			.append_message(&Message::user("saved question"))
+			.unwrap();
+		let path = saved.session_dir().unwrap().to_path_buf();
+		drop(saved);
+		let agent = pi_agent::Agent::new(pi_agent::AgentOptions::default());
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session(
+			agent,
+			crate::core::SessionManager::in_memory(),
+			registry.clone(),
+		);
+		let ui = UiConfig {
+			theme: Theme::dark(),
+			keybindings: crate::core::ui_config::new_keybindings_manager(),
+			notices: Vec::new(),
+		};
+		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
+		mode.handle_slash(&format!("resume {}", path.display()));
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let event = mode.session.events.recv().await.unwrap();
+				let replaced = matches!(event, SessionEvent::SessionReplaced);
+				mode.handle_session_event(event);
+				if replaced {
+					break;
+				}
+			}
+		})
+		.await
+		.unwrap();
+		assert!(
+			mode.blocks
+				.iter()
+				.any(|block| matches!(block, ChatBlock::User(text) if text == "saved question"))
+		);
+		assert_eq!(mode.cwd, root.to_string_lossy());
+		mode.overlay = Some(ModelOverlay::sessions(vec![path.clone()], || false));
+		mode.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let event = mode.session.events.recv().await.unwrap();
+				let replaced = matches!(event, SessionEvent::SessionReplaced);
+				mode.handle_session_event(event);
+				if replaced {
+					break;
+				}
+			}
+		})
+		.await
+		.unwrap();
+		assert!(
+			mode.blocks
+				.iter()
+				.any(|block| matches!(block, ChatBlock::User(text) if text == "saved question"))
+		);
+		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+		drop(mode);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn session_picker_displays_and_searches_names_projects_and_first_messages() {
+		let root = std::env::temp_dir().join(format!("pi-picker-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let mut named = crate::core::SessionManager::create_with_parent_in(
+			&root,
+			&root.join("project-alpha"),
+			None,
+		)
+		.unwrap();
+		named
+			.append_message(&Message::user("first question\nsecond line"))
+			.unwrap();
+		named
+			.append_message(&Message::user(format!(
+				"{} hidden-after-preview",
+				"x".repeat(300)
+			)))
+			.unwrap();
+		let model = Model::new("test", "test", "mock", "mock", "");
+		let mut assistant = pi_ai::AssistantMessage::error(&model, pi_ai::StopReason::Stop, "");
+		assistant.content = vec![pi_ai::AssistantContent::Text(pi_ai::TextContent {
+			text: "response-unique-marker".into(),
+			text_signature: None,
+		})];
+		named
+			.append_message(&Message::Assistant(assistant))
+			.unwrap();
+		named.append_session_info("Refactor auth").unwrap();
+		let named_path = named.session_dir().unwrap().to_path_buf();
+		let mut unnamed = crate::core::SessionManager::create_with_parent_in(
+			&root,
+			&root.join("project-beta"),
+			None,
+		)
+		.unwrap();
+		unnamed
+			.append_message(&Message::user("inspect logs\nplease"))
+			.unwrap();
+		let unnamed_path = unnamed.session_dir().unwrap().to_path_buf();
+		let calls = std::cell::Cell::new(0);
+		let cancelled =
+			ModelOverlay::sessions(vec![named_path.clone(), unnamed_path.clone()], || {
+				let count = calls.get();
+				calls.set(count + 1);
+				count > 0
+			});
+		assert_eq!(cancelled.list.len(), 1);
+		let mut picker = ModelOverlay::sessions(vec![named_path, unnamed_path], || false);
+		let items = picker.list.filtered();
+		assert_eq!(items[0].label, "Refactor auth");
+		assert_eq!(items[1].label, "inspect logs please");
+		assert!(
+			items[0]
+				.description
+				.as_deref()
+				.unwrap()
+				.contains("first question second line")
+		);
+		picker.list.set_filter("project-beta");
+		assert!(
+			picker
+				.list
+				.filtered()
+				.iter()
+				.any(|item| item.label == "inspect logs please")
+		);
+		picker.list.set_filter("first question");
+		assert!(
+			picker
+				.list
+				.filtered()
+				.iter()
+				.any(|item| item.label == "Refactor auth")
+		);
+		picker.list.set_filter("hidden-after-preview");
+		assert!(
+			picker
+				.list
+				.filtered()
+				.iter()
+				.any(|item| item.label == "Refactor auth")
+		);
+		picker.list.set_filter("response-unique-marker");
+		assert!(
+			picker
+				.list
+				.filtered()
+				.iter()
+				.any(|item| item.label == "Refactor auth")
+		);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn resume_asks_before_trusting_project_mcp_and_escape_cancels() {
+		let root = std::env::temp_dir().join(format!("pi-tui-trust-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(root.join(".pi")).unwrap();
+		std::fs::write(root.join(".pi/mcp.json"), "{}").unwrap();
+		let saved = crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+		let path = saved.session_dir().unwrap().to_path_buf();
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session(
+			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
+			crate::core::SessionManager::in_memory(),
+			registry.clone(),
+		);
+		handle.configure_mcp(crate::core::tools::McpRuntime {
+			assembly: Default::default(),
+			allow: None,
+			exclude: None,
+		});
+		let ui = UiConfig {
+			theme: Theme::light(),
+			keybindings: crate::core::ui_config::new_keybindings_manager(),
+			notices: Vec::new(),
+		};
+		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
+		mode.resume_session(&path.to_string_lossy());
+		assert!(mode.trust_prompt.is_some());
+		mode.handle_terminal_event(TermEvent::Key(KeyEvent::new(
+			KeyCode::Char('y'),
+			KeyModifiers::CONTROL,
+		)));
+		assert!(mode.trust_prompt.is_some());
+		mode.handle_terminal_event(TermEvent::Key(KeyEvent::new(
+			KeyCode::Esc,
+			KeyModifiers::empty(),
+		)));
+		assert!(mode.trust_prompt.is_none());
+		assert!(
+			mode.session
+				.log
+				.lock()
+				.unwrap()
+				.session
+				.session_dir()
+				.is_none()
+		);
+		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn switching_session_keeps_typed_input_until_ready() {
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session(
+			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
+			crate::core::SessionManager::in_memory(),
+			registry.clone(),
+		);
+		let ui = UiConfig {
+			theme: Theme::dark(),
+			keybindings: crate::core::ui_config::new_keybindings_manager(),
+			notices: Vec::new(),
+		};
+		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
+		let (_sender, receiver) = tokio::sync::oneshot::channel();
+		mode.pending_replacement = Some(receiver);
+		mode.editor.set_text("/tools");
+		mode.handle_terminal_event(TermEvent::Key(KeyEvent::new(
+			KeyCode::Enter,
+			KeyModifiers::empty(),
+		)));
+		assert_eq!(mode.editor.text(), "/tools");
+		assert!(mode.blocks.iter().any(
+			|block| matches!(block, ChatBlock::Notice(text) if text.contains("switch in progress"))
+		));
+		mode.pending_replacement = None;
+		mode.handle_terminal_event(TermEvent::Key(KeyEvent::new(
+			KeyCode::Enter,
+			KeyModifiers::empty(),
+		)));
+		assert!(mode.editor.text().is_empty());
+		assert!(mode.blocks.iter().any(
+			|block| matches!(block, ChatBlock::Notice(text) if text.contains("active tools:"))
+		));
+		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+	}
+
+	#[tokio::test]
+	async fn loading_sessions_allows_input_and_can_be_cancelled() {
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session(
+			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
+			crate::core::SessionManager::in_memory(),
+			registry.clone(),
+		);
+		let ui = UiConfig {
+			theme: Theme::dark(),
+			keybindings: crate::core::ui_config::new_keybindings_manager(),
+			notices: Vec::new(),
+		};
+		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
+		let (sender, receiver) = tokio::sync::oneshot::channel();
+		mode.loading_sessions = Some(receiver);
+		mode.editor.set_text("hello");
+		mode.handle_terminal_event(TermEvent::Key(KeyEvent::new(
+			KeyCode::Enter,
+			KeyModifiers::empty(),
+		)));
+		assert_eq!(mode.editor.text(), "hello");
+		mode.handle_terminal_event(TermEvent::Key(KeyEvent::new(
+			KeyCode::Esc,
+			KeyModifiers::empty(),
+		)));
+		assert!(mode.loading_sessions.is_none());
+		assert!(sender.is_closed());
+		assert_eq!(mode.editor.text(), "hello");
+		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+	}
+
+	#[tokio::test]
+	async fn new_session_replaces_live_agent_and_name_command_updates_session() {
+		let agent = pi_agent::Agent::new(pi_agent::AgentOptions {
+			system_prompt: Some("INITIAL_PROMPT".into()),
+			..Default::default()
+		});
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session(
+			agent,
+			crate::core::SessionManager::in_memory(),
+			registry.clone(),
+		);
+		let ui = UiConfig {
+			theme: Theme::dark(),
+			keybindings: crate::core::ui_config::new_keybindings_manager(),
+			notices: Vec::new(),
+		};
+		let mut mode = InteractiveMode::new(
+			handle,
+			registry.lock().unwrap().models().to_vec(),
+			registry.clone(),
+			".".into(),
+			ui,
+		);
+		mode.push_notice("old chat".into());
+		mode.handle_slash("new");
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let event = mode.session.events.recv().await.unwrap();
+				let replaced = matches!(event, SessionEvent::SessionReplaced);
+				mode.handle_session_event(event);
+				if replaced {
+					break;
+				}
+			}
+		})
+		.await
+		.unwrap();
+		assert!(mode.blocks.is_empty());
+		assert!(
+			!mode
+				.session
+				.agent
+				.snapshot()
+				.system_prompt
+				.contains("INITIAL_PROMPT")
+		);
+		mode.handle_slash("name test session");
+		let event = tokio::time::timeout(Duration::from_secs(5), mode.session.wire_events.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		assert!(
+			matches!(event, WireEvent::SessionInfoChanged { name: Some(name) } if name == "test session")
+		);
+		assert_eq!(
+			mode.session.shared.session_name.lock().unwrap().as_deref(),
+			Some("test session")
+		);
+		mode.handle_slash("session");
+		assert!(mode.blocks.iter().any(|block| matches!(block, ChatBlock::Notice(text) if text.contains("test session") && text.contains("(not saved)"))));
+		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+	}
 
 	#[test]
 	fn tool_result_text_handles_partial_and_final_content() {

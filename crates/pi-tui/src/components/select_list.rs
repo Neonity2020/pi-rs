@@ -40,6 +40,7 @@ pub enum SelectAction {
 pub struct SelectList {
 	items: Vec<SelectItem>,
 	filtered: Vec<usize>, // indices into items
+	search_texts: Vec<String>,
 	filter: String,
 	selected: usize,
 	max_visible: usize,
@@ -57,6 +58,7 @@ impl SelectList {
 		Self {
 			items,
 			filtered,
+			search_texts: Vec::new(),
 			filter: String::new(),
 			selected: 0,
 			max_visible: max_visible.max(1),
@@ -67,6 +69,13 @@ impl SelectList {
 
 	pub fn set_items(&mut self, items: Vec<SelectItem>) {
 		self.items = items;
+		self.search_texts.clear();
+		self.refilter();
+	}
+
+	/// Additional searchable content corresponding to each item, not rendered.
+	pub fn set_search_texts(&mut self, texts: Vec<String>) {
+		self.search_texts = texts;
 		self.refilter();
 	}
 
@@ -101,10 +110,14 @@ impl SelectList {
 		}
 		let mut scored: Vec<(usize, f64)> = Vec::new();
 		for (i, item) in self.items.iter().enumerate() {
-			let text = match &item.description {
+			let mut text = match &item.description {
 				Some(desc) => format!("{} {} {}", item.value, item.label, desc),
 				None => format!("{} {}", item.value, item.label),
 			};
+			if let Some(extra) = self.search_texts.get(i) {
+				text.push(' ');
+				text.push_str(extra);
+			}
 			let m = crate::fuzzy::fuzzy_match(self.filter.trim(), &text);
 			if m.matches {
 				scored.push((i, m.score));
@@ -195,6 +208,16 @@ impl SelectList {
 
 	/// Render the visible window of items at `width` cells.
 	pub fn render_lines(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+		self.render_lines_with_limit(width, theme, self.max_visible)
+	}
+
+	/// Render a window sized for the available terminal height.
+	pub fn render_lines_with_limit(
+		&self,
+		width: usize,
+		theme: &Theme,
+		limit: usize,
+	) -> Vec<Line<'static>> {
 		if self.filtered.is_empty() {
 			return vec![Line::from(Span::styled(
 				format!("  {}", self.no_match_message),
@@ -202,7 +225,7 @@ impl SelectList {
 			))];
 		}
 
-		let max_visible = self.max_visible;
+		let max_visible = limit.max(1).min(self.max_visible);
 		let start = (self.selected.saturating_sub(max_visible / 2))
 			.min(self.filtered.len().saturating_sub(max_visible));
 		let end = (start + max_visible).min(self.filtered.len());
@@ -312,6 +335,42 @@ mod tests {
 			],
 			10,
 		)
+	}
+
+	#[test]
+	fn small_render_window_keeps_selected_item_visible() {
+		let mut list = list();
+		list.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+		let lines = list.render_lines_with_limit(40, &Theme::light(), 1);
+		let text = lines
+			.iter()
+			.flat_map(|line| &line.spans)
+			.map(|span| span.content.as_ref())
+			.collect::<String>();
+		assert!(text.contains("second"));
+		assert!(!text.contains("first"));
+	}
+
+	#[test]
+	fn additional_search_text_is_not_rendered_or_reused_after_replacing_items() {
+		let mut list = list();
+		list.set_search_texts(vec!["unique hidden content".into(), "different".into()]);
+		list.set_filter("unique hidden content");
+		assert_eq!(list.filtered().len(), 1);
+		assert_eq!(list.filtered()[0].label, "first");
+		let rendered = list
+			.render_lines_with_limit(80, &Theme::light(), 10)
+			.iter()
+			.flat_map(|line| &line.spans)
+			.map(|span| span.content.as_ref())
+			.collect::<String>();
+		assert!(!rendered.contains("unique hidden content"));
+		list.set_items(vec![SelectItem {
+			value: "c".into(),
+			label: "third".into(),
+			description: None,
+		}]);
+		assert!(list.filtered().is_empty());
 	}
 
 	#[test]

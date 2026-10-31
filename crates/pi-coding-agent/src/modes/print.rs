@@ -133,7 +133,7 @@ async fn run_print_to<W: Write>(
 					PrintOutputMode::Text => eprintln!("· {text}"),
 					PrintOutputMode::Json => eprintln!("{text}"),
 				},
-				SessionEvent::Persisted { .. } => {}
+				SessionEvent::Persisted { .. } | SessionEvent::SessionReplaced => {}
 			}
 		}
 	}

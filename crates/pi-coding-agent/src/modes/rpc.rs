@@ -38,15 +38,9 @@
 //!   the current queue mode would deliver next (`one-at-a-time` peeks only
 //!   the oldest message per queue); everything queued is cleared either way.
 //! - Session replacement (`new_session`/`switch_session`/`fork`/`clone`):
-//!   the replacement happens asynchronously in the session task, so the
-//!   response frames answer `{cancelled: false}` immediately (extensions can
-//!   cancel upstream — this port has none, hence always false).
-//!   `switch_session` pre-validates the target (valid log, existing cwd —
-//!   upstream `assertSessionCwdExists`) so failures answer synchronously;
-//!   `fork` pre-validates the entry (must be a user message for the default
-//!   `before` position) and computes `selectedText` for the response. After a
-//!   replacement, `get_state` and friends read the live session through the
-//!   session task's shared slots.
+//!   responses wait for the session task to finish; failures are returned to
+//!   the caller. Extensions can cancel upstream; this port has none, so a
+//!   successful response always carries `cancelled: false`.
 //! - `bash` answers asynchronously: the response frame carries the finished
 //!   `BashResult` and is emitted when the execution completes; streaming
 //!   output arrives as `bash_execution_update` frames meanwhile. Upstream
@@ -87,11 +81,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use pi_ai::{Model, ThinkingLevel};
 
-use crate::core::agent_session::{
-	ForkPosition, SessionCommand, SessionEvent, SessionHandle, WireEvent,
-};
+use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle, WireEvent};
 use crate::core::model_registry::ModelRegistry;
-use crate::core::session_manager::{EntryKind, SessionEntry, SessionTreeNode, peek_session_header};
+use crate::core::session_manager::{EntryKind, SessionEntry, SessionTreeNode};
 
 /// One command frame from the client — `RpcCommand` in
 /// `modes/rpc/rpc-types.ts`, reduced to the commands this port serves.
@@ -211,6 +203,11 @@ pub struct RpcSession {
 	/// True while a compaction summarization is in flight (`get_state`'s
 	/// `isCompacting`; the session task owns the authoritative state).
 	compacting: Arc<std::sync::atomic::AtomicBool>,
+	pending_replacements: std::sync::atomic::AtomicUsize,
+	replacement_tx: mpsc::UnboundedSender<String>,
+	replacement_rx: mpsc::UnboundedReceiver<String>,
+	events_closed: bool,
+	wire_events_closed: bool,
 }
 
 impl RpcSession {
@@ -228,6 +225,7 @@ impl RpcSession {
 			auto_retry: _,
 		} = handle;
 		let live_agent = shared.live_agent.clone();
+		let (replacement_tx, replacement_rx) = mpsc::unbounded_channel();
 		*live_agent.lock().unwrap() = agent;
 		Self {
 			cmd_tx,
@@ -239,6 +237,11 @@ impl RpcSession {
 			wire_events,
 			auto_compaction,
 			compacting,
+			pending_replacements: std::sync::atomic::AtomicUsize::new(0),
+			replacement_tx,
+			replacement_rx,
+			events_closed: false,
+			wire_events_closed: false,
 		}
 	}
 
@@ -249,8 +252,7 @@ impl RpcSession {
 	}
 
 	/// Parse and dispatch one input line; returns the response frames to
-	/// write (empty for blank lines and for `bash`, whose response frame is
-	/// emitted when the execution finishes).
+	/// write (empty for blank lines and asynchronous bash/session replacement).
 	pub fn handle_line(&self, line: &str) -> Vec<String> {
 		let trimmed = line.trim();
 		if trimmed.is_empty() {
@@ -285,6 +287,66 @@ impl RpcSession {
 				return vec![error_frame(&id, name, format!("invalid command: {e}"))];
 			}
 		};
+		let replacement = match &command {
+			RpcCommand::NewSession { parent_session } => {
+				Some(crate::core::agent_session::RpcReplacement::New {
+					parent_session: parent_session.clone(),
+				})
+			}
+			RpcCommand::SwitchSession { session_path } => {
+				Some(crate::core::agent_session::RpcReplacement::Switch {
+					path: session_path.clone(),
+				})
+			}
+			RpcCommand::Fork { entry_id } => {
+				Some(crate::core::agent_session::RpcReplacement::Fork {
+					entry_id: entry_id.clone(),
+				})
+			}
+			RpcCommand::Clone => Some(crate::core::agent_session::RpcReplacement::Clone),
+			_ => None,
+		};
+		if let Some(operation) = replacement {
+			let (response, received) = tokio::sync::oneshot::channel();
+			self.pending_replacements
+				.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			if self
+				.cmd_tx
+				.send(SessionCommand::RpcReplacement {
+					operation,
+					response,
+				})
+				.is_err()
+			{
+				self.pending_replacements
+					.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+				return vec![error_frame(
+					&id,
+					&command_type,
+					"session task is unavailable",
+				)];
+			}
+			let output = self.replacement_tx.clone();
+			tokio::spawn(async move {
+				let frame = match received.await {
+					Ok(Ok(text)) => {
+						let mut data = json!({"cancelled": false});
+						if let Some(text) = text {
+							data["text"] = json!(text);
+						}
+						success_frame(&id, &command_type, data)
+					}
+					Ok(Err(error)) => error_frame(&id, &command_type, error),
+					Err(_) => error_frame(
+						&id,
+						&command_type,
+						"session task stopped before completing the request",
+					),
+				};
+				let _ = output.send(frame);
+			});
+			return Vec::new();
+		}
 		// `bash` answers asynchronously: the response carries the finished
 		// `BashResult` and is emitted when the session task reports the
 		// execution done (upstream awaits inside the handler).
@@ -308,8 +370,20 @@ impl RpcSession {
 	/// events); `None` once the session task has shut down.
 	pub async fn next_event_frame(&mut self) -> Option<String> {
 		loop {
+			if self.events_closed
+				&& self
+					.pending_replacements
+					.load(std::sync::atomic::Ordering::Relaxed)
+					== 0
+			{
+				return None;
+			}
 			tokio::select! {
-				event = self.events.recv() => match event {
+				Some(frame) = self.replacement_rx.recv() => {
+					self.pending_replacements.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+					return Some(frame);
+				}
+				event = self.events.recv(), if !self.events_closed => match event {
 					Ok(SessionEvent::Agent(event)) => {
 						let mut frame = agent_event_frame(&event);
 						if matches!(&*event, pi_agent::AgentEvent::AgentEnd { .. }) {
@@ -342,7 +416,7 @@ impl RpcSession {
 						);
 					}
 					// Internal bookkeeping; not part of the wire protocol.
-					Ok(SessionEvent::Persisted { .. }) => continue,
+					Ok(SessionEvent::Persisted { .. } | SessionEvent::SessionReplaced) => continue,
 					Err(broadcast::error::RecvError::Lagged(count)) => {
 						// Dropped events can include an `agent_end`, whose
 						// queued willRetry decision is now unpairable — drop
@@ -354,9 +428,9 @@ impl RpcSession {
 								.to_string(),
 						);
 					}
-					Err(broadcast::error::RecvError::Closed) => return None,
+					Err(broadcast::error::RecvError::Closed) => self.events_closed = true,
 				},
-				event = self.wire_events.recv() => match event {
+				event = self.wire_events.recv(), if !self.wire_events_closed => match event {
 					Ok(WireEvent::BashExecutionUpdate { id, delta }) => {
 						let mut frame = json!({"type": "bash_execution_update", "delta": delta});
 						if let Some(id) = id {
@@ -397,7 +471,7 @@ impl RpcSession {
 					Err(broadcast::error::RecvError::Lagged(_)) => continue,
 					// The wire bus dies with the session handle; the session
 					// event channel governs shutdown.
-					Err(broadcast::error::RecvError::Closed) => continue,
+					Err(broadcast::error::RecvError::Closed) => self.wire_events_closed = true,
 				},
 			}
 		}
@@ -607,124 +681,10 @@ impl RpcSession {
 					.collect();
 				success_frame(&id, "get_commands", json!({ "commands": commands }))
 			}
-			RpcCommand::NewSession { parent_session } => {
-				// The replacement runs in the session task; extensions could
-				// cancel upstream, and this port has none, so the response is
-				// always `cancelled: false` (the module doc records the
-				// async-response skew).
-				let _ = self
-					.cmd_tx
-					.send(SessionCommand::NewSession { parent_session });
-				success_frame(&id, "new_session", json!({ "cancelled": false }))
-			}
-			RpcCommand::SwitchSession { session_path } => {
-				// Pre-validate synchronously so failures answer like upstream
-				// (which awaits the switch): a valid log, and an existing
-				// stored cwd (`assertSessionCwdExists`).
-				let path = std::path::Path::new(&session_path);
-				let dir = if path.is_dir() {
-					path
-				} else {
-					path.parent().unwrap_or(path)
-				};
-				match peek_session_header(dir) {
-					None => error_frame(
-						&id,
-						"switch_session",
-						format!("cannot open session {session_path}: no session header"),
-					),
-					Some(header)
-						if !header.cwd.is_empty()
-							&& !std::path::Path::new(&header.cwd).exists() =>
-					{
-						error_frame(
-							&id,
-							"switch_session",
-							format!(
-								"Stored session working directory does not exist: {}",
-								header.cwd
-							),
-						)
-					}
-					Some(_) => {
-						let _ = self
-							.cmd_tx
-							.send(SessionCommand::SwitchSession { path: session_path });
-						success_frame(&id, "switch_session", json!({ "cancelled": false }))
-					}
-				}
-			}
-			RpcCommand::Fork { entry_id } => {
-				// Upstream `fork` defaults to position "before": the entry
-				// must be a user message and the message text rides back as
-				// `selectedText`. Pre-computed from the live log so the
-				// response matches upstream's awaited result.
-				let outcome: Result<Option<String>, String> = {
-					let guard = self.log.lock().unwrap();
-					let session = &guard.session;
-					if session.session_dir().is_none() {
-						Err(
-							"This session has not been saved yet. Send a message before cloning or forking it."
-								.into(),
-						)
-					} else {
-						match session.get_entry(&entry_id) {
-							None => Err("Invalid entry ID for forking".into()),
-							Some(entry) => match &entry.kind {
-								EntryKind::Message { message } => match message.as_ref() {
-									pi_ai::Message::User(user) => Ok(Some(user.content.as_text())),
-									_ => Err("Invalid entry ID for forking".into()),
-								},
-								_ => Err("Invalid entry ID for forking".into()),
-							},
-						}
-					}
-				};
-				match outcome {
-					Err(error) => error_frame(&id, "fork", error),
-					Ok(selected_text) => {
-						let _ = self.cmd_tx.send(SessionCommand::Fork {
-							entry_id,
-							position: ForkPosition::Before,
-						});
-						let mut data = json!({ "cancelled": false });
-						if let Some(text) = selected_text {
-							data["text"] = json!(text);
-						}
-						success_frame(&id, "fork", data)
-					}
-				}
-			}
-			RpcCommand::Clone => {
-				// Upstream clones at the current leaf (`fork(leafId, {position: "at"})`).
-				let (persisted, leaf) = {
-					let guard = self.log.lock().unwrap();
-					(
-						guard.session.session_dir().is_some(),
-						guard.session.leaf_id().map(str::to_owned),
-					)
-				};
-				match (persisted, leaf) {
-					(_, None) => error_frame(
-						&id,
-						"clone",
-						"Cannot clone session: no current entry selected",
-					),
-					// Same unsaved refusal as upstream (runtime.ts:314).
-					(false, Some(_)) => error_frame(
-						&id,
-						"clone",
-						"This session has not been saved yet. Send a message before cloning or forking it.",
-					),
-					(true, Some(entry_id)) => {
-						let _ = self.cmd_tx.send(SessionCommand::Fork {
-							entry_id,
-							position: ForkPosition::At,
-						});
-						success_frame(&id, "clone", json!({ "cancelled": false }))
-					}
-				}
-			}
+			RpcCommand::NewSession { .. }
+			| RpcCommand::SwitchSession { .. }
+			| RpcCommand::Fork { .. }
+			| RpcCommand::Clone => unreachable!("replacement commands are handled asynchronously"),
 			RpcCommand::GetForkMessages => {
 				// Upstream `getUserMessagesForForking`: user messages with
 				// their entry ids (`contentText` extraction).
@@ -1156,8 +1116,12 @@ pub async fn run_rpc(
 		}};
 	}
 	loop {
+		let accepting_commands = session
+			.pending_replacements
+			.load(std::sync::atomic::Ordering::Relaxed)
+			== 0;
 		tokio::select! {
-			line = line_rx.recv() => {
+			line = line_rx.recv(), if accepting_commands => {
 				let Some(line) = line else { break };
 				for frame in session.handle_line(&line) {
 					emit!(frame);
@@ -1178,6 +1142,27 @@ mod tests {
 	use super::*;
 	use pi_agent::{Agent, AgentOptions};
 	use std::time::Duration;
+
+	async fn replacement_response(session: &mut RpcSession, request: &str) -> Value {
+		let request_value: Value = serde_json::from_str(request).unwrap();
+		let immediate = session.handle_line(request);
+		if let Some(frame) = immediate.first() {
+			return parse_frame(frame);
+		}
+		tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				let frame = parse_frame(&session.next_event_frame().await.unwrap());
+				if frame["type"] == "response"
+					&& frame["command"] == request_value["type"]
+					&& frame["id"] == request_value["id"]
+				{
+					return frame;
+				}
+			}
+		})
+		.await
+		.unwrap()
+	}
 
 	fn mock_handle() -> (SessionHandle, Arc<Mutex<ModelRegistry>>) {
 		mock_handle_with_reasoning(false)
@@ -1925,21 +1910,23 @@ mod tests {
 	#[tokio::test]
 	async fn fork_frames_validate_entry_and_unsaved_session() {
 		let (handle, registry) = mock_handle();
-		let session = RpcSession::new(handle, registry);
+		let mut session = RpcSession::new(handle, registry);
 		// In-memory session: fork/clone refuse until the session is saved.
-		let frame = parse_frame(
-			&session.handle_line(r#"{"type":"fork","entryId":"whatever","id":"f"}"#)[0],
-		);
+		let frame = replacement_response(
+			&mut session,
+			r#"{"type":"fork","entryId":"whatever","id":"f"}"#,
+		)
+		.await;
 		assert_eq!(frame["success"], false);
 		assert!(
 			frame["error"]
 				.as_str()
 				.unwrap()
-				.contains("has not been saved yet")
+				.contains("Invalid entry ID")
 		);
 		// The in-memory session has startup entries, so the leaf exists — the
 		// unsaved refusal is what the frame must carry.
-		let frame = parse_frame(&session.handle_line(r#"{"type":"clone","id":"c"}"#)[0]);
+		let frame = replacement_response(&mut session, r#"{"type":"clone","id":"c"}"#).await;
 		assert_eq!(frame["success"], false);
 		assert!(
 			frame["error"]
@@ -2002,31 +1989,15 @@ mod tests {
 			.to_string();
 
 		// fork(Before) at the first user message answers with its text.
-		let frame = parse_frame(
-			&session.handle_line(&format!(
-				r#"{{"type":"fork","entryId":"{entry_id}","id":"f1"}}"#
-			))[0],
-		);
+		let frame = replacement_response(
+			&mut session,
+			&format!(r#"{{"type":"fork","entryId":"{entry_id}","id":"f1"}}"#),
+		)
+		.await;
 		assert_eq!(frame["success"], true);
 		assert_eq!(frame["id"], "f1");
 		assert_eq!(frame["data"]["cancelled"], false);
 		assert_eq!(frame["data"]["text"], "first question");
-		let fork_notice = tokio::time::timeout(Duration::from_secs(10), async {
-			loop {
-				let frame = parse_frame(&session.next_event_frame().await.unwrap());
-				if frame["type"] == "notice"
-					&& frame["message"]
-						.as_str()
-						.unwrap_or("")
-						.starts_with("session → ")
-				{
-					break frame["message"].as_str().unwrap().to_string();
-				}
-			}
-		})
-		.await
-		.expect("the fork replacement should finish");
-		assert!(!fork_notice.is_empty());
 		// get_state follows the branched session.
 		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
 		let branched = frame["data"]["sessionFile"].as_str().unwrap().to_string();
@@ -2035,26 +2006,9 @@ mod tests {
 		// Prompt the branched session, then clone at the leaf.
 		session.handle_line(r#"{"type":"prompt","message":"edited"}"#);
 		until_agent_end(&mut session).await;
-		let frame = parse_frame(&session.handle_line(r#"{"type":"clone","id":"c1"}"#)[0]);
+		let frame = replacement_response(&mut session, r#"{"type":"clone","id":"c1"}"#).await;
 		assert_eq!(frame["success"], true);
 		assert_eq!(frame["data"]["cancelled"], false);
-		// Wait for the clone's replacement to land before probing state (the
-		// fork's notice was already consumed above).
-		tokio::time::timeout(Duration::from_secs(10), async {
-			loop {
-				let frame = parse_frame(&session.next_event_frame().await.unwrap());
-				if frame["type"] == "notice"
-					&& frame["message"]
-						.as_str()
-						.unwrap_or("")
-						.starts_with("session → ")
-				{
-					break;
-				}
-			}
-		})
-		.await
-		.expect("the clone replacement should finish");
 		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
 		let cloned = frame["data"]["sessionFile"].as_str().unwrap().to_string();
 		assert_ne!(cloned, branched, "the clone is its own session file");
@@ -2073,11 +2027,11 @@ mod tests {
 		let (handle, registry) = mock_handle_with_session("switch-frame");
 		let mut session = RpcSession::new(handle, registry);
 		// A missing target fails synchronously.
-		let frame = parse_frame(
-			&session.handle_line(
-				r#"{"type":"switch_session","sessionPath":"/nonexistent/session","id":"w"}"#,
-			)[0],
-		);
+		let frame = replacement_response(
+			&mut session,
+			r#"{"type":"switch_session","sessionPath":"/nonexistent/session","id":"w"}"#,
+		)
+		.await;
 		assert_eq!(frame["success"], false);
 		// A valid target answers cancelled:false and the session swaps.
 		let target = temp_rpc_dir("switch-target");
@@ -2089,29 +2043,16 @@ mod tests {
 				.append_message(&pi_ai::Message::user("switched history"))
 				.unwrap();
 		}
-		let frame = parse_frame(
-			&session.handle_line(&format!(
+		let frame = replacement_response(
+			&mut session,
+			&format!(
 				r#"{{"type":"switch_session","sessionPath":"{}","id":"w2"}}"#,
 				target.display()
-			))[0],
-		);
+			),
+		)
+		.await;
 		assert_eq!(frame["success"], true);
 		assert_eq!(frame["data"]["cancelled"], false);
-		tokio::time::timeout(Duration::from_secs(10), async {
-			loop {
-				let frame = parse_frame(&session.next_event_frame().await.unwrap());
-				if frame["type"] == "notice"
-					&& frame["message"]
-						.as_str()
-						.unwrap_or("")
-						.starts_with("session → ")
-				{
-					break;
-				}
-			}
-		})
-		.await
-		.expect("the switch should finish");
 		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
 		assert_eq!(
 			frame["data"]["sessionFile"],
@@ -2128,27 +2069,100 @@ mod tests {
 		let mut session = RpcSession::new(handle, registry);
 		session.handle_line(r#"{"type":"prompt","message":"old"}"#);
 		until_agent_end(&mut session).await;
-		let frame = parse_frame(&session.handle_line(r#"{"type":"new_session","id":"n"}"#)[0]);
+		let frame = replacement_response(&mut session, r#"{"type":"new_session","id":"n"}"#).await;
 		assert_eq!(frame["success"], true);
 		assert_eq!(frame["data"]["cancelled"], false);
-		tokio::time::timeout(Duration::from_secs(10), async {
+		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
+		assert_eq!(frame["data"]["messageCount"], 1, "fresh transcript");
+		session.shutdown();
+	}
+
+	#[tokio::test]
+	async fn switch_reports_save_failure_and_keeps_original_state() {
+		let root = temp_rpc_dir("switch-save-failure");
+		std::fs::create_dir_all(&root).unwrap();
+		let target =
+			crate::core::session_manager::SessionManager::create_with_parent_in(&root, &root, None)
+				.unwrap();
+		let target_path = target.session_dir().unwrap().to_path_buf();
+		let readonly_path = root.join("readonly.jsonl");
+		std::fs::write(&readonly_path, "").unwrap();
+		let (handle, registry) = mock_handle();
+		{
+			let mut log = handle.log.lock().unwrap();
+			log.session = crate::core::session_manager::SessionManager::with_file(
+				root.clone(),
+				std::fs::File::open(&readonly_path).unwrap(),
+			);
+		}
+		let mut session = RpcSession::new(handle, registry);
+		session.handle_line(r#"{"type":"prompt","message":"keep me"}"#);
+		until_agent_end(&mut session).await;
+		let frame = replacement_response(
+			&mut session,
+			&json!({"type":"switch_session", "id":"failure", "sessionPath":target_path})
+				.to_string(),
+		)
+		.await;
+		assert_eq!(frame["id"], "failure");
+		assert_eq!(frame["success"], false);
+		assert!(
+			frame["error"]
+				.as_str()
+				.unwrap()
+				.contains("could not be saved")
+		);
+		assert!(session.agent().snapshot().messages.iter().any(
+			|message| matches!(message, pi_ai::Message::User(user) if user.content.as_text() == "keep me")
+		));
+		session.shutdown_settled().await;
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn replacement_response_survives_wire_event_overflow() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		assert!(
+			session
+				.handle_line(r#"{"type":"new_session","id":"overflow"}"#)
+				.is_empty()
+		);
+		for _ in 0..2048 {
+			let _ = session
+				.shared
+				.wire_events
+				.send(WireEvent::SessionInfoChanged { name: None });
+		}
+		let response = tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				let frame = parse_frame(&session.next_event_frame().await.unwrap());
-				if frame["type"] == "notice"
-					&& frame["message"]
-						.as_str()
-						.unwrap_or("")
-						.starts_with("session → ")
-				{
-					break;
+				if frame["id"] == "overflow" {
+					break frame;
 				}
 			}
 		})
 		.await
-		.expect("the replacement should finish");
-		let frame = parse_frame(&session.handle_line(r#"{"type":"get_state"}"#)[0]);
-		assert_eq!(frame["data"]["messageCount"], 1, "fresh transcript");
-		session.shutdown();
+		.unwrap();
+		assert_eq!(response["success"], true);
+		assert_eq!(
+			session
+				.pending_replacements
+				.load(std::sync::atomic::Ordering::Relaxed),
+			0
+		);
+		session.shutdown_settled().await;
+	}
+
+	#[tokio::test]
+	async fn replacement_reports_session_task_stopping_before_execution() {
+		let (handle, registry) = mock_handle();
+		let mut session = RpcSession::new(handle, registry);
+		session.cmd_tx.send(SessionCommand::Exit).unwrap();
+		let response =
+			replacement_response(&mut session, r#"{"type":"new_session","id":"stopped"}"#).await;
+		assert_eq!(response["success"], false);
+		assert!(response["error"].as_str().unwrap().contains("session task"));
 	}
 
 	// -- bash passthrough frames ----------------------------------------------

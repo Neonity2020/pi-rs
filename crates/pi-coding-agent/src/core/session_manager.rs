@@ -1204,6 +1204,7 @@ pub struct SessionManager {
 	by_id: HashMap<String, usize>,
 	leaf_id: Option<String>,
 	pending_sync: Option<String>,
+	pending_entry: Option<SessionEntry>,
 	pending_metadata: bool,
 	pending_message_id: Option<String>,
 	#[cfg(test)]
@@ -1431,6 +1432,7 @@ impl SessionManager {
 			by_id: HashMap::new(),
 			leaf_id: None,
 			pending_sync: None,
+			pending_entry: None,
 			pending_metadata: false,
 			pending_message_id: None,
 			#[cfg(test)]
@@ -1636,6 +1638,13 @@ impl SessionManager {
 	/// Append one entry as a child of the current leaf; returns the assigned
 	/// entry id. No-op write for in-memory sessions (state still advances).
 	pub fn append(&mut self, mut entry: SessionEntry) -> Result<Option<String>, SessionError> {
+		if let Some(pending) = &self.pending_entry
+			&& entry.base.id.is_some()
+			&& entry.base.id == pending.base.id
+			&& entry.kind == pending.kind
+		{
+			entry = pending.clone();
+		}
 		if entry.base.id.is_none() {
 			let taken = |id: &str| self.by_id.contains_key(id);
 			entry.base.id = Some(generate_entry_id(&taken));
@@ -1655,7 +1664,13 @@ impl SessionManager {
 		let value = entry.to_value();
 		let mut line = serde_json::to_string(&value)?;
 		line.push('\n');
-		self.append_line(&line, is_message)?;
+		if let Err(error) = self.append_line(&line, is_message) {
+			if self.pending_sync.as_deref() == Some(line.as_str()) {
+				self.pending_entry = Some(entry);
+			}
+			return Err(error);
+		}
+		self.pending_entry = None;
 		self.index_entry(entry);
 		Ok(id)
 	}
@@ -1752,6 +1767,9 @@ impl SessionManager {
 			self.pending_sync = None;
 			self.pending_metadata = false;
 			self.entries_written += 1;
+			if let Some(entry) = self.pending_entry.take() {
+				self.index_entry(entry);
+			}
 		}
 		Ok(())
 	}
@@ -1759,6 +1777,10 @@ impl SessionManager {
 	/// List recent sessions (newest first) with their entry counts.
 	pub fn list_recent(limit: usize) -> Vec<(PathBuf, u64)> {
 		list_recent_in(&config::sessions_dir(), limit)
+	}
+
+	pub fn recent_paths(limit: usize) -> Vec<PathBuf> {
+		recent_session_paths(&config::sessions_dir(), limit)
 	}
 
 	/// `createBranchedSession(leafId)` upstream (`session-manager.ts:1632`):
@@ -1857,7 +1879,7 @@ pub enum SessionSelector {
 	/// skipped.
 	Recent,
 	/// `--resume <id|path>`: a session id (directory name under the sessions
-	/// root, exact or unique prefix) or a path to the session directory.
+	/// root, exact or unique prefix) or a path to the session directory or log.
 	ByIdOrPath(String),
 }
 
@@ -1874,19 +1896,25 @@ pub fn resolve_session_in(
 	selector: &SessionSelector,
 ) -> Result<PathBuf, String> {
 	match selector {
-		SessionSelector::Recent => list_recent_in(root, usize::MAX)
+		SessionSelector::Recent => recent_session_paths(root, usize::MAX)
 			.into_iter()
-			.find(|(dir, _)| {
+			.find(|dir| {
 				peek_session_header(dir).is_some_and(|header| {
 					!header.cwd.is_empty() && paths_equivalent(Path::new(&header.cwd), cwd)
 				})
 			})
-			.map(|(dir, _)| dir)
 			.ok_or_else(|| format!("no previous session to continue in {}", cwd.display())),
 		SessionSelector::ByIdOrPath(arg) => {
-			let candidate = PathBuf::from(arg);
+			let candidate = cwd.join(arg);
 			if candidate.is_dir() {
 				return Ok(candidate);
+			}
+			if candidate.is_file()
+				&& candidate
+					.file_name()
+					.is_some_and(|name| name == "session.jsonl")
+			{
+				return Ok(candidate.parent().unwrap_or(cwd).to_path_buf());
 			}
 			// Exact id (directory name), then a unique prefix match.
 			let exact = root.join(arg);
@@ -1968,20 +1996,37 @@ fn sanitize_session_name(name: &str) -> String {
 }
 
 fn list_recent_in(root: &Path, limit: usize) -> Vec<(PathBuf, u64)> {
+	recent_session_paths(root, limit)
+		.into_iter()
+		.map(|path| {
+			let count = count_entries(&path).unwrap_or(0);
+			(path, count)
+		})
+		.collect()
+}
+
+fn recent_session_paths(root: &Path, limit: usize) -> Vec<PathBuf> {
 	let Ok(entries) = std::fs::read_dir(root) else {
 		return Vec::new();
 	};
-	let mut sessions: Vec<(PathBuf, u64)> = entries
+	let mut sessions: Vec<(PathBuf, std::time::SystemTime)> = entries
 		.flatten()
 		.filter(|e| e.path().is_dir())
-		.map(|e| {
-			let entries = count_entries(&e.path()).unwrap_or(0);
-			(e.path(), entries)
+		.filter_map(|e| {
+			let path = e.path();
+			let metadata = std::fs::metadata(path.join("session.jsonl")).ok()?;
+			if !metadata.is_file() {
+				return None;
+			}
+			let modified = metadata
+				.modified()
+				.unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+			Some((path, modified))
 		})
 		.collect();
-	sessions.sort_by(|a, b| b.0.cmp(&a.0));
+	sessions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 	sessions.truncate(limit);
-	sessions
+	sessions.into_iter().map(|(path, _)| path).collect()
 }
 
 fn prefix_matches(root: &Path, prefix: &str) -> Vec<PathBuf> {
@@ -2478,6 +2523,26 @@ mod tests {
 		let text = std::fs::read_to_string(dir.join("session.jsonl")).unwrap();
 		assert_eq!(text.lines().count(), 3);
 		assert_eq!(session.entries_written, 3);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn message_retry_preserves_assigned_timestamp_after_sync_failure() {
+		let dir = temp_session_dir("message-timestamp-retry");
+		let mut session = open_bare(&dir);
+		session.fail_next_sync();
+		let message = user_message("once");
+		assert!(session.append_message(&message).is_err());
+		std::thread::sleep(std::time::Duration::from_millis(5));
+		session.append_message(&message).unwrap();
+		let (_, entries) = load_session_file(&dir.join("session.jsonl"));
+		assert_eq!(entries.len(), 1);
+		assert_eq!(
+			entries[0].kind,
+			EntryKind::Message {
+				message: Box::new(message)
+			}
+		);
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 
@@ -3408,11 +3473,41 @@ mod tests {
 	fn resolve_recent_picks_newest() {
 		let root = resume_root("recent");
 		let cwd = Path::new("/project");
-		make_session(&root, "20260101-000000-1", cwd, "old");
-		make_session(&root, "20260303-000000-3", cwd, "new");
-		make_session(&root, "20260202-000000-2", cwd, "mid");
+		let old = make_session(&root, "20260101-000000-1", cwd, "old");
+		let new = make_session(&root, "20260303-000000-3", cwd, "new");
+		let mid = make_session(&root, "20260202-000000-2", cwd, "mid");
+		for (path, seconds) in [(&old, 1), (&new, 3), (&mid, 2)] {
+			std::fs::File::open(path.join("session.jsonl"))
+				.unwrap()
+				.set_modified(
+					std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+				)
+				.unwrap();
+		}
 		let dir = resolve_session_in(&root, cwd, &SessionSelector::Recent).unwrap();
 		assert_eq!(dir.file_name().unwrap(), "20260303-000000-3");
+		std::fs::File::open(old.join("session.jsonl"))
+			.unwrap()
+			.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(4))
+			.unwrap();
+		assert_eq!(
+			resolve_session_in(&root, cwd, &SessionSelector::Recent).unwrap(),
+			old
+		);
+		assert_eq!(list_recent_in(&root, 1)[0].0, old);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn recent_session_listing_can_include_more_than_one_hundred_sessions() {
+		let root = resume_root("many-sessions");
+		for index in 0..105 {
+			let dir = root.join(format!("session-{index:03}"));
+			std::fs::create_dir_all(&dir).unwrap();
+			std::fs::write(dir.join("session.jsonl"), "{}\n").unwrap();
+		}
+		assert_eq!(list_recent_in(&root, usize::MAX).len(), 105);
+		assert_eq!(list_recent_in(&root, 100).len(), 100);
 		std::fs::remove_dir_all(root).unwrap();
 	}
 
@@ -3524,6 +3619,16 @@ mod tests {
 				&root,
 				Path::new("/p"),
 				&SessionSelector::ByIdOrPath(target.display().to_string())
+			)
+			.unwrap(),
+			target
+		);
+		let id = target.file_name().unwrap().to_str().unwrap();
+		assert_eq!(
+			resolve_session_in(
+				&root,
+				&root,
+				&SessionSelector::ByIdOrPath(format!("{id}/session.jsonl"))
 			)
 			.unwrap(),
 			target

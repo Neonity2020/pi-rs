@@ -21,9 +21,38 @@ pub struct Settings {
 	pub external_editor: Option<String>,
 	pub shell_path: Option<String>,
 	pub compaction: Option<CompactionSettings>,
+	pub retry: Option<RetrySettings>,
 	/// Raw `defaultTools` selection: plain names/patterns or `+name`/`-name`
 	/// modifiers, resolved by `tool_selection::resolve_default_tools`.
 	pub default_tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RetrySettings {
+	pub enabled: Option<bool>,
+	pub max_retries: Option<u32>,
+	pub base_delay_ms: Option<u64>,
+	pub max_agent_delay_ms: Option<u64>,
+}
+
+impl RetrySettings {
+	fn merged(project: Option<&Self>, global: Option<&Self>) -> Self {
+		Self {
+			enabled: project
+				.and_then(|s| s.enabled)
+				.or_else(|| global.and_then(|s| s.enabled)),
+			max_retries: project
+				.and_then(|s| s.max_retries)
+				.or_else(|| global.and_then(|s| s.max_retries)),
+			base_delay_ms: project
+				.and_then(|s| s.base_delay_ms)
+				.or_else(|| global.and_then(|s| s.base_delay_ms)),
+			max_agent_delay_ms: project
+				.and_then(|s| s.max_agent_delay_ms)
+				.or_else(|| global.and_then(|s| s.max_agent_delay_ms)),
+		}
+	}
 }
 
 /// `compaction` settings — upstream `CompactionSettings`
@@ -97,6 +126,10 @@ impl SettingsManager {
 	pub fn effective(&self) -> Settings {
 		use crate::core::tool_selection::merge_default_tools;
 		Settings {
+			retry: Some(RetrySettings::merged(
+				self.project.retry.as_ref(),
+				self.global.retry.as_ref(),
+			)),
 			compaction: Some(CompactionSettings::merged(
 				self.project.compaction.as_ref(),
 				self.global.compaction.as_ref(),
@@ -156,6 +189,25 @@ fn load_settings(path: &std::path::Path) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn retry_merges_fields_across_layers() {
+		let global: Settings = serde_json::from_str(
+			r#"{"retry":{"enabled":false,"maxRetries":5,"baseDelayMs":100,"maxAgentDelayMs":500}}"#,
+		)
+		.unwrap();
+		let project: Settings =
+			serde_json::from_str(r#"{"retry":{"enabled":true,"baseDelayMs":20}}"#).unwrap();
+		let merged = RetrySettings::merged(project.retry.as_ref(), global.retry.as_ref());
+		assert_eq!(
+			(
+				merged.enabled,
+				merged.max_retries,
+				merged.base_delay_ms,
+				merged.max_agent_delay_ms
+			),
+			(Some(true), Some(5), Some(20), Some(500))
+		);
+	}
 	#[test]
 	fn compaction_merges_individual_settings() {
 		let global: Settings = serde_json::from_str(

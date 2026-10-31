@@ -78,7 +78,7 @@ use super::event_bus::{EventBus, EventBusWeak};
 use super::model_registry::ModelRegistry;
 use super::retry as retry_policy;
 use super::session_manager::{self, EntryKind, SessionEntry, SessionManager};
-use super::settings_manager::CompactionSettings;
+use super::settings_manager::{CompactionSettings, RetrySettings};
 
 /// Where a fork re-runs from — upstream `fork(entryId, {position})` with
 /// `"before"` (re-edit the message) or `"at"` (clone up to the entry).
@@ -92,8 +92,16 @@ pub enum ForkPosition {
 	At,
 }
 
-/// Commands a mode sends to the session task.
 #[derive(Debug, Clone)]
+pub enum RpcReplacement {
+	New { parent_session: Option<String> },
+	Switch { path: String },
+	Fork { entry_id: String },
+	Clone,
+}
+
+/// Commands a mode sends to the session task.
+#[derive(Debug)]
 pub enum SessionCommand {
 	/// New prompt; queued when a run is active.
 	Prompt {
@@ -139,6 +147,10 @@ pub enum SessionCommand {
 	Fork {
 		entry_id: String,
 		position: ForkPosition,
+	},
+	RpcReplacement {
+		operation: RpcReplacement,
+		response: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
 	},
 	/// Run a bash command outside the agent loop (RPC `bash`).
 	ExecuteBash {
@@ -239,6 +251,8 @@ pub enum SessionEvent {
 	Persisted {
 		kind: &'static str,
 	},
+	/// Internal notification that the live agent has been replaced.
+	SessionReplaced,
 	/// The session reached a quiescent state: no active run, no in-flight
 	/// compaction, empty prompt queue (upstream `agent_settled` — the RPC
 	/// client's lifecycle anchor for "no auto-continuation is pending").
@@ -290,6 +304,9 @@ pub(crate) type SharedLogRef = Arc<std::sync::Mutex<SharedLog>>;
 /// updates the slots in place on session replacement; probes read them
 /// without round-tripping a command.
 pub(crate) struct SessionShared {
+	prompt_options: super::system_prompt::SystemPromptOptions,
+	mcp: std::sync::Mutex<Option<Arc<tokio::sync::Mutex<super::tools::McpRuntime>>>>,
+	tool_options: std::sync::Mutex<Option<ToolRuntimeOptions>>,
 	/// The live agent (swapped on session replacement).
 	pub(crate) live_agent: Arc<std::sync::Mutex<Agent>>,
 	/// The live session file (`…/session.jsonl`); `None` while unpersisted.
@@ -308,13 +325,20 @@ pub(crate) struct SessionShared {
 	pub(crate) retry: Arc<std::sync::Mutex<RetryRuntime>>,
 }
 
-/// The auto-retry attempt counter plus the effective backoff base. The
-/// shipped settings schema has no retry key yet, so the base defaults to
-/// `retry::RETRY_BASE_DELAY_MS`; tests shorten it through this slot.
+#[derive(Clone)]
+pub struct ToolRuntimeOptions {
+	pub tools: Option<Vec<String>>,
+	pub exclude: Vec<String>,
+	pub no_tools: Option<super::tool_selection::NoTools>,
+}
+
+/// The auto-retry attempt counter and effective retry settings.
 #[derive(Debug)]
 pub(crate) struct RetryRuntime {
 	pub(crate) attempt: u32,
 	pub(crate) base_delay_ms: u64,
+	pub(crate) max_retries: u32,
+	pub(crate) max_delay_ms: u64,
 }
 
 impl SessionShared {
@@ -357,9 +381,27 @@ pub struct SessionHandle {
 	pub(crate) shared: Arc<SessionShared>,
 	/// Wire-level events (bash updates, retry lifecycle), pre-subscribed.
 	pub wire_events: tokio::sync::broadcast::Receiver<WireEvent>,
-	/// Auto-retry toggle (runtime state; the settings schema has no retry
-	/// key yet — see `core/retry.rs`).
+	/// Auto-retry toggle, initialized from settings and mutable at runtime.
 	pub(crate) auto_retry: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionHandle {
+	pub fn configure_tool_options(&self, options: ToolRuntimeOptions) {
+		*self.shared.tool_options.lock().unwrap() = Some(options);
+	}
+
+	pub fn mcp_enabled(&self) -> bool {
+		self.shared.mcp.lock().unwrap().is_some()
+	}
+
+	pub fn configure_mcp(
+		&self,
+		runtime: super::tools::McpRuntime,
+	) -> Arc<tokio::sync::Mutex<super::tools::McpRuntime>> {
+		let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+		*self.shared.mcp.lock().unwrap() = Some(runtime.clone());
+		runtime
+	}
 }
 
 /// Build and spawn the session task.
@@ -373,9 +415,27 @@ pub fn spawn_agent_session(
 
 pub fn spawn_agent_session_with_settings(
 	agent: Agent,
+	session: SessionManager,
+	registry: Arc<std::sync::Mutex<ModelRegistry>>,
+	settings: CompactionSettings,
+) -> SessionHandle {
+	spawn_agent_session_with_options(
+		agent,
+		session,
+		registry,
+		settings,
+		Default::default(),
+		Default::default(),
+	)
+}
+
+pub fn spawn_agent_session_with_options(
+	agent: Agent,
 	mut session: SessionManager,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 	settings: CompactionSettings,
+	prompt_options: super::system_prompt::SystemPromptOptions,
+	retry_settings: RetrySettings,
 ) -> SessionHandle {
 	let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 	let event_bus = EventBus::<SessionEvent>::new();
@@ -401,6 +461,9 @@ pub fn spawn_agent_session_with_settings(
 	}));
 
 	let shared = Arc::new(SessionShared {
+		prompt_options,
+		mcp: std::sync::Mutex::new(None),
+		tool_options: std::sync::Mutex::new(None),
 		live_agent: Arc::new(std::sync::Mutex::new(agent.clone())),
 		current_session_file: Arc::new(std::sync::Mutex::new(
 			session_dir.as_ref().map(|dir| dir.join("session.jsonl")),
@@ -412,7 +475,15 @@ pub fn spawn_agent_session_with_settings(
 		agent_end_will_retry: Arc::new(std::sync::Mutex::new(VecDeque::new())),
 		retry: Arc::new(std::sync::Mutex::new(RetryRuntime {
 			attempt: 0,
-			base_delay_ms: retry_policy::RETRY_BASE_DELAY_MS,
+			base_delay_ms: retry_settings
+				.base_delay_ms
+				.unwrap_or(retry_policy::RETRY_BASE_DELAY_MS),
+			max_retries: retry_settings
+				.max_retries
+				.unwrap_or(retry_policy::RETRY_MAX_RETRIES),
+			max_delay_ms: retry_settings
+				.max_agent_delay_ms
+				.unwrap_or(retry_policy::RETRY_MAX_AGENT_DELAY_MS),
 		})),
 	});
 	shared.publish_session(&log.lock().unwrap().session, &agent);
@@ -430,7 +501,9 @@ pub fn spawn_agent_session_with_settings(
 	);
 
 	let auto_retry = Arc::new(std::sync::atomic::AtomicBool::new(
-		retry_policy::RETRY_ENABLED_DEFAULT,
+		retry_settings
+			.enabled
+			.unwrap_or(retry_policy::RETRY_ENABLED_DEFAULT),
 	));
 
 	tokio::spawn(session_task(
@@ -961,6 +1034,36 @@ async fn session_task(
 							Err(error) => notice(&event_bus, error),
 						}
 					}
+					SessionCommand::RpcReplacement { operation, response } => {
+						let planned = match operation {
+							RpcReplacement::New { parent_session } => plan_new_session(&log, parent_session).map(|plan| (plan, None)),
+							RpcReplacement::Switch { path } => plan_switch_session(&path).map(|plan| (plan, None)),
+							RpcReplacement::Fork { entry_id } => plan_fork(&log, &entry_id, ForkPosition::Before),
+							RpcReplacement::Clone => {
+								let leaf = log.lock().unwrap().session.leaf_id().map(str::to_owned);
+								leaf.ok_or_else(|| "Cannot clone session: no current entry selected".to_string()).and_then(|id| plan_fork(&log, &id, ForkPosition::At))
+							}
+						};
+						let result = match planned {
+							Err(error) => Err(error),
+							Ok((plan, selected_text)) => {
+								let generation = log.lock().unwrap().generation;
+								let (new_agent, new_rx) = apply_replacement(ReplacementContext {
+									agent: &agent, log: &log, event_bus: &event_bus, auto_compaction: &auto_compaction,
+									compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
+									agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
+									overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
+									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan,
+								}).await;
+								agent = new_agent;
+								agent_rx = new_rx;
+								if log.lock().unwrap().generation == generation {
+									Err("current conversation could not be saved".into())
+								} else { Ok(selected_text) }
+							}
+						};
+						let _ = response.send(result);
+					}
 					SessionCommand::ExecuteBash { command, exclude_from_context, id } => {
 						let (cwd, session_env, generation) = {
 							let guard = log.lock().unwrap();
@@ -1026,7 +1129,9 @@ async fn session_task(
 				}
 				// Persist the completed turn before selecting a durable cut.
 				let mut guard = log.lock().unwrap();
-				persist_messages(&agent, &mut guard, &event_bus);
+				if persist_messages(&agent, &mut guard, &event_bus) {
+					flush_pending_bash(&agent, &mut guard, &event_bus);
+				}
 				drop(guard);
 
 				// Mid-run compaction committed by the hook: the run was cut
@@ -1109,20 +1214,19 @@ async fn session_task(
 					&& last_assistant.as_ref().is_some_and(|assistant| {
 						retry_policy::is_retryable_error(assistant, agent.model().context_window)
 					})
-					&& shared.retry.lock().unwrap().attempt < retry_policy::RETRY_MAX_RETRIES;
+					&& { let retry = shared.retry.lock().unwrap(); retry.attempt < retry.max_retries };
 				if will_retry && compacting.is_none() && run.is_none() && !agent.is_streaming() {
 					match omit_failed_attempt(&agent, &log) {
 						Ok(()) => {
-							let (attempt, delay_ms) = {
+							let (attempt, delay_ms, max_retries) = {
 								let mut guard = shared.retry.lock().unwrap();
 								guard.attempt += 1;
-								let delay =
-									retry_policy::retry_delay_with(guard.base_delay_ms, guard.attempt);
-								(guard.attempt, delay)
+								let delay = retry_policy::retry_delay_capped(guard.base_delay_ms, guard.attempt, guard.max_delay_ms);
+								(guard.attempt, delay, guard.max_retries)
 							};
 							shared.emit(WireEvent::AutoRetryStart {
 								attempt,
-								max_attempts: retry_policy::RETRY_MAX_RETRIES,
+								max_attempts: max_retries,
 								delay_ms,
 								error_message: last_assistant
 									.as_ref()
@@ -1250,7 +1354,7 @@ async fn session_task(
 							// buffered event is forwarded.
 							let will_retry = !abort_requested
 								&& auto_retry.load(std::sync::atomic::Ordering::Relaxed)
-								&& shared.retry.lock().unwrap().attempt < retry_policy::RETRY_MAX_RETRIES
+								&& { let retry = shared.retry.lock().unwrap(); retry.attempt < retry.max_retries }
 								&& messages
 									.iter()
 									.rev()
@@ -1305,8 +1409,9 @@ async fn session_task(
 	}
 	if !compaction_commit_failed {
 		let mut guard = log.lock().unwrap();
-		flush_pending_bash(&agent, &mut guard, &event_bus);
-		persist_messages(&agent, &mut guard, &event_bus);
+		if persist_messages(&agent, &mut guard, &event_bus) {
+			flush_pending_bash(&agent, &mut guard, &event_bus);
+		}
 	}
 }
 
@@ -1323,12 +1428,12 @@ fn persist_thinking_level(log: &SharedLogRef, level: ThinkingLevel, bus: &EventB
 
 // The broadcast channel is lossy; the transcript is the authoritative source.
 // Advance only after a successful append so a later event can retry a failed write.
-fn persist_messages(agent: &Agent, log: &mut SharedLog, bus: &EventBus<SessionEvent>) {
+fn persist_messages(agent: &Agent, log: &mut SharedLog, bus: &EventBus<SessionEvent>) -> bool {
 	if let Err(error) = log.session.sync_pending_metadata() {
 		bus.emit(SessionEvent::Notice(format!(
 			"session write failed: {error}"
 		)));
-		return;
+		return false;
 	}
 	let snapshot = agent.snapshot();
 	for message in snapshot.messages.iter().skip(log.persisted) {
@@ -1341,10 +1446,11 @@ fn persist_messages(agent: &Agent, log: &mut SharedLog, bus: &EventBus<SessionEv
 			}
 			Err(e) => {
 				bus.emit(SessionEvent::Notice(format!("session write failed: {e}")));
-				break;
+				return false;
 			}
 		}
 	}
+	true
 }
 
 /// Reset the retry attempt counter and report the cancellation
@@ -1407,14 +1513,16 @@ fn bash_session_env_vars(
 /// Flush bash results that completed while the transcript was not fully
 /// persisted (upstream `_flushPendingBashMessages`, run at agent
 /// boundaries): persist the entry, then join the live context when eligible.
-fn flush_pending_bash(agent: &Agent, log: &mut SharedLog, bus: &EventBus<SessionEvent>) {
-	if log.pending_bash.is_empty() {
-		return;
+fn flush_pending_bash(agent: &Agent, log: &mut SharedLog, bus: &EventBus<SessionEvent>) -> bool {
+	let mut records = std::mem::take(&mut log.pending_bash).into_iter();
+	while let Some(mut record) = records.next() {
+		if !persist_bash_record(agent, log, bus, &mut record) {
+			log.pending_bash.push(record);
+			log.pending_bash.extend(records);
+			return false;
+		}
 	}
-	let records = std::mem::take(&mut log.pending_bash);
-	for record in records {
-		persist_bash_record(agent, log, bus, record);
-	}
+	true
 }
 
 /// Persist one bash record and — when the entry joins the model context —
@@ -1426,31 +1534,45 @@ fn persist_bash_record(
 	agent: &Agent,
 	log: &mut SharedLog,
 	bus: &EventBus<SessionEvent>,
-	record: PendingBashRecord,
-) {
-	if let Err(error) = log.session.append(record.entry) {
+	record: &mut PendingBashRecord,
+) -> bool {
+	let id = record
+		.entry
+		.base
+		.id
+		.get_or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
+		.clone();
+	record
+		.entry
+		.base
+		.timestamp
+		.get_or_insert_with(|| session_manager::iso_timestamp(pi_ai::types::now_ms()));
+	if log.session.get_entry(&id).is_none()
+		&& let Err(error) = log.session.append(record.entry.clone())
+	{
 		bus.emit(SessionEvent::Notice(format!(
 			"session write failed: {error}"
 		)));
-		return;
+		return false;
 	}
 	if log.session.session_dir().is_some() {
 		bus.emit(SessionEvent::Persisted { kind: "bash" });
 	}
-	let Some(text) = record.context_text else {
-		return; // excludeFromContext: persisted only
+	let Some(text) = &record.context_text else {
+		return true; // excludeFromContext: persisted only
 	};
 	let snapshot = agent.snapshot();
 	if agent.is_streaming() || log.persisted != snapshot.messages.len() {
 		// Transcript not settleable right now: the log stays authoritative
 		// and the context contribution reconciles on resume.
-		return;
+		return true;
 	}
 	let mut messages = snapshot.messages.clone();
-	messages.push(Message::user(text));
+	messages.push(Message::user(text.clone()));
 	if agent.replace_messages(messages).is_ok() {
 		log.persisted = agent.snapshot().messages.len();
 	}
+	true
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,7 +1782,6 @@ async fn apply_replacement(
 	finish_cancelled_retry(ctx.shared);
 	{
 		let mut guard = ctx.log.lock().unwrap();
-		flush_pending_bash(ctx.agent, &mut guard, ctx.event_bus);
 		persist_messages(ctx.agent, &mut guard, ctx.event_bus);
 	}
 	// Forward whatever the outgoing agent still has buffered (its final
@@ -1682,25 +1803,102 @@ async fn apply_replacement(
 		}
 		ctx.event_bus.emit(SessionEvent::Agent(Box::new(event)));
 	}
+	let saved = {
+		let mut guard = ctx.log.lock().unwrap();
+		persist_messages(ctx.agent, &mut guard, ctx.event_bus)
+			&& flush_pending_bash(ctx.agent, &mut guard, ctx.event_bus)
+	};
+	if !saved {
+		ctx.event_bus.emit(SessionEvent::Notice(
+			"session replacement cancelled: current conversation could not be saved".into(),
+		));
+		return (ctx.agent.clone(), ctx.agent.subscribe());
+	}
 
 	// -- build the replacement runtime -------------------------------------
 	let model = ctx.agent.model();
 	let thinking = ctx.agent.thinking_level();
 	let stream_fn = ctx.agent.stream_fn();
 	let (steering_mode, follow_up_mode) = ctx.agent.queue_modes();
-	// Tool table: rebuilt built-ins for the (possibly new) cwd, filtered to
-	// the startup tool-name set. Deviation: MCP tools (`mcp__*`) cannot be
-	// rebuilt here — the MCP assembly is owned by `main.rs` and does not
-	// re-run on replacement (upstream re-registers them at `session_start`).
-	let startup_names: std::collections::HashSet<String> =
-		ctx.agent.snapshot().tool_names.into_iter().collect();
-	let tools: Vec<Arc<dyn pi_agent::AgentTool>> = super::tools::create_tools(&ctx.plan.cwd)
+	// Rebuild cwd-bound tools. Existing MCP connections are valid only for the
+	// same project; a different cwd must not inherit its trusted project tools.
+	let same_cwd = session_cwd(&ctx.log.lock().unwrap().session) == ctx.plan.cwd;
+	let options = ctx.shared.tool_options.lock().unwrap().clone();
+	let selection = if !same_cwd {
+		options.and_then(|options| {
+			let settings =
+				super::settings_manager::SettingsManager::load(Some(&ctx.plan.cwd)).effective();
+			match super::tool_selection::resolve_tool_selection(
+				super::tool_selection::ToolSelectionInput {
+					tools: options.tools.as_deref(),
+					exclude_tools: &options.exclude,
+					no_tools: options.no_tools,
+					settings_default_tools: settings.default_tools.as_deref(),
+				},
+			) {
+				Ok(selection) => Some(selection),
+				Err(error) => {
+					ctx.event_bus.emit(SessionEvent::Notice(format!(
+						"tool selection failed: {error}"
+					)));
+					None
+				}
+			}
+		})
+	} else {
+		None
+	};
+	let startup_names: std::collections::HashSet<String> = selection
+		.as_ref()
+		.map(|selection| selection.builtin_active.clone())
+		.unwrap_or_else(|| ctx.agent.snapshot().tool_names)
+		.into_iter()
+		.collect();
+	let mut tools: Vec<Arc<dyn pi_agent::AgentTool>> = super::tools::create_tools(&ctx.plan.cwd)
 		.into_iter()
 		.filter(|tool| startup_names.contains(tool.name()))
 		.collect();
-	// Deviation: the rebuilt system prompt assumes context files enabled —
-	// the `--no-context-files` CLI flag is not visible to the session task.
-	let system_prompt = super::system_prompt::build_system_prompt(&ctx.plan.cwd, &tools, true);
+	if same_cwd {
+		tools.extend(
+			ctx.agent
+				.tools()
+				.into_iter()
+				.filter(|tool| tool.name().starts_with("mcp__")),
+		);
+	} else {
+		let runtime = ctx.shared.mcp.lock().unwrap().clone();
+		if let Some(runtime) = runtime {
+			let mut runtime = runtime.lock().await;
+			if let Some(selection) = &selection {
+				runtime.allow = selection.mcp_filter.clone();
+			}
+			for notice in runtime.reconnect(&ctx.plan.cwd).await {
+				ctx.event_bus
+					.emit(SessionEvent::Notice(format!("mcp: {notice}")));
+			}
+			tools.extend(runtime.assembly.tools.iter().cloned());
+		}
+	}
+	if let Some(index) = tools.iter().position(|tool| tool.name() == "bash") {
+		let session = &ctx.plan.new_session;
+		let context = super::tools::bash::SessionToolContext {
+			session_id: session.session_id(),
+			session_file: session
+				.session_dir()
+				.map(|dir| dir.join("session.jsonl").to_string_lossy().into_owned()),
+			provider: Some(model.provider.clone()),
+			model: Some(model.id.clone()),
+			reasoning_level: Some(format!("{thinking:?}").to_lowercase()),
+		};
+		tools[index] = Arc::new(
+			super::tools::bash::BashTool::new(ctx.plan.cwd.clone()).with_session_context(context),
+		);
+	}
+	let system_prompt = super::system_prompt::build_system_prompt_with_options(
+		&ctx.plan.cwd,
+		&tools,
+		&ctx.shared.prompt_options,
+	);
 	let new_agent = Agent::new(AgentOptions {
 		model,
 		thinking_level: thinking,
@@ -1740,6 +1938,7 @@ async fn apply_replacement(
 	}
 	ctx.shared
 		.publish_session(&ctx.log.lock().unwrap().session, &new_agent);
+	ctx.event_bus.emit(SessionEvent::SessionReplaced);
 	let destination = ctx
 		.shared
 		.current_session_file
@@ -1923,23 +2122,12 @@ async fn run_bash_job(job: BashJob) {
 		});
 		let mut guard = job.log.lock().unwrap();
 		let fully_persisted = guard.persisted == job.agent.snapshot().messages.len();
-		if fully_persisted {
-			persist_bash_record(
-				&job.agent,
-				&mut guard,
-				&job.bus,
-				PendingBashRecord {
-					entry,
-					context_text,
-				},
-			);
-		} else {
-			// Transcript tail not persisted yet: queue like upstream's
-			// `_pendingBashMessages`, flushed at the next run boundary.
-			guard.pending_bash.push(PendingBashRecord {
-				entry,
-				context_text,
-			});
+		guard.pending_bash.push(PendingBashRecord {
+			entry,
+			context_text,
+		});
+		if fully_persisted && !job.agent.is_streaming() {
+			flush_pending_bash(&job.agent, &mut guard, &job.bus);
 		}
 	}
 	job.shared.emit(WireEvent::BashExecutionDone {
@@ -2134,9 +2322,6 @@ fn omit_failed_attempt(agent: &Agent, log: &std::sync::Mutex<SharedLog>) -> anyh
 		let guard = log.lock().unwrap();
 		if guard.persisted != snapshot.messages.len() {
 			anyhow::bail!("transcript is not fully persisted");
-		}
-		if guard.session.session_dir().is_none() {
-			anyhow::bail!("overflow recovery needs a session log");
 		}
 		let projection = guard.session.projection();
 		let Some((entry_id, logged)) = projection.messages.last() else {
@@ -3472,6 +3657,9 @@ mod tests {
 			Arc::new(std::sync::atomic::AtomicBool::new(false)),
 			CompactionSettings::default(),
 			Arc::new(SessionShared {
+				prompt_options: Default::default(),
+				mcp: std::sync::Mutex::new(None),
+				tool_options: std::sync::Mutex::new(None),
 				live_agent: Arc::new(std::sync::Mutex::new(agent.clone())),
 				current_session_file: Arc::new(std::sync::Mutex::new(Some(
 					dir.join("session.jsonl"),
@@ -3482,6 +3670,8 @@ mod tests {
 				retry: Arc::new(std::sync::Mutex::new(RetryRuntime {
 					attempt: 0,
 					base_delay_ms: retry_policy::RETRY_BASE_DELAY_MS,
+					max_retries: retry_policy::RETRY_MAX_RETRIES,
+					max_delay_ms: retry_policy::RETRY_MAX_AGENT_DELAY_MS,
 				})),
 			}),
 			Arc::new(std::sync::atomic::AtomicBool::new(
@@ -4007,7 +4197,340 @@ mod tests {
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 
+	#[tokio::test]
+	async fn session_switch_preserves_unsaved_conversation_when_log_write_fails() {
+		let dir = temp_session_dir("replace-write-failure");
+		let target = SessionManager::create_with_parent_in(&dir, &dir, None).unwrap();
+		let target_path = target.session_dir().unwrap().to_path_buf();
+		let readonly_path = dir.join("readonly.jsonl");
+		std::fs::write(&readonly_path, "").unwrap();
+		let session =
+			SessionManager::with_file(dir.clone(), std::fs::File::open(&readonly_path).unwrap());
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session(mock_agent(), session, registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "keep this conversation".into(),
+			})
+			.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				if matches!(
+					handle.events.recv().await.unwrap(),
+					SessionEvent::Settled { .. }
+				) {
+					break;
+				}
+			}
+		})
+		.await
+		.unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::SwitchSession {
+				path: target_path.to_string_lossy().into_owned(),
+			})
+			.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				match handle.events.recv().await.unwrap() {
+					SessionEvent::Notice(text)
+						if text.contains("session replacement cancelled") =>
+					{
+						break;
+					}
+					SessionEvent::SessionReplaced => panic!("unsaved conversation was discarded"),
+					_ => {}
+				}
+			}
+		})
+		.await
+		.unwrap();
+		assert_eq!(
+			handle.log.lock().unwrap().session.session_dir(),
+			Some(dir.as_path())
+		);
+		assert!(handle.shared.live_agent.lock().unwrap().snapshot().messages.iter().any(|message| matches!(message, Message::User(user) if user.content.as_text() == "keep this conversation")));
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn failed_bash_sync_retries_once_and_keeps_session_tree_consistent() {
+		let root = temp_session_dir("bash-sync-retry");
+		let mut session = SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+		let session_dir = session.session_dir().unwrap().to_path_buf();
+		session.fail_next_sync();
+		let mut log = SharedLog {
+			session,
+			persisted: 0,
+			pending_mid_run: None,
+			generation: 0,
+			pending_bash: vec![PendingBashRecord {
+				entry: SessionEntry::new(EntryKind::BashExecution {
+					command: "echo hi".into(),
+					output: "hi\n".into(),
+					exit_code: Some(0),
+					cancelled: false,
+					truncated: false,
+					full_output_path: None,
+					exclude_from_context: false,
+				}),
+				context_text: Some("bash output: hi".into()),
+			}],
+		};
+		let agent = mock_agent();
+		log.persisted = agent.snapshot().messages.len();
+		let initial_messages = log.persisted;
+		let bus = EventBus::new();
+		assert!(!flush_pending_bash(&agent, &mut log, &bus));
+		assert_eq!(log.pending_bash.len(), 1);
+		assert!(persist_messages(&agent, &mut log, &bus));
+		assert!(flush_pending_bash(&agent, &mut log, &bus));
+		assert!(log.pending_bash.is_empty());
+		assert_eq!(agent.snapshot().messages.len(), initial_messages + 1);
+		log.session.append_message(&Message::user("next")).unwrap();
+		let (_, entries) = session_manager::load_session_file(&session_dir.join("session.jsonl"));
+		assert_eq!(entries.len(), 2);
+		assert!(matches!(entries[0].kind, EntryKind::BashExecution { .. }));
+		assert_eq!(entries[1].parent_id(), entries[0].id());
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
 	// -- session replacement --------------------------------------------------
+	#[tokio::test]
+	async fn cross_project_switch_reloads_default_tools_and_keeps_cli_overrides() {
+		let root = temp_session_dir("replace-project-tools");
+		let first = root.join("first");
+		let second = root.join("second");
+		std::fs::create_dir_all(&first).unwrap();
+		std::fs::create_dir_all(second.join(".pi")).unwrap();
+		std::fs::write(
+			second.join(".pi/settings.json"),
+			r#"{"defaultTools":["grep"]}"#,
+		)
+		.unwrap();
+		for (tools, exclude, no_tools, expected) in [
+			(None, vec![], None, vec!["grep"]),
+			(Some(vec!["read".to_string()]), vec![], None, vec!["read"]),
+			(
+				Some(vec!["+ls".to_string()]),
+				vec![],
+				None,
+				vec!["grep", "ls"],
+			),
+			(None, vec!["grep".to_string()], None, vec![]),
+			(
+				None,
+				vec![],
+				Some(super::super::tool_selection::NoTools::All),
+				vec![],
+			),
+			(
+				Some(vec!["*".to_string()]),
+				vec!["bash".to_string()],
+				None,
+				vec!["edit", "find", "grep", "ls", "read", "write"],
+			),
+		] {
+			let session = SessionManager::create_with_parent_in(&root, &first, None).unwrap();
+			let target = SessionManager::create_with_parent_in(&root, &second, None).unwrap();
+			let target_path = target.session_dir().unwrap().to_path_buf();
+			let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+			let agent = Agent::new(AgentOptions {
+				tools: super::super::tools::create_tools(&first),
+				..Default::default()
+			});
+			let mut handle = spawn_agent_session(agent, session, registry);
+			handle.configure_tool_options(ToolRuntimeOptions {
+				tools,
+				exclude,
+				no_tools,
+			});
+			handle
+				.cmd_tx
+				.send(SessionCommand::SwitchSession {
+					path: target_path.to_string_lossy().into_owned(),
+				})
+				.unwrap();
+			wait_for_replacement(&mut handle).await;
+			let mut actual = handle.shared.live_agent.lock().unwrap().tool_names();
+			actual.sort();
+			assert_eq!(actual, expected);
+			handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		}
+		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	struct TestMcpTool;
+
+	#[async_trait::async_trait]
+	impl pi_agent::AgentTool for TestMcpTool {
+		fn name(&self) -> &str {
+			"mcp__test__echo"
+		}
+		fn description(&self) -> &str {
+			"test"
+		}
+		fn parameters_schema(&self) -> serde_json::Value {
+			serde_json::json!({"type":"object"})
+		}
+		async fn execute(
+			&self,
+			_: &str,
+			_: serde_json::Value,
+			_: tokio_util::sync::CancellationToken,
+			_: Option<pi_agent::ToolUpdate>,
+		) -> pi_agent::AgentToolResult {
+			pi_agent::AgentToolResult::text("mcp result")
+		}
+	}
+
+	#[tokio::test]
+	async fn replacement_preserves_same_project_mcp_and_refreshes_bash_context() {
+		let root = temp_session_dir("replace-tools");
+		let first = root.join("first");
+		let second = root.join("second");
+		std::fs::create_dir_all(&first).unwrap();
+		std::fs::create_dir_all(&second).unwrap();
+		let session = SessionManager::create_with_parent_in(&root, &first, None).unwrap();
+		let other = SessionManager::create_with_parent_in(&root, &second, None).unwrap();
+		let other_dir = other.session_dir().unwrap().to_path_buf();
+		drop(other);
+		let tools: Vec<Arc<dyn pi_agent::AgentTool>> = vec![
+			Arc::new(super::super::tools::bash::BashTool::new(first.clone())),
+			Arc::new(TestMcpTool),
+		];
+		let agent = Agent::new(AgentOptions {
+			tools,
+			stream_fn: Some(agent_stream_fn()),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session(agent, session, registry);
+		handle
+			.cmd_tx
+			.send(SessionCommand::NewSession {
+				parent_session: None,
+			})
+			.unwrap();
+		wait_for_replacement(&mut handle).await;
+		let live = handle.shared.live_agent.lock().unwrap().clone();
+		let mcp = live
+			.tools()
+			.into_iter()
+			.find(|tool| tool.name() == "mcp__test__echo")
+			.expect("same-project MCP tool");
+		let output = mcp
+			.execute(
+				"test",
+				serde_json::json!({}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		assert!(!output.is_error);
+		let bash = live
+			.tools()
+			.into_iter()
+			.find(|tool| tool.name() == "bash")
+			.unwrap();
+		let output = bash
+			.execute(
+				"test",
+				serde_json::json!({"command":"printf '%s' \"$PI_RS_SESSION_FILE\""}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		let text = output
+			.content
+			.iter()
+			.filter_map(|content| content.text_content())
+			.collect::<String>();
+		assert!(text.contains(&current_session_file(&handle).unwrap().display().to_string()));
+		handle
+			.cmd_tx
+			.send(SessionCommand::SwitchSession {
+				path: other_dir.display().to_string(),
+			})
+			.unwrap();
+		wait_for_replacement(&mut handle).await;
+		assert!(
+			!handle
+				.shared
+				.live_agent
+				.lock()
+				.unwrap()
+				.tool_names()
+				.iter()
+				.any(|name| name == "mcp__test__echo")
+		);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		drop(handle);
+		std::fs::remove_dir_all(root).unwrap();
+	}
+	#[tokio::test]
+	async fn replacement_preserves_system_prompt_options() {
+		let root = temp_session_dir("prompt-options");
+		let cwd = root.join("project");
+		std::fs::create_dir_all(&cwd).unwrap();
+		std::fs::write(cwd.join("AGENTS.md"), "CONTEXT_SHOULD_BE_DISABLED").unwrap();
+		let session = SessionManager::create_with_parent_in(&root, &cwd, None).unwrap();
+		let original = session.session_dir().unwrap().to_path_buf();
+		let options = super::super::system_prompt::SystemPromptOptions {
+			context_files: false,
+			custom: Some("CUSTOM_PROMPT".into()),
+			append: vec!["APPENDED_PROMPT".into()],
+		};
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session_with_options(
+			mock_agent(),
+			session,
+			registry,
+			CompactionSettings::default(),
+			options,
+			Default::default(),
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::NewSession {
+				parent_session: None,
+			})
+			.unwrap();
+		wait_for_replacement(&mut handle).await;
+		let new_dir = current_session_file(&handle)
+			.unwrap()
+			.parent()
+			.unwrap()
+			.to_path_buf();
+		let check = |handle: &SessionHandle| {
+			let prompt = handle
+				.shared
+				.live_agent
+				.lock()
+				.unwrap()
+				.snapshot()
+				.system_prompt;
+			assert!(prompt.contains("CUSTOM_PROMPT"));
+			assert!(prompt.contains("APPENDED_PROMPT"));
+			assert!(!prompt.contains("CONTEXT_SHOULD_BE_DISABLED"));
+		};
+		check(&handle);
+		handle
+			.cmd_tx
+			.send(SessionCommand::SwitchSession {
+				path: original.display().to_string(),
+			})
+			.unwrap();
+		wait_for_replacement(&mut handle).await;
+		check(&handle);
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+		drop(handle);
+		let _ = std::fs::remove_dir_all(new_dir);
+		std::fs::remove_dir_all(root).unwrap();
+	}
 
 	/// Wait for the `session → …` replacement notice.
 	async fn wait_for_replacement(handle: &mut SessionHandle) -> String {
@@ -4576,6 +5099,103 @@ mod tests {
 		pi_ai::AssistantMessageEvent::Error {
 			reason: StopReason::Error,
 			error: message,
+		}
+	}
+
+	#[tokio::test]
+	async fn retry_settings_limit_attempts_and_backoff() {
+		let (stream, requests) = retry_stream_fn(|_, model| retryable_error(model));
+		let agent = Agent::new(AgentOptions {
+			model: recovery_model(),
+			stream_fn: Some(stream),
+			..Default::default()
+		});
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let retry = RetrySettings {
+			enabled: Some(true),
+			max_retries: Some(1),
+			base_delay_ms: Some(100),
+			max_agent_delay_ms: Some(5),
+		};
+		let mut handle = spawn_agent_session_with_options(
+			agent,
+			SessionManager::in_memory(),
+			registry,
+			CompactionSettings::default(),
+			Default::default(),
+			retry,
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt { text: "try".into() })
+			.unwrap();
+		notices_until_agent_ends(&mut handle, 2).await;
+		assert_eq!(*requests.lock().unwrap(), 2);
+		let projection = handle.log.lock().unwrap().session.projection();
+		assert_eq!(
+			projection.messages.len(),
+			2,
+			"the omitted failure must not reappear in the in-memory context"
+		);
+		assert!(matches!(projection.messages[0].1, Message::User(_)));
+		assert!(matches!(projection.messages[1].1, Message::Assistant(_)));
+		loop {
+			if let WireEvent::AutoRetryStart {
+				max_attempts,
+				delay_ms,
+				..
+			} = next_wire_event(&mut handle).await
+			{
+				assert_eq!((max_attempts, delay_ms), (1, 5));
+				break;
+			}
+		}
+		handle.cmd_tx.send(SessionCommand::Exit).unwrap();
+	}
+
+	#[tokio::test]
+	async fn retry_settings_can_disable_retry() {
+		for retry in [
+			RetrySettings {
+				enabled: Some(false),
+				..Default::default()
+			},
+			RetrySettings {
+				max_retries: Some(0),
+				..Default::default()
+			},
+		] {
+			let (stream, requests) = retry_stream_fn(|_, model| retryable_error(model));
+			let agent = Agent::new(AgentOptions {
+				model: recovery_model(),
+				stream_fn: Some(stream),
+				..Default::default()
+			});
+			let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+			let mut handle = spawn_agent_session_with_options(
+				agent,
+				SessionManager::in_memory(),
+				registry,
+				CompactionSettings::default(),
+				Default::default(),
+				retry,
+			);
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt { text: "try".into() })
+				.unwrap();
+			notices_until_agent_ends(&mut handle, 1).await;
+			assert_eq!(*requests.lock().unwrap(), 1);
+			assert_eq!(
+				handle
+					.shared
+					.agent_end_will_retry
+					.lock()
+					.unwrap()
+					.pop_front(),
+				Some(false)
+			);
+			handle.cmd_tx.send(SessionCommand::Exit).unwrap();
 		}
 	}
 

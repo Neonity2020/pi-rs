@@ -8,10 +8,42 @@ use std::path::Path;
 
 use pi_agent::AgentTool;
 
+#[derive(Clone)]
+pub struct SystemPromptOptions {
+	pub context_files: bool,
+	pub custom: Option<String>,
+	pub append: Vec<String>,
+}
+
+impl Default for SystemPromptOptions {
+	fn default() -> Self {
+		Self {
+			context_files: true,
+			custom: None,
+			append: Vec::new(),
+		}
+	}
+}
+
 pub fn build_system_prompt(
 	cwd: &Path,
 	tools: &[std::sync::Arc<dyn AgentTool>],
 	context_files: bool,
+) -> String {
+	build_system_prompt_with_options(
+		cwd,
+		tools,
+		&SystemPromptOptions {
+			context_files,
+			..Default::default()
+		},
+	)
+}
+
+pub fn build_system_prompt_with_options(
+	cwd: &Path,
+	tools: &[std::sync::Arc<dyn AgentTool>],
+	options: &SystemPromptOptions,
 ) -> String {
 	let tool_lines: Vec<String> = tools
 		.iter()
@@ -55,7 +87,16 @@ prefer the dedicated file tools over bash for file operations.
 		date = today(),
 		tools = tool_lines.join("\n"),
 	);
-	if context_files {
+	if let Some(custom) = options.custom.as_deref().filter(|text| !text.is_empty()) {
+		prompt = custom.to_string();
+	}
+	for text in &options.append {
+		if !text.is_empty() {
+			prompt.push_str("\n\n");
+			prompt.push_str(text);
+		}
+	}
+	if options.context_files {
 		let files = load_project_context(cwd, &crate::config::agent_dir());
 		if !files.is_empty() {
 			prompt
@@ -69,7 +110,27 @@ prefer the dedicated file tools over bash for file operations.
 			}
 		}
 	}
+	if options
+		.custom
+		.as_deref()
+		.is_some_and(|text| !text.is_empty())
+	{
+		prompt.push_str(&format!("\n\n<cwd>\n{}\n</cwd>", cwd.display()));
+	}
 	prompt
+}
+
+pub fn resolve_prompt_input(input: &str) -> String {
+	if input.is_empty() {
+		return String::new();
+	}
+	if Path::new(input).exists() {
+		match std::fs::read_to_string(input) {
+			Ok(text) => return text.trim_start_matches('\u{feff}').to_string(),
+			Err(error) => eprintln!("Warning: Could not read system prompt file {input}: {error}"),
+		}
+	}
+	input.to_string()
 }
 
 /// Load the first matching file from the global agent directory and each
@@ -130,6 +191,27 @@ fn today() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn custom_prompt_and_append_resolve_files_and_keep_context_order() {
+		let root = std::env::temp_dir().join(format!("pi-prompt-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		std::fs::write(root.join("AGENTS.md"), "PROJECT_CONTEXT").unwrap();
+		let file = root.join("prompt.txt");
+		std::fs::write(&file, "\u{feff}FILE_PROMPT").unwrap();
+		assert_eq!(resolve_prompt_input(file.to_str().unwrap()), "FILE_PROMPT");
+		assert_eq!(resolve_prompt_input("literal text"), "literal text");
+		let options = SystemPromptOptions {
+			context_files: true,
+			custom: Some("CUSTOM".into()),
+			append: vec!["FIRST".into(), "SECOND".into()],
+		};
+		let prompt = build_system_prompt_with_options(&root, &[], &options);
+		assert!(prompt.starts_with("CUSTOM\n\nFIRST\n\nSECOND"));
+		assert!(prompt.contains("PROJECT_CONTEXT"));
+		assert!(prompt.contains(&root.display().to_string()));
+		assert!(!prompt.contains("# Tools"));
+		std::fs::remove_dir_all(root).unwrap();
+	}
 	#[test]
 	fn context_precedence_order_and_bom() {
 		let root = std::env::temp_dir().join(format!(

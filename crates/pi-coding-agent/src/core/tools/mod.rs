@@ -61,6 +61,7 @@ const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Connected MCP servers: the bridged tools plus the clients they run
 /// against. Main keeps the assembly alive for the session and calls
 /// [`McpAssembly::shutdown`] on exit (upstream `session_shutdown`).
+#[derive(Default)]
 pub struct McpAssembly {
 	/// Bridged `mcp__<server>__<tool>` tools, ready for `AgentOptions.tools`.
 	pub tools: Vec<Arc<dyn AgentTool>>,
@@ -82,6 +83,51 @@ impl McpAssembly {
 			let mut client = client.lock().await;
 			let _ = tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, client.close()).await;
 		}
+	}
+}
+
+/// Owns the current project's servers and the CLI tool filters across switches.
+pub struct McpRuntime {
+	pub assembly: McpAssembly,
+	pub allow: Option<super::tool_selection::ToolMatcher>,
+	pub exclude: Option<super::tool_selection::ToolMatcher>,
+}
+
+impl McpRuntime {
+	pub async fn reconnect(&mut self, cwd: &Path) -> Vec<String> {
+		self.assembly.shutdown().await;
+		let trusted = super::trust::is_trusted(cwd);
+		let mut config = super::mcp_config::load_mcp_config_with(cwd, trusted).await;
+		for server in &mut config.servers {
+			let path = server
+				.cwd
+				.as_deref()
+				.map(Path::new)
+				.unwrap_or(Path::new("."));
+			server.cwd = Some(cwd.join(path).to_string_lossy().into_owned());
+		}
+		let mut assembly = connect_mcp_servers(&config).await;
+		if !trusted && cwd.join(".pi/mcp.json").exists() {
+			assembly.notices.insert(
+				0,
+				format!(
+					"project {} is not trusted; project MCP servers are skipped",
+					cwd.display()
+				),
+			);
+		}
+		assembly.tools.retain(|tool| {
+			self.allow
+				.as_ref()
+				.is_none_or(|matcher| matcher.matches(tool.name()))
+				&& self
+					.exclude
+					.as_ref()
+					.is_none_or(|matcher| !matcher.matches(tool.name()))
+		});
+		let notices = std::mem::take(&mut assembly.notices);
+		self.assembly = assembly;
+		notices
 	}
 }
 

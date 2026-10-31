@@ -5,10 +5,8 @@
 //!
 //! Defaults come from `SETTINGS_DEFAULTS.retry` (`core/settings-defaults.ts`):
 //! `enabled: true`, `maxRetries: 3`, `baseDelayMs: 2000`,
-//! `maxAgentDelayMs: 60_000`. pi-rs hardcodes them here because the settings
-//! schema (`core/settings_manager.rs`) does not carry a `retry` key yet — the
-//! runtime `set_auto_retry` toggle covers the enabled flag; wiring the
-//! remaining knobs through settings lands with the settings-manager expansion.
+//! `maxAgentDelayMs: 60_000`. The settings manager can override these values;
+//! the runtime `set_auto_retry` toggle changes the enabled flag.
 //!
 //! Pattern reduction (accepted, mirrors `OVERFLOW_PATTERNS` in
 //! `core/agent_session.rs`): upstream classifies errors with two regexes;
@@ -34,8 +32,12 @@ pub const RETRY_MAX_AGENT_DELAY_MS: u64 = 60_000;
 /// `maxAgentDelayMs` (60s). `attempt` is 1-based. The `_with` variant takes
 /// the effective base (tests shorten it; see `RetryRuntime`).
 pub fn retry_delay_with(base_delay_ms: u64, attempt: u32) -> u64 {
+	retry_delay_capped(base_delay_ms, attempt, RETRY_MAX_AGENT_DELAY_MS)
+}
+
+pub fn retry_delay_capped(base_delay_ms: u64, attempt: u32, max_delay_ms: u64) -> u64 {
 	let delay = base_delay_ms.saturating_mul(1u64 << attempt.saturating_sub(1).min(63));
-	delay.min(RETRY_MAX_AGENT_DELAY_MS)
+	delay.min(max_delay_ms)
 }
 
 pub fn retry_delay_ms(attempt: u32) -> u64 {
@@ -208,6 +210,7 @@ mod tests {
 
 	#[test]
 	fn delay_formula_matches_upstream_backoff() {
+		assert_eq!(retry_delay_capped(100, 3, 150), 150);
 		assert_eq!(retry_delay_ms(1), 2000);
 		assert_eq!(retry_delay_ms(2), 4000);
 		assert_eq!(retry_delay_ms(3), 8000);

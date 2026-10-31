@@ -505,6 +505,11 @@ impl Agent {
 			.collect()
 	}
 
+	/// Snapshot the executable tools for rebuilding a session runtime.
+	pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+		self.inner.tools.read().unwrap().clone()
+	}
+
 	pub fn session_id(&self) -> Option<String> {
 		self.inner.session_id.read().unwrap().clone()
 	}

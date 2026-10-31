@@ -29,6 +29,22 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info("clear", "clear the chat view", SlashCommandSource::Builtin),
+	info("new", "start a new session", SlashCommandSource::Builtin),
+	info(
+		"resume",
+		"select or resume a saved session: /resume [id|path]",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"session",
+		"show current session details",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"name",
+		"set the session name: /name <name>",
+		SlashCommandSource::Builtin,
+	),
 	info(
 		"provider",
 		"add a model provider",

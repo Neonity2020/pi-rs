@@ -103,7 +103,9 @@ pub fn to_json_event(event: &SessionEvent) -> Option<String> {
 		SessionEvent::Settled { aborted } => {
 			Some(json!({"type": "agent_settled", "aborted": aborted}).to_string())
 		}
-		SessionEvent::Notice(_) | SessionEvent::Persisted { .. } => None,
+		SessionEvent::Notice(_)
+		| SessionEvent::Persisted { .. }
+		| SessionEvent::SessionReplaced => None,
 	}
 }
 

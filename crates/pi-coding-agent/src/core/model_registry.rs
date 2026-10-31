@@ -139,6 +139,7 @@ pub fn add_provider(
 
 pub struct ModelRegistry {
 	models: Vec<Model>,
+	runtime_api_key: Option<(String, String)>,
 	/// Raw `apiKey`/`headers` config per provider id (models.json object
 	/// format), as written. Values go through [`resolve_config_value`] at
 	/// request-build time; request plumbing consumes them later.
@@ -174,7 +175,18 @@ impl ModelRegistry {
 		Self {
 			models,
 			provider_auth,
+			runtime_api_key: None,
 		}
+	}
+
+	pub fn set_runtime_api_key(&mut self, provider: String, key: String) {
+		self.runtime_api_key = Some((provider, key));
+	}
+
+	pub fn reload(&mut self, default_model: Option<&str>) {
+		let runtime_api_key = self.runtime_api_key.take();
+		*self = Self::load(default_model);
+		self.runtime_api_key = runtime_api_key;
 	}
 
 	pub fn models(&self) -> &[Model] {
@@ -191,6 +203,13 @@ impl ModelRegistry {
 	/// or `!command` (shared command cache). `None` when the provider or key
 	/// is absent or the value fails to resolve.
 	pub fn resolve_api_key(&self, provider: &str) -> Option<String> {
+		if let Some((_, key)) = self
+			.runtime_api_key
+			.as_ref()
+			.filter(|(name, _)| name == provider)
+		{
+			return Some(key.clone());
+		}
 		let key = self.provider_auth.get(provider)?.api_key.as_deref()?;
 		resolve_config_value(key, None)
 	}
@@ -214,6 +233,24 @@ impl ModelRegistry {
 				self.models.iter().find(|m| {
 					m.key().to_lowercase().contains(&query.to_lowercase())
 						|| m.name.to_lowercase().contains(&query.to_lowercase())
+				})
+			})
+			.cloned()
+	}
+
+	pub fn find_for_provider(&self, provider: &str, query: &str) -> Option<Model> {
+		let query = query.trim();
+		let models = || {
+			self.models
+				.iter()
+				.filter(|model| model.provider == provider)
+		};
+		models()
+			.find(|model| matches_key(model, query))
+			.or_else(|| {
+				models().find(|model| {
+					model.key().to_lowercase().contains(&query.to_lowercase())
+						|| model.name.to_lowercase().contains(&query.to_lowercase())
 				})
 			})
 			.cloned()
@@ -877,7 +914,24 @@ mod tests {
 		ModelRegistry {
 			models,
 			provider_auth,
+			runtime_api_key: None,
 		}
+	}
+
+	#[test]
+	fn runtime_key_overrides_only_its_provider() {
+		let mut registry = registry(
+			r#"{"providers":{"one":{"apiKey":"saved-one"},"two":{"apiKey":"saved-two"}}}"#,
+		);
+		registry.set_runtime_api_key("one".into(), "temporary".into());
+		assert_eq!(
+			registry.resolve_api_key("one").as_deref(),
+			Some("temporary")
+		);
+		assert_eq!(
+			registry.resolve_api_key("two").as_deref(),
+			Some("saved-two")
+		);
 	}
 
 	#[test]

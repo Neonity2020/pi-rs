@@ -20,7 +20,7 @@ use clap::Parser;
 use pi_agent::{Agent, AgentOptions};
 use pi_ai::ThinkingLevel;
 
-use crate::core::agent_session::{restore_initial_messages, spawn_agent_session_with_settings};
+use crate::core::agent_session::{restore_initial_messages, spawn_agent_session_with_options};
 use crate::core::model_registry::{ModelRegistry, authed_stream_fn};
 use crate::core::session_manager::{
 	SessionManager, SessionSelector, resolve_session, validate_session_dir,
@@ -59,14 +59,39 @@ struct Cli {
 	#[arg(short = 'm', long)]
 	model: Option<String>,
 
+	/// Restrict --model lookup to one provider.
+	#[arg(long, requires = "model")]
+	provider: Option<String>,
+
+	/// API key for the selected provider (not persisted).
+	#[arg(long, requires = "model")]
+	api_key: Option<String>,
+
+	/// List known models, optionally filtered by a fuzzy search pattern.
+	#[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PATTERN")]
+	list_models: Option<String>,
+
+	/// Set the thinking level: off, minimal, low, medium, high, xhigh, max.
+	#[arg(long, value_name = "LEVEL")]
+	thinking: Option<String>,
+
 	/// Continue the most recent session.
-	#[arg(long, conflicts_with_all = ["resume", "no_session"])]
+	#[arg(short = 'c', long, conflicts_with_all = ["resume", "no_session"])]
 	r#continue: bool,
 
 	/// Resume a session by id (sessions-dir entry, exact or unique prefix) or
 	/// by path to its session directory.
-	#[arg(long, value_name = "ID|PATH", conflicts_with = "no_session")]
+	#[arg(
+		long,
+		visible_alias = "session",
+		value_name = "ID|PATH",
+		conflicts_with = "no_session"
+	)]
 	resume: Option<String>,
+
+	/// Set the session display name.
+	#[arg(short = 'n', long, value_name = "NAME")]
+	name: Option<String>,
 
 	/// Disable session persistence.
 	#[arg(long)]
@@ -75,6 +100,18 @@ struct Cli {
 	/// Disable loading AGENTS.md and CLAUDE.md context files.
 	#[arg(long)]
 	no_context_files: bool,
+
+	/// Replace the default system prompt with text or the contents of a file.
+	#[arg(long, value_name = "TEXT_OR_FILE")]
+	system_prompt: Option<String>,
+
+	/// Append text or a file to the system prompt; may be repeated.
+	#[arg(long, value_name = "TEXT_OR_FILE")]
+	append_system_prompt: Vec<String>,
+
+	/// Disable MCP server loading and startup.
+	#[arg(long)]
+	no_mcp: bool,
 
 	/// Tool selection: an allowlist of builtin names/patterns, or only
 	/// `+name`/`-name` entries editing the default set (read, bash, edit,
@@ -276,16 +313,43 @@ fn parse_thinking(value: Option<&str>) -> ThinkingLevel {
 	}
 }
 
+fn is_thinking_level(level: &str) -> bool {
+	matches!(
+		level,
+		"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+	)
+}
+
+fn split_model_thinking(query: &str) -> (&str, Option<&str>) {
+	match query.rsplit_once(':') {
+		Some((model, level)) if !model.is_empty() && is_thinking_level(level) => {
+			(model, Some(level))
+		}
+		_ => (query, None),
+	}
+}
+
 /// Upstream combined short flags (`args.ts` `-nt`, `-nbt`, `-xt`) that
 /// clap cannot express as single tokens; rewritten to their long forms
 /// before parsing.
 fn rewrite_combined_short_args(args: Vec<String>) -> Vec<String> {
+	let mut positional_only = false;
 	args.into_iter()
-		.map(|arg| match arg.as_str() {
-			"-nt" => "--no-tools".into(),
-			"-nbt" => "--no-builtin-tools".into(),
-			"-xt" => "--exclude-tools".into(),
-			other => other.to_string(),
+		.map(|arg| {
+			if arg == "--" {
+				positional_only = true;
+				return arg;
+			}
+			if positional_only {
+				return arg;
+			}
+			match arg.as_str() {
+				"-nt" => "--no-tools".into(),
+				"-nbt" => "--no-builtin-tools".into(),
+				"-nc" => "--no-context-files".into(),
+				"-xt" => "--exclude-tools".into(),
+				other => other.to_string(),
+			}
 		})
 		.collect()
 }
@@ -299,6 +363,68 @@ fn split_tool_list(value: &str) -> Vec<String> {
 		.collect()
 }
 
+fn list_models(registry: &ModelRegistry, pattern: &str) -> String {
+	let mut models: Vec<_> = registry
+		.models()
+		.iter()
+		.filter(|model| {
+			pattern.is_empty()
+				|| pi_tui::fuzzy::fuzzy_match(pattern, &format!("{} {}", model.provider, model.id))
+					.matches
+		})
+		.collect();
+	models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
+	if models.is_empty() {
+		return format!("No models matching \"{pattern}\"");
+	}
+	let count = |n: u64| {
+		if n >= 1_000_000 {
+			format!("{:.1}M", n as f64 / 1_000_000.0).replace(".0M", "M")
+		} else if n >= 1_000 {
+			format!("{:.1}K", n as f64 / 1_000.0).replace(".0K", "K")
+		} else {
+			n.to_string()
+		}
+	};
+	let mut rows = vec![[
+		"provider".to_string(),
+		"model".to_string(),
+		"context".to_string(),
+		"max-out".to_string(),
+		"thinking".to_string(),
+		"images".to_string(),
+	]];
+	rows.extend(models.iter().map(|model| {
+		[
+			model.provider.clone(),
+			model.id.clone(),
+			count(model.context_window),
+			count(model.max_tokens),
+			if model.reasoning { "yes" } else { "no" }.into(),
+			if model.supports_images() { "yes" } else { "no" }.into(),
+		]
+	}));
+	let widths: Vec<_> = (0..6)
+		.map(|i| {
+			rows.iter()
+				.map(|row| row[i].chars().count())
+				.max()
+				.unwrap_or(0)
+		})
+		.collect();
+	rows.iter()
+		.map(|row| {
+			(0..6)
+				.map(|i| format!("{:<width$}", row[i], width = widths[i]))
+				.collect::<Vec<_>>()
+				.join("  ")
+				.trim_end()
+				.to_string()
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	match dotenvy::dotenv() {
@@ -310,7 +436,14 @@ async fn main() -> anyhow::Result<()> {
 		let argv: Vec<String> = std::env::args().collect();
 		Cli::parse_from(rewrite_combined_short_args(argv))
 	};
-	let cwd = std::env::current_dir()?;
+	let startup_cwd = std::env::current_dir()?;
+	if cli
+		.name
+		.as_deref()
+		.is_some_and(|name| name.trim().is_empty())
+	{
+		anyhow::bail!("--name requires a non-empty value");
+	}
 
 	// Mode resolution runs before anything else so `--mode` validation errors
 	// exit with the upstream diagnostics text (`resolveAppMode`).
@@ -335,7 +468,41 @@ async fn main() -> anyhow::Result<()> {
 		anyhow::bail!("@file arguments are not supported in RPC mode");
 	}
 
-	// Settings (global + project merge).
+	if let Some(pattern) = &cli.list_models {
+		println!("{}", list_models(&ModelRegistry::load(None), pattern));
+		return Ok(());
+	}
+
+	// Resolve an existing session before loading cwd-bound settings and tools.
+	let selector = if cli.r#continue {
+		Some(SessionSelector::Recent)
+	} else {
+		cli.resume
+			.as_deref()
+			.map(|arg| SessionSelector::ByIdOrPath(arg.to_string()))
+	};
+	let resume_dir = selector
+		.as_ref()
+		.map(|selector| {
+			let dir = resolve_session(selector)
+				.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+			validate_session_dir(&dir)
+				.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+			Ok::<_, anyhow::Error>(dir)
+		})
+		.transpose()?;
+	let cwd = resume_dir
+		.as_ref()
+		.and_then(|dir| crate::core::session_manager::peek_session_header(dir))
+		.map(|header| std::path::PathBuf::from(header.cwd))
+		.filter(|cwd| !cwd.as_os_str().is_empty())
+		.unwrap_or_else(|| startup_cwd.clone());
+	if !cwd.is_dir() {
+		anyhow::bail!(
+			"session working directory does not exist: {}",
+			cwd.display()
+		);
+	}
 	let settings_manager = SettingsManager::load(Some(&cwd));
 	let settings = settings_manager.effective();
 
@@ -364,14 +531,37 @@ async fn main() -> anyhow::Result<()> {
 	.map_err(|error| anyhow::anyhow!("{error}"))?;
 
 	// Model resolution.
-	let mut registry = ModelRegistry::load(settings.default_model.as_deref());
+	let default_model = match (
+		settings.default_provider.as_deref(),
+		settings.default_model.as_deref(),
+	) {
+		(Some(provider), Some(model)) if !model.starts_with(&format!("{provider}/")) => {
+			Some(format!("{provider}/{model}"))
+		}
+		(_, Some(model)) => Some(model.to_string()),
+		_ => None,
+	};
+	let mut registry = ModelRegistry::load(default_model.as_deref());
+	let (model_query, model_thinking) = cli
+		.model
+		.as_deref()
+		.map(split_model_thinking)
+		.unwrap_or(("", None));
 	let model = match &cli.model {
-		Some(query) => registry
-			.find(query)
-			.ok_or_else(|| anyhow::anyhow!("no model matching `{query}`"))?,
+		Some(_) => cli
+			.provider
+			.as_deref()
+			.map_or_else(
+				|| registry.find(model_query),
+				|provider| registry.find_for_provider(provider, model_query),
+			)
+			.ok_or_else(|| anyhow::anyhow!("no model matching `{model_query}`"))?,
 		None => registry.default_model(),
 	};
 	registry.set_default(&model);
+	if let Some(key) = cli.api_key.as_ref() {
+		registry.set_runtime_api_key(model.provider.clone(), key.clone());
+	}
 	let models: Vec<pi_ai::Model> = registry.models().to_vec();
 
 	// Tools + agent + system prompt. All builtin definitions are built, then
@@ -394,13 +584,23 @@ async fn main() -> anyhow::Result<()> {
 	// project's, gated on project trust. One server failing becomes a notice;
 	// all servers failing does not block startup. The assembly must outlive
 	// the agent so the server processes stay owned until exit.
-	let mut mcp = {
+	let mut mcp = if cli.no_mcp {
+		crate::core::tools::McpAssembly::default()
+	} else {
 		// Trust gate: a project `.pi/mcp.json` loads only for trusted
 		// projects. Interactive runs get a one-time prompt whose answer is
 		// stored; print/rpc skip project servers with a notice instead.
 		let mut trust_notices: Vec<String> = Vec::new();
 		resolve_project_mcp_trust(&cwd, app_mode, &mut trust_notices)?;
-		let config = mcp_config::load_mcp_config().await;
+		let mut config = mcp_config::load_mcp_config_with(&cwd, trust::is_trusted(&cwd)).await;
+		for server in &mut config.servers {
+			let server_cwd = server
+				.cwd
+				.as_deref()
+				.map(std::path::Path::new)
+				.unwrap_or(std::path::Path::new("."));
+			server.cwd = Some(cwd.join(server_cwd).to_string_lossy().into_owned());
+		}
 		let mut assembly = connect_mcp_servers(&config).await;
 		assembly.notices.splice(..0, trust_notices);
 		// Notices are surfaced per mode at dispatch (stderr for print/rpc,
@@ -428,30 +628,31 @@ async fn main() -> anyhow::Result<()> {
 			.as_ref()
 			.is_some_and(|matcher| matcher.matches(name))
 	});
+	let prompt_options = crate::core::system_prompt::SystemPromptOptions {
+		context_files: !cli.no_context_files,
+		custom: cli
+			.system_prompt
+			.as_deref()
+			.map(crate::core::system_prompt::resolve_prompt_input),
+		append: cli
+			.append_system_prompt
+			.iter()
+			.map(|value| crate::core::system_prompt::resolve_prompt_input(value))
+			.collect(),
+	};
 	let system_prompt =
-		crate::core::system_prompt::build_system_prompt(&cwd, &tools, !cli.no_context_files);
+		crate::core::system_prompt::build_system_prompt_with_options(&cwd, &tools, &prompt_options);
 
 	// Session persistence. `--continue`/`--resume` reopen an existing log and
 	// seed the agent with its transcript; failures exit before anything is
 	// written (no half-open session is left behind).
 	let mut startup_notices: Vec<String> = Vec::new();
-	let (session, initial_messages) = if cli.no_session {
+	let (mut session, initial_messages) = if cli.no_session {
 		(SessionManager::in_memory(), Vec::new())
 	} else {
-		let selector = if cli.r#continue {
-			Some(SessionSelector::Recent)
-		} else {
-			cli.resume
-				.as_deref()
-				.map(|arg| SessionSelector::ByIdOrPath(arg.to_string()))
-		};
-		match selector {
+		match resume_dir {
 			None => (SessionManager::create(&cwd)?, Vec::new()),
-			Some(selector) => {
-				let dir = resolve_session(&selector)
-					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
-				validate_session_dir(&dir)
-					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+			Some(dir) => {
 				let restored = restore_initial_messages(&dir);
 				startup_notices.push(format!("resuming session {}", dir.display()));
 				let session = SessionManager::open(&dir)?;
@@ -459,12 +660,32 @@ async fn main() -> anyhow::Result<()> {
 			}
 		}
 	};
+	if let Some(name) = &cli.name {
+		session.append_session_info(name)?;
+	}
 
 	// Session-scoped environment for the bash tool (`PI_RS_*` variables),
 	// wired after session resolution so the log path is known. The tool
 	// declaration is unchanged, so the already-built system prompt stays
 	// valid.
-	let thinking_level = parse_thinking(settings.default_thinking_level.as_deref());
+	let cli_thinking = cli
+		.thinking
+		.as_deref()
+		.filter(|value| is_thinking_level(value));
+	if let Some(value) = cli
+		.thinking
+		.as_deref()
+		.filter(|value| !is_thinking_level(value))
+	{
+		startup_notices.push(format!(
+			"Invalid thinking level \"{value}\". Valid values: off, minimal, low, medium, high, xhigh, max"
+		));
+	}
+	let thinking_level = parse_thinking(
+		cli_thinking
+			.or(model_thinking)
+			.or(settings.default_thinking_level.as_deref()),
+	);
 	if let Some(index) = tools.iter().position(|tool| tool.name() == "bash") {
 		let context = SessionToolContext {
 			session_id: session.session_id(),
@@ -494,15 +715,30 @@ async fn main() -> anyhow::Result<()> {
 	// (in-memory sessions carry no header → no line, see print.rs).
 	let session_header_line = session.header().map(|header| header.to_value().to_string());
 
-	let handle = spawn_agent_session_with_settings(
+	let handle = spawn_agent_session_with_options(
 		agent,
 		session,
 		registry.clone(),
 		settings.compaction.unwrap_or_default(),
+		prompt_options,
+		settings.retry.unwrap_or_default(),
 	);
+	handle.configure_tool_options(crate::core::agent_session::ToolRuntimeOptions {
+		tools: tools_flag,
+		exclude: exclude_flag,
+		no_tools,
+	});
+	let mut mcp_notices = std::mem::take(&mut mcp.notices);
+	let mcp_runtime = (!cli.no_mcp).then(|| {
+		handle.configure_mcp(crate::core::tools::McpRuntime {
+			assembly: mcp,
+			allow: selection.mcp_filter.clone(),
+			exclude: exclude_matcher.clone(),
+		})
+	});
 
 	if app_mode == AppMode::Rpc {
-		for notice in mcp.notices.drain(..) {
+		for notice in mcp_notices.drain(..) {
 			eprintln!("mcp: {notice}");
 		}
 		for notice in startup_notices.drain(..) {
@@ -510,7 +746,9 @@ async fn main() -> anyhow::Result<()> {
 		}
 		let result = modes::rpc::run_rpc(handle, registry).await;
 		// Session shutdown: close the MCP server transports before returning.
-		mcp.shutdown().await;
+		if let Some(runtime) = &mcp_runtime {
+			runtime.lock().await.assembly.shutdown().await;
+		}
 		return result;
 	}
 
@@ -531,12 +769,12 @@ async fn main() -> anyhow::Result<()> {
 	// `@file` injection (cli/file-processor.ts): file blocks are appended to
 	// the first prompt — stdin content, then file text, then the first
 	// message, joined with no separator (buildInitialMessage).
-	let file_text = process_file_arguments(&file_args, &cwd);
+	let file_text = process_file_arguments(&file_args, &startup_cwd);
 	let (initial_message, remaining_messages) =
 		build_initial_message(piped_prompt, &file_text, &messages);
 
 	if app_mode == AppMode::Json || app_mode == AppMode::Text {
-		for notice in mcp.notices.drain(..) {
+		for notice in mcp_notices.drain(..) {
 			eprintln!("mcp: {notice}");
 		}
 		for notice in startup_notices.drain(..) {
@@ -554,7 +792,9 @@ async fn main() -> anyhow::Result<()> {
 		// Close the MCP transports before the forced exit —
 		// std::process::exit skips destructors, so the graceful close ladder
 		// (and the orphan guard's SIGKILL) must run explicitly here.
-		mcp.shutdown().await;
+		if let Some(runtime) = &mcp_runtime {
+			runtime.lock().await.assembly.shutdown().await;
+		}
 		std::process::exit(code);
 	}
 
@@ -578,7 +818,7 @@ async fn main() -> anyhow::Result<()> {
 	// assembly and resume notices surface as chat notices inside the TUI.
 	let mut ui = ui_config::load(settings.theme.as_deref(), cli.light);
 	ui.notices
-		.extend(mcp.notices.drain(..).map(|notice| format!("mcp: {notice}")));
+		.extend(mcp_notices.drain(..).map(|notice| format!("mcp: {notice}")));
 	ui.notices.extend(startup_notices);
 	let mode = modes::interactive::InteractiveMode::new(
 		handle,
@@ -590,7 +830,9 @@ async fn main() -> anyhow::Result<()> {
 	let result = mode.run(initial_prompt).await;
 	// Session shutdown: close the MCP server transports (graceful ladder,
 	// process group reaped) before main drops the assembly.
-	mcp.shutdown().await;
+	if let Some(runtime) = &mcp_runtime {
+		runtime.lock().await.assembly.shutdown().await;
+	}
 	result
 }
 
@@ -637,16 +879,43 @@ mod tests {
 	use super::*;
 	use std::path::PathBuf;
 
+	#[test]
+	fn combined_aliases_respect_double_dash() {
+		let args = ["pi-rs", "-nc", "-nt", "--", "-nc", "-nt"]
+			.into_iter()
+			.map(str::to_string)
+			.collect();
+		assert_eq!(
+			rewrite_combined_short_args(args),
+			[
+				"pi-rs",
+				"--no-context-files",
+				"--no-tools",
+				"--",
+				"-nc",
+				"-nt"
+			]
+		);
+	}
+
 	fn cli(mode: Option<&str>, print: bool, rpc: bool) -> Cli {
 		Cli {
 			print,
 			mode: mode.map(str::to_string),
 			rpc,
 			model: None,
+			provider: None,
+			api_key: None,
+			list_models: None,
+			thinking: None,
 			r#continue: false,
 			resume: None,
+			name: None,
 			no_session: false,
 			no_context_files: false,
+			system_prompt: None,
+			append_system_prompt: Vec::new(),
+			no_mcp: false,
 			tools: None,
 			exclude_tools: None,
 			no_tools: false,

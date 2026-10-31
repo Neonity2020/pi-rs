@@ -242,11 +242,18 @@ pub fn resolve_tool_selection(
 		})
 	};
 	let exclude = (!input.exclude_tools.is_empty()).then(|| ToolMatcher::new(input.exclude_tools));
-	let builtin_active = selected
-		.unwrap_or_else(|| default_tool_names.clone())
-		.into_iter()
-		.filter(|name| !exclude.as_ref().is_some_and(|m| m.matches(name)))
-		.collect();
+	let mut builtin_active = Vec::new();
+	for entry in selected.unwrap_or_else(|| default_tool_names.clone()) {
+		let matcher = ToolMatcher::new(&[entry]);
+		for name in super::tools::ALL_TOOL_NAMES {
+			if matcher.matches(name)
+				&& !exclude.as_ref().is_some_and(|m| m.matches(name))
+				&& !builtin_active.iter().any(|active| active == name)
+			{
+				builtin_active.push((*name).to_string());
+			}
+		}
+	}
 	// `_allowlistFiltersMcp`: the allowlist reaches MCP tools only when it is
 	// empty (no tools at all) or explicitly carries `mcp__` entries.
 	let mcp_filter = allowed.and_then(|allowed| {
@@ -411,6 +418,20 @@ mod tests {
 		assert_eq!(selection.builtin_active, list(&["read", "edit", "write"]));
 		// The exclude matcher is applied per-name by the caller for MCP tools.
 		assert!(ToolMatcher::new(&list(&["bash", "mcp__fs__*"])).matches("mcp__fs__read"));
+	}
+
+	#[test]
+	fn builtin_patterns_expand_before_exclusions() {
+		let selection = resolve_tool_selection(ToolSelectionInput {
+			tools: Some(&list(&["*", "read"])),
+			exclude_tools: &list(&["bash", "w*"]),
+			..Default::default()
+		})
+		.unwrap();
+		assert_eq!(
+			selection.builtin_active,
+			list(&["read", "edit", "grep", "find", "ls"])
+		);
 	}
 
 	#[test]
