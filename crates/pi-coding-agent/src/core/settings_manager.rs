@@ -22,9 +22,46 @@ pub struct Settings {
 	pub shell_path: Option<String>,
 	pub compaction: Option<CompactionSettings>,
 	pub retry: Option<RetrySettings>,
+	/// `branchSummary.skipPrompt` — skip the summarize-branch prompt when
+	/// navigating the session tree (`/tree`).
+	pub branch_summary: Option<BranchSummarySettings>,
+	/// `treeFilterMode` — entry filter for the `/tree` selector: `default`,
+	/// `no-tools`, `user-only`, `labeled-only`, or `all`.
+	pub tree_filter_mode: Option<String>,
+	/// `sessionDir` — session storage directory override (global settings;
+	/// upstream `SettingsManager.getSessionDir`). CLI `--session-dir` and
+	/// `PI_SESSION_DIR` take precedence.
+	pub session_dir: Option<String>,
 	/// Raw `defaultTools` selection: plain names/patterns or `+name`/`-name`
 	/// modifiers, resolved by `tool_selection::resolve_default_tools`.
 	pub default_tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BranchSummarySettings {
+	pub skip_prompt: Option<bool>,
+}
+
+impl BranchSummarySettings {
+	fn merged(project: Option<&Self>, global: Option<&Self>) -> Self {
+		Self {
+			skip_prompt: project
+				.and_then(|s| s.skip_prompt)
+				.or_else(|| global.and_then(|s| s.skip_prompt)),
+		}
+	}
+}
+
+/// Upstream `getTreeFilterMode`: invalid values fall back to `"default"`.
+pub fn normalize_tree_filter_mode(value: Option<&str>) -> &'static str {
+	match value {
+		Some("no-tools") => "no-tools",
+		Some("user-only") => "user-only",
+		Some("labeled-only") => "labeled-only",
+		Some("all") => "all",
+		_ => "default",
+	}
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,6 +167,20 @@ impl SettingsManager {
 				self.project.retry.as_ref(),
 				self.global.retry.as_ref(),
 			)),
+			branch_summary: Some(BranchSummarySettings::merged(
+				self.project.branch_summary.as_ref(),
+				self.global.branch_summary.as_ref(),
+			)),
+			tree_filter_mode: self
+				.project
+				.tree_filter_mode
+				.clone()
+				.or_else(|| self.global.tree_filter_mode.clone()),
+			session_dir: self
+				.project
+				.session_dir
+				.clone()
+				.or_else(|| self.global.session_dir.clone()),
 			compaction: Some(CompactionSettings::merged(
 				self.project.compaction.as_ref(),
 				self.global.compaction.as_ref(),
