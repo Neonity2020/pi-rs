@@ -69,7 +69,7 @@ struct ListFrame {
 
 #[derive(Default)]
 struct TableState {
-	aligns: Vec<pulldown_cmark::Alignment>,
+	raw: String,
 	header: Vec<Vec<Span<'static>>>,
 	rows: Vec<Vec<Vec<Span<'static>>>>,
 	current_row: Vec<Vec<Span<'static>>>,
@@ -224,9 +224,15 @@ impl<'t> Renderer<'t> {
 		options.insert(Options::ENABLE_TASKLISTS);
 		options.insert(Options::ENABLE_TABLES);
 
-		for event in Parser::new_ext(source, options) {
+		for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
 			match event {
-				Event::Start(tag) => self.start_tag(tag),
+				Event::Start(tag) => {
+					let is_table = matches!(&tag, Tag::Table(_));
+					self.start_tag(tag);
+					if is_table && let Some(table) = self.table.as_mut() {
+						table.raw = source[range].to_string();
+					}
+				}
 				Event::End(tag) => self.end_tag(tag),
 				Event::Text(text) => self.inline_text(&text),
 				Event::Code(code) => {
@@ -360,12 +366,9 @@ impl<'t> Renderer<'t> {
 				self.link_stack.push(dest_url.to_string());
 			}
 			Tag::Image { .. } => self.style_stack.push(Style::new().fg(self.theme.md_link)),
-			Tag::Table(aligns) => {
+			Tag::Table(_) => {
 				self.flush_block_inline();
-				self.table = Some(TableState {
-					aligns: aligns.into_iter().collect(),
-					..TableState::default()
-				});
+				self.table = Some(TableState::default());
 			}
 			Tag::TableHead | Tag::TableRow => {
 				if let Some(t) = self.table.as_mut() {
@@ -522,77 +525,155 @@ impl<'t> Renderer<'t> {
 	// -- tables ---------------------------------------------------------------------
 
 	fn render_table(&mut self, t: TableState) {
-		if t.header.is_empty() && t.rows.is_empty() {
+		let n = t.header.len();
+		if n == 0 {
 			return;
 		}
-		let n_cols = t
-			.header
-			.len()
-			.max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
-		if n_cols == 0 {
-			return;
-		}
-		// Column widths from cell content (single-line projection).
-		let mut widths = vec![0usize; n_cols];
-		let cell_text = |cell: &Vec<Span<'static>>| -> String {
-			cell.iter()
-				.map(|s| s.content.as_ref())
-				.collect::<Vec<_>>()
-				.join("")
-		};
-		for (i, cell) in t.header.iter().enumerate() {
-			widths[i] = widths[i].max(cell_text(cell).width());
-		}
-		for row in &t.rows {
-			for (i, cell) in row.iter().enumerate() {
-				widths[i] = widths[i].max(cell_text(cell).width());
-			}
-		}
-		for w in widths.iter_mut() {
-			*w = (*w).clamp(3, 40);
-		}
-
-		let border = Style::new().fg(self.theme.md_hr);
-		let render_row = |row: &[Vec<Span<'static>>], bold: bool| -> Vec<Span<'static>> {
-			let mut spans = vec![Span::styled("│", border)];
-			for (i, w) in widths.iter().enumerate() {
-				let cell = row.get(i);
-				let text = cell.map(cell_text).unwrap_or_default();
-				let style = if bold {
-					Style::new().add_modifier(Modifier::BOLD)
-				} else {
-					Style::default()
-				};
-				let padded = match t.aligns.get(i) {
-					Some(pulldown_cmark::Alignment::Right) => format!("{text:>w$}"),
-					Some(pulldown_cmark::Alignment::Center) => {
-						let total = w.saturating_sub(text.width());
-						let left = total / 2;
-						format!("{}{text}{}", " ".repeat(left), " ".repeat(total - left))
+		let available = self.effective_width();
+		let overhead = 3 * n + 1;
+		if available < overhead + n {
+			for line in t.raw.lines() {
+				let mut line = line;
+				for _ in 0..self.quote_depth {
+					let trimmed = line.trim_start();
+					if let Some(rest) = trimmed.strip_prefix('>') {
+						line = rest.strip_prefix(' ').unwrap_or(rest);
 					}
-					_ => format!("{text:<w$}"),
-				};
-				spans.push(Span::raw(" "));
-				spans.push(Span::styled(padded, style));
-				spans.push(Span::raw(" "));
-				spans.push(Span::styled("│", border));
+				}
+				let chunks = wrap_runs(
+					&[Run {
+						text: line.to_string(),
+						style: Style::default(),
+					}],
+					available.max(1),
+				);
+				if chunks.is_empty() {
+					self.push_raw(Vec::new());
+				}
+				for chunk in chunks {
+					self.push_raw(chunk);
+				}
 			}
-			spans
-		};
-
-		self.push_raw(render_row(&t.header, true));
-		let sep: Vec<Span<'static>> = {
-			let mut spans = vec![Span::styled("│", border)];
-			for w in &widths {
-				spans.push(Span::styled("─".repeat(w + 2), border));
-				spans.push(Span::styled("│", border));
-			}
-			spans
-		};
-		self.push_raw(sep);
-		for row in &t.rows {
-			self.push_raw(render_row(row, false));
+			return;
 		}
+		let capacity = available - overhead;
+		let mut natural = vec![0usize; n];
+		let mut minimum = vec![1usize; n];
+		for row in std::iter::once(&t.header).chain(&t.rows) {
+			for (i, cell) in row.iter().take(n).enumerate() {
+				let text: String = cell.iter().map(|span| span.content.as_ref()).collect();
+				natural[i] = natural[i].max(text.width());
+				minimum[i] = minimum[i].max(
+					text.split_whitespace()
+						.map(UnicodeWidthStr::width)
+						.max()
+						.unwrap_or(0)
+						.min(30),
+				);
+			}
+		}
+		let total_min = minimum.iter().sum::<usize>();
+		if total_min > capacity {
+			let remaining = capacity - n;
+			let weight: usize = minimum.iter().map(|w| w - 1).sum();
+			let mut reduced: Vec<usize> = minimum
+				.iter()
+				.map(|w| 1 + ((w - 1) * remaining).checked_div(weight).unwrap_or(0))
+				.collect();
+			let leftover = capacity - reduced.iter().sum::<usize>();
+			for width in reduced.iter_mut().take(leftover) {
+				*width += 1;
+			}
+			minimum = reduced;
+		}
+		let mut widths = if natural.iter().sum::<usize>() <= capacity {
+			natural
+				.iter()
+				.zip(&minimum)
+				.map(|(a, b)| (*a).max(*b))
+				.collect::<Vec<_>>()
+		} else {
+			let extra = capacity.saturating_sub(minimum.iter().sum());
+			let weight: usize = natural
+				.iter()
+				.zip(&minimum)
+				.map(|(a, b)| a.saturating_sub(*b))
+				.sum();
+			minimum
+				.iter()
+				.zip(&natural)
+				.map(|(min, max)| {
+					min + (max.saturating_sub(*min) * extra)
+						.checked_div(weight)
+						.unwrap_or(0)
+				})
+				.collect::<Vec<_>>()
+		};
+		while natural.iter().sum::<usize>() > capacity
+			&& widths.iter().sum::<usize>() < capacity
+			&& widths.iter().zip(&natural).any(|(w, n)| w < n)
+		{
+			for i in 0..n {
+				if widths.iter().sum::<usize>() == capacity {
+					break;
+				}
+				if widths[i] < natural[i] {
+					widths[i] += 1;
+				}
+			}
+		}
+		let border = Style::new().fg(self.theme.md_hr);
+		let border_line = |left: &str, middle: &str, right: &str| {
+			let cells: Vec<String> = widths.iter().map(|width| "─".repeat(width + 2)).collect();
+			vec![Span::styled(
+				format!("{left}{}{right}", cells.join(middle)),
+				border,
+			)]
+		};
+		self.push_raw(border_line("┌", "┬", "┐"));
+		for (row_index, row) in std::iter::once(&t.header).chain(&t.rows).enumerate() {
+			let cells: Vec<_> = (0..n)
+				.map(|i| {
+					row.get(i)
+						.map(|cell| {
+							let runs: Vec<_> = cell
+								.iter()
+								.map(|span| Run {
+									text: span.content.to_string(),
+									style: span.style,
+								})
+								.collect();
+							wrap_runs(&runs, widths[i])
+						})
+						.unwrap_or_default()
+				})
+				.collect();
+			let height = cells.iter().map(Vec::len).max().unwrap_or(0).max(1);
+			for line_index in 0..height {
+				let mut spans = vec![Span::styled("│", border)];
+				for (i, width) in widths.iter().enumerate() {
+					let mut content = cells[i].get(line_index).cloned().unwrap_or_default();
+					if row_index == 0 {
+						for span in &mut content {
+							span.style = span.style.add_modifier(Modifier::BOLD);
+						}
+					}
+					let used = content
+						.iter()
+						.map(|span| span.content.width())
+						.sum::<usize>();
+					spans.push(Span::raw(" "));
+					spans.extend(content);
+					spans.push(Span::raw(" ".repeat(width.saturating_sub(used) + 1)));
+					spans.push(Span::styled("│", border));
+				}
+				self.push_raw(spans);
+			}
+			if row_index < t.rows.len() {
+				self.push_raw(border_line("├", "┼", "┤"));
+			}
+		}
+		self.push_raw(border_line("└", "┴", "┘"));
 	}
 }
 
@@ -909,6 +990,74 @@ mod tests {
 			40,
 			&theme,
 		));
-		assert_eq!(out.iter().filter(|l| l.contains("│")).count(), 3);
+		assert_eq!(
+			out,
+			vec![
+				"┌───┬───┐",
+				"│ a │ b │",
+				"├───┼───┤",
+				"│ 1 │ 2 │",
+				"└───┴───┘"
+			]
+		);
+	}
+
+	#[test]
+	fn table_wraps_cells_to_terminal_width_and_keeps_styles() {
+		let theme = Theme::dark();
+		let lines = markdown_lines(
+			"| 名称 | Details |\n|:---|---:|\n| 中文测试 | **bold** and `code` |\n",
+			22,
+			&theme,
+		);
+		assert!(lines.iter().all(|line| line.width() <= 22));
+		let output = plain(lines.clone()).join("\n");
+		assert!(output.contains("中文"));
+		assert!(output.contains("测试"));
+		assert!(output.contains("bold"));
+		assert!(output.contains("code"));
+		assert!(
+			lines
+				.iter()
+				.flat_map(|l| &l.spans)
+				.any(|span| span.content == "bold"
+					&& span.style.add_modifier.contains(Modifier::BOLD))
+		);
+		assert!(
+			lines
+				.iter()
+				.flat_map(|l| &l.spans)
+				.any(|span| span.content == "code" && span.style.fg == Some(theme.md_code))
+		);
+	}
+
+	#[test]
+	fn table_uses_pi_layout_and_narrow_falls_back_to_markdown() {
+		let theme = Theme::light();
+		let source = "| 名称 | 值 |\n|:---|---:|\n| 中 | 12 |\n| 长长 | 3 |\n";
+		let lines = plain(markdown_lines(source, 40, &theme));
+		assert!(lines.iter().all(|line| line.width() == lines[0].width()));
+		assert!(lines.iter().any(|line| line.contains("│ 3  │")));
+		let narrow = plain(markdown_lines(source, 8, &theme));
+		assert!(narrow.iter().all(|line| line.width() <= 8));
+		assert!(narrow.iter().any(|line| line.contains("---")));
+		let joined = narrow.join("");
+		for cell in ["名称", "值", "中", "12", "长长", "3"] {
+			assert!(joined.contains(cell), "missing {cell}");
+		}
+	}
+
+	#[test]
+	fn quoted_table_wraps_long_cells_without_clipping() {
+		let source =
+			"> | Header |\n> |---|\n> | abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ |\n";
+		let lines = plain(markdown_lines(source, 20, &Theme::dark()));
+		assert!(lines.iter().all(|line| line.width() <= 20));
+		let text: String = lines
+			.join("")
+			.chars()
+			.filter(|c| c.is_ascii_alphabetic())
+			.collect();
+		assert!(text.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
 	}
 }

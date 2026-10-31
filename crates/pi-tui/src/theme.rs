@@ -96,7 +96,7 @@ impl Theme {
 	pub fn dark() -> Self {
 		Self {
 			name: "pi-dark".into(),
-			user: Color::Blue,
+			user: Color::Rgb(235, 235, 235),
 			assistant: Color::White,
 			thinking: Color::DarkGray,
 			tool: Color::Yellow,
@@ -116,7 +116,7 @@ impl Theme {
 			md_quote_border: Color::DarkGray,
 			md_hr: Color::DarkGray,
 			md_list_bullet: Color::Magenta,
-			user_bg: Color::Indexed(236),
+			user_bg: Color::Rgb(48, 48, 48),
 		}
 	}
 
@@ -704,6 +704,27 @@ fn oklch_to_rgb(l: f64, c: f64, hue: f64) -> (u8, u8, u8) {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn dark_user_message_has_readable_contrast() {
+		let theme = super::Theme::dark();
+		let (ratatui::style::Color::Rgb(fr, fg, fb), ratatui::style::Color::Rgb(br, bg, bb)) =
+			(theme.user, theme.user_bg)
+		else {
+			panic!("user message colors must not depend on the terminal palette");
+		};
+		let luminance = |r: u8, g: u8, b: u8| {
+			let linear = |v: u8| {
+				let c = f64::from(v) / 255.0;
+				if c <= 0.04045 {
+					c / 12.92
+				} else {
+					((c + 0.055) / 1.055).powf(2.4)
+				}
+			};
+			0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+		};
+		assert!((luminance(fr, fg, fb) + 0.05) / (luminance(br, bg, bb) + 0.05) >= 4.5);
+	}
 	#[test]
 	fn light_theme_colors_remain_readable_on_light_backgrounds() {
 		let theme = super::Theme::light();
