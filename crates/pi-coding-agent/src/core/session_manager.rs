@@ -1234,6 +1234,37 @@ pub enum SessionError {
 	EntryNotFound(String),
 }
 
+fn atomic_rewrite(
+	path: &Path,
+	write: impl FnOnce(&mut std::fs::File) -> Result<(), SessionError>,
+) -> Result<(), SessionError> {
+	let temporary = path.with_file_name(format!(".session-{}.tmp", uuid::Uuid::new_v4()));
+	let mut created = false;
+	let result = (|| {
+		let mut options = std::fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(0o600);
+		}
+		let mut file = options.open(&temporary)?;
+		created = true;
+		write(&mut file)?;
+		file.set_permissions(std::fs::metadata(path)?.permissions())?;
+		file.sync_all()?;
+		drop(file);
+		std::fs::rename(&temporary, path)?;
+		#[cfg(unix)]
+		std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+		Ok(())
+	})();
+	if result.is_err() && created {
+		let _ = std::fs::remove_file(&temporary);
+	}
+	result
+}
+
 impl SessionManager {
 	/// Create a fresh timestamped session under the sessions root.
 	pub fn create(cwd: &Path) -> Result<Self, SessionError> {
@@ -1294,12 +1325,13 @@ impl SessionManager {
 	/// are rejected without modification.
 	pub fn open(dir: &Path) -> Result<Self, SessionError> {
 		let path = dir.join("session.jsonl");
-		// A missing/unreadable file behaves like an empty one (self-heal
-		// below); a missing DIRECTORY still fails in open_file.
-		let text = std::fs::read_to_string(&path).unwrap_or_default();
+		let text = match std::fs::read_to_string(&path) {
+			Ok(text) => text,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+			Err(error) => return Err(error.into()),
+		};
 		let mut values = parse_file_lines(&text);
-		if values.is_empty() {
-			// Empty (or fully torn) log: start a fresh v3 session in place.
+		if text.is_empty() {
 			let header = SessionHeader {
 				version: Some(CURRENT_SESSION_VERSION),
 				id: uuid::Uuid::now_v7().to_string(),
@@ -1316,6 +1348,17 @@ impl SessionManager {
 			manager.write_header(&header)?;
 			return Ok(manager);
 		}
+		if text
+			.lines()
+			.find(|line| !line.trim().is_empty())
+			.and_then(|line| serde_json::from_str::<Value>(line).ok())
+			.is_none()
+		{
+			return Err(SessionError::InvalidFormat(format!(
+				"{} is not a valid session log (no session header)",
+				path.display()
+			)));
+		}
 		let first_type = values[0].get("type").and_then(Value::as_str);
 		if first_type == Some("header") {
 			return Err(SessionError::LegacyFormat(
@@ -1329,6 +1372,12 @@ impl SessionManager {
 			)));
 		}
 		let migrated = migrate_to_current_version(&mut values);
+		if migrated && text.lines().filter(|line| !line.trim().is_empty()).count() != values.len() {
+			return Err(SessionError::InvalidFormat(format!(
+				"{} contains malformed entries and cannot be migrated safely",
+				path.display()
+			)));
+		}
 		// The header is parsed after migration so the in-memory copy carries
 		// the current version (upstream reads `header.version` post-migrate).
 		let header = SessionHeader::from_value(&values[0]).expect("checked above");
@@ -1338,11 +1387,10 @@ impl SessionManager {
 			.filter_map(SessionEntry::from_value)
 			.collect();
 		let mut manager = Self::empty(dir.to_path_buf(), Some(header));
-		manager.open_file()?;
 		if migrated {
-			// Upstream rewrites migrated files in place (`_rewriteFile`).
 			manager.rewrite_file(&values)?;
 		}
+		manager.open_file()?;
 		for entry in entries {
 			manager.index_entry(entry);
 		}
@@ -1403,20 +1451,15 @@ impl SessionManager {
 		Ok(())
 	}
 
-	/// Rewrite the whole log (migration path): truncate, write every line,
-	/// fsync. Only called from `open` before anything else holds state.
 	fn rewrite_file(&mut self, values: &[Value]) -> Result<(), SessionError> {
-		let Some(file) = &mut self.file else {
-			return Ok(()); // in-memory
-		};
-		file.set_len(0)?;
-		file.seek(std::io::SeekFrom::Start(0))?;
-		for value in values {
-			let mut line = serde_json::to_string(value)?;
-			line.push('\n');
-			file.write_all(line.as_bytes())?;
-		}
-		file.sync_data()?;
+		let path = self.session_dir.join("session.jsonl");
+		atomic_rewrite(&path, |file| {
+			for value in values {
+				serde_json::to_writer(&mut *file, value)?;
+				file.write_all(b"\n")?;
+			}
+			Ok(())
+		})?;
 		self.entries_written = values.len() as u64;
 		Ok(())
 	}
@@ -2224,6 +2267,23 @@ mod tests {
 	}
 
 	#[test]
+	fn open_rejects_invalid_nonempty_logs_without_changes() {
+		let dir = temp_session_dir("invalid-nonempty");
+		let path = dir.join("session.jsonl");
+		for bytes in [
+			&b"  \n"[..],
+			&b"{\"type\":\"sess"[..],
+			&b"\xff"[..],
+			&b"bad\n{\"type\":\"session\",\"id\":\"s\"}\n"[..],
+		] {
+			std::fs::write(&path, bytes).unwrap();
+			assert!(SessionManager::open(&dir).is_err());
+			assert_eq!(std::fs::read(&path).unwrap(), bytes);
+		}
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
 	fn resume_appends_after_reopen_preserves_order() {
 		let dir = temp_session_dir("resume");
 		{
@@ -2436,6 +2496,35 @@ mod tests {
 	}
 
 	// -- migrations ----------------------------------------------------------
+
+	#[test]
+	fn failed_atomic_rewrite_preserves_original_and_cleans_up() {
+		let dir = temp_session_dir("rewrite-failure");
+		let path = dir.join("session.jsonl");
+		std::fs::write(&path, b"original").unwrap();
+		let result = atomic_rewrite(&path, |file| {
+			file.write_all(b"partial")?;
+			Err(std::io::Error::other("injected write failure").into())
+		});
+		assert!(result.is_err());
+		assert_eq!(std::fs::read(&path).unwrap(), b"original");
+		assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn migration_rejects_malformed_entries_without_changes() {
+		let dir = temp_session_dir("migration-corrupt");
+		let path = dir.join("session.jsonl");
+		let original = b"{\"type\":\"session\",\"version\":2,\"id\":\"s\"}\n{broken";
+		std::fs::write(&path, original).unwrap();
+		assert!(matches!(
+			SessionManager::open(&dir),
+			Err(SessionError::InvalidFormat(_))
+		));
+		assert_eq!(std::fs::read(&path).unwrap(), original);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
 
 	fn write_lines(dir: &Path, lines: &[Value]) {
 		let text = lines

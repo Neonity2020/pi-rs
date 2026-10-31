@@ -8,6 +8,7 @@
 pub mod connection;
 pub mod errors;
 pub mod local;
+mod output_archive;
 pub mod remote;
 
 pub use connection::{
@@ -15,4 +16,5 @@ pub use connection::{
 };
 pub use errors::{Error, Result};
 pub use local::LocalEnv;
+pub use output_archive::create_output_archive;
 pub use remote::RemoteEnv;

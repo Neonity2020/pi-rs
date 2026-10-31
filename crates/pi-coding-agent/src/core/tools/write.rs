@@ -2,10 +2,6 @@
 //!
 //! Behavior matches upstream: `path` + `content`, parent directories are
 //! created as needed (mkdir -p), the file is overwritten when it exists.
-//!
-//! Accepted difference: upstream serializes all file mutations through a
-//! per-path `withFileMutationQueue`; pi-rs runs tools sequentially and does
-//! not have the extension-host machinery yet (P2), so no queue is ported.
 
 use std::path::PathBuf;
 
@@ -13,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use pi_agent::{AgentTool, AgentToolResult, ToolUpdate};
+use pi_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdate};
 
 use super::{param_str, resolve_path};
 
@@ -36,6 +32,10 @@ impl AgentTool for WriteTool {
 	fn description(&self) -> &str {
 		"Write content to a file. Creates the file if it doesn't exist, \
 overwrites if it does. Automatically creates parent directories."
+	}
+
+	fn execution_mode(&self) -> Option<ToolExecutionMode> {
+		Some(ToolExecutionMode::Sequential)
 	}
 
 	fn parameters_schema(&self) -> Value {
@@ -139,5 +139,13 @@ mod tests {
 		let result = run(&dir, json!({"path": "f.txt"})).await;
 		assert!(result.is_error);
 		assert_eq!(text(&result), "missing required string parameter: content");
+	}
+
+	#[test]
+	fn write_forces_sequential_tool_batch() {
+		assert_eq!(
+			WriteTool::new(PathBuf::new()).execution_mode(),
+			Some(ToolExecutionMode::Sequential)
+		);
 	}
 }

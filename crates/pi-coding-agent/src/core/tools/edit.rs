@@ -8,8 +8,6 @@
 //!
 //! Accepted differences vs upstream (recorded, not blocking):
 //! - No fuzzy-match fallback for non-exact `oldText` (see tools/edit_diff.rs).
-//! - No file-mutation-queue serialization (the extension-host machinery
-//!   lands with the P2 extension system); pi-rs tools run sequentially.
 //! - The abort signal is observed between the file operations, not from an
 //!   event listener.
 
@@ -19,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use pi_agent::{AgentTool, AgentToolResult, ToolUpdate};
+use pi_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdate};
 
 use super::edit_diff::{
 	Edit, apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
@@ -113,6 +111,10 @@ instead of emitting overlapping edits. Do not include large unchanged \
 regions just to connect distant changes."
 	}
 
+	fn execution_mode(&self) -> Option<ToolExecutionMode> {
+		Some(ToolExecutionMode::Sequential)
+	}
+
 	fn parameters_schema(&self) -> Value {
 		json!({
 			"type": "object",
@@ -162,9 +164,8 @@ regions just to connect distant changes."
 		}
 
 		let resolved = resolve_path(&self.cwd, &path);
-		// Read as bytes decoded lossily, like the TS `buffer.toString("utf-8")`.
-		let raw_content = match tokio::fs::read(&resolved).await {
-			Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+		let raw_content = match tokio::fs::read_to_string(&resolved).await {
+			Ok(text) => text,
 			Err(e) => return AgentToolResult::error(format!("Could not edit file: {path}. {e}.")),
 		};
 		if signal.is_cancelled() {
@@ -477,5 +478,28 @@ mod tests {
 		.await;
 		assert!(result.is_error);
 		assert!(result_text(&result).starts_with("No changes made to f.txt."));
+	}
+
+	#[tokio::test]
+	async fn rejects_non_utf8_without_modifying_file() {
+		let dir = tmp_dir("invalid-utf8");
+		let file = dir.join("f.txt");
+		let original = b"hello\n\xff\n";
+		std::fs::write(&file, original).unwrap();
+		let result = run_edit(
+			&dir,
+			json!({"path": "f.txt", "edits": [{"oldText": "hello", "newText": "hi"}]}),
+		)
+		.await;
+		assert!(result.is_error);
+		assert_eq!(std::fs::read(file).unwrap(), original);
+	}
+
+	#[test]
+	fn edit_forces_sequential_tool_batch() {
+		assert_eq!(
+			EditTool::new(PathBuf::new()).execution_mode(),
+			Some(ToolExecutionMode::Sequential)
+		);
 	}
 }

@@ -299,26 +299,14 @@ fn truncation_notice(
 /// pi-env did not spill either stream (output between the 50KB display cap
 /// and pi-env's 60KB capture cap).
 ///
-/// The name is `pid + nanosecond timestamp + per-process counter` rather than
-/// `pid + now_ms()`: two truncations landing in the same millisecond (the
-/// parallel test suite, or a future concurrent tool call) would otherwise
-/// collide and one archive would silently overwrite the other's "Full output"
-/// path.
-fn write_full_output_file(text: &str) -> Option<String> {
-	static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-	let nanos = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.map(|d| d.as_nanos())
-		.unwrap_or(0);
-	let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	let path = std::env::temp_dir().join(format!(
-		"pi-rs-bash-{}-{}{:04}.log",
-		std::process::id(),
-		nanos,
-		seq
-	));
-	std::fs::write(&path, text).ok()?;
-	Some(path.to_string_lossy().into_owned())
+fn write_full_output_file(text: &str) -> std::io::Result<String> {
+	use std::io::Write;
+	let (mut file, path) = pi_env::create_output_archive("bash")?;
+	if let Err(error) = file.write_all(text.as_bytes()) {
+		let _ = std::fs::remove_file(path);
+		return Err(error);
+	}
+	Ok(path.to_string_lossy().into_owned())
 }
 
 /// Read at most `max_bytes` of a file, keeping head and tail around a
@@ -563,7 +551,12 @@ a timeout in seconds."
 							.collect();
 						let path = match spill_paths.is_empty() {
 							false => Some(spill_paths.join(", ")),
-							true => write_full_output_file(&full_text),
+							true => match write_full_output_file(&full_text) {
+								Ok(path) => Some(path),
+								Err(error) => return AgentToolResult::error(format!(
+									"{}\n\nCommand ran, but full output could not be archived: {error}", tail.content
+								)),
+							},
 						};
 						let last_line_bytes = if stderr_shown { stderr_view.last_line_bytes } else { stdout_view.last_line_bytes };
 						let notice = match &path {

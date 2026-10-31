@@ -55,49 +55,38 @@ const EXIT_STDIO_GRACE_MS: u64 = 100;
 struct Capture {
 	buf: Arc<std::sync::Mutex<Vec<u8>>>,
 	truncated: Arc<std::sync::atomic::AtomicBool>,
-	/// Lazily created file holding the complete stream once the in-memory cap
-	/// was hit.
+	total: Arc<std::sync::atomic::AtomicU64>,
 	spill: Arc<std::sync::Mutex<Option<SpillFile>>>,
+	error: Arc<std::sync::Mutex<Option<std::io::Error>>>,
 	task: tokio::task::JoinHandle<()>,
 }
 
-/// Append-only temp file holding the complete stream once the in-memory
-/// capture cap was hit. Named with the process id and a counter so concurrent
-/// sessions never collide; files are left behind for the caller
-/// (session-scoped cleanup), mirroring upstream's bash temp-file handling
-/// (`OutputAccumulator`).
 struct SpillFile {
 	file: std::fs::File,
 	path: std::path::PathBuf,
+	keep: bool,
 }
 
 impl SpillFile {
 	fn create(tag: &str) -> std::io::Result<Self> {
-		static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-		loop {
-			let path = std::env::temp_dir().join(format!(
-				"pi-rs-exec-{}-{}-{tag}",
-				std::process::id(),
-				COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-			));
-			// create_new: a stale file from a recycled pid must never be
-			// appended to.
-			match std::fs::OpenOptions::new()
-				.write(true)
-				.create_new(true)
-				.open(&path)
-			{
-				Ok(file) => return Ok(Self { file, path }),
-				Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-				Err(e) => return Err(e),
-			}
-		}
+		let (file, path) = crate::create_output_archive(tag)?;
+		Ok(Self {
+			file,
+			path,
+			keep: false,
+		})
 	}
 
-	fn append(&mut self, bytes: &[u8]) {
-		// Best effort: a spill failure loses only the archived stream copy,
-		// the in-memory capture is unaffected.
-		let _ = std::io::Write::write_all(&mut self.file, bytes);
+	fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+		std::io::Write::write_all(&mut self.file, bytes)
+	}
+}
+
+impl Drop for SpillFile {
+	fn drop(&mut self) {
+		if !self.keep {
+			let _ = std::fs::remove_file(&self.path);
+		}
 	}
 }
 
@@ -109,55 +98,74 @@ impl Drop for Capture {
 
 impl Capture {
 	fn start<R: AsyncRead + Unpin + Send + 'static>(
-		mut reader: R,
+		reader: R,
 		on_output: Option<crate::connection::OutputCallback>,
 		on_chunk: Option<crate::connection::OutputChunkCallback>,
 		tag: &'static str,
 	) -> Self {
+		Self::start_with(reader, on_output, on_chunk, tag, SpillFile::create)
+	}
+
+	fn start_with<R: AsyncRead + Unpin + Send + 'static>(
+		mut reader: R,
+		on_output: Option<crate::connection::OutputCallback>,
+		on_chunk: Option<crate::connection::OutputChunkCallback>,
+		tag: &'static str,
+		create: fn(&str) -> std::io::Result<SpillFile>,
+	) -> Self {
 		let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
-		let spill = Arc::new(std::sync::Mutex::new(None));
+		let total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let spill = Arc::new(std::sync::Mutex::new(None::<SpillFile>));
+		let error = Arc::new(std::sync::Mutex::new(None));
 		let task = {
 			let buf = buf.clone();
 			let truncated = truncated.clone();
+			let total = total.clone();
 			let spill = spill.clone();
+			let error = error.clone();
 			tokio::spawn(async move {
 				let mut chunk = [0u8; 8192];
 				loop {
-					// Read errors (including our own task abort closing in) end
-					// the stream, matching the TS "destroy the stream" semantics.
 					match reader.read(&mut chunk).await {
-						Ok(0) | Err(_) => break,
+						Ok(0) => break,
+						Err(e) => {
+							*error.lock().unwrap() = Some(e);
+							break;
+						}
 						Ok(n) => {
+							total.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 							if let Some(callback) = &on_output {
 								callback(&chunk[..n]);
 							}
 							if let Some(on_chunk) = &on_chunk {
-								// Decoded stdout ping for streaming callers; lossy
-								// decode is fine — chunks split mid-UTF-8 only
-								// momentarily corrupt the streaming view, the
-								// captured result text is byte-faithful.
-								let text = String::from_utf8_lossy(&chunk[..n]);
-								on_chunk(&text);
+								on_chunk(&String::from_utf8_lossy(&chunk[..n]));
 							}
 							let mut guard = buf.lock().unwrap();
 							let keep = n.min(MAX_CAPTURE_BYTES.saturating_sub(guard.len()));
-							truncated.store(keep < n, std::sync::atomic::Ordering::Relaxed);
 							guard.extend_from_slice(&chunk[..keep]);
 							if keep < n {
-								// The spill file holds the COMPLETE stream: the
-								// first excess chunk flushes the in-memory prefix,
-								// then the tail streams in.
+								truncated.store(true, std::sync::atomic::Ordering::Relaxed);
+								let mut error = error.lock().unwrap();
+								if error.is_some() {
+									continue;
+								}
 								let mut spill = spill.lock().unwrap();
-								match spill.as_mut() {
-									None => {
-										if let Ok(mut file) = SpillFile::create(tag) {
-											file.append(&guard);
-											file.append(&chunk[keep..n]);
-											*spill = Some(file);
-										}
-									}
+								let result = match spill.as_mut() {
 									Some(file) => file.append(&chunk[keep..n]),
+									None => create(tag).and_then(|mut file| {
+										file.append(&guard)?;
+										file.append(&chunk[keep..n])?;
+										*spill = Some(file);
+										Ok(())
+									}),
+								};
+								if let Err(e) = result {
+									*error = Some(std::io::Error::new(
+										e.kind(),
+										format!("could not archive {tag}: {e}"),
+									));
+									spill.take();
 								}
 							}
 						}
@@ -168,37 +176,41 @@ impl Capture {
 		Self {
 			buf,
 			truncated,
+			total,
 			spill,
+			error,
 			task,
 		}
 	}
 
-	fn len(&self) -> usize {
-		self.buf.lock().unwrap().len()
+	fn len(&self) -> u64 {
+		self.total.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
 	fn is_finished(&self) -> bool {
 		self.task.is_finished()
 	}
 
-	/// Path of the spill file holding the complete stream, if one was created.
-	fn spill_path(&self) -> Option<String> {
-		self.spill
-			.lock()
-			.unwrap()
-			.as_ref()
-			.map(|file| file.path.display().to_string())
+	async fn stop(&mut self) {
+		self.task.abort();
+		let _ = (&mut self.task).await;
 	}
 
-	/// Stop waiting for EOF and return the output gathered so far.
-	fn finish(self) -> String {
-		self.task.abort();
+	fn take_error(&self) -> Option<std::io::Error> {
+		self.error.lock().unwrap().take()
+	}
+
+	fn finish(self) -> (String, Option<String>) {
 		let bytes = std::mem::take(&mut *self.buf.lock().unwrap());
 		let mut text = String::from_utf8_lossy(&bytes).into_owned();
 		if self.truncated.load(std::sync::atomic::Ordering::Relaxed) {
 			text.push_str("\n… (output truncated at 60000 bytes)");
 		}
-		text
+		let path = self.spill.lock().unwrap().as_mut().map(|file| {
+			file.keep = true;
+			file.path.display().to_string()
+		});
+		(text, path)
 	}
 }
 
@@ -259,8 +271,8 @@ impl LocalEnv {
 		let mut group = ProcessGroup(child.id());
 		let stdout = child.stdout.take().expect("stdout is piped");
 		let stderr = child.stderr.take().expect("stderr is piped");
-		let out = Capture::start(stdout, options.on_output.clone(), on_chunk, "stdout");
-		let err = Capture::start(stderr, options.on_output.clone(), None, "stderr");
+		let mut out = Capture::start(stdout, options.on_output.clone(), on_chunk, "stdout");
+		let mut err = Capture::start(stderr, options.on_output.clone(), None, "stderr");
 
 		let status = match options.timeout_ms {
 			Some(timeout_ms) => {
@@ -290,10 +302,13 @@ impl LocalEnv {
 			last_len = now;
 			deadline = tokio::time::Instant::now() + grace;
 		}
-		let full_stdout_path = out.spill_path();
-		let full_stderr_path = err.spill_path();
-		let stdout = out.finish();
-		let stderr = err.finish();
+		out.stop().await;
+		err.stop().await;
+		if let Some(error) = out.take_error().or_else(|| err.take_error()) {
+			return Err(error.into());
+		}
+		let (stdout, full_stdout_path) = out.finish();
+		let (stderr, full_stderr_path) = err.finish();
 		#[cfg(unix)]
 		{
 			group.0 = None;
@@ -383,6 +398,99 @@ impl EnvConnection for LocalEnv {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn capture_reports_archive_creation_failure_and_drains() {
+		use tokio::io::AsyncWriteExt;
+		let (mut writer, reader) = tokio::io::duplex(8192);
+		let mut capture = Capture::start_with(reader, None, None, "test", |_| {
+			Err(std::io::Error::other("injected create failure"))
+		});
+		writer.write_all(&vec![b'x'; 100_000]).await.unwrap();
+		drop(writer);
+		while !capture.is_finished() {
+			tokio::task::yield_now().await;
+		}
+		capture.stop().await;
+		assert!(
+			capture
+				.take_error()
+				.unwrap()
+				.to_string()
+				.contains("injected create failure")
+		);
+		assert!(capture.spill.lock().unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn capture_reports_archive_write_failure() {
+		use tokio::io::AsyncWriteExt;
+		let (mut writer, reader) = tokio::io::duplex(8192);
+		let mut capture = Capture::start_with(reader, None, None, "test", |_| {
+			let (file, path) = crate::create_output_archive("readonly-test")?;
+			drop(file);
+			Ok(SpillFile {
+				file: std::fs::File::open(&path)?,
+				path,
+				keep: false,
+			})
+		});
+		writer.write_all(&vec![b'x'; 100_000]).await.unwrap();
+		drop(writer);
+		while !capture.is_finished() {
+			tokio::task::yield_now().await;
+		}
+		capture.stop().await;
+		assert!(
+			capture
+				.take_error()
+				.unwrap()
+				.to_string()
+				.contains("could not archive test")
+		);
+		assert!(capture.spill.lock().unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn abandoned_capture_removes_unclaimed_archive() {
+		use tokio::io::AsyncWriteExt;
+		let (mut writer, reader) = tokio::io::duplex(8192);
+		let capture = Capture::start(reader, None, None, "cancel-test");
+		writer.write_all(&vec![b'x'; 100_000]).await.unwrap();
+		let path = loop {
+			if let Some(path) = capture
+				.spill
+				.lock()
+				.unwrap()
+				.as_ref()
+				.map(|f| f.path.clone())
+			{
+				break path;
+			}
+			tokio::task::yield_now().await;
+		};
+		assert!(path.exists());
+		drop(capture);
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while path.exists() {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("abandoned archive must be removed");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn post_exit_spilled_output_keeps_draining_while_active() {
+		let result = LocalEnv::new().exec(
+			"(head -c 70000 /dev/zero; sleep 0.06; head -c 1000 /dev/zero; sleep 0.06; head -c 1000 /dev/zero; sleep 0.06; head -c 1000 /dev/zero) & exit",
+			ExecOptions::default(),
+		).await.unwrap();
+		let path = result.full_stdout_path.unwrap();
+		assert_eq!(std::fs::metadata(&path).unwrap().len(), 73_000);
+		std::fs::remove_file(path).unwrap();
+	}
 
 	#[tokio::test]
 	async fn limits_and_drains_both_output_streams() {
