@@ -13,12 +13,12 @@
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
 | 其他 HTTP provider | mock provider 可用于本地演示 |
-| 会话压缩与重试 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次）；错误自动重试（可重试错误判定 + 指数退避 + `auto_retry_start/end` 事件 + `agent_end.willRetry`，RPC 可开关/中止；settings 键待接入） |
+| 会话压缩与重试 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次）；错误自动重试（可重试错误判定 + 指数退避 + `auto_retry_start/end` 事件 + `agent_end.willRetry`，RPC 可开关/中止；支持 settings 的 `retry.enabled/maxRetries/baseDelayMs/maxAgentDelayMs`） |
 | agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek）；事件顺序对齐上游（turn_start 先于消息公告、assistant 盖 thinkingLevel、turn_end.toolResults 带 role） |
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
-| MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，协议版本协商（LATEST 2025-11-25 + 旧版接受表）、30s 请求超时 + notifications/cancelled、ping；OAuth 未实现 |
+| MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，协议版本协商（LATEST 2025-11-25 + 旧版接受表）、30s 请求超时 + notifications/cancelled、ping；`--no-mcp` 禁用 MCP 加载和启动；OAuth 未实现 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
-| `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false、MCP 工具不随会话替换重建（已声明偏差），逐条见 rpc.rs 模块文档 |
+| `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false；跨项目切换会关闭旧 MCP 连接并按目标项目的信任状态重连 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
 
@@ -34,6 +34,10 @@ cargo build --release
 ```
 
 交互模式键位：`Enter` 发送（`\`+Enter 换行续写）· `Esc` 中止运行 · `Ctrl+C` 退出 · `PgUp/PgDn` / 滚轮 翻页 · `Ctrl+O` 展开工具完整输出 · `Ctrl+T` 折叠/展开思考 · 编辑器支持 readline 词导航（`Ctrl+←/→`、`Alt+B/F`、`Alt+Backspace`、`Ctrl+W/K/U/D`）。`/model` 打开模糊搜索的模型选择浮层（↑↓ 选择、Enter 确认、Esc 取消）。
+
+交互模式可使用 `/new` 新建会话、`/name <名称>` 命名当前会话、`/session` 查看当前会话、`/resume` 选择会话或 `/resume <ID或路径>` 恢复指定会话；选择器支持搜索会话名称、项目路径及用户和助手消息。`/help` 显示其他命令。恢复含 MCP 配置的未信任项目时，可以选择信任项目、跳过项目 MCP 或取消切换。跨项目切换会应用目标项目的 `defaultTools`，并保留启动时指定的工具选项。
+
+启动时可用 `-n <名称>` 命名会话，使用 `--session <ID或路径>` 恢复已有会话（与 `--resume` 等价）。恢复跨项目会话时使用会话原项目的设置与工作目录；原目录不存在时启动失败。
 
 浅色终端可使用 `cargo run -p pi-coding-agent -- --light`，或在 settings.json 中设置 `"theme": "light"`。如果终端设置了 `COLORFGBG`，程序也会按它声明的背景颜色选择默认主题；显式主题设置优先。
 
@@ -113,6 +117,8 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 
 ## 开发
+
+系统提示词可用 `--system-prompt <文本或文件>` 替换默认提示词，用可重复的 `--append-system-prompt <文本或文件>` 追加内容。项目上下文仍会加载；使用 `--no-context-files` 可关闭，包括切换或新建会话后。
 
 ```bash
 cargo build          # 全工作区

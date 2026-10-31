@@ -9,19 +9,19 @@
 | `-p, --print` | `src/cli/args.ts:177-183`；docs/cli.md:45 | main.rs:41-43 | 已验证(语义部分) | 上游 `-p` 吸收非 flag 参数为 message 且可多条组合；Rust 无吸收逻辑 |
 | `--mode text\|json\|rpc` | args.ts:96-110 | 无 `--mode`；等价物 `--rpc` | 部分 | **`--mode json` 完全缺失**（JSONL 事件一次性模式） |
 | `-c, --continue` | args.ts:111-112；main.ts:432-434 | main.rs:53-55 + SessionSelector::Recent | 已验证(部分) | 缺 `-c` 短选项 |
-| `-r, --resume`（无值，选择器）/ `--session <path\|id>` | args.ts:113-114,134-135；main.ts:391-430 | `--resume <ID\|PATH>` 带值（session_manager.rs:345-380） | 接受差异 | Rust `--resume` 实为上游 `--session` 语义；无选择器 UI、无跨项目 fork 提示 |
-| `--session-id` / `--fork` / `--session-dir` / `-n --name` | args.ts:136-141,126-131 | 无 | 未实现 | |
-| `--provider` / `--api-key` / `--models` | args.ts:115-120,142-146 | 无 | 未实现 | |
-| `--model <pattern>`（provider/id、`:thinking` 后缀、fuzzy） | args.ts:117-118；main.ts:475-498 | main.rs:49-51 + registry find | 部分 | 未验证 `:thinking` 后缀；多加 `-m` 短选项（上游无） |
-| `--thinking <level>` | args.ts:167-176 | 无 CLI flag（读 settings；非法值静默→off） | 部分 | 上游非法值 warning；Rust 静默 |
+| `-r, --resume`（无值，选择器）/ `--session <path\|id>` | args.ts:113-114,134-135；main.ts:391-430 | `--resume` / `--session` 指定 ID 或路径；交互模式 `/resume` 提供选择器 | 部分 | CLI 无 `-r` 选择器及跨项目 fork 提示 |
+| `--session-id` / `--fork` / `--session-dir` / `-n --name` | args.ts:136-141,126-131 | `-n` / `--name` 设置会话名 | 部分 | 其他参数尚未实现 |
+| `--provider` / `--api-key` / `--models` | args.ts:115-120,142-146 | `--provider` 限定 `--model` 查找；`--api-key` 设置非持久化的 provider 凭证 | 部分 | `--models` 尚未实现；provider 选择与 API key 请求头有真实进程测试 |
+| `--model <pattern>`（provider/id、`:thinking` 后缀、fuzzy） | args.ts:117-118；main.ts:475-498 | 支持 provider/id、模糊匹配和 thinking 后缀 | 部分 | 支持 `-m` 短选项；模型能力约束尚未完全对齐 |
+| `--thinking <level>` | args.ts:167-176 | CLI 优先于模型后缀和 settings；非法值警告 | 部分 | 尚未按具体模型能力裁剪档位 |
 | `-t --tools`（含 +name/-name）/ `-xt` / `-nt` / `-nbt` | args.ts:147-166 | 无（工具集固定 create_tools） | 未实现 | |
-| `--system-prompt` / `--append-system-prompt` | args.ts:121-125 | 无 | 未实现 | |
+| `--system-prompt` / `--append-system-prompt` | args.ts:121-125 | 支持文本、文件及多次追加；会话替换时保留 | 部分 | 原有系统提示词仍是 pi-rs 简化版本，非上游结构化 sections |
 | `-e --extension` / `-ne --no-extensions` | args.ts:186-190 | 无 | 未实现 | |
-| `--no-mcp` | args.ts:191-192 | 无（MCP 始终尝试连接） | 未实现 | |
+| `--no-mcp` | args.ts:191-192 | `main.rs` 跳过 MCP 信任、配置加载及服务启动 | 已验证 | `tests/no_mcp.rs` 以真实子进程验证禁用及默认启用路径（2026-10-31） |
 | `--skill` / `--prompt-template` 系 | args.ts:193-198,210-213 | 无 | 未实现 | |
 | `--theme` / `--use-theme` / `--no-themes` | args.ts:199-209,214-215 | 等价物 `--light`（上游无此 flag） | 接受差异 | |
 | `-nc --no-context-files` | args.ts:216-217 | main.rs:66-68 | 已验证 | 缺 `-nc` 短选项 |
-| `--list-models` / `--export` / `--tui-mode` / `--verbose` | args.ts:218-240 | 无 | 未实现 | |
+| `--list-models` / `--export` / `--tui-mode` / `--verbose` | args.ts:218-240 | `--list-models [pattern]` 支持模糊搜索 | 部分 | 列出已知目录，暂不按认证状态过滤；其他选项未实现 |
 | `-a --approve` / `-na` | args.ts:241-244；main.ts:720-750 | trust 仅作用于 .pi/mcp.json | 部分 | 无全局 resource trust |
 | `--offline` | args.ts:245-246 | 无 | 未实现 | |
 | `-h/--help`、`-v/--version` | args.ts:92-95；main.ts:881-888 | clap 自动 | 已验证 | 上游 `-v` vs clap `-V` |

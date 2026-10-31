@@ -60,7 +60,8 @@
 |---|---|---|
 | 已验证 | /model /thinking /compact | 3 个（/thinking 为 cycle，上游可带参） |
 | Rust 增设 | /help /exit /clear /tools /prompt /sessions | 接受差异（调试命令；/sessions 是 stub） |
-| 未实现（会话管理） | /settings /tree /scoped-models /new /resume /name /session /fork /clone /import | 依赖会话树/管理 UI |
+| 会话管理（增量） | `/new` / `/name <name>` / `/session` / `/resume [id\|path]` | 已接入交互模式；可选择或指定会话，恢复当前上下文中的消息与工具结果 |
+| 未实现（会话管理） | /settings /tree /scoped-models /fork /clone /import | 依赖会话树/管理 UI |
 | 未实现（导出/分享） | /copy /export /share /bug | — |
 | 未实现（资源/信任） | /login /logout /llama /trust /mcp /reload /hotkeys /changelog | trust 有底层 API 无命令入口 |
 | SlashCommandSource | extension/prompt/skill 注册通路 | 部分（枚举已定义，无注册通路） |

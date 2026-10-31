@@ -1,5 +1,7 @@
 # Pi 1.4 兼容矩阵（P0 审计）
 
+> 2026-10-31 增量：实现 `--no-mcp`、系统提示词参数、provider/临时密钥选择、模型查询、thinking 参数及重试设置；会话替换保留提示词配置、刷新项目工具及 bash 会话环境，并按目标项目的信任状态重连 MCP。恢复界面支持搜索会话名称、项目路径及用户和助手消息，`--continue` 按文件修改时间选择当前项目的会话。真实进程和单元测试覆盖关键路径。下方原始审计和统计保留当时快照，不代表当前逐项状态。
+
 审计日期：2026-10-28。上游基线：本地快照 `f9daca3480732d0042b1df3a6e27221f597a620d`，各包声明版本 1.4.0。**tag 核实结论**：上游仓库存在 `v1.4.0` 发布 tag（指向 `4a080252`），但快照 SHA **不是**该 tag 的提交——快照领先 v1.4.0 恰好 72 个提交、落后 0 个（tag 之后 "Add [Unreleased] section for next cycle" 的开发态）。因此：
 
 - 本轮审计与差分测试以快照 SHA `f9daca34` 为冻结基线（GitHub 上可追溯）；
@@ -35,7 +37,7 @@ P1 交付在差分中的实证（保留）：SUMMARIZATION_PROMPT 与压缩 summ
 
 差分框架扩到 **6 场景全部 IDENTICAL**（原 4 个 print 场景 + 新增 `05-json-single-turn`/`06-json-tool-call`，对比 `--mode json` 的逐事件流）。归一化新增规则（均有据）：system 消息 start/end 对与 agent_end.messages 中的 system 丢弃（同会话视图规则）；`message_start` 只比 role（上游 spread 活引用、内容为消费时序伪影）；流中 `message_update.usage` 不比（本地单包回放下上游解析器跑在消费者前面，真实网络两侧一致于末帧）；`agent_settled.aborted`、`agent_end.willRetry`、`thinkingLevel`、`turn_end.toolResults` role 标签、`toolcall_end.toolCall` type 标签已按上游形状补齐。事件顺序对齐：`agent_start → turn_start → 消息公告`（steering/follow-up 入栈即时、公告随续轮 turn_start）。
 
-RPC 补齐到 **33/33**：session 树族（new_session/switch_session/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name，底层叶指针写入模型 + create_branched_session 重链）、bash/abort_bash 透传（bash_execution_update 流帧 + bashExecution entry）、get_session_stats、export_html、set/abort_auto_retry（错误重试引擎：可重试判定 + 指数退避 + willRetry，与溢出恢复互斥）。声明偏差：无扩展取消钩子故 cancelled 恒 false；MCP 工具表不随会话替换重建；新分支会话目录布局为同级目录（上游平铺同目录）。CLI 补 `--mode text|json|rpc` 与 `@file` 注入。
+RPC 补齐到 **33/33**：session 树族（new_session/switch_session/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name，底层叶指针写入模型 + create_branched_session 重链）、bash/abort_bash 透传（bash_execution_update 流帧 + bashExecution entry）、get_session_stats、export_html、set/abort_auto_retry（错误重试引擎：可重试判定 + 指数退避 + willRetry，与溢出恢复互斥）。声明偏差：无扩展取消钩子故 cancelled 恒 false；新分支会话目录布局为同级目录（上游平铺同目录）。跨项目切换时 MCP 按目标项目的信任状态重连，未信任的项目配置跳过。CLI 补 `--mode text|json|rpc` 与 `@file` 注入。
 
 ## 源码盘点发现的高风险项（P1 候选，按风险排序）
 
