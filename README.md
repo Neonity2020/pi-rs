@@ -35,11 +35,15 @@ cargo build --release
 
 交互模式键位：`Enter` 发送（`\`+Enter 换行续写）· `Esc` 中止运行 · `Ctrl+C` 退出 · `PgUp/PgDn` / 滚轮 翻页 · `Ctrl+O` 展开工具完整输出 · `Ctrl+T` 折叠/展开思考 · 编辑器支持 readline 词导航（`Ctrl+←/→`、`Alt+B/F`、`Alt+Backspace`、`Ctrl+W/K/U/D`）。`/model` 打开模糊搜索的模型选择浮层（↑↓ 选择、Enter 确认、Esc 取消）。
 
+浅色终端可使用 `cargo run -p pi-coding-agent -- --light`，或在 settings.json 中设置 `"theme": "light"`。如果终端设置了 `COLORFGBG`，程序也会按它声明的背景颜色选择默认主题；显式主题设置优先。
+
 渲染按 pi 的组件语义移植：助手/用户消息以 markdown 渲染（标题、粗斜体、行内代码、围栏代码块、列表、引用、表格、链接），工具调用折叠显示 `key=value` 参数与 10 行输出预览（含运行时长），底栏两行显示 cwd+git 分支与 token/费用/上下文占比（>70% 变黄、>90% 变红），右侧对齐当前模型与 thinking 档位。
 
 mock provider 行为：普通消息回显（演示流式渲染）；包含 "list"/"ls" 的消息触发一次 `ls` 工具调用往返（演示完整 agent loop：toolUse → 执行 → 结果回传 → 二轮总结）。
 
 ## 使用 OpenAI 兼容接口
+
+在交互界面输入 `/login`（或 `/provider`），用方向键选择 MiMo 中国区 Token Plan、OpenAI、Anthropic 或自定义服务。预设服务只需输入 API key；自定义服务还需填写 ID、API 类型、Base URL 和模型 ID。保存后自动切换到该服务的模型；下次启动默认仍为 MiMo（除非 settings 指定了其他默认模型）。密钥输入时会隐藏，并以明文写入用户配置目录下的 `models.json`（Unix 文件权限为 0600）。预设服务可重新输入密钥；已有同名自定义服务不会被覆盖。
 
 默认模型为 `mimo/mimo-v2.6-pro`。在 `.env` 中设置 `MIMO_API_KEY=你的Token Plan密钥` 后即可运行。默认地址为 `https://token-plan-cn.xiaomimimo.com/v1`；如订阅页面提供不同地址，可设置 `MIMO_BASE_URL`。Token Plan 密钥和按量付费密钥不可混用，请以订阅页面的凭证为准。
 

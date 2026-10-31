@@ -123,27 +123,27 @@ impl Theme {
 	pub fn light() -> Self {
 		Self {
 			name: "pi-light".into(),
-			user: Color::Blue,
-			assistant: Color::Black,
-			thinking: Color::Indexed(244),
-			tool: Color::Indexed(130),
-			tool_output: Color::Indexed(238),
-			error: Color::Red,
-			success: Color::Green,
-			border: Color::Indexed(250),
-			accent: Color::Cyan,
-			muted: Color::Indexed(249),
-			md_heading: Color::Indexed(130),
-			md_link: Color::Blue,
-			md_link_url: Color::Indexed(244),
-			md_code: Color::Indexed(127),
-			md_code_block: Color::Indexed(28),
-			md_code_block_border: Color::Indexed(249),
-			md_quote: Color::Indexed(238),
-			md_quote_border: Color::Indexed(249),
-			md_hr: Color::Indexed(249),
-			md_list_bullet: Color::Indexed(127),
-			user_bg: Color::Indexed(254),
+			user: Color::Rgb(0, 55, 130),
+			assistant: Color::Rgb(25, 25, 25),
+			thinking: Color::Rgb(90, 90, 90),
+			tool: Color::Rgb(120, 65, 0),
+			tool_output: Color::Rgb(55, 55, 55),
+			error: Color::Rgb(165, 20, 20),
+			success: Color::Rgb(0, 100, 45),
+			border: Color::Rgb(105, 105, 105),
+			accent: Color::Rgb(0, 90, 115),
+			muted: Color::Rgb(90, 90, 90),
+			md_heading: Color::Rgb(120, 65, 0),
+			md_link: Color::Rgb(0, 60, 145),
+			md_link_url: Color::Rgb(90, 90, 90),
+			md_code: Color::Rgb(125, 30, 115),
+			md_code_block: Color::Rgb(0, 100, 45),
+			md_code_block_border: Color::Rgb(105, 105, 105),
+			md_quote: Color::Rgb(55, 55, 55),
+			md_quote_border: Color::Rgb(105, 105, 105),
+			md_hr: Color::Rgb(105, 105, 105),
+			md_list_bullet: Color::Rgb(125, 30, 115),
+			user_bg: Color::Rgb(238, 238, 238),
 		}
 	}
 
@@ -704,6 +704,48 @@ fn oklch_to_rgb(l: f64, c: f64, hue: f64) -> (u8, u8, u8) {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn light_theme_colors_remain_readable_on_light_backgrounds() {
+		let theme = super::Theme::light();
+		let contrast = |color: ratatui::style::Color, background: u8| {
+			let ratatui::style::Color::Rgb(r, g, b) = color else {
+				panic!("light palette must not depend on terminal ANSI colors")
+			};
+			let linear = |v: u8| {
+				let c = f64::from(v) / 255.0;
+				if c <= 0.04045 {
+					c / 12.92
+				} else {
+					((c + 0.055) / 1.055).powf(2.4)
+				}
+			};
+			let fg = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+			(linear(background) + 0.05) / (fg + 0.05)
+		};
+		for color in [
+			theme.assistant,
+			theme.thinking,
+			theme.tool,
+			theme.tool_output,
+			theme.error,
+			theme.success,
+			theme.accent,
+			theme.muted,
+			theme.md_heading,
+			theme.md_link,
+			theme.md_link_url,
+			theme.md_code,
+			theme.md_code_block,
+			theme.md_quote,
+			theme.md_list_bullet,
+		] {
+			assert!(
+				contrast(color, 255) >= 4.5,
+				"insufficient light theme contrast: {color:?}"
+			);
+		}
+		assert!(contrast(theme.user, 238) >= 4.5);
+	}
 	use super::*;
 
 	#[test]

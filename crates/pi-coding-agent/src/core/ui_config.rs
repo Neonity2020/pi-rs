@@ -232,7 +232,55 @@ pub struct UiConfig {
 /// settings.json `theme`, and `keybindings.json` for user keybindings.
 /// `light` selects the built-in fallback theme when no user theme applies
 /// (pi-rs has no `system` theme; upstream's default).
+fn colorfgbg_is_light(value: &str) -> bool {
+	let Some(index) = value.rsplit(';').next().and_then(|v| v.parse::<u8>().ok()) else {
+		return false;
+	};
+	let (r, g, b) = match index {
+		0..=15 => {
+			const ANSI: [(u8, u8, u8); 16] = [
+				(0, 0, 0),
+				(128, 0, 0),
+				(0, 128, 0),
+				(128, 128, 0),
+				(0, 0, 128),
+				(128, 0, 128),
+				(0, 128, 128),
+				(192, 192, 192),
+				(128, 128, 128),
+				(255, 0, 0),
+				(0, 255, 0),
+				(255, 255, 0),
+				(0, 0, 255),
+				(255, 0, 255),
+				(0, 255, 255),
+				(255, 255, 255),
+			];
+			ANSI[index as usize]
+		}
+		16..=231 => {
+			let n = index - 16;
+			let level = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
+			(level(n / 36), level((n / 6) % 6), level(n % 6))
+		}
+		_ => {
+			let v = 8 + 10 * (index - 232);
+			(v, v, v)
+		}
+	};
+	let linear = |v: u8| {
+		let c = f64::from(v) / 255.0;
+		if c <= 0.04045 {
+			c / 12.92
+		} else {
+			((c + 0.055) / 1.055).powf(2.4)
+		}
+	};
+	0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b) > 0.179
+}
+
 pub fn load(theme_setting: Option<&str>, light: bool) -> UiConfig {
+	let light = light || std::env::var("COLORFGBG").is_ok_and(|value| colorfgbg_is_light(&value));
 	let agent_dir = config::agent_dir();
 	load_from(
 		&agent_dir.join("keybindings.json"),
@@ -390,6 +438,14 @@ fn load_theme(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn terminal_background_detection_uses_last_color_and_handles_invalid_values() {
+		assert!(super::colorfgbg_is_light("0;15"));
+		assert!(super::colorfgbg_is_light("0;231"));
+		assert!(!super::colorfgbg_is_light("15;0"));
+		assert!(!super::colorfgbg_is_light("0;16"));
+		assert!(!super::colorfgbg_is_light("bad"));
+	}
 	use super::*;
 	use pi_tui::Theme;
 	use ratatui::style::Color;

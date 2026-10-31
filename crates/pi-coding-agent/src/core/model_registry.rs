@@ -38,6 +38,105 @@ use pi_ai::{Api, Model, ModelCost, StreamFn};
 
 use crate::config;
 
+pub fn add_provider(
+	path: &std::path::Path,
+	id: &str,
+	api: &str,
+	base_url: &str,
+	model: &str,
+	key: &str,
+) -> anyhow::Result<()> {
+	use std::io::Write;
+	#[cfg(not(unix))]
+	anyhow::bail!("Saving API keys is not supported on this platform");
+	if id.is_empty()
+		|| !id
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+	{
+		anyhow::bail!("Provider ID must contain only letters, digits, - or _");
+	}
+	if !matches!(api, "openai-completions" | "anthropic-messages") {
+		anyhow::bail!("API must be openai-completions or anthropic-messages");
+	}
+	if !model.is_empty()
+		&& (!(base_url.starts_with("https://") || base_url.starts_with("http://"))
+			|| base_url.chars().any(char::is_whitespace)
+			|| base_url
+				.split_once("://")
+				.is_none_or(|(_, host)| host.is_empty()))
+	{
+		anyhow::bail!("Enter a valid http:// or https:// base URL");
+	}
+	if key.is_empty() {
+		anyhow::bail!("API key is required");
+	}
+	let mut root: Value = match std::fs::read_to_string(path) {
+		Ok(text) => serde_json::from_str(&text)?,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({"providers": {}}),
+		Err(e) => return Err(e.into()),
+	};
+	let object = root
+		.as_object_mut()
+		.ok_or_else(|| anyhow::anyhow!("models.json must contain an object"))?;
+	let providers = object
+		.entry("providers")
+		.or_insert_with(|| serde_json::json!({}))
+		.as_object_mut()
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"models.json providers must be an object; existing file was not changed"
+			)
+		})?;
+	if !model.is_empty() && providers.contains_key(id) {
+		anyhow::bail!(
+			"Provider already exists in models.json; edit it manually to avoid overwriting its settings"
+		);
+	}
+	let escaped = key.replace('$', "$$");
+	let escaped = if let Some(rest) = escaped.strip_prefix('!') {
+		format!("$!{rest}")
+	} else {
+		escaped
+	};
+	if model.is_empty() {
+		if !matches!(id, "mimo" | "openai" | "anthropic") {
+			anyhow::bail!("Unknown built-in provider");
+		}
+		let entry = providers.entry(id).or_insert_with(|| serde_json::json!({}));
+		entry
+			.as_object_mut()
+			.ok_or_else(|| anyhow::anyhow!("Existing provider configuration is invalid"))?
+			.insert("apiKey".into(), Value::String(escaped));
+	} else {
+		providers.insert(id.to_owned(), serde_json::json!({"api": api, "baseUrl": base_url, "apiKey": escaped, "models": [{"id": model}]}));
+	}
+	let parent = path
+		.parent()
+		.ok_or_else(|| anyhow::anyhow!("Invalid models.json path"))?;
+	std::fs::create_dir_all(parent)?;
+	let temp = parent.join(format!(".models-{}.tmp", uuid::Uuid::new_v4()));
+	let result = (|| -> anyhow::Result<()> {
+		let mut options = std::fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(0o600);
+		}
+		let mut file = options.open(&temp)?;
+		serde_json::to_writer_pretty(&mut file, &root)?;
+		file.write_all(b"\n")?;
+		file.sync_all()?;
+		std::fs::rename(&temp, path)?;
+		Ok(())
+	})();
+	if result.is_err() {
+		let _ = std::fs::remove_file(temp);
+	}
+	result
+}
+
 pub struct ModelRegistry {
 	models: Vec<Model>,
 	/// Raw `apiKey`/`headers` config per provider id (models.json object
@@ -674,6 +773,90 @@ fn builtin_models() -> Vec<Model> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn preset_key_updates_without_replacing_provider_settings() {
+		let dir = std::env::temp_dir().join(format!("pi-preset-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("models.json");
+		std::fs::write(&path, r#"{"providers":{"mimo":{"baseUrl":"https://custom.example/v1","headers":{"X-Test":"keep"},"apiKey":"old"}}}"#).unwrap();
+		super::add_provider(&path, "mimo", "openai-completions", "", "", "new-key").unwrap();
+		let root: serde_json::Value =
+			serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+		assert_eq!(root["providers"]["mimo"]["apiKey"], "new-key");
+		assert_eq!(
+			root["providers"]["mimo"]["baseUrl"],
+			"https://custom.example/v1"
+		);
+		assert_eq!(root["providers"]["mimo"]["headers"]["X-Test"], "keep");
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn add_provider_preserves_config_and_protects_key() {
+		let dir = std::env::temp_dir().join(format!("pi-provider-{}", uuid::Uuid::new_v4()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("models.json");
+		std::fs::write(
+			&path,
+			r#"{"other":true,"providers":{"old":{"apiKey":"keep"}}}"#,
+		)
+		.unwrap();
+		super::add_provider(
+			&path,
+			"new",
+			"openai-completions",
+			"https://example.com/v1",
+			"model",
+			"!key$word",
+		)
+		.unwrap();
+		let text = std::fs::read_to_string(&path).unwrap();
+		let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+		assert_eq!(value["other"], true);
+		assert_eq!(value["providers"]["old"]["apiKey"], "keep");
+		assert_eq!(
+			super::resolve_config_value(
+				value["providers"]["new"]["apiKey"].as_str().unwrap(),
+				None
+			)
+			.as_deref(),
+			Some("!key$word")
+		);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			assert_eq!(
+				std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+				0o600
+			);
+		}
+		assert!(
+			super::add_provider(
+				&path,
+				"new",
+				"openai-completions",
+				"https://example.com",
+				"x",
+				"key"
+			)
+			.is_err()
+		);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+		std::fs::write(&path, "broken").unwrap();
+		assert!(
+			super::add_provider(
+				&path,
+				"x",
+				"openai-completions",
+				"https://example.com",
+				"x",
+				"key"
+			)
+			.is_err()
+		);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+		std::fs::remove_dir_all(dir).unwrap();
+	}
 	use super::*;
 
 	fn apply(text: &str) -> (Vec<Model>, BTreeMap<String, ProviderAuth>) {

@@ -30,6 +30,16 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 	),
 	info("clear", "clear the chat view", SlashCommandSource::Builtin),
 	info(
+		"provider",
+		"add a model provider",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"login",
+		"select a provider and enter an API key",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"model",
 		"list models or switch: /model <query>",
 		SlashCommandSource::Builtin,

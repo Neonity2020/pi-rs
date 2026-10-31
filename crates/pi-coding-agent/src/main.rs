@@ -580,8 +580,13 @@ async fn main() -> anyhow::Result<()> {
 	ui.notices
 		.extend(mcp.notices.drain(..).map(|notice| format!("mcp: {notice}")));
 	ui.notices.extend(startup_notices);
-	let mode =
-		modes::interactive::InteractiveMode::new(handle, models, cwd.display().to_string(), ui);
+	let mode = modes::interactive::InteractiveMode::new(
+		handle,
+		models,
+		registry,
+		cwd.display().to_string(),
+		ui,
+	);
 	let result = mode.run(initial_prompt).await;
 	// Session shutdown: close the MCP server transports (graceful ladder,
 	// process group reaped) before main drops the assembly.

@@ -14,6 +14,7 @@
 //! (`components/model-selector.ts`).
 
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
@@ -32,8 +33,37 @@ use pi_tui::keybindings::KeybindingsManager;
 use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
 
 use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle};
+use crate::core::model_registry::{ModelRegistry, add_provider};
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
 use crate::core::ui_config::UiConfig;
+
+#[derive(Default)]
+struct ProviderWizard {
+	values: Vec<String>,
+	input: String,
+	error: Option<String>,
+	selected: Option<usize>,
+	cursor: usize,
+}
+
+const PROVIDER_OPTIONS: [&str; 4] = [
+	"MiMo Token Plan (中国区，默认)",
+	"OpenAI",
+	"Anthropic",
+	"自定义 OpenAI / Anthropic 兼容服务",
+];
+
+impl ProviderWizard {
+	fn prompt(&self) -> &'static str {
+		[
+			"Provider ID (e.g. my-provider)",
+			"API (openai-completions or anthropic-messages)",
+			"Base URL (e.g. https://example.com/v1)",
+			"Model ID",
+			"API key (hidden; stored in models.json)",
+		][self.values.len()]
+	}
+}
 
 const TICK_MS: u64 = 80;
 const TOOL_PREVIEW_LINES: usize = 10;
@@ -108,6 +138,8 @@ impl ModelOverlay {
 pub struct InteractiveMode {
 	session: SessionHandle,
 	models: Vec<Model>,
+	registry: Arc<Mutex<ModelRegistry>>,
+	provider_wizard: Option<ProviderWizard>,
 	theme: Theme,
 	// Resolved app keybindings (ui_config.rs): default table + user
 	// keybindings.json overrides.
@@ -251,12 +283,20 @@ fn resolve_global_action(
 }
 
 impl InteractiveMode {
-	pub fn new(session: SessionHandle, models: Vec<Model>, cwd: String, ui: UiConfig) -> Self {
+	pub fn new(
+		session: SessionHandle,
+		models: Vec<Model>,
+		registry: Arc<Mutex<ModelRegistry>>,
+		cwd: String,
+		ui: UiConfig,
+	) -> Self {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 		let theme = ui.theme;
 		Self {
 			session,
 			models,
+			registry,
+			provider_wizard: None,
 			theme: theme.clone(),
 			keybindings: ui.keybindings,
 			startup_notices: ui.notices,
@@ -363,8 +403,18 @@ impl InteractiveMode {
 	// -- input handling -------------------------------------------------------
 
 	fn handle_terminal_event(&mut self, event: TermEvent) {
+		if let (Some(wizard), TermEvent::Paste(text)) = (&mut self.provider_wizard, &event) {
+			if wizard.selected.is_some() {
+				wizard.input.push_str(&text.replace(['\r', '\n'], ""));
+			}
+			return;
+		}
 		if let TermEvent::Key(key) = &event {
 			if key.kind == crossterm::event::KeyEventKind::Release {
+				return;
+			}
+			if self.provider_wizard.is_some() {
+				self.handle_provider_key(*key);
 				return;
 			}
 			if self.overlay.is_some() {
@@ -385,6 +435,103 @@ impl InteractiveMode {
 			return;
 		}
 		self.chat.handle_event(&event);
+	}
+
+	fn handle_provider_key(&mut self, key: KeyEvent) {
+		let wizard = self.provider_wizard.as_mut().unwrap();
+		if wizard.selected.is_none() {
+			match key.code {
+				KeyCode::Up => wizard.cursor = wizard.cursor.saturating_sub(1),
+				KeyCode::Down => {
+					wizard.cursor = (wizard.cursor + 1).min(PROVIDER_OPTIONS.len() - 1)
+				}
+				KeyCode::Esc => self.provider_wizard = None,
+				KeyCode::Enter => {
+					wizard.selected = Some(wizard.cursor);
+					let preset = match wizard.cursor {
+						0 => Some(("mimo", "openai-completions")),
+						1 => Some(("openai", "openai-completions")),
+						2 => Some(("anthropic", "anthropic-messages")),
+						_ => None,
+					};
+					if let Some((id, api)) = preset {
+						wizard.values = vec![id.into(), api.into(), String::new(), String::new()];
+					}
+				}
+				_ => {}
+			}
+			return;
+		}
+		match key.code {
+			KeyCode::Esc => {
+				self.provider_wizard = None;
+				self.push_notice("Provider setup cancelled".into());
+			}
+			KeyCode::Backspace => {
+				wizard.input.pop();
+			}
+			KeyCode::Char(c)
+				if !key
+					.modifiers
+					.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+			{
+				wizard.input.push(c)
+			}
+			KeyCode::Enter => {
+				if wizard.input.trim().is_empty() {
+					wizard.error = Some("A value is required".into());
+					return;
+				}
+				if wizard.values.len() == 1
+					&& wizard.selected == Some(3)
+					&& !matches!(
+						wizard.input.trim(),
+						"openai-completions" | "anthropic-messages"
+					) {
+					wizard.error = Some("Use openai-completions or anthropic-messages".into());
+					return;
+				}
+				wizard.error = None;
+				wizard
+					.values
+					.push(std::mem::take(&mut wizard.input).trim().to_string());
+				if wizard.values.len() == 5 {
+					let wizard = self.provider_wizard.take().unwrap();
+					let v = &wizard.values;
+					match add_provider(
+						&crate::config::models_json_path(),
+						&v[0],
+						&v[1],
+						&v[2],
+						&v[3],
+						&v[4],
+					) {
+						Ok(()) => {
+							let mut registry = self.registry.lock().unwrap();
+							let default = registry.default_model();
+							*registry = ModelRegistry::load(Some(&default.key()));
+							self.models = registry.models().to_vec();
+							drop(registry);
+							let model = match wizard.selected {
+								Some(0) => "mimo/mimo-v2.6-pro".to_string(),
+								Some(1) => "openai/gpt-5.2".to_string(),
+								Some(2) => "anthropic/claude-sonnet-4-6".to_string(),
+								_ => format!("{}/{}", v[0], v[3]),
+							};
+							let _ = self.session.cmd_tx.send(SessionCommand::SetModel {
+								query: model.clone(),
+							});
+							self.push_notice(format!(
+								"Provider {} saved. Switching to {}.",
+								v[0], model
+							));
+						}
+						Err(error) => self.push_notice(format!("Provider was not saved: {error}")),
+					}
+				}
+			}
+			_ => {}
+		}
 	}
 
 	fn handle_overlay_key(&mut self, key: KeyEvent) {
@@ -517,6 +664,7 @@ impl InteractiveMode {
 			None => (command, ""),
 		};
 		match name {
+			"provider" | "login" => self.provider_wizard = Some(ProviderWizard::default()),
 			"help" | "h" | "?" => {
 				let mut text = String::from("commands:\n");
 				for info in BUILTIN_SLASH_COMMANDS {
@@ -808,6 +956,47 @@ impl InteractiveMode {
 		self.draw_editor(frame, chunks[2]);
 		self.draw_footer(frame, chunks[3]);
 		self.draw_overlay(frame, chunks[1]);
+		if let Some(wizard) = &self.provider_wizard {
+			let area = chunks[1];
+			let height = area
+				.height
+				.min(if wizard.selected.is_none() { 8 } else { 6 });
+			let panel = Rect {
+				x: area.x,
+				y: area.y,
+				width: area.width,
+				height,
+			};
+			frame.render_widget(Clear, panel);
+			let input = if wizard.values.len() == 4 {
+				"*".repeat(wizard.input.chars().count())
+			} else {
+				wizard.input.clone()
+			};
+			let text = if wizard.selected.is_none() {
+				let mut text = PROVIDER_OPTIONS
+					.iter()
+					.enumerate()
+					.map(|(i, label)| {
+						format!("{} {}", if i == wizard.cursor { "❯" } else { " " }, label)
+					})
+					.collect::<Vec<_>>()
+					.join("\n");
+				text.push_str("\n↑/↓ 选择 · Enter 确认 · Esc 取消");
+				text
+			} else {
+				format!(
+					"{}\n{}▌\n{}\nEnter: next/save · Esc: cancel",
+					wizard.prompt(),
+					input,
+					wizard.error.as_deref().unwrap_or("")
+				)
+			};
+			frame.render_widget(
+				Paragraph::new(text).block(Block::bordered().title(" Add provider ")),
+				panel,
+			);
+		}
 	}
 
 	fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
