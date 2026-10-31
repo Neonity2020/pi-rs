@@ -9,6 +9,7 @@ pub mod markdown;
 pub mod scroll_view;
 pub mod select_list;
 pub mod text;
+pub mod tree_selector;
 
 use crossterm::event::Event;
 use ratatui::buffer::Buffer;
@@ -19,6 +20,7 @@ pub use markdown::{Markdown, markdown_lines};
 pub use scroll_view::ScrollView;
 pub use select_list::{SelectAction, SelectItem, SelectList};
 pub use text::Text;
+pub use tree_selector::{TreeAction, TreeCategory, TreeFilterMode, TreeItem, TreeSelector};
 
 /// Base component contract shared by all pi-tui widgets.
 pub trait Component {
