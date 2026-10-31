@@ -7,31 +7,31 @@
 | 能力项 | 上游证据 | Rust 证据 | 状态 | 差距 |
 |---|---|---|---|---|
 | `-p, --print` | `src/cli/args.ts:177-183`；docs/cli.md:45 | main.rs:41-43 | 已验证(语义部分) | 上游 `-p` 吸收非 flag 参数为 message 且可多条组合；Rust 无吸收逻辑 |
-| `--mode text\|json\|rpc` | args.ts:96-110 | 无 `--mode`；等价物 `--rpc` | 部分 | **`--mode json` 完全缺失**（JSONL 事件一次性模式） |
-| `-c, --continue` | args.ts:111-112；main.ts:432-434 | main.rs:53-55 + SessionSelector::Recent | 已验证(部分) | 缺 `-c` 短选项 |
-| `-r, --resume`（无值，选择器）/ `--session <path\|id>` | args.ts:113-114,134-135；main.ts:391-430 | `--resume` / `--session` 指定 ID 或路径；交互模式 `/resume` 提供选择器 | 部分 | CLI 无 `-r` 选择器及跨项目 fork 提示 |
-| `--session-id` / `--fork` / `--session-dir` / `-n --name` | args.ts:136-141,126-131 | `-n` / `--name` 设置会话名 | 部分 | 其他参数尚未实现 |
-| `--provider` / `--api-key` / `--models` | args.ts:115-120,142-146 | `--provider` 限定 `--model` 查找；`--api-key` 设置非持久化的 provider 凭证 | 部分 | `--models` 尚未实现；provider 选择与 API key 请求头有真实进程测试 |
-| `--model <pattern>`（provider/id、`:thinking` 后缀、fuzzy） | args.ts:117-118；main.ts:475-498 | 支持 provider/id、模糊匹配和 thinking 后缀 | 部分 | 支持 `-m` 短选项；模型能力约束尚未完全对齐 |
+| `--mode text\|json\|rpc` | args.ts:96-110 | main.rs `resolve_app_mode`（resolveAppMode 移植，stdout 非 TTY 也进 print） | 已验证 | difftest 05/06 场景覆盖 json 模式 |
+| `-c, --continue` | args.ts:111-112；main.ts:432-434 | main.rs `-c` 短选项 + SessionSelector::Recent（mtime 降序） | 已验证 | |
+| `-r, --resume`（无值，选择器）/ `--session <path\|id>` | args.ts:113-114,134-135；main.ts:391-430 | `--resume` / `--session` 指定 ID 或路径；交互模式 `/resume` 提供选择器 | 部分 | CLI 无 `-r` 选择器及跨项目 fork 提示（Rust 按会话原项目 cwd 恢复，已声明） |
+| `--session-id` / `--fork` / `--session-dir` / `-n --name` | args.ts:136-141,126-131 | 四者齐备：`--session-id`（校验/冲突/查重）、`--fork`（resolveSessionPath 移植 + `fork_from_in`）、`--session-dir`（CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings `sessionDir`，交互 `/resume` 与选择器同根）、`-n/--name` | 已验证 | pi-rs 会话为目录式布局（id 在 header），`--session-id` 精确匹配走 header.id（tests/cli_flags.rs 2026-10-31） |
+| `--provider` / `--api-key` / `--models` | args.ts:115-120,142-146 | `--provider` 限定 `--model` 查找；`--api-key` 非持久化凭证；`--models` 逗号模式作用域（glob nocase + 引用解析，`models()` 内部过滤，picker/RPC 零适配生效） | 已验证 | 上游跨 provider 歧义告警与 settings `enabledModels` 回退未移植（已注释）；provider 选择与 API key 请求头有真实进程测试 |
+| `--model <pattern>` | args.ts:117-118；main.ts:475-498 | 支持 provider/id、模糊匹配和 thinking 后缀 | 部分 | 支持 `-m` 短选项；模型能力约束尚未完全对齐 |
 | `--thinking <level>` | args.ts:167-176 | CLI 优先于模型后缀和 settings；非法值警告 | 部分 | 尚未按具体模型能力裁剪档位 |
-| `-t --tools`（含 +name/-name）/ `-xt` / `-nt` / `-nbt` | args.ts:147-166 | 无（工具集固定 create_tools） | 未实现 | |
+| `-t --tools`（含 +name/-name）/ `-xt` / `-nt` / `-nbt` | args.ts:147-166 | `-t/--tools`、`-xt/--exclude-tools`、`-nt/--no-tools`、`-nbt/--no-builtin-tools`（组合短旗标经 argv 预处理），settings `defaultTools` 两层合并 | 已验证 | 第七轮 tool_selection 移植；无效 `--tools` 诊断 exit 1 |
 | `--system-prompt` / `--append-system-prompt` | args.ts:121-125 | 支持文本、文件及多次追加；会话替换时保留 | 部分 | 原有系统提示词仍是 pi-rs 简化版本，非上游结构化 sections |
-| `-e --extension` / `-ne --no-extensions` | args.ts:186-190 | 无 | 未实现 | |
+| `-e --extension` / `-ne --no-extensions` | args.ts:186-190 | 无 | 未实现 | 依赖扩展系统（P3） |
 | `--no-mcp` | args.ts:191-192 | `main.rs` 跳过 MCP 信任、配置加载及服务启动 | 已验证 | `tests/no_mcp.rs` 以真实子进程验证禁用及默认启用路径（2026-10-31） |
 | `--skill` / `--prompt-template` 系 | args.ts:193-198,210-213 | 无 | 未实现 | |
-| `--theme` / `--use-theme` / `--no-themes` | args.ts:199-209,214-215 | 等价物 `--light`（上游无此 flag） | 接受差异 | |
-| `-nc --no-context-files` | args.ts:216-217 | main.rs:66-68 | 已验证 | 缺 `-nc` 短选项 |
-| `--list-models` / `--export` / `--tui-mode` / `--verbose` | args.ts:218-240 | `--list-models [pattern]` 支持模糊搜索 | 部分 | 列出已知目录，暂不按认证状态过滤；其他选项未实现 |
-| `-a --approve` / `-na` | args.ts:241-244；main.ts:720-750 | trust 仅作用于 .pi/mcp.json | 部分 | 无全局 resource trust |
-| `--offline` | args.ts:245-246 | 无 | 未实现 | |
+| `--theme` / `--use-theme` / `--no-themes` | args.ts:199-209,214-215 | `--theme <path>` 可重复加载额外主题文件；`--use-theme <name>` 运行期覆盖（对照 applyOverrides，不落盘）；`--no-themes` 跳过用户主题；另有 `--light`（上游无） | 已验证(部分) | 主题文件解析失败回退内置并 notice |
+| `-nc --no-context-files` | args.ts:216-217 | main.rs + 组合短旗标 `-nc` 预处理 | 已验证 | |
+| `--list-models` / `--export` / `--tui-mode` / `--verbose` | args.ts:218-240 | `--list-models [pattern]` 全量目录模糊搜索（不按认证过滤，已声明）；`--export <id\|path> [out]` 恒为 HTML（exportFromFile 语义，默认 `pi-rs-session-<basename>.html`） | 部分 | `--tui-mode`/`--verbose` 未实现（TUI 恒为全屏 alt-screen，推迟到 TUI 轮） |
+| `-a --approve` / `-na --no-approve` | args.ts:241-244；main.ts:720-750 | projectTrustOverride：`-a` 视为已信任（加载项目 .pi/mcp.json、跳过提示不落盘），`-na` 视为不信任（跳过 + notice） | 已验证(部分) | 仅覆盖 .pi 资源信任；无全局 resource trust 体系 |
+| `--offline` | args.ts:245-246 | 设 `PI_OFFLINE=1` | 已验证(部分) | 声明差异：pi-rs 无版本检查/远程目录抓取，无更多可门控 |
 | `-h/--help`、`-v/--version` | args.ts:92-95；main.ts:881-888 | clap 自动 | 已验证 | 上游 `-v` vs clap `-V` |
 | 未知长选项 → 交扩展 | args.ts:249-262 | clap 报错 exit 2 | 接受差异(暂) | 扩展系统落地前拒绝合理，但退出码 2 vs 上游 1 |
-| `@file` 参数注入首条 prompt | args.ts:247-248；src/cli/file-processor.ts | 无（`@path` 当字面文本） | 未实现 | |
-| 管道 stdin 内容前置到 prompt | main.ts:80-97,897-907 | **不读内容**（只判 is_terminal） | 未实现 | `echo x \| pi-rs -p` 语义丢失 |
-| 模式解析规则（stdout 非 TTY 也进 print） | main.ts:112-123 | main.rs:224-226 | 部分 | 无 prompt + 非 TTY stdin 时 Rust 进 interactive（上游进 print） |
+| `@file` 参数注入首条 prompt | args.ts:247-248；src/cli/file-processor.ts | `process_file_arguments`（文本分支；缺失 exit 1；RPC 模式拒绝） | 已验证(部分) | 图片附件走上游失败文本形态（第八轮） |
+| 管道 stdin 内容前置到 prompt | main.ts:80-97,897-907 | `buildInitialMessage` 移植（stdin→@file→prompt 单消息拼接） | 已验证(部分) | |
+| 模式解析规则（stdout 非 TTY 也进 print） | main.ts:112-123 | main.rs `resolve_app_mode` | 已验证 | |
 | 子命令 install/remove/update/list/config/auth/mcp | docs/cli.md:8-16,250-333 | 无 | 未实现 | |
 
-**CLI 覆盖度**：上游 ~44 项 vs Rust 8 项（≈18%，语义完全一致 4 项）。
+**CLI 覆盖度**：上游 ~44 项 vs Rust 已验证/部分 19 项（≈43%，2026-10-31 第十轮后；完全一致项见各行状态）。
 
 ## 2. 退出码
 

@@ -18,6 +18,7 @@
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
 | MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，协议版本协商（LATEST 2025-11-25 + 旧版接受表）、30s 请求超时 + notifications/cancelled、ping；`--no-mcp` 禁用 MCP 加载和启动；OAuth 未实现 |
 | SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
+| CLI 会话与资源旗标 | `--session-id`（校验/查重，存在即打开否则按该 id 新建）、`--fork <id\|路径>`（路径→本地精确→前缀→全局解析后分支新会话）、`--session-dir <dir>`（CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings `sessionDir`，交互 `/resume` 与选择器同根）、`--models <模式,…>`（glob/模糊作用域，picker 与 RPC 同步收窄）、`--theme <文件>` 可重复 / `--use-theme <名>` / `--no-themes`、`--export <id\|路径> [输出]`（恒为 HTML）、`--offline`、`-a/--approve` 与 `-na/--no-approve`（项目 `.pi` 资源信任覆盖）；`--tui-mode`/`--verbose` 未实现（TUI 恒全屏） |
 | `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false；跨项目切换会关闭旧 MCP 连接并按目标项目的信任状态重连 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
@@ -37,7 +38,9 @@ cargo build --release
 
 交互模式可使用 `/new` 新建会话、`/name <名称>` 命名当前会话、`/session` 查看当前会话、`/resume` 选择会话或 `/resume <ID或路径>` 恢复指定会话；选择器支持搜索会话名称、项目路径及用户和助手消息。`/help` 显示其他命令。恢复含 MCP 配置的未信任项目时，可以选择信任项目、跳过项目 MCP 或取消切换。跨项目切换会应用目标项目的 `defaultTools`，并保留启动时指定的工具选项。
 
-启动时可用 `-n <名称>` 命名会话，使用 `--session <ID或路径>` 恢复已有会话（与 `--resume` 等价）。恢复跨项目会话时使用会话原项目的设置与工作目录；原目录不存在时启动失败。
+会话树可用 `/fork`（选择一条用户消息，从其之前分支出全新会话，选中文本回填编辑器）、`/clone`（以当前叶为终点克隆新会话）、`/tree`（树形浏览条目，五种过滤模式，切换节点时可选 LLM 分支总结——三选一或自定义提示词，Esc 中止总结回树选择器）、`/import <path.jsonl>`（确认后复制进会话存储并切换）与 `/export [路径]`（`.jsonl` 导出原始分支，否则导出 HTML）。
+
+启动时可用 `-n <名称>` 命名会话，使用 `--session <ID或路径>` 恢复已有会话（与 `--resume` 等价），或 `--session-id <id>` 指定会话 id、`--fork <id|路径>` 从既有会话分支。恢复跨项目会话时使用会话原项目的设置与工作目录；原目录不存在时启动失败。
 
 浅色终端可使用 `cargo run -p pi-coding-agent -- --light`，或在 settings.json 中设置 `"theme": "light"`。如果终端设置了 `COLORFGBG`，程序也会按它声明的背景颜色选择默认主题；显式主题设置优先。
 

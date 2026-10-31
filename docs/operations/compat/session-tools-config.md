@@ -54,24 +54,27 @@
 | ls | tools/ls.ts:11-14（path?,limit?默认500；大小写不敏感排序；50KB 截断） | ls.rs:34-42（仅 path?；字典序；无上限） | 部分（未验证） | 大目录会爆上下文 |
 | 工具级权限/hook | tool-definition-wrapper.ts；extensions/types.ts | 无 | 未实现 | — |
 
-## 4. Slash 命令（上游 23 / Rust 9）
+## 4. Slash 命令（上游 23 / Rust 18）
 
 | 组 | 命令 | 状态 |
 |---|---|---|
 | 已验证 | /model /thinking /compact | 3 个（/thinking 为 cycle，上游可带参） |
 | Rust 增设 | /help /exit /clear /tools /prompt /sessions | 接受差异（调试命令；/sessions 是 stub） |
-| 会话管理（增量） | `/new` / `/name <name>` / `/session` / `/resume [id\|path]` | 已接入交互模式；可选择或指定会话，恢复当前上下文中的消息与工具结果 |
-| 未实现（会话管理） | /settings /tree /scoped-models /fork /clone /import | 依赖会话树/管理 UI |
-| 未实现（导出/分享） | /copy /export /share /bug | — |
-| 未实现（资源/信任） | /login /logout /llama /trust /mcp /reload /hotkeys /changelog | trust 有底层 API 无命令入口 |
+| 会话管理（第九轮） | `/new` / `/name <name>` / `/session` / `/resume [id\|path]` | 已接入交互模式；可选择或指定会话，恢复当前上下文中的消息与工具结果 |
+| 会话管理（第十轮） | `/fork` / `/clone` / `/tree` / `/import <path.jsonl>` / `/export [path]` | 已接入：fork 用户消息选择器（selectedText 回填编辑器）、clone 当前叶、树选择器（五种过滤模式 + 分支总结三选一/自定义提示词 + 导航重建视图）、import 复制进存储并替换、export jsonl/HTML 双分支；状态文案逐字对照上游 |
+| 未实现（会话管理） | /settings /scoped-models | 依赖设置 UI/作用域 UI |
+| 未实现（导出/分享） | /copy /share /bug | — |
+| 未实现（资源/信任） | /login /logout /llama /trust /mcp /reload /hotkeys /changelog | trust 有底层 API 无命令入口（/tree、/export 依赖的 settings 键 branchSummary/treeFilterMode 已接入） |
 | SlashCommandSource | extension/prompt/skill 注册通路 | 部分（枚举已定义，无注册通路） |
+
+`/tree` 声明差异（interactive.rs 模块注释）：分支总结完成 LLM 生成与 entry 落盘但无 readFiles/modifiedFiles 追踪；树选择器无折叠/标签编辑/复制/水平滚动；abort 时 steer 队列消息不能还原编辑器。
 
 ## 5. 配置体系
 
 | 配置 | 上游证据 | Rust 证据 | 状态 | 差距 |
 |---|---|---|---|---|
 | 配置根 | `~/.pi/agent/`（PI_CODING_AGENT_DIR）+ 项目 `.pi/` | `~/.pi-rs/agent/`（PI_RS_AGENT_DIR）+ 项目 `.pi/` | 接受差异 | 有意隔离 |
-| settings.json 键面 | settings-schema.ts:206-454（**约 40 键**） | settings_manager.rs:14-24（**7 键**；项目>全局合并有测试） | 部分 | 缺 steeringMode/followUpMode/retry/sessionDir/defaultTools 等 |
+| settings.json 键面 | settings-schema.ts:206-454（**约 40 键**） | settings_manager.rs:14-60（**12 键**：defaultProvider/defaultModel/defaultThinkingLevel/theme/externalEditor/shellPath/compaction/retry/branchSummary/treeFilterMode/sessionDir/defaultTools；项目>全局合并有测试） | 部分 | 缺 steeringMode/followUpMode/quietStartup/tuiMode 等 |
 | settings compaction 子树 | settings-schema.ts:18-27 | settings_manager.rs:31-53（前三者） | 部分已验证 | 缺 modelOverrides |
 | **models.json 格式** | docs/models-configuration.md:11-24：`providers` 为**对象**（键=provider id）；字段 apiKey(`$ENV`/`!cmd`)/oauth/headers/compat/models/modelOverrides；model 条目含 reasoning/thinkingLevelMap/input/inputLimits/cost/promptCache/contextWindow(默认128000)/**maxTokens(默认16384)** | model_registry.rs:19-45：`providers` 为**数组**；仅 5 字段；max_tokens 默认 **8192**；0 测试 | 部分（**shape 不兼容**） | 另有默认模型硬编码 mimo/mimo-v2.6-pro（:78-80）非上游行为 |
 | keybindings.json | docs/keybindings.md；keybindings-schema.ts:7-21 | ui_config.rs（44 个 app 级定义；坏文件 notice；16 测试） | 部分已验证 | 键位 id 集合需逐条对照 |
