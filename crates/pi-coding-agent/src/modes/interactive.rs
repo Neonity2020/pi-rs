@@ -773,7 +773,7 @@ impl InteractiveMode {
 
 	fn send_prompt(&mut self, text: String) {
 		let _ = self.session.cmd_tx.send(SessionCommand::Prompt { text });
-		self.chat.scroll_to_bottom(usize::MAX);
+		self.chat.scroll_to_bottom();
 	}
 
 	fn handle_slash(&mut self, command: &str) {
@@ -873,12 +873,12 @@ impl InteractiveMode {
 		match event {
 			AgentEvent::AgentStart => {
 				self.working = true;
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::AgentEnd { .. } => {
 				self.working = false;
 				self.refresh_branch();
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::MessageStart { message } => {
 				match &message {
@@ -897,7 +897,7 @@ impl InteractiveMode {
 					}
 					_ => {}
 				}
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::MessageUpdate { message, .. } => {
 				if let Message::Assistant(assistant) = &message
@@ -967,7 +967,7 @@ impl InteractiveMode {
 					*cache_write += assistant.usage.cache_write;
 					*cost += assistant.usage.cost.total.unwrap_or(0.0);
 				}
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::ToolExecutionStart {
 				tool_call_id,
@@ -985,7 +985,7 @@ impl InteractiveMode {
 					duration_ms: None,
 					rendered: None,
 				});
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::ToolExecutionUpdate {
 				tool_call_id,
@@ -1028,7 +1028,7 @@ impl InteractiveMode {
 
 	fn push_notice(&mut self, text: String) {
 		self.blocks.push(ChatBlock::Notice(text));
-		self.chat.scroll_to_bottom(usize::MAX);
+		self.chat.scroll_to_bottom();
 	}
 
 	// -- git branch (footer data provider) ---------------------------------------
