@@ -33,7 +33,7 @@ cargo build --release
 ./target/release/pi-rs --help
 ```
 
-交互模式键位：`Enter` 发送（`\`+Enter 换行续写）· `Esc` 中止运行 · `Ctrl+C` 退出 · `PgUp/PgDn` / 滚轮 翻页 · `Ctrl+O` 展开工具完整输出 · `Ctrl+T` 折叠/展开思考 · 编辑器支持 readline 词导航（`Ctrl+←/→`、`Alt+B/F`、`Alt+Backspace`、`Ctrl+W/K/U/D`）。`/model` 打开模糊搜索的模型选择浮层（↑↓ 选择、Enter 确认、Esc 取消）。
+交互模式键位：`Enter` 发送（`\`+Enter 换行续写）· `Esc` 中止运行 · `Ctrl+C` 退出 · `PgUp/PgDn` / 滚轮 翻页 · `Ctrl+O` 展开工具完整输出 · `Ctrl+T` 折叠/展开思考 · 编辑器支持 readline 词导航（`Ctrl+←/→`、`Alt+B/F`、`Alt+Backspace`、`Ctrl+W/K/U/D`）。输入 `/` 弹出命令菜单（实时模糊过滤，↑↓ 选择、Enter/Tab 补全、Esc 关闭——补全优先于中止运行），`/model` 打开模糊搜索的模型选择浮层（↑↓ 选择、Enter 确认、Esc 取消）。
 
 浅色终端可使用 `cargo run -p pi-coding-agent -- --light`，或在 settings.json 中设置 `"theme": "light"`。如果终端设置了 `COLORFGBG`，程序也会按它声明的背景颜色选择默认主题；显式主题设置优先。
 

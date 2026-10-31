@@ -135,6 +135,50 @@ impl ModelOverlay {
 	}
 }
 
+/// Slash-command autocomplete — the editor-typed `/` menu (upstream
+/// `tui/src/autocomplete.ts` `CombinedAutocompleteProvider` slash branch plus
+/// the interactive-mode fuzzy items): while the first token is still
+/// `/name`, the menu lists commands fuzzy-filtered by the text after the
+/// slash; confirming completes to `/name ` in the editor.
+struct SlashMenu {
+	list: SelectList,
+}
+
+impl SlashMenu {
+	fn new() -> Self {
+		let items: Vec<SelectItem> = BUILTIN_SLASH_COMMANDS
+			.iter()
+			.map(|info| SelectItem {
+				value: info.name.to_string(),
+				label: format!("/{}", info.name),
+				description: Some(info.description.to_string()),
+			})
+			.collect();
+		let mut list = SelectList::new(items, 8);
+		list.set_no_match_message("No matching commands");
+		Self { list }
+	}
+}
+
+/// The live fuzzy query when the editor text qualifies for the slash menu:
+/// starts with `/`, still a single token (no whitespace yet — argument
+/// completion has no provider in this port) and not a lone `/` line with
+/// other lines. `None` closes the menu.
+fn slash_command_query(text: &str) -> Option<&str> {
+	let command = text.strip_prefix('/')?;
+	if command.contains(char::is_whitespace) {
+		return None;
+	}
+	Some(command)
+}
+
+/// Upstream `applyCompletion` slash branch: the selected name completes the
+/// token and a trailing space cues the argument position. The qualifying
+/// editor text IS the token, so the replacement is total.
+fn apply_slash_completion(name: &str) -> String {
+	format!("/{name} ")
+}
+
 pub struct InteractiveMode {
 	session: SessionHandle,
 	models: Vec<Model>,
@@ -163,6 +207,8 @@ pub struct InteractiveMode {
 	thinking_expanded: bool,
 	// Model selector overlay.
 	overlay: Option<ModelOverlay>,
+	// Slash-command autocomplete anchored above the editor (live-filtered).
+	slash_menu: Option<SlashMenu>,
 	// UI-only messages from background tasks (git branch watcher).
 	ui_rx: mpsc::UnboundedReceiver<String>,
 	ui_tx: mpsc::UnboundedSender<String>,
@@ -313,6 +359,7 @@ impl InteractiveMode {
 			tools_expanded: false,
 			thinking_expanded: true,
 			overlay: None,
+			slash_menu: None,
 			ui_rx,
 			ui_tx,
 		}
@@ -421,6 +468,12 @@ impl InteractiveMode {
 				self.handle_overlay_key(*key);
 				return;
 			}
+			// Slash menu: intercept only the completion keys — every other
+			// key (typing included) reaches the editor so the menu keeps
+			// live-filtering, like upstream's editor-driven autocomplete.
+			if self.slash_menu.is_some() && self.handle_slash_menu_key(*key) {
+				return;
+			}
 			// Global keys first, mirroring pi's keybinding manager.
 			if self.handle_global_key(*key) {
 				return;
@@ -432,6 +485,7 @@ impl InteractiveMode {
 					self.handle_submit(line);
 				}
 			}
+			self.update_slash_menu();
 			return;
 		}
 		self.chat.handle_event(&event);
@@ -646,11 +700,75 @@ impl InteractiveMode {
 		if line.is_empty() {
 			return;
 		}
+		self.slash_menu = None;
 		if let Some(command) = line.strip_prefix('/') {
 			self.handle_slash(command.trim());
 		} else {
 			self.send_prompt(line);
 		}
+	}
+
+	/// Re-evaluate the slash menu against the editor text: opens while the
+	/// text is a single `/token`, closes otherwise or on zero matches
+	/// (upstream `getSuggestions` returns null → no popup).
+	fn update_slash_menu(&mut self) {
+		let query = match slash_command_query(self.editor.text()) {
+			Some(query) => query,
+			None => {
+				self.slash_menu = None;
+				return;
+			}
+		};
+		if self.slash_menu.is_none() {
+			self.slash_menu = Some(SlashMenu::new());
+		}
+		let menu = self.slash_menu.as_mut().unwrap();
+		menu.list.set_filter(query);
+		if menu.list.filtered().is_empty() {
+			self.slash_menu = None;
+		}
+	}
+
+	/// Keys the open menu consumes. Returns `false` for everything else so
+	/// typing continues in the editor (`update_slash_menu` then refilters).
+	fn handle_slash_menu_key(&mut self, key: KeyEvent) -> bool {
+		match key.code {
+			KeyCode::Esc => {
+				// custom-editor.ts: escape cancels the autocomplete first and
+				// must not abort the running turn.
+				self.slash_menu = None;
+				true
+			}
+			KeyCode::Tab | KeyCode::Enter => {
+				self.apply_slash_menu_selection();
+				true
+			}
+			KeyCode::Up | KeyCode::Down => {
+				let action = match self.slash_menu.as_mut() {
+					Some(menu) => menu.list.handle_key_with(key, &self.keybindings),
+					None => return true,
+				};
+				!matches!(action, SelectAction::Ignored)
+			}
+			_ => false,
+		}
+	}
+
+	/// Complete the highlighted command into the editor (`/name `), upstream
+	/// `applyCompletion`'s slash branch. With no match under the cursor the
+	/// menu stays open (pi behavior).
+	fn apply_slash_menu_selection(&mut self) {
+		let Some(menu) = self.slash_menu.as_ref() else {
+			return;
+		};
+		let Some(item) = menu.list.selected_item() else {
+			return;
+		};
+		let name = item.value.clone();
+		let completed = apply_slash_completion(&name);
+		self.editor.set_text(completed);
+		// The trailing space disqualifies the menu; refresh to be exact.
+		self.update_slash_menu();
 	}
 
 	fn send_prompt(&mut self, text: String) {
@@ -955,6 +1073,7 @@ impl InteractiveMode {
 		self.chat.render(chunks[1], frame.buffer_mut());
 		self.draw_editor(frame, chunks[2]);
 		self.draw_footer(frame, chunks[3]);
+		self.draw_slash_menu(frame, chunks[1], chunks[2]);
 		self.draw_overlay(frame, chunks[1]);
 		if let Some(wizard) = &self.provider_wizard {
 			let area = chunks[1];
@@ -1135,6 +1254,34 @@ impl InteractiveMode {
 	}
 
 	/// Model selector overlay (model-selector.ts): bordered panel with a search
+	/// Slash-command menu floating directly above the editor, editor-width
+	/// and bottom-anchored in the chat area (upstream renders the
+	/// autocomplete list just above the input).
+	fn draw_slash_menu(&mut self, frame: &mut Frame, chat_area: Rect, editor_area: Rect) {
+		let Some(menu) = self.slash_menu.as_ref() else {
+			return;
+		};
+		let visible = menu.list.filtered().len().clamp(1, 8) as u16;
+		let height = (visible + 2).min(chat_area.height);
+		let area = Rect {
+			x: editor_area.x,
+			y: chat_area.y + chat_area.height.saturating_sub(height),
+			width: editor_area.width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.border))
+			.title(Span::styled(
+				" Commands ",
+				Style::new().fg(self.theme.accent),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = menu.list.render_lines(inner.width as usize, &self.theme);
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
 	/// line, the filtered list and a key hint.
 	fn draw_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
 		let Some(overlay) = self.overlay.as_ref() else {
@@ -1610,6 +1757,31 @@ mod tests {
 	use super::*;
 	use pi_tui::keybindings::KeybindingsManager;
 	use pi_tui::parse_chord;
+
+	#[test]
+	fn slash_menu_query_tracks_the_single_token_rule() {
+		// Upstream getSuggestions: only a leading `/` token before any space
+		// opens the command menu.
+		assert_eq!(slash_command_query("/"), Some(""));
+		assert_eq!(slash_command_query("/mo"), Some("mo"));
+		assert_eq!(slash_command_query("/model"), Some("model"));
+		assert_eq!(
+			slash_command_query("/model x"),
+			None,
+			"argument position closes the menu"
+		);
+		assert_eq!(slash_command_query("model"), None, "no slash, no menu");
+		assert_eq!(
+			slash_command_query("say /mo"),
+			None,
+			"slash must lead the text"
+		);
+	}
+
+	#[test]
+	fn slash_menu_completion_adds_the_argument_space() {
+		assert_eq!(apply_slash_completion("model"), "/model ");
+	}
 
 	#[test]
 	fn tool_result_text_handles_partial_and_final_content() {
