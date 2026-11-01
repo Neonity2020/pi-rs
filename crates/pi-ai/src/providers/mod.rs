@@ -6,6 +6,7 @@
 //! unknown APIs return an explicit error.
 
 pub mod anthropic;
+pub mod google_generative_ai;
 mod json_repair;
 pub mod mock;
 pub mod openai_completions;
@@ -24,6 +25,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::ANTHROPIC_MESSAGES => anthropic::stream_fn(),
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
 		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
+		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {
 			let error = crate::types::AssistantMessage::error(

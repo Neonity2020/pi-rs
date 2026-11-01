@@ -175,3 +175,14 @@ cargo fmt --all -- --check
 - **声明偏差**：透传路径不烘焙 EXIF（上游同行为，旋转显示仅在重缩/转换时生效）；上游 Photon WASM 用原生 image crate 替代（Lanczos3 同款滤波）；上游保留 jpeg/gif/webp 原始容器的字节，端口同（不做容器归一化）；图片只进首条 prompt（上游同），steer/follow-up 仍纯文本。
 
 **验证**：605 项测试全绿（597→605，+8：嗅探/APNG/TIFF 方向读取/透传/重缩注记/auto-resize off/garbage/EXIF 变换 + main.rs 图片参数接线 2 项）；fmt/clippy -D warnings 干净。坑：mock 夹具三连——APNG 夹具漏 IHDR CRC、TIFF IFD entry 的 count 是 4 字节（SHORT 值在前 2 字节）、JPEG APP1 标记是 FF E1 两字节（u16 to_be_bytes 会写成 00 E1）。
+
+## 第十三轮：google-generative-ai provider（2026-10-31，主会话单线）
+
+基线 `4fb7db4`（上游 `api/google-generative-ai.ts` 466 行 + `google-shared.ts` 574 行的 Rust 移植首片）：
+
+- **新模块 `pi-ai/src/providers/google_generative_ai.rs`**：POST `{base}/models/{id}:streamGenerateContent?alt=sse`（`x-goog-api-key` 头，base 缺省 v1beta，上游 baseUrl 已含版本路径）；请求 wire（`contents` 条目、leading system→`systemInstruction.parts`、工具→`functionDeclarations` + `parametersJsonSchema`（**const→单值 enum 重写**，name-map 旗标只作用当层键名）、Gemini 3+ 离散 `thinkingLevel` vs 2.5 系 `thinkingBudget` 表（pro/flash-lite/flash，无表 → -1 动态）、Off→`thinkingBudget:0`、`generationConfig` temperature/maxOutputTokens）。
+- **消息转换**（`convert_contents`）：user text/inlineData；assistant 文本带 thoughtSignature 重放（仅同 provider+model 且合法 base64），空文本仅在有签名时保留（Gemini 签名回显规则）；同模型 thinking→`thought:true` 条目、跨模型→纯文本（防模仿）；functionCall 仅 `requiresToolCallId`（claude-/gpt-oss-/gemini≥3）带 id；toolResult→`functionResponse`（output/error 键）合并进单个 user turn，Gemini 3+ 图片嵌套 parts、<3 单独 user turn；`mapStopReason`（STOP→stop、MAX_TOKENS→length、其余安全/其他原因→error）+ 有 toolCall 时 stop 升级 toolUse。
+- **流处理**（`GoogleSession`）：`thought:true` 驱动 text/thinking 块切换（块尾事件关闭）；thoughtSignature 首个非空保留（`retainThoughtSignature`）；functionCall 缺 id/重复 id → `{name}_{now}_{counter}` 合成；usage（prompt − cached、output + thoughts、reasoning=thoughts）；无 finishReason→流失败；safety 等 error 原因→`Provider stopped with: REASON`。
+- **声明偏差**：toolChoice/constrained-sampling VALIDATED/useParameters（Cloud Code Assist）/请求重试/thinkingLevelMap（Xhigh/Max 钳到 High）推迟，均上游默认关闭或不可达；cost 沿用零值口径。
+
+**验证**：621 项测试全绿（605→621，+16：wire/thinking 配置分族/工具结果合并/跨模型 thinking/签名重放/Gemini3 id/流切换/合成 id/usage/空文本回显/inlineData 11 项单测 + 5 项 mock HTTP+SSE 集成——跨 chunk 增量、429、无 finishReason、SAFETY→error、abort）；fmt/clippy -D warnings 干净。model_registry api 白名单扩入 google-generative-ai。
