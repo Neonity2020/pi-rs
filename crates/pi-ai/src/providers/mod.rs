@@ -26,6 +26,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::ANTHROPIC_MESSAGES => anthropic::stream_fn(),
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
 		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
+		Api::AZURE_OPENAI_RESPONSES => openai_responses::azure_stream_fn(),
 		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
 		Api::PI_MESSAGES => pi_messages::stream_fn(),
 		"mock" => Arc::new(mock::stream),

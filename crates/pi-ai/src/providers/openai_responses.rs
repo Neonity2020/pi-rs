@@ -46,13 +46,120 @@ pub fn stream_fn() -> StreamFn {
 		|model: &Model,
 		 context: &TranscriptContext,
 		 options: StreamOptions|
-		 -> AssistantMessageEventStream { spawn_stream(model.clone(), context.clone(), options) },
+		 -> AssistantMessageEventStream {
+			spawn_stream(Endpoint::OpenAi, model.clone(), context.clone(), options)
+		},
 	)
+}
+
+/// Azure OpenAI Responses (upstream `azure-openai-responses.ts`): the same
+/// wire protocol against an Azure resource — `api-key` auth, a resolved
+/// base URL, and the deployment name in place of the model id.
+pub fn azure_stream_fn() -> StreamFn {
+	Arc::new(
+		|model: &Model,
+		 context: &TranscriptContext,
+		 options: StreamOptions|
+		 -> AssistantMessageEventStream {
+			spawn_stream(Endpoint::Azure, model.clone(), context.clone(), options)
+		},
+	)
+}
+
+/// Per-API endpoint differences (upstream splits the two adapters).
+#[derive(Debug, Clone, Copy)]
+enum Endpoint {
+	OpenAi,
+	Azure,
+}
+
+impl Endpoint {
+	fn key_env(&self) -> Option<&'static str> {
+		match self {
+			Endpoint::OpenAi => Some("OPENAI_API_KEY"),
+			Endpoint::Azure => Some("AZURE_OPENAI_API_KEY"),
+		}
+	}
+}
+
+/// Azure endpoint resolution (upstream `resolveAzureBaseUrl`): explicit
+/// base URL / `AZURE_OPENAI_BASE_URL` → `https://<resource>
+/// .openai.azure.com/openai/v1` from `AZURE_OPENAI_RESOURCE_NAME` → the
+/// model's baseUrl. Azure hosts are normalized onto the `/openai/v1` path.
+fn azure_base_url(model: &Model) -> Result<String, String> {
+	let from_env = |name: &str| {
+		std::env::var(name)
+			.ok()
+			.map(|v| v.trim().to_string())
+			.filter(|v| !v.is_empty())
+	};
+	let resolved = from_env("AZURE_OPENAI_BASE_URL")
+		.or_else(|| {
+			from_env("AZURE_OPENAI_RESOURCE_NAME")
+				.map(|resource| format!("https://{resource}.openai.azure.com/openai/v1"))
+		})
+		.or_else(|| (!model.base_url.is_empty()).then(|| model.base_url.trim().to_string()))
+		.ok_or_else(|| {
+			"Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or set the model's baseUrl.".to_string()
+		})?;
+	let trimmed = resolved.trim_end_matches('/').to_string();
+	// Normalize azure hosts onto /openai/v1.
+	let is_azure_host = [
+		"openai.azure.com",
+		"cognitiveservices.azure.com",
+		"ai.azure.com",
+	]
+	.iter()
+	.any(|suffix| {
+		trimmed
+			.split_once("://")
+			.map(|(_, host_path)| host_path.split('/').next().unwrap_or_default())
+			.is_some_and(|host| host.ends_with(suffix))
+	});
+	let path_only = trimmed
+		.split_once("://")
+		.map(|(_, host_path)| {
+			host_path
+				.split_once('/')
+				.map(|(_, path)| format!("/{}", path.trim_end_matches('/')))
+				.unwrap_or_default()
+		})
+		.unwrap_or_default();
+	if is_azure_host
+		&& matches!(
+			path_only.as_str(),
+			"" | "/" | "/openai" | "/openai/v1/responses"
+		) {
+		let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
+		let host = trimmed[scheme_end..].split('/').next().unwrap_or_default();
+		return Ok(format!("https://{host}/openai/v1"));
+	}
+	Ok(trimmed)
+}
+
+/// Azure deployment name (upstream `resolveDeploymentName`): the
+/// `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` env (`modelId=deployment,...`)
+/// looked up by model id, else the id itself.
+fn azure_deployment_name(model: &Model) -> String {
+	let map = std::env::var("AZURE_OPENAI_DEPLOYMENT_NAME_MAP").unwrap_or_default();
+	for entry in map.split(',') {
+		let entry = entry.trim();
+		if entry.is_empty() {
+			continue;
+		}
+		if let Some((model_id, deployment)) = entry.split_once('=')
+			&& model_id.trim() == model.id
+		{
+			return deployment.trim().to_string();
+		}
+	}
+	model.id.clone()
 }
 
 /// Runs the request on a task and forwards events through a channel, so the
 /// returned stream yields deltas while the HTTP body is still arriving.
 fn spawn_stream(
+	endpoint: Endpoint,
 	model: Model,
 	context: TranscriptContext,
 	options: StreamOptions,
@@ -66,7 +173,7 @@ fn spawn_stream(
 				message: "Request was aborted".to_string(),
 				session: None,
 			}),
-			result = run_stream(&model, &context, &options, &tx) => result,
+			result = run_stream(endpoint, &model, &context, &options, &tx) => result,
 		};
 		if let Err(failure) = result {
 			let error = match failure.session {
@@ -103,12 +210,13 @@ struct StreamFailure {
 }
 
 async fn run_stream(
+	endpoint: Endpoint,
 	model: &Model,
 	context: &TranscriptContext,
 	options: &StreamOptions,
 	tx: &Sender<Event>,
 ) -> Result<(), StreamFailure> {
-	let mut response = open_response(model, context, options)
+	let mut response = open_response(endpoint, model, context, options)
 		.await
 		.map_err(|message| StreamFailure {
 			reason: StopReason::Error,
@@ -219,6 +327,7 @@ async fn forward(tx: &Sender<Event>, events: Vec<Event>) -> bool {
 }
 
 async fn open_response(
+	endpoint: Endpoint,
 	model: &Model,
 	context: &TranscriptContext,
 	options: &StreamOptions,
@@ -226,25 +335,39 @@ async fn open_response(
 	let key = options
 		.api_key
 		.clone()
-		.or_else(|| std::env::var("OPENAI_API_KEY").ok())
+		.or_else(|| endpoint.key_env().and_then(|name| std::env::var(name).ok()))
 		.filter(|s| !s.is_empty())
-		.ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
-	let base = if model.base_url.is_empty() {
-		"https://api.openai.com/v1"
-	} else {
-		model.base_url.trim_end_matches('/')
+		.ok_or_else(|| format!("{} not set", endpoint.key_env().unwrap_or("API key")))?;
+	let (url, body_model) = match endpoint {
+		Endpoint::OpenAi => {
+			let base = if model.base_url.is_empty() {
+				"https://api.openai.com/v1"
+			} else {
+				model.base_url.trim_end_matches('/')
+			};
+			(format!("{base}/responses"), model.clone())
+		}
+		Endpoint::Azure => {
+			let base = azure_base_url(model)?;
+			// The deployment name replaces the model id in the body.
+			let mut body_model = model.clone();
+			body_model.id = azure_deployment_name(model);
+			(format!("{base}/responses"), body_model)
+		}
 	};
 	// Session affinity headers (upstream `createClient`, openai format).
-	let mut request = reqwest::Client::new()
-		.post(format!("{base}/responses"))
-		.bearer_auth(key);
+	let mut request = reqwest::Client::new().post(url);
+	match endpoint {
+		Endpoint::OpenAi => request = request.bearer_auth(key),
+		Endpoint::Azure => request = request.header("api-key", key),
+	}
 	if let Some(session_id) = &options.session_id {
 		request = request
 			.header("session_id", session_id)
 			.header("x-client-request-id", session_id);
 	}
 	let response = request
-		.json(&request_body(model, context, options))
+		.json(&request_body(&body_model, context, options))
 		.send()
 		.await
 		.map_err(|e| format!("request failed: {e}"))?;
@@ -1563,5 +1686,75 @@ mod tests {
 		let text_model = test_model();
 		let output = tool_result_output(&text_model, &content);
 		assert_eq!(output, json!("see attachment"));
+	}
+}
+
+#[cfg(test)]
+mod azure_tests {
+	use super::*;
+	use crate::stream::normalize_context;
+
+	#[test]
+	fn azure_base_url_normalizes_azure_hosts() {
+		let mut model = Model::new("gpt", "gpt", "azure-openai-responses", "azure", "");
+		// Explicit base URLs keep their path unless they are an Azure root.
+		model.base_url = "https://my-res.openai.azure.com/".into();
+		assert_eq!(
+			azure_base_url(&model).unwrap(),
+			"https://my-res.openai.azure.com/openai/v1"
+		);
+		model.base_url = "https://my-res.openai.azure.com/openai/v1/responses".into();
+		assert_eq!(
+			azure_base_url(&model).unwrap(),
+			"https://my-res.openai.azure.com/openai/v1"
+		);
+		// Non-azure hosts pass through untouched.
+		model.base_url = "https://proxy.example.com/v1/".into();
+		assert_eq!(
+			azure_base_url(&model).unwrap(),
+			"https://proxy.example.com/v1"
+		);
+		// No URL anywhere is an error.
+		model.base_url = "".into();
+		assert!(azure_base_url(&model).is_err());
+	}
+
+	#[test]
+	fn azure_deployment_name_follows_the_env_map() {
+		let model = Model::new("gpt-5.2", "gpt-5.2", "azure-openai-responses", "azure", "");
+		// No map → the id itself.
+		assert_eq!(azure_deployment_name(&model), "gpt-5.2");
+		// SAFETY: single-threaded test; the doc-tested helpers only read.
+		unsafe {
+			std::env::set_var(
+				"AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+				"gpt-5.2=prod-deploy, o3=reasoning",
+			);
+		}
+		assert_eq!(azure_deployment_name(&model), "prod-deploy");
+		let other = Model::new("gpt-4.1", "gpt-4.1", "azure-openai-responses", "azure", "");
+		assert_eq!(
+			azure_deployment_name(&other),
+			"gpt-4.1",
+			"unmapped ids keep their name"
+		);
+		// SAFETY: single-threaded test teardown.
+		unsafe {
+			std::env::remove_var("AZURE_OPENAI_DEPLOYMENT_NAME_MAP");
+		}
+	}
+
+	#[test]
+	fn azure_body_uses_the_deployment_and_models_keep_their_id() {
+		// request_body takes the (id-overridden) model clone built by
+		// open_response; verify the body uses the passed model's id.
+		let mut model = Model::new("gpt-5.2", "gpt-5.2", "azure-openai-responses", "azure", "");
+		model.reasoning = true;
+		let ctx = normalize_context(None, &[], vec![Message::user("hi")]);
+		let body = request_body(&model, &ctx, &StreamOptions::default());
+		assert_eq!(body["model"], "gpt-5.2");
+		model.id = "prod-deploy".into();
+		let body = request_body(&model, &ctx, &StreamOptions::default());
+		assert_eq!(body["model"], "prod-deploy");
 	}
 }
