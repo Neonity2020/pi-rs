@@ -32,7 +32,7 @@ use pi_tui::components::{Component, SelectAction, SelectItem, SelectList, markdo
 use pi_tui::keybindings::KeybindingsManager;
 use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
 
-use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle};
+use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle, WireEvent};
 use crate::core::model_registry::{ModelRegistry, add_provider};
 use crate::core::session_manager::SessionInfo;
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
@@ -103,6 +103,14 @@ enum ChatBlock {
 		rendered: Option<(usize, Vec<Line<'static>>)>,
 	},
 	Notice(String),
+	/// Passthrough bash (`!cmd`): live output tail while running, full text
+	/// (or the spill-file note) once done.
+	Bash {
+		command: String,
+		output: String,
+		status: String,
+		rendered: Option<(usize, Vec<Line<'static>>)>,
+	},
 }
 
 struct ModelOverlay {
@@ -223,6 +231,8 @@ pub struct InteractiveMode {
 	/// `@file` image attachments riding on the next prompt (`@file` text
 	/// files are inlined into the text; images wait for the first submit).
 	pending_images: Vec<pi_ai::ImageContent>,
+	/// A passthrough bash command is in flight (upstream `isBashRunning`).
+	bash_running: bool,
 	// External editor (ctrl+g): the terminal is suspended while the editor
 	// runs; the outcome comes back through the channel.
 	external_editor_cmd: String,
@@ -303,6 +313,58 @@ fn thinking_levels_for_model(model: &Model) -> Vec<ThinkingLevel> {
 	} else {
 		vec![ThinkingLevel::Off]
 	}
+}
+
+/// Passthrough bash block (`!cmd`): a `bash:` header with the status, then
+/// the output preview — live tail while running (upstream
+/// `bash-execution.ts` PREVIEW_LINES), first lines once done.
+fn render_bash_block(
+	command: &str,
+	output: &str,
+	status: &str,
+	width: usize,
+	theme: &Theme,
+) -> Vec<Line<'static>> {
+	let _ = width;
+	let mut lines = Vec::new();
+	let running = status == "running";
+	let status_color = match status {
+		"running" => theme.accent,
+		"done" => theme.success,
+		_ => theme.error,
+	};
+	lines.push(Line::from(vec![
+		Span::styled("  bash: ", Style::new().fg(theme.tool)),
+		Span::styled(command.to_string(), Style::new().fg(theme.assistant)),
+		Span::styled(format!("  ({status})"), Style::new().fg(status_color)),
+	]));
+	if !output.is_empty() {
+		let out_lines: Vec<&str> = output.lines().collect();
+		let preview = if running {
+			TOOL_RUNNING_PREVIEW_LINES
+		} else {
+			TOOL_PREVIEW_LINES
+		};
+		let (start, shown) = if running && out_lines.len() > preview {
+			(out_lines.len() - preview, preview)
+		} else {
+			(0, out_lines.len().min(preview))
+		};
+		for line in out_lines.iter().skip(start).take(shown) {
+			lines.push(Line::from(Span::styled(
+				format!("    {line}"),
+				Style::new().fg(theme.tool_output),
+			)));
+		}
+		let remaining = out_lines.len() - shown;
+		if remaining > 0 {
+			lines.push(Line::from(Span::styled(
+				format!("  … ({remaining} more lines)"),
+				Style::new().fg(theme.muted),
+			)));
+		}
+	}
+	lines
 }
 
 /// Chat blocks for a restored/replaced session's messages: tool calls pair
@@ -633,6 +695,7 @@ impl InteractiveMode {
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
+			bash_running: false,
 			external_editor_cmd,
 			suspended: false,
 			pending_external_editor: false,
@@ -713,6 +776,15 @@ impl InteractiveMode {
 				}
 				Some(msg) = self.session_list_rx.recv() => {
 					self.handle_session_list_msg(msg);
+				}
+				event = self.session.wire_events.recv() => {
+					match event {
+						Ok(wire) => self.handle_wire_event(wire),
+						Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+							self.push_notice(format!("event lag: dropped {count} wire events"));
+						}
+						Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+					}
 				}
 				Some(outcome) = self.editor_rx.recv() => {
 					// The editor exited: bring the terminal back before any
@@ -1197,11 +1269,48 @@ impl InteractiveMode {
 			return;
 		}
 		self.slash_menu = None;
+		// Bash passthrough (upstream bash mode): `!cmd` runs outside the
+		// agent loop and lands in the transcript; `!!cmd` additionally
+		// stays out of the model context.
+		if let Some(rest) = line.strip_prefix('!') {
+			let (exclude_from_context, command) = match rest.strip_prefix('!') {
+				Some(command) => (true, command.trim()),
+				None => (false, rest.trim()),
+			};
+			if !command.is_empty() {
+				self.run_passthrough_bash(command, exclude_from_context);
+			}
+			return;
+		}
 		if let Some(command) = line.strip_prefix('/') {
 			self.handle_slash(command.trim());
 		} else {
 			self.send_prompt(line);
 		}
+	}
+
+	/// Send a passthrough bash command; output streams into a dedicated
+	/// chat block via the wire-event channel.
+	fn run_passthrough_bash(&mut self, command: &str, exclude_from_context: bool) {
+		if self.bash_running {
+			self.push_notice(
+				"A bash command is already running. Press Esc to cancel it first.".into(),
+			);
+			return;
+		}
+		self.bash_running = true;
+		let _ = self.session.cmd_tx.send(SessionCommand::ExecuteBash {
+			command: command.to_string(),
+			exclude_from_context,
+			id: None,
+		});
+		self.blocks.push(ChatBlock::Bash {
+			command: command.to_string(),
+			output: String::new(),
+			status: "running".into(),
+			rendered: None,
+		});
+		self.chat.scroll_to_bottom();
 	}
 
 	/// Re-evaluate the slash menu against the editor text: opens while the
@@ -1930,6 +2039,56 @@ impl InteractiveMode {
 		}
 	}
 
+	/// Passthrough bash stream: append deltas to the live Bash block and
+	/// finalize on done (output, exit code, cancellation, spill note).
+	fn handle_wire_event(&mut self, wire: WireEvent) {
+		match wire {
+			WireEvent::BashExecutionUpdate { delta, .. } => {
+				if let Some(ChatBlock::Bash {
+					output, rendered, ..
+				}) = self
+					.blocks
+					.iter_mut()
+					.rev()
+					.find(|block| matches!(block, ChatBlock::Bash { .. }))
+				{
+					output.push_str(&delta);
+					*rendered = None;
+				}
+			}
+			WireEvent::BashExecutionDone { result, .. } => {
+				self.bash_running = false;
+				if let Some(ChatBlock::Bash {
+					output,
+					status,
+					rendered,
+					..
+				}) = self
+					.blocks
+					.iter_mut()
+					.rev()
+					.find(|block| matches!(block, ChatBlock::Bash { .. }))
+				{
+					*output = result.output;
+					*status = match (result.exit_code, result.cancelled) {
+						(_, true) => "cancelled".into(),
+						(Some(0), false) => "done".into(),
+						(Some(code), false) => format!("exit {code}"),
+						(None, false) => "done".into(),
+					};
+					if result.truncated {
+						status.push_str(" (truncated — full output on disk)");
+					}
+					*rendered = None;
+				}
+				self.chat.scroll_to_bottom();
+			}
+			WireEvent::SessionInfoChanged { .. }
+			| WireEvent::AutoRetryStart { .. }
+			| WireEvent::AutoRetryEnd { .. } => {}
+		}
+	}
+
 	/// Rebuild the chat view (and usage totals) from the live agent after a
 	/// session replacement.
 	fn rebuild_from_live_session(&mut self) {
@@ -2568,6 +2727,23 @@ impl InteractiveMode {
 						*rendered = Some((width, out.clone()));
 					}
 					lines.extend(out);
+				}
+				ChatBlock::Bash {
+					command,
+					output,
+					status,
+					rendered,
+				} => {
+					if let Some((w, cached)) = rendered
+						&& *w == width
+					{
+						lines.extend(cached.iter().cloned());
+						continue;
+					}
+					let out = render_bash_block(command, output, status, width, &theme);
+					*rendered = Some((width, out.clone()));
+					lines.extend(out);
+					lines.push(Line::default());
 				}
 				ChatBlock::Notice(text) => {
 					for line in text.lines() {

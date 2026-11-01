@@ -274,3 +274,7 @@ cargo fmt --all -- --check
 ## 第三十二轮：--session-dir 旗标（2026-10-31，主会话单线）
 
 基线 `249b0c0`（上游 `--session-dir`）：CLI 增 `--session-dir <DIR>`，解析后立即写 `PI_RS_SESSION_DIR` 环境变量（edition-2024 下 unsafe set_var，单线程早期调用；`config::sessions_dir()` 已读该变量）——自定义根下的会话落盘与退出恢复提示均实证。632 项测试维持全绿（测试 Cli 构造补 None），fmt/clippy 干净。上一轮声明的偏差（恢复提示的自定义根）就此闭合。
+
+## 第三十三轮：!cmd bash 透传（2026-10-31，主会话单线）
+
+基线 `1e09fce`（上游 bash mode：`!cmd` 入 transcript、`!!cmd` 排除上下文）：handle_submit 识别 `!`/`!!` 前缀 → `SessionCommand::ExecuteBash`（RPC 轮底层复用）；新增 `ChatBlock::Bash`（`bash: <cmd> (status)` 头 + 输出预览，运行中尾 20 行、完成后首 10 行 + done/exit N/cancelled/truncated 状态着色）——TUI select 循环新增 `session.wire_events` 臂，`BashExecutionUpdate` 追加增量、`BashExecutionDone` 终结（bash_running 标志置回，重复提交报上游同文案警告）。Esc 取消走既有 AbortBash？未接——推迟（wire_events 臂只读 done；abort 需把 esc 分流）。632 项测试维持全绿，pty 冒烟（块渲染/输出/完成状态），fmt/clippy 干净。
