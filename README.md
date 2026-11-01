@@ -17,7 +17,8 @@
 | pi-messages | 已实现：`{model, context, options}` 直传 + 已序列化事件流（contentIndex 槽位、签名/redacted 重放）；gateway rewrite 诊断/debug 旗标/toolChoice 推迟 |
 | Azure OpenAI Responses | 已实现：azure `api-key` 认证、URL 归一化（`/openai/v1`）、`AZURE_OPENAI_DEPLOYMENT_NAME_MAP` deployment 名解析；复用 responses 流处理 |
 | Google Vertex AI | 已实现：express API key 与 ADC 双认证（service_account RS256 JWT / authorized_user refresh）、区域端点与自定义 baseUrl；metadata-server 凭据/toolChoice 推迟 |
-| 其他 HTTP provider | mock provider 可用于本地演示；mistral-conversations 等其余 3 个 API 未移植 |
+| Mistral Conversations | 已实现：原生 Chat Completions wire（thinking 块数组、index 键控工具调用、`[tool error]` 文案、x-affinity 亲和、六拼写缓存命中）；toolChoice/reasoningEffort 推迟 |
+| 其他 HTTP provider | mock provider 可用于本地演示；bedrock-converse-stream、openai-codex-responses 未移植 |
 | 会话压缩与重试 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次）；错误自动重试（可重试错误判定 + 指数退避 + `auto_retry_start/end` 事件 + `agent_end.willRetry`，RPC 可开关/中止；settings `retry.maxRetries`/`baseDelayMs` 可配） |
 | agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek）；事件顺序对齐上游（turn_start 先于消息公告、assistant 盖 thinkingLevel、turn_end.toolResults 带 role） |
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
