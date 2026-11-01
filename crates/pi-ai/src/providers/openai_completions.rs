@@ -318,14 +318,14 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 /// with `\n`), stopping at the `[DONE]` sentinel. This mirrors the SSE
 /// decoding the OpenAI SDK performs around the TS adapter's chunk loop.
 #[derive(Default)]
-struct SseDecoder {
+pub(crate) struct SseDecoder {
 	buffer: Vec<u8>,
 	data: String,
 	done: bool,
 }
 
 impl SseDecoder {
-	fn feed(&mut self, chunk: &[u8], payloads: &mut Vec<String>) {
+	pub(crate) fn feed(&mut self, chunk: &[u8], payloads: &mut Vec<String>) {
 		self.buffer.extend_from_slice(chunk);
 		while !self.done {
 			let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') else {
@@ -342,7 +342,7 @@ impl SseDecoder {
 
 	/// Flushes a final line that ended at EOF without a newline, plus any
 	/// event still open when the server closed the stream.
-	fn finish(&mut self, payloads: &mut Vec<String>) {
+	pub(crate) fn finish(&mut self, payloads: &mut Vec<String>) {
 		if !self.buffer.is_empty() {
 			let bytes = std::mem::take(&mut self.buffer);
 			let line = String::from_utf8_lossy(&bytes).into_owned();
@@ -353,7 +353,7 @@ impl SseDecoder {
 		}
 	}
 
-	fn is_done(&self) -> bool {
+	pub(crate) fn is_done(&self) -> bool {
 		self.done
 	}
 

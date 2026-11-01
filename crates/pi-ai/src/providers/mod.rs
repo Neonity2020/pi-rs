@@ -9,6 +9,7 @@ pub mod anthropic;
 mod json_repair;
 pub mod mock;
 pub mod openai_completions;
+pub mod openai_responses;
 
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 	match model.api.as_str() {
 		Api::ANTHROPIC_MESSAGES => anthropic::stream_fn(),
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
+		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {
 			let error = crate::types::AssistantMessage::error(
