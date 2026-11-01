@@ -198,3 +198,11 @@ cargo fmt --all -- --check
 ## 第十五轮：/new 命令（2026-10-31，主会话单线）
 
 基线 `097ea20`（上游 `handleClearCommand` / `app.session.new` 的斜杠入口）：`/new` 发送 `SessionCommand::NewSession`（排队 prompt 由替换逻辑丢弃），"New session started" 通知 + "session → " 通知触发既有聊天重建；新会话文件落盘经 pty 冒烟实证。623 项测试维持全绿（无新增单测——命令入口由 pty 冒烟覆盖），fmt/clippy 干净。会话命令组现状：/new ✅、/resume 选择器 ✅、/export ✅、/tree 与 /fork 需树/消息选择器（推迟）。
+
+## 第十六轮：/copy 命令（2026-10-31，主会话单线）
+
+基线 `20c5674`（上游 `handleCopyCommand` + `utils/clipboard.ts` 首片）：
+
+- **新模块 `core/clipboard.rs`**：平台命令阶梯（macOS pbcopy / Windows clip / linux 按 env：termux-clipboard-set、wl-copy、xclip、xsel）+ OSC 52 回退（SSH/mosh/PI_CLIPBOARD_OSC52 远程会话与 headless Linux，100k base64 上限）；WSL PowerShell 互操作与原生 FFI 写入推迟。`copy_to_clipboard` 错误文案对齐上游。
+- **interactive**：`/copy` 命令 + `app.message.copy`（ctrl+x）→ 从 live agent 快照倒序找末条非空助手文本复制；无消息报 "No agent messages to copy yet."；成功通知。alt-screen 选区分支无对应 API（推迟）。实现时踩坑：slash_commands.rs 的 fmt 单行 info 使多行锚点替换静默失配——冒烟发现菜单缺命令后核对 git status 才补上。
+- **验证**：626 项测试全绿（623→626，+3 clipboard 单测）；pty 冒烟错误路径（空会话提示），成功路径依赖 pbcopy 旁路（单测覆盖阶梯选择）；fmt/clippy 干净。

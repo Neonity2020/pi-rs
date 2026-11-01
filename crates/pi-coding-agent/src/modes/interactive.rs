@@ -507,6 +507,7 @@ enum GlobalAction {
 	ThinkingToggle,
 	SessionResume,
 	EditorExternal,
+	CopyMessage,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -548,6 +549,9 @@ fn resolve_global_action(
 	}
 	if keybindings.matches("app.editor.external", key) {
 		return Some(GlobalAction::EditorExternal);
+	}
+	if keybindings.matches("app.message.copy", key) {
+		return Some(GlobalAction::CopyMessage);
 	}
 	None
 }
@@ -954,6 +958,7 @@ impl InteractiveMode {
 			// Handled in run(): suspending the terminal must happen where
 			// the TerminalGuard lives.
 			GlobalAction::EditorExternal => self.pending_external_editor = true,
+			GlobalAction::CopyMessage => self.handle_copy_command(),
 		}
 		true
 	}
@@ -1199,6 +1204,34 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/copy` / ctrl+x (upstream `handleCopyCommand`): copy the last
+	/// assistant message to the clipboard. The alt-screen selection branch
+	/// has no port counterpart (no selection API).
+	fn handle_copy_command(&mut self) {
+		let text = self
+			.session
+			.live_agent()
+			.snapshot()
+			.messages
+			.iter()
+			.rev()
+			.find_map(|message| match message {
+				Message::Assistant(assistant) => {
+					let text = assistant.text();
+					(!text.is_empty()).then_some(text)
+				}
+				_ => None,
+			});
+		let Some(text) = text else {
+			self.push_notice("No agent messages to copy yet.".into());
+			return;
+		};
+		match crate::core::clipboard::copy_to_clipboard(&text) {
+			Ok(()) => self.push_notice("Copied last agent message to clipboard".into()),
+			Err(error) => self.push_notice(error),
+		}
+	}
+
 	/// `/export [path]` (upstream `handleExportCommand`): `.jsonl` writes the
 	/// current branch, anything else HTML; no argument takes the default
 	/// path. In-memory sessions only export JSONL.
@@ -1288,6 +1321,7 @@ impl InteractiveMode {
 				}
 			}
 			"resume" => self.open_session_selector(),
+			"copy" => self.handle_copy_command(),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "

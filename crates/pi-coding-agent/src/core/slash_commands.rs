@@ -70,6 +70,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		"open the session selector (switch/delete/rename)",
 		SlashCommandSource::Builtin,
 	),
+	info(
+		"copy",
+		"copy the last agent message to the clipboard",
+		SlashCommandSource::Builtin,
+	),
 	info("new", "start a new session", SlashCommandSource::Builtin),
 	info(
 		"export",
