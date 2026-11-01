@@ -246,3 +246,7 @@ cargo fmt --all -- --check
 ## 第二十六轮：/tree 只读视图（2026-10-31，主会话单线）
 
 基线 `c14e9d1`（上游 `showTreeSelector` 只读首片）：`/tree` 渲染 get_tree 的条目树（`├─/└─/│` 前缀 + 每条目单行摘要：user/assistant 文本 48 字符、toolResult 工具名、其余为 type_name；多根依序）；叶切换选择器 UI 推迟。628 项测试维持全绿，pty 冒烟（--resume alpha-1 后 user/assistant 条目渲染），fmt/clippy 干净。
+
+## 回归验证（2026-10-31，第九至二十六轮之后）
+
+本会话 15 个 feat 全部落地后重跑差分套件：**六场景（单轮/ bash 往返/ 多轮工具/ 阈值压缩/ json 单轮/ json 工具调用）双侧 6/6 IDENTICAL（canonical view，上游快照 f9daca34）**——@file 图片、Prompt images 字段、会话导出/导入、retry settings 等改动未引入任何 wire 回归。
