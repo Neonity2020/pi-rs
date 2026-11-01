@@ -206,3 +206,7 @@ cargo fmt --all -- --check
 - **新模块 `core/clipboard.rs`**：平台命令阶梯（macOS pbcopy / Windows clip / linux 按 env：termux-clipboard-set、wl-copy、xclip、xsel）+ OSC 52 回退（SSH/mosh/PI_CLIPBOARD_OSC52 远程会话与 headless Linux，100k base64 上限）；WSL PowerShell 互操作与原生 FFI 写入推迟。`copy_to_clipboard` 错误文案对齐上游。
 - **interactive**：`/copy` 命令 + `app.message.copy`（ctrl+x）→ 从 live agent 快照倒序找末条非空助手文本复制；无消息报 "No agent messages to copy yet."；成功通知。alt-screen 选区分支无对应 API（推迟）。实现时踩坑：slash_commands.rs 的 fmt 单行 info 使多行锚点替换静默失配——冒烟发现菜单缺命令后核对 git status 才补上。
 - **验证**：626 项测试全绿（623→626，+3 clipboard 单测）；pty 冒烟错误路径（空会话提示），成功路径依赖 pbcopy 旁路（单测覆盖阶梯选择）；fmt/clippy 干净。
+
+## 第十七轮：/name 命令（2026-10-31，主会话单线）
+
+基线 `93ee2eb`（上游 `handleNameCommand`）：`/name` 显示当前显示名、`/name <name>` 经 `SessionCommand::SetSessionName` 设置（RPC 同款命令；清洗后的名字异步落盘，端口回显请求名并注明与上游同步读回的偏差）。626 项测试维持全绿，pty 冒烟 set+show 双路径，fmt/clippy 干净。

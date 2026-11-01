@@ -71,6 +71,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info(
+		"name",
+		"show or set the session display name",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"copy",
 		"copy the last agent message to the clipboard",
 		SlashCommandSource::Builtin,

@@ -1204,6 +1204,27 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/name [name]` (upstream `handleNameCommand`): show the current
+	/// display name, or set one. The sanitized name arrives through the
+	/// session task; a mismatch surfaces as a warning.
+	fn handle_name_command(&mut self, args: &str) {
+		let name = args.trim();
+		if name.is_empty() {
+			match self.session.session_name() {
+				Some(current) => self.push_notice(format!("Session name: {current}")),
+				None => self.push_notice("Usage: /name <name>".into()),
+			}
+			return;
+		}
+		let _ = self.session.cmd_tx.send(SessionCommand::SetSessionName {
+			name: name.to_string(),
+		});
+		// The authoritative sanitized name lands asynchronously; echo the
+		// requested one (upstream reads back synchronously and warns on
+		// normalization — the port's notice would race the session task).
+		self.push_notice(format!("Session name set: {name}"));
+	}
+
 	/// `/copy` / ctrl+x (upstream `handleCopyCommand`): copy the last
 	/// assistant message to the clipboard. The alt-screen selection branch
 	/// has no port counterpart (no selection API).
@@ -1322,6 +1343,7 @@ impl InteractiveMode {
 			}
 			"resume" => self.open_session_selector(),
 			"copy" => self.handle_copy_command(),
+			"name" => self.handle_name_command(args),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "
