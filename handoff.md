@@ -226,3 +226,7 @@ cargo fmt --all -- --check
 ## 第二十一轮：/fork 首片（2026-10-31，主会话单线）
 
 基线 `844a248`（上游 `showUserMessageSelector` 的最小可用替身）：`/fork` 无参列出 transcript 中的 user 消息（1 基编号 + 60 字符预览），`/fork <n>` 定位该消息的会话条目并发 `SessionCommand::Fork { position: Before }`（分支根在消息父节点，消息文本经替换 notice 回流供预填——上游 selectedText 语义）；交互式选择器 UI 推迟。**坑：/fork <n> 是 1 基索引，0 基取值会静默错位（pty 冒烟实证）。** 626 项测试维持全绿，pty 冒烟列表 + 分叉落盘（新分支会话文件），fmt/clippy 干净。
+
+## 第二十二轮：retry settings 键（2026-10-31，主会话单线）
+
+基线 `d207bd6`（第八轮遗留：maxRetries/baseDelay 进 settings.json）：`Settings` 增 `retry: Option<RetrySettings>`（camelCase maxRetries/baseDelayMs，字段级 project>global 合并，两层都无 → None → 引擎常量默认）；`RetryRuntime` 增 `max_retries`，自动重试引擎的上限与退避基数从 settings 读取（WireEvent max_attempts 同步）；`spawn_agent_session_with_settings` 增 RetrySettings 参数，main 传入 `settings.retry`。**事故：`shared.retry.lock().unwrap().attempt < shared.retry.lock().unwrap().max_retries` 同一 std Mutex 单表达式双锁死锁，cargo test 挂起——改单守卫块。** 627 项测试全绿（+1 解析/合并测试），fmt/clippy 干净。上游 retry.enabled 与 maxAgentDelayMs 仍是运行时开关（settings 键未接）。

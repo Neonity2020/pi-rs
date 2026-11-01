@@ -21,6 +21,7 @@ pub struct Settings {
 	pub external_editor: Option<String>,
 	pub shell_path: Option<String>,
 	pub compaction: Option<CompactionSettings>,
+	pub retry: Option<RetrySettings>,
 	/// Raw `defaultTools` selection: plain names/patterns or `+name`/`-name`
 	/// modifiers, resolved by `tool_selection::resolve_default_tools`.
 	pub default_tools: Option<Vec<String>>,
@@ -31,6 +32,34 @@ pub struct Settings {
 /// reserveTokens 16384, keepRecentTokens 20000; the call sites in
 /// `agent_session.rs` fill those defaults for absent fields). Per-model
 /// overrides (`compaction.modelOverrides`) are deferred.
+/// `retry` settings — upstream `RetrySettingsSchema` (the port's auto-retry
+/// engine reads maxRetries/baseDelayMs; enabled and maxAgentDelayMs stay
+/// runtime toggles).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RetrySettings {
+	pub max_retries: Option<u32>,
+	pub base_delay_ms: Option<u64>,
+}
+
+impl RetrySettings {
+	/// Field-level merge, project wins (upstream `?? defaults` per field).
+	/// `None` only when neither layer carries a `retry` key.
+	fn merged(project: Option<&Self>, global: Option<&Self>) -> Option<Self> {
+		if project.is_none() && global.is_none() {
+			return None;
+		}
+		Some(Self {
+			max_retries: project
+				.and_then(|r| r.max_retries)
+				.or(global.and_then(|r| r.max_retries)),
+			base_delay_ms: project
+				.and_then(|r| r.base_delay_ms)
+				.or(global.and_then(|r| r.base_delay_ms)),
+		})
+	}
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {
@@ -131,6 +160,7 @@ impl SettingsManager {
 				self.global.default_tools.clone(),
 				self.project.default_tools.clone(),
 			),
+			retry: RetrySettings::merged(self.project.retry.as_ref(), self.global.retry.as_ref()),
 		}
 	}
 
@@ -194,5 +224,31 @@ mod tests {
 		let plain: Settings = serde_json::from_str(r#"{"defaultTools":["bash","grep"]}"#).unwrap();
 		let merged = merge_default_tools(global.default_tools, plain.default_tools).unwrap();
 		assert_eq!(merged, vec!["bash", "grep"]);
+	}
+}
+
+#[cfg(test)]
+mod retry_settings_tests {
+	use super::*;
+
+	#[test]
+	fn retry_settings_parse_and_fall_through() {
+		let global: Settings =
+			serde_json::from_str(r#"{"retry":{"maxRetries":5,"baseDelayMs":100}}"#).unwrap();
+		let retry = global.retry.as_ref().expect("retry parsed");
+		assert_eq!(retry.max_retries, Some(5));
+		assert_eq!(retry.base_delay_ms, Some(100));
+
+		// Project overrides per field; missing fields fall through to global
+		// (effective() merge, project wins).
+		let project: Settings = serde_json::from_str(r#"{"retry":{"maxRetries":2}}"#).unwrap();
+		let merged = RetrySettings::merged(project.retry.as_ref(), global.retry.as_ref());
+		let retry = merged.as_ref().expect("merged retry");
+		assert_eq!(retry.max_retries, Some(2));
+		assert_eq!(retry.base_delay_ms, Some(100));
+
+		// No retry key anywhere → None → engine defaults.
+		let plain: Settings = serde_json::from_str("{}").unwrap();
+		assert!(plain.retry.is_none());
 	}
 }

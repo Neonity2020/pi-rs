@@ -507,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
 		session,
 		registry.clone(),
 		settings.compaction.unwrap_or_default(),
+		settings.retry.unwrap_or_default(),
 	);
 
 	if app_mode == AppMode::Rpc {

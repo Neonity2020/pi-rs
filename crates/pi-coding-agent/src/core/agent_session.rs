@@ -318,6 +318,8 @@ pub(crate) struct SessionShared {
 pub(crate) struct RetryRuntime {
 	pub(crate) attempt: u32,
 	pub(crate) base_delay_ms: u64,
+	/// `settings.retry.maxRetries` (upstream default 3).
+	pub(crate) max_retries: u32,
 }
 
 impl SessionShared {
@@ -390,7 +392,13 @@ pub fn spawn_agent_session(
 	session: SessionManager,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 ) -> SessionHandle {
-	spawn_agent_session_with_settings(agent, session, registry, CompactionSettings::default())
+	spawn_agent_session_with_settings(
+		agent,
+		session,
+		registry,
+		CompactionSettings::default(),
+		crate::core::settings_manager::RetrySettings::default(),
+	)
 }
 
 pub fn spawn_agent_session_with_settings(
@@ -398,6 +406,7 @@ pub fn spawn_agent_session_with_settings(
 	mut session: SessionManager,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 	settings: CompactionSettings,
+	retry: crate::core::settings_manager::RetrySettings,
 ) -> SessionHandle {
 	let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 	let event_bus = EventBus::<SessionEvent>::new();
@@ -434,7 +443,10 @@ pub fn spawn_agent_session_with_settings(
 		agent_end_will_retry: Arc::new(std::sync::Mutex::new(VecDeque::new())),
 		retry: Arc::new(std::sync::Mutex::new(RetryRuntime {
 			attempt: 0,
-			base_delay_ms: retry_policy::RETRY_BASE_DELAY_MS,
+			base_delay_ms: retry
+				.base_delay_ms
+				.unwrap_or(retry_policy::RETRY_BASE_DELAY_MS),
+			max_retries: retry.max_retries.unwrap_or(retry_policy::RETRY_MAX_RETRIES),
 		})),
 	});
 	shared.publish_session(&log.lock().unwrap().session, &agent);
@@ -1133,7 +1145,12 @@ async fn session_task(
 					&& last_assistant.as_ref().is_some_and(|assistant| {
 						retry_policy::is_retryable_error(assistant, agent.model().context_window)
 					})
-					&& shared.retry.lock().unwrap().attempt < retry_policy::RETRY_MAX_RETRIES;
+					&& {
+						// Single lock: two lock() calls on the same std Mutex
+						// in one expression deadlock.
+						let guard = shared.retry.lock().unwrap();
+						guard.attempt < guard.max_retries
+					};
 				if will_retry && compacting.is_none() && run.is_none() && !agent.is_streaming() {
 					match omit_failed_attempt(&agent, &log) {
 						Ok(()) => {
@@ -1144,9 +1161,10 @@ async fn session_task(
 									retry_policy::retry_delay_with(guard.base_delay_ms, guard.attempt);
 								(guard.attempt, delay)
 							};
+							let max_attempts = shared.retry.lock().unwrap().max_retries;
 							shared.emit(WireEvent::AutoRetryStart {
 								attempt,
-								max_attempts: retry_policy::RETRY_MAX_RETRIES,
+								max_attempts,
 								delay_ms,
 								error_message: last_assistant
 									.as_ref()
@@ -2654,6 +2672,7 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
@@ -2777,6 +2796,7 @@ mod tests {
 			session,
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
@@ -2875,6 +2895,7 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
@@ -2971,6 +2992,7 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
@@ -3031,6 +3053,7 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
@@ -3629,6 +3652,7 @@ mod tests {
 				retry: Arc::new(std::sync::Mutex::new(RetryRuntime {
 					attempt: 0,
 					base_delay_ms: retry_policy::RETRY_BASE_DELAY_MS,
+					max_retries: retry_policy::RETRY_MAX_RETRIES,
 				})),
 			}),
 			Arc::new(std::sync::atomic::AtomicBool::new(
