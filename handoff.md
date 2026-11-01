@@ -154,3 +154,14 @@ cargo fmt --all -- --check
 - **声明偏差**：上游 Windows `shell:true` 未移植（直接 exec）；上游 spawn error 静默，移植同样静默不改内容。
 
 **验证**：581 项测试全绿（576→581，+5：BOM/尾换行剥离、脚本编辑器往返、非零退出与坏命令失败、ctrl+g 分发、配置优先级）；fmt/clippy -D warnings 干净。pty 冒烟：EDITOR=脚本 → ctrl+g → 两行提示 → 编辑内容进 editor → 提交后会话文件含编辑后文本。教训延续：pty 冒烟用会话文件断言状态，勿用去 escape 拼接文本。
+
+## 第十一轮：openai-responses provider（2026-10-31，主会话单线）
+
+基线 `9b5bc57`（上游 `api/openai-responses.ts` 453 行 + `openai-responses-shared.ts` 891 行的 Rust 移植首片，路线图 providers 项）：
+
+- **新模块 `pi-ai/src/providers/openai_responses.rs`**：POST `{base}/responses`（bearer + session_id/x-client-request-id 亲和头）；请求 wire（`input` 条目数组、`store:false`、`prompt_cache_key` 64 字符截断、`max_output_tokens` 最低 16 钳制、temperature、function tools 无 strict、`reasoning:{effort,summary:"auto"}` + `include:["reasoning.encrypted_content"]`、Off→`effort:"none"`）；消息转换（系统消息塌缩为单条头部条目——非 reasoning 模型 role=system、reasoning 模型 role=developer，工具集从全部 system 的 toolsAdded/Removed 解析 current；assistant 文本→`message` 条目（textSignature `{v:1,id,phase}` 重放 id/phase，回退 `msg_pi_N[_K]`，>64 截断）；thinking 带 signature→原始 reasoning item JSON 重放；toolCall→`function_call`（`call_id|fc_*` 复合 id，非 fc 前缀/外来 id 省略 item id 跳过配对校验）；toolResult→`function_call_output`（纯文本或 input_text/input_image 数组，按模型视觉能力））。
+- **流处理**（`ResponsesSession`）：`output_index` 键控槽位（thinking/text/toolCall），事件映射 reasoning_summary_text/reasoning_text/summary_part.done(`\n\n`)/output_text/refusal delta、function_call_arguments delta/done（`ToolArgsStream`：lenient 部分预览 + replace 续传/重启 + finish 全量解析出 arguments_error，复用 json_repair）、output_item.done（reasoning: summary||content 文本 + 原始 item 作 thinkingSignature；message: 文本 + textSignature 编码；function_call: 替换+finish+namespace）、`phase:"final_answer"`→stop、response.completed/incomplete→usage（input 减 cached/cache_write）+ rawStopReason + mapStopReason（max_output_tokens→length，其余 incomplete→error，failed/cancelled→error，in_progress/queued→stop）+ 有 toolCall 时 stop 升级 toolUse；response.failed/error 事件→流失败；无 terminal event、toolUse 带未完成调用→流失败（上游 post-loop 守卫）。
+- **接线**：`providers/mod.rs` 分发 `Api::OPENAI_RESPONSES`；model_registry 的 api 校验白名单加入；`SseDecoder` 改 pub(crate) 复用。
+- **声明偏差（compat 门控路径，上游默认关闭，推迟）**：grammar/custom 工具（`custom_tool_call`）、additional_tools/tool_search 条目、configuration_update（thinkingLevelMap 也未建模）、ChatGPT 登录特判、copilot/xai 头、service-tier 定价、长缓存 retention/24h、OpenRouter 会话亲和；cost 计算沿用全库零值口径；`sanitizeSurrogates` 在 Rust UTF-8 下为 no-op；上游 Windows shell:true 未移植。
+
+**验证**：597 项测试全绿（581→597，+16：wire/effort/off/重放/事件映射/incomplete/failed/未完成调用/视觉输出 9 项单测 + 6 项 mock HTTP+SSE 集成——增量 delta、429 错误体、response.failed、无 terminal 断连、abort、请求 wire 断言）；fmt/clippy -D warnings 干净。坑：mock 服务器 content-length 必须与 body 等长（reqwest 严格解码）；chunked body 需 `0\r\n\r\n` 终止才走干净 EOF 路径，否则 reqwest 报 decode error。
