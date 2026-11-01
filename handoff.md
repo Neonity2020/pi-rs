@@ -312,3 +312,7 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **流处理**：`{data:{id,usage,choices[0]:{finish_reason,delta}}}`；delta.content 为 string 或 chunk 数组（text/thinking——GLM 空 content delta 不开新块）；tool_calls 按 `index`（无 index 用派生 id）键控累积（ToolArgsStream），收尾统一 finish() 出 arguments_error；usage 缓存命中六种字段拼写、input 扣 cached；finishReason：stop→stop、length/model_length→length、tool_calls→toolUse、error→"server error" 可重试文案、其余→error。
 - **声明推迟**：toolChoice、reasoningEffort/promptMode（thinkingLevelMap 未建模）、60s header 超时、header 覆盖、`shortHash`（std hasher 替代——id 仅需会话内稳定，不需与上游一致）。
 645 项测试全绿（+4：wire/历史重放/块切换+index 工具调用+缓存扣减/stop 映射），fmt/clippy 干净。**坑：Mistral 事件 JSON 外层是 `{data:{choices}}`，检查层级写错会全帧报 "Invalid Mistral streaming event"。** providers 完成 8/10+（剩 bedrock-converse-stream、openai-codex-responses）。
+
+## 第三十五轮：/fork 交互选择器（2026-10-31，主会话单线）
+
+基线 `891db01`（上游 `showUserMessageSelector` 的 SelectList 化）：裸 `/fork` 打开浮层（每条 user 消息一项，`n. 预览` 标签，value=条目 id），Enter 发 `Fork{position:Before}`、Esc 取消；`/fork <n>` 编号路径保留；trust 浮层同款面板与键位路由。顺手清理第二轮遗留的死代码桩（users 空向量）。645 项测试维持全绿，pty 冒烟（浮层/条目/分叉落盘/`session → ` 通知），fmt/clippy 干净。坑（重申）：pty 冒烟前必须重新 cargo build——上一轮二进制会让新 feat 看似失败。

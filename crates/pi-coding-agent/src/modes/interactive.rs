@@ -226,6 +226,8 @@ pub struct InteractiveMode {
 	session_overlay: Option<SessionSelectorOverlay>,
 	// /trust confirm overlay (a SelectList with two items).
 	trust_overlay: Option<(SelectList, std::path::PathBuf)>,
+	// /fork interactive selector: one item per user-message entry.
+	fork_overlay: Option<SelectList>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -692,6 +694,7 @@ impl InteractiveMode {
 			slash_menu: None,
 			session_overlay: None,
 			trust_overlay: None,
+			fork_overlay: None,
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -865,6 +868,10 @@ impl InteractiveMode {
 			}
 			if self.trust_overlay.is_some() {
 				self.handle_trust_overlay_key(*key);
+				return;
+			}
+			if self.fork_overlay.is_some() {
+				self.handle_fork_overlay_key(*key);
 				return;
 			}
 			if self.overlay.is_some() {
@@ -1517,6 +1524,62 @@ impl InteractiveMode {
 		}
 	}
 
+	/// /fork selector keys: navigation + Enter forks before the selected
+	/// user message, Esc cancels.
+	fn handle_fork_overlay_key(&mut self, key: KeyEvent) {
+		let action = match self.fork_overlay.as_mut() {
+			Some(list) => list.handle_key_with(key, &self.keybindings),
+			None => return,
+		};
+		let selected = match action {
+			SelectAction::Select(index) => self
+				.fork_overlay
+				.as_ref()
+				.and_then(|list| list.filtered().get(index).map(|item| item.value.clone())),
+			SelectAction::Cancel => Some("cancel".into()),
+			SelectAction::Handled | SelectAction::Ignored => None,
+		};
+		let Some(selected) = selected else {
+			return;
+		};
+		self.fork_overlay = None;
+		if selected != "cancel" {
+			let _ = self.session.cmd_tx.send(SessionCommand::Fork {
+				entry_id: selected,
+				position: crate::core::agent_session::ForkPosition::Before,
+			});
+		}
+	}
+
+	/// /fork selector: a bordered list over the chat area (title carries the
+	/// fork semantics).
+	fn draw_fork_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some(list) = self.fork_overlay.as_ref() else {
+			return;
+		};
+		let width = chat_area.width.clamp(60, 100).min(chat_area.width);
+		let height = 12.min(chat_area.height);
+		let area = Rect {
+			x: chat_area.x + (chat_area.width - width) / 2,
+			y: chat_area.y + (chat_area.height - height) / 2,
+			width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				" Fork before user message ",
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = list.render_lines(inner.width as usize, &self.theme);
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
 	/// `/import <path.jsonl>` (upstream `handleImportCommand`, minus the
 	/// confirm dialog): import the export into a fresh session directory and
 	/// switch to it.
@@ -1554,42 +1617,56 @@ impl InteractiveMode {
 	fn handle_fork_command(&mut self, args: &str) {
 		let arg = args.trim();
 		if arg.is_empty() {
-			let mut listed = 0usize;
-			let mut text = String::from("Fork points (user messages):\n");
-			for (index, user) in self
-				.session
-				.live_agent()
-				.snapshot()
-				.messages
-				.iter()
-				.filter_map(|message| match message {
-					Message::User(user) => Some(user),
-					_ => None,
-				})
-				.enumerate()
-			{
-				let preview: String = user.content.as_text().chars().take(60).collect();
-				text.push_str(&format!("{:>3}. {}\n", index + 1, preview));
-				listed += 1;
-			}
-			if listed == 0 {
+			// Interactive selector (upstream showUserMessageSelector): one
+			// item per user-message entry, Enter forks before it.
+			let user_entries: Vec<(String, String)> = {
+				let guard = self.session.log.lock().unwrap();
+				guard
+					.session
+					.entries()
+					.iter()
+					.filter(|entry| {
+						matches!(
+							&entry.kind,
+							crate::core::session_manager::EntryKind::Message { message }
+								if matches!(message.as_ref(), pi_ai::Message::User(_))
+						)
+					})
+					.filter_map(|entry| {
+						let id = entry.id()?.to_string();
+						let crate::core::session_manager::EntryKind::Message { message } =
+							&entry.kind
+						else {
+							return None;
+						};
+						let pi_ai::Message::User(user) = message.as_ref() else {
+							return None;
+						};
+						let preview: String = user.content.as_text().chars().take(64).collect();
+						Some((id, preview))
+					})
+					.collect()
+			};
+			if user_entries.is_empty() {
 				self.push_notice("No user messages to fork from yet.".into());
-			} else {
-				text.push_str("Use /fork <n> to fork before message n.");
-				self.push_notice(text);
+				return;
 			}
+			let items = user_entries
+				.iter()
+				.enumerate()
+				.map(|(index, (id, preview))| SelectItem {
+					value: id.clone(),
+					label: format!("{}. {}", index + 1, preview),
+					description: None,
+				})
+				.collect();
+			self.fork_overlay = Some(SelectList::new(items, 10));
 			return;
 		}
 		let Ok(entry_index) = arg.parse::<usize>() else {
 			self.push_notice(format!("Usage: /fork <n> ({arg} is not a number)"));
 			return;
 		};
-		let users: Vec<(usize, &String)> = {
-			let snapshot = self.session.live_agent().snapshot();
-			let _ = snapshot; // borrow scope helper
-			Vec::new()
-		};
-		let _ = users;
 		// Resolve the nth user message's entry id from the session log.
 		let fork_target = {
 			let guard = self.session.log.lock().unwrap();
@@ -2310,6 +2387,7 @@ impl InteractiveMode {
 		self.draw_overlay(frame, chunks[1]);
 		self.draw_session_overlay(frame, chunks[1]);
 		self.draw_trust_overlay(frame, chunks[1]);
+		self.draw_fork_overlay(frame, chunks[1]);
 		if let Some(wizard) = &self.provider_wizard {
 			let area = chunks[1];
 			let height = area

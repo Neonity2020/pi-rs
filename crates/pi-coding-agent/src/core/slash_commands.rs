@@ -72,7 +72,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 	),
 	info(
 		"fork",
-		"fork the session at a user message (/fork lists, /fork <n>)",
+		"fork at a user message (selector, or /fork <n>)",
 		SlashCommandSource::Builtin,
 	),
 	info(
