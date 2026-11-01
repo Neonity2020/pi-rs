@@ -262,3 +262,7 @@ cargo fmt --all -- --check
 ## 第二十九轮：ctrl+p/alt+p 模型循环（2026-10-31，主会话单线）
 
 基线 `dd953f5`（上游 `cycleModel` 的 available-models 变体）：`GlobalAction::ModelCycleForward/Backward`（ctrl+p / 平台相关 backward 弦——darwin shift+ctrl+p、其他 alt+p）接 resolve_global_action；interactive `cycle_model(±1)` 对 registry 模型列表环绕取下一个并发 `SetModel`，单模型提示 "Only one model available"；scoped-models 变体无对应（推迟）。**坑：MODEL_CYCLE_BACKWARD 是平台相关常量（darwin=shift+ctrl+p），测试用 alt+p 在 mac 上必挂；调试用 panic!() 测试用完必须删（fmt 会重排行导致正则删除失配，二次清理）。** 631 项测试全绿（+2 cycle 弦分发），pty 冒烟（单步 ctrl+p → "model → mimo/mimo-v2.6-flash" 通知），fmt/clippy 干净。
+
+## 第三十轮：app.session.tree/fork 键位分发（2026-10-31，主会话单线）
+
+基线 `3e039e9`：`GlobalAction::SessionTree/SessionFork` 接 resolve_global_action（默认无键，keybindings.json 可绑——如 `super+t`/`super+f`）分别触发只读 /tree 视图与编号 /fork。app.session.* 动作组至此全接线（new/resume/tree/fork）。632 项测试全绿（+1 分发测试），fmt/clippy 干净。坑：chord 解析器不认 "ctrl+meta+"，meta 用 `super+` 前缀。

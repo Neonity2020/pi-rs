@@ -531,6 +531,8 @@ enum GlobalAction {
 	CopyMessage,
 	ModelCycleForward,
 	ModelCycleBackward,
+	SessionTree,
+	SessionFork,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -581,6 +583,12 @@ fn resolve_global_action(
 	}
 	if keybindings.matches("app.model.cycleBackward", key) {
 		return Some(GlobalAction::ModelCycleBackward);
+	}
+	if keybindings.matches("app.session.tree", key) {
+		return Some(GlobalAction::SessionTree);
+	}
+	if keybindings.matches("app.session.fork", key) {
+		return Some(GlobalAction::SessionFork);
 	}
 	None
 }
@@ -995,6 +1003,8 @@ impl InteractiveMode {
 			GlobalAction::CopyMessage => self.handle_copy_command(),
 			GlobalAction::ModelCycleForward => self.cycle_model(1),
 			GlobalAction::ModelCycleBackward => self.cycle_model(-1),
+			GlobalAction::SessionTree => self.handle_tree_command(),
+			GlobalAction::SessionFork => self.handle_fork_command(""),
 		}
 		true
 	}
@@ -3351,6 +3361,32 @@ mod session_selector_tests {
 		assert_eq!(
 			resolve_global_action(&kb, &backward, true),
 			Some(GlobalAction::ModelCycleBackward)
+		);
+	}
+
+	#[test]
+	fn session_tree_and_fork_actions_dispatch_through_overrides() {
+		let mut kb = crate::core::ui_config::new_keybindings_manager();
+		// Both actions ship unbound (upstream opens selectors); keybindings.json
+		// can bind them to the read-only /tree view and the numbered /fork.
+		kb.set_user_bindings(
+			[
+				("app.session.tree".to_string(), vec!["super+t".to_string()]),
+				("app.session.fork".to_string(), vec!["super+f".to_string()]),
+			]
+			.into_iter()
+			.collect(),
+		)
+		.unwrap();
+		let tree_key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER);
+		let fork_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::SUPER);
+		assert_eq!(
+			resolve_global_action(&kb, &tree_key, true),
+			Some(GlobalAction::SessionTree)
+		);
+		assert_eq!(
+			resolve_global_action(&kb, &fork_key, true),
+			Some(GlobalAction::SessionFork)
 		);
 	}
 
