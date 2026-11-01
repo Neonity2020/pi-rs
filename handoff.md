@@ -210,3 +210,7 @@ cargo fmt --all -- --check
 ## 第十七轮：/name 命令（2026-10-31，主会话单线）
 
 基线 `93ee2eb`（上游 `handleNameCommand`）：`/name` 显示当前显示名、`/name <name>` 经 `SessionCommand::SetSessionName` 设置（RPC 同款命令；清洗后的名字异步落盘，端口回显请求名并注明与上游同步读回的偏差）。626 项测试维持全绿，pty 冒烟 set+show 双路径，fmt/clippy 干净。
+
+## 第十八轮：/thinking <level> 参数（2026-10-31，主会话单线）
+
+基线 `6dee54a`（上游 `handleThinkingCommand`）：`/thinking <level>` 按模型能力（reasoning → off..max，否则仅 off）直接 `SessionCommand::SetThinking`，未知级别报 "Unknown thinking level ... Available levels: ..."（上游文案）；裸 `/thinking` 维持循环。626 项测试维持全绿，pty 冒烟 set（thinking → Low）+ 未知级别错误路径，fmt/clippy 干净。

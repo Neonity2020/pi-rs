@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 use pi_agent::AgentEvent;
-use pi_ai::{Message, Model, StopReason};
+use pi_ai::{Message, Model, StopReason, ThinkingLevel};
 use pi_tui::components::{Component, SelectAction, SelectItem, SelectList, markdown_lines};
 use pi_tui::keybindings::KeybindingsManager;
 use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
@@ -281,6 +281,25 @@ pub fn format_duration(ms: u128) -> String {
 	} else {
 		let hours = minutes / 60;
 		format!("{hours}h {}m {rem}s", minutes % 60)
+	}
+}
+
+/// The thinking levels the current model accepts (upstream
+/// `getAvailableThinkingLevels`): everything for reasoning models, off only
+/// otherwise.
+fn thinking_levels_for_model(model: &Model) -> Vec<ThinkingLevel> {
+	if model.reasoning {
+		vec![
+			ThinkingLevel::Off,
+			ThinkingLevel::Minimal,
+			ThinkingLevel::Low,
+			ThinkingLevel::Medium,
+			ThinkingLevel::High,
+			ThinkingLevel::Xhigh,
+			ThinkingLevel::Max,
+		]
+	} else {
+		vec![ThinkingLevel::Off]
 	}
 }
 
@@ -1355,7 +1374,37 @@ impl InteractiveMode {
 			}
 			"export" => self.handle_export_command(args),
 			"thinking" => {
-				let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);
+				// Upstream `handleThinkingCommand`: an argument sets that
+				// level directly; bare `/thinking` cycles.
+				if args.is_empty() {
+					let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);
+					return;
+				}
+				let levels = thinking_levels_for_model(&self.session.live_agent().model());
+				let requested = args.trim().to_lowercase();
+				let wire = |level: &ThinkingLevel| match level {
+					ThinkingLevel::Off => "off",
+					ThinkingLevel::Minimal => "minimal",
+					ThinkingLevel::Low => "low",
+					ThinkingLevel::Medium => "medium",
+					ThinkingLevel::High => "high",
+					ThinkingLevel::Xhigh => "xhigh",
+					ThinkingLevel::Max => "max",
+				};
+				match levels.iter().find(|level| wire(level) == requested) {
+					Some(level) => {
+						let _ = self
+							.session
+							.cmd_tx
+							.send(SessionCommand::SetThinking { level: *level });
+					}
+					None => {
+						let names = levels.iter().map(wire).collect::<Vec<_>>().join(", ");
+						self.push_notice(format!(
+							"Unknown thinking level \"{requested}\". Available levels: {names}."
+						));
+					}
+				}
 			}
 			"tools" => {
 				let names = self.session.live_agent().tool_names().join(", ");
