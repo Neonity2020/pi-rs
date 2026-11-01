@@ -286,3 +286,7 @@ cargo fmt --all -- --check
 ## 第三十一轮补充：azure-openai-responses（2026-10-31，主会话单线）
 
 基线 `7bd5096`（上游 `azure-openai-responses.ts` 255 行 + `azure-openai-config.ts`，复用 openai-responses 全部流处理）：openai_responses.rs 增 `Endpoint` 参数化（OpenAI/Azure）——auth 头 bearer vs `api-key`、key env OPENAI_API_KEY vs AZURE_OPENAI_API_KEY、URL 归一化（azure 主机 `.openai.azure.com/.cognitiveservices/.ai.azure.com` 路径归 `/openai/v1`）、deployment 名（AZURE_OPENAI_DEPLOYMENT_NAME_MAP `id=deployment,..` 按 model id 查找，未映射用 id）；body 的 model 字段用 deployment 名。`azure_stream_fn()` 注册 Api::AZURE_OPENAI_RESPONSES，model_registry 白名单扩入。声明推迟：grammar 工具、toolChoice、strict-mode 差异（与 openai-responses 首片同口径；上游 azure 的 compat 默认 supportsStrictMode=true 等——端口统一无 strict）。638 项测试全绿（+3 azure：URL 归一化/deployment 映射/body model 名），fmt/clippy 干净。providers 完成 6/10+。
+
+## 第三十二轮补充：settings retry.enabled（2026-10-31，主会话单线）
+
+基线 `bef0cd5`：`RetrySettings` 增 `enabled: Option<bool>`（字段级合并），spawn 时播种 auto_retry 原子量（缺省仍 RETRY_ENABLED_DEFAULT=true）——settings `{"retry":{"enabled":false}}` 可关闭自动重试（此前只有 RPC 开关）。638 项测试维持全绿，fmt/clippy 干净。剩余声明缺口：maxAgentDelayMs（上游 agent 级重试上限，与 provider 级 maxRetryDelayMs 分开）。

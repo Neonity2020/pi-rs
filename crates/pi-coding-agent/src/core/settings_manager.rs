@@ -38,6 +38,7 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RetrySettings {
+	pub enabled: Option<bool>,
 	pub max_retries: Option<u32>,
 	pub base_delay_ms: Option<u64>,
 }
@@ -50,6 +51,9 @@ impl RetrySettings {
 			return None;
 		}
 		Some(Self {
+			enabled: project
+				.and_then(|r| r.enabled)
+				.or(global.and_then(|r| r.enabled)),
 			max_retries: project
 				.and_then(|r| r.max_retries)
 				.or(global.and_then(|r| r.max_retries)),
@@ -234,8 +238,10 @@ mod retry_settings_tests {
 	#[test]
 	fn retry_settings_parse_and_fall_through() {
 		let global: Settings =
-			serde_json::from_str(r#"{"retry":{"maxRetries":5,"baseDelayMs":100}}"#).unwrap();
+			serde_json::from_str(r#"{"retry":{"enabled":false,"maxRetries":5,"baseDelayMs":100}}"#)
+				.unwrap();
 		let retry = global.retry.as_ref().expect("retry parsed");
+		assert_eq!(retry.enabled, Some(false));
 		assert_eq!(retry.max_retries, Some(5));
 		assert_eq!(retry.base_delay_ms, Some(100));
 
