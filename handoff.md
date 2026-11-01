@@ -304,3 +304,11 @@ cargo fmt --all -- --check
 ## 差分回归（2026-10-31，第二十九至三十三轮之后）
 
 google-generative-ai 流处理重构（process_payload_streamed）、google-vertex、pi-messages、azure、Prompt images、retry settings、bash 透传等改动后重跑：**六场景双侧 6/6 IDENTICAL（canonical view，f9daca34）**——继续零 wire 回归。
+
+## 第三十四轮：mistral-conversations provider（2026-10-31，主会话单线）
+
+基线 `0fc097a`（上游 `mistral-conversations.ts` 924 行首片）：**新模块 `pi-ai/src/providers/mistral_conversations.rs`**——
+- **请求**：`{base}/v1/chat/completions`（bearer + accept SSE + `x-affinity` 会话亲和）；messages（system 文本、user text/`image_url` 块（无视觉模型图片降级文案）、assistant `{content:[{type:text|thinking}],tool_calls:[{id,type,function,index:0}],prefix:false}`、tool `{tool_call_id,name,content:[text(+image)]}` 带 `[tool error]`/图片省略文案）；tools `function.strict:false`；`max_tokens`/`prompt_cache_key` snake_case；错误体 `Mistral API error (<code>): <4000 字符截断>`。
+- **流处理**：`{data:{id,usage,choices[0]:{finish_reason,delta}}}`；delta.content 为 string 或 chunk 数组（text/thinking——GLM 空 content delta 不开新块）；tool_calls 按 `index`（无 index 用派生 id）键控累积（ToolArgsStream），收尾统一 finish() 出 arguments_error；usage 缓存命中六种字段拼写、input 扣 cached；finishReason：stop→stop、length/model_length→length、tool_calls→toolUse、error→"server error" 可重试文案、其余→error。
+- **声明推迟**：toolChoice、reasoningEffort/promptMode（thinkingLevelMap 未建模）、60s header 超时、header 覆盖、`shortHash`（std hasher 替代——id 仅需会话内稳定，不需与上游一致）。
+645 项测试全绿（+4：wire/历史重放/块切换+index 工具调用+缓存扣减/stop 映射），fmt/clippy 干净。**坑：Mistral 事件 JSON 外层是 `{data:{choices}}`，检查层级写错会全帧报 "Invalid Mistral streaming event"。** providers 完成 8/10+（剩 bedrock-converse-stream、openai-codex-responses）。
