@@ -186,3 +186,11 @@ cargo fmt --all -- --check
 - **声明偏差**：toolChoice/constrained-sampling VALIDATED/useParameters（Cloud Code Assist）/请求重试/thinkingLevelMap（Xhigh/Max 钳到 High）推迟，均上游默认关闭或不可达；cost 沿用零值口径。
 
 **验证**：621 项测试全绿（605→621，+16：wire/thinking 配置分族/工具结果合并/跨模型 thinking/签名重放/Gemini3 id/流切换/合成 id/usage/空文本回显/inlineData 11 项单测 + 5 项 mock HTTP+SSE 集成——跨 chunk 增量、429、无 finishReason、SAFETY→error、abort）；fmt/clippy -D warnings 干净。model_registry api 白名单扩入 google-generative-ai。
+
+## 第十四轮：/export 命令（2026-10-31，主会话单线）
+
+基线 `9397cf9`（上游 `interactive-mode.ts handleExportCommand` + `core/session-export.ts` 移植）：
+
+- **新模块 `core/session_export.rs`**：`serialize_session_branch`（新导出头 `type:"session"` + 同 id/cwd + 分支条目 parentId 重链——对照上游 `serializeSessionBranch`，getBranch=build_session_path）、`export_session_to_jsonl`（默认名 `session-<ISO>.jsonl` 解析到 cwd、嵌套父目录创建；内存会话也可导出）。
+- **interactive `/export [path]`**：`.jsonl`→JSONL 分支导出；其余（含无参默认路径）→HTML（`write_session_html`，内存会话报 "Cannot export in-memory session to HTML"）；参数支持成对引号剥离；成功/失败均走聊天通知（上游 showStatus/showError）。
+- **验证**：623 项测试全绿（621→623，+2：分支重链序列化、默认/显式路径导出）；pty 冒烟：无参 HTML 导出落盘 + `/export out/session.jsonl` 嵌套路径导出成功；fmt/clippy -D warnings 干净。RPC `export_html` 命令与 CLI 共用 `write_session_html`，行为一致。

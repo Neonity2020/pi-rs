@@ -1199,6 +1199,49 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/export [path]` (upstream `handleExportCommand`): `.jsonl` writes the
+	/// current branch, anything else HTML; no argument takes the default
+	/// path. In-memory sessions only export JSONL.
+	fn handle_export_command(&mut self, args: &str) {
+		let arg = args.trim();
+		let arg = match (arg.chars().next(), arg.chars().last()) {
+			(Some(q), Some(last)) if (q == '"' || q == '\'') && q == last && arg.len() >= 2 => {
+				&arg[1..arg.len() - 1]
+			}
+			_ => arg,
+		};
+		let outcome: anyhow::Result<std::path::PathBuf> = (|| {
+			if arg.ends_with(".jsonl") {
+				let log = self.session.log.lock().unwrap();
+				let path = crate::core::session_export::export_session_to_jsonl(
+					&log.session,
+					(!arg.is_empty()).then_some(std::path::Path::new(arg)),
+					std::path::Path::new(&self.cwd),
+				)?;
+				return Ok(path);
+			}
+			let session_dir = self
+				.session
+				.log
+				.lock()
+				.unwrap()
+				.session
+				.session_dir()
+				.map(std::path::Path::to_path_buf);
+			let Some(session_dir) = session_dir else {
+				anyhow::bail!("Cannot export in-memory session to HTML");
+			};
+			crate::core::export_html::write_session_html(
+				&session_dir,
+				(!arg.is_empty()).then_some(std::path::Path::new(arg)),
+			)
+		})();
+		match outcome {
+			Ok(path) => self.push_notice(format!("Session exported to: {}", path.display())),
+			Err(error) => self.push_notice(format!("Failed to export session: {error}")),
+		}
+	}
+
 	fn send_prompt(&mut self, text: String) {
 		let images = std::mem::take(&mut self.pending_images);
 		let _ = self
@@ -1245,6 +1288,7 @@ impl InteractiveMode {
 				}
 			}
 			"resume" => self.open_session_selector(),
+			"export" => self.handle_export_command(args),
 			"thinking" => {
 				let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);
 			}

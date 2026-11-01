@@ -70,6 +70,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		"open the session selector (switch/delete/rename)",
 		SlashCommandSource::Builtin,
 	),
+	info(
+		"export",
+		"export session (HTML default, or specify path: .html/.jsonl)",
+		SlashCommandSource::Builtin,
+	),
 ];
 
 const fn info(

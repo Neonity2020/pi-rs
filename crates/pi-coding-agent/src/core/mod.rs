@@ -11,6 +11,7 @@ pub mod json_event;
 pub mod mcp_config;
 pub mod model_registry;
 pub mod retry;
+pub mod session_export;
 pub mod session_manager;
 pub mod settings_manager;
 pub mod slash_commands;
