@@ -254,3 +254,7 @@ cargo fmt --all -- --check
 ## 第二十七轮：/compact <instructions>（2026-10-31，主会话单线）
 
 基线 `c14e9d1` 前后连推（上游 compaction.ts:714-716）：`SessionCommand::Compact` 增 `instructions: Option<String>`，`compact_prefix` 增第三参（None=全部既有路径），自定义指令在基础提示词后追加 `\n\nAdditional focus: …`（UPDATE 路径同）；interactive `/compact [focus]` 传参、RPC `compact` 传 None（wire 无字段）、阈值/mid-run/溢出路径均 None。629 项测试全绿（+1 提示词含 Additional focus 断言），pty 冒烟（空会话拒绝路径证明参数贯通），fmt/clippy 干净。
+
+## 第二十八轮：RPC compact customInstructions（2026-10-31，主会话单线）
+
+基线 `fbf056d`：`RpcCommand::Compact` 增可选 `customInstructions`（serde rename 到上游 camelCase 字段，缺省 None——additive，旧帧不受影响）并传入 SessionCommand；+1 wire 测试（"compact" 命令帧形状）。630 项测试全绿，fmt/clippy 干净。坑：字符串手术修补测试尾部两次失败后，按精确文本 replace + 手工核对括号结构修复（教训：测试插入用 Edit 工具锚定模块内位置，勿用 rindex 猜括号）。

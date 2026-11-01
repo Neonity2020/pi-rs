@@ -132,7 +132,11 @@ pub enum RpcCommand {
 	SetFollowUpMode {
 		mode: RpcQueueMode,
 	},
-	Compact,
+	Compact {
+		/// Upstream wire field (optional): custom focus for the summary.
+		#[serde(default, rename = "customInstructions")]
+		custom_instructions: Option<String>,
+	},
 	SetAutoCompaction {
 		enabled: bool,
 	},
@@ -553,7 +557,9 @@ impl RpcSession {
 				self.agent().set_follow_up_mode(mode.into());
 				success_frame(&id, "set_follow_up_mode", Value::Null)
 			}
-			RpcCommand::Compact => {
+			RpcCommand::Compact {
+				custom_instructions,
+			} => {
 				// Same disposition inference as `prompt`; the session task
 				// reports progress/refusals through notices.
 				let disposition = if self.is_run_active() {
@@ -561,9 +567,9 @@ impl RpcSession {
 				} else {
 					"started"
 				};
-				let _ = self
-					.cmd_tx
-					.send(SessionCommand::Compact { instructions: None });
+				let _ = self.cmd_tx.send(SessionCommand::Compact {
+					instructions: custom_instructions,
+				});
 				success_frame(&id, "compact", json!({ "disposition": disposition }))
 			}
 			RpcCommand::SetAutoCompaction { enabled } => {
@@ -2412,5 +2418,18 @@ mod tests {
 			json!({"type": "agent_settled", "aborted": false}),
 			"the settle frame matches the upstream agent_settled shape"
 		);
+	}
+
+	#[tokio::test]
+	async fn compact_accepts_the_upstream_custom_instructions_field() {
+		let (handle, registry) = mock_handle();
+		let session = RpcSession::new(handle, registry);
+		let frames = session
+			.handle_line(r#"{"type":"compact","id":"c1","customInstructions":"keep paths"}"#);
+		assert_eq!(frames.len(), 1);
+		let frame: Value = serde_json::from_str(&frames[0]).unwrap();
+		assert_eq!(frame["command"], "compact");
+		assert_eq!(frame["success"], true);
+		assert_eq!(frame["data"]["disposition"], "started");
 	}
 }
