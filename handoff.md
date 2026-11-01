@@ -214,3 +214,7 @@ cargo fmt --all -- --check
 ## 第十八轮：/thinking <level> 参数（2026-10-31，主会话单线）
 
 基线 `6dee54a`（上游 `handleThinkingCommand`）：`/thinking <level>` 按模型能力（reasoning → off..max，否则仅 off）直接 `SessionCommand::SetThinking`，未知级别报 "Unknown thinking level ... Available levels: ..."（上游文案）；裸 `/thinking` 维持循环。626 项测试维持全绿，pty 冒烟 set（thinking → Low）+ 未知级别错误路径，fmt/clippy 干净。
+
+## 第十九轮：/session 信息命令（2026-10-31，主会话单线）
+
+基线 `0115b24`（上游 `handleSessionCommand` + `getSessionStats`）：统计逻辑从 rpc.rs 抽出为 `core/agent_session::compute_session_stats`（消息计数 + assistant/toolResult/usage 条目的用量求和），RPC `get_session_stats` 与 interactive `/session` 共用；`/session` 渲染 Name/File/ID、消息计数、Token 总量与 cached/uncached 拆分（上游 cache-warming 与按模型分解节无对应物，声明推迟）。**事故与恢复：用 `s.index("\n\tfn ")` 找方法边界时吞掉了 rpc.rs 后续方法与测试嵌套，靠 `git checkout -- rpc.rs` 还原后按真实方法边界（首个 `\n\t}\n`）重做手术式替换**——大块文本替换前先确认锚点唯一性。626 项测试维持全绿（RPC 45 项含 stats 聚合仍过），pty 冒烟渲染完整信息块，fmt/clippy 干净。

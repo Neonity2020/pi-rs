@@ -1223,6 +1223,61 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/session` (upstream `handleSessionCommand`): name, file, id, message
+	/// counts, and the token/cost totals with the cached/uncached split. The
+	/// cache-warming and per-model breakdown sections have no port
+	/// counterpart.
+	fn handle_session_command(&mut self) {
+		let (session_file, log_stats) = {
+			let guard = self.session.log.lock().unwrap();
+			(
+				self.session.current_session_file(),
+				crate::core::agent_session::compute_session_stats(&guard.session, None),
+			)
+		};
+		let model = self.session.live_agent().model();
+		let mut info = String::from("Session Info\n\n");
+		if let Some(name) = self.session.session_name() {
+			info.push_str(&format!("Name: {name}\n"));
+		}
+		info.push_str(&format!(
+			"File: {}\n",
+			session_file
+				.as_ref()
+				.map(|path| path.display().to_string())
+				.unwrap_or_else(|| "In-memory".into())
+		));
+		info.push_str(&format!("ID: {}\n\n", log_stats.session_id));
+		info.push_str("Messages\n");
+		info.push_str(&format!("Total: {}\n", log_stats.total_messages));
+		info.push_str(&format!("User: {}\n", log_stats.user_messages));
+		info.push_str(&format!("Assistant: {}\n", log_stats.assistant_messages));
+		info.push_str(&format!(
+			"Tools: {} calls, {} results\n\n",
+			log_stats.tool_calls, log_stats.tool_results
+		));
+		info.push_str("Tokens\n");
+		let prompt_tokens = log_stats.input + log_stats.cache_read + log_stats.cache_write;
+		info.push_str(&format!("Input: {prompt_tokens}\n"));
+		if prompt_tokens > 0 && (log_stats.cache_read > 0 || log_stats.cache_write > 0) {
+			info.push_str(&format!(
+				"  Cached: {} ({:.1}%)\n",
+				log_stats.cache_read,
+				log_stats.cache_read as f64 / prompt_tokens as f64 * 100.0
+			));
+			info.push_str(&format!(
+				"  Uncached: {}\n",
+				log_stats.input + log_stats.cache_write
+			));
+		}
+		info.push_str(&format!("Output: {}\n", log_stats.output));
+		let total =
+			log_stats.input + log_stats.output + log_stats.cache_read + log_stats.cache_write;
+		info.push_str(&format!("Total: {total}\n"));
+		info.push_str(&format!("\nModel: {}", model.key()));
+		self.push_notice(info);
+	}
+
 	/// `/name [name]` (upstream `handleNameCommand`): show the current
 	/// display name, or set one. The sanitized name arrives through the
 	/// session task; a mismatch surfaces as a warning.
@@ -1363,6 +1418,7 @@ impl InteractiveMode {
 			"resume" => self.open_session_selector(),
 			"copy" => self.handle_copy_command(),
 			"name" => self.handle_name_command(args),
+			"session" => self.handle_session_command(),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "

@@ -71,6 +71,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info(
+		"session",
+		"show session info and stats",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"name",
 		"show or set the session display name",
 		SlashCommandSource::Builtin,

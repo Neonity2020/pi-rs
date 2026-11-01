@@ -901,83 +901,27 @@ impl RpcSession {
 	/// does not track them yet (declared omission).
 	fn session_stats_value(&self) -> Value {
 		let guard = self.log.lock().unwrap();
-		let session = &guard.session;
-		let mut user_messages = 0u64;
-		let mut assistant_messages = 0u64;
-		let mut tool_calls = 0u64;
-		let mut tool_results = 0u64;
-		let mut total_messages = 0u64;
-		let mut input = 0u64;
-		let mut output = 0u64;
-		let mut cache_read = 0u64;
-		let mut cache_write = 0u64;
-		let mut add_usage = |usage: &pi_ai::Usage| {
-			input += usage.input;
-			output += usage.output;
-			cache_read += usage.cache_read;
-			cache_write += usage.cache_write;
-		};
-		for entry in session.entries() {
-			match &entry.kind {
-				EntryKind::Usage { usage, .. } => add_usage(usage),
-				// Model-attributed usage carried by summaries counts too.
-				EntryKind::BranchSummary {
-					usage: Some(usage), ..
-				}
-				| EntryKind::Compaction {
-					usage: Some(usage), ..
-				} => add_usage(usage),
-				EntryKind::Message { message } => {
-					total_messages += 1;
-					match message.as_ref() {
-						pi_ai::Message::User(_) => user_messages += 1,
-						pi_ai::Message::ToolResult(result) => {
-							tool_results += 1;
-							if let Some(usage) = &result.usage {
-								add_usage(usage);
-							}
-						}
-						pi_ai::Message::Assistant(assistant) => {
-							assistant_messages += 1;
-							tool_calls += assistant
-								.content
-								.iter()
-								.filter(|block| {
-									matches!(block, pi_ai::AssistantContent::ToolCall(_))
-								})
-								.count() as u64;
-							add_usage(&assistant.usage);
-						}
-						pi_ai::Message::System(_) => {}
-					}
-				}
-				_ => {}
-			}
-		}
-		let session_id = session
-			.session_id()
-			.or_else(|| session.header_id().map(str::to_owned))
-			.unwrap_or_default();
+		let stats = crate::core::agent_session::compute_session_stats(
+			&guard.session,
+			self.shared.current_session_file.lock().unwrap().clone(),
+		);
 		json!({
-			"sessionFile": self
-				.shared
-				.current_session_file
-				.lock()
-				.unwrap()
+			"sessionFile": stats
+				.session_file
 				.as_ref()
 				.map(|path| path.display().to_string()),
-			"sessionId": session_id,
-			"userMessages": user_messages,
-			"assistantMessages": assistant_messages,
-			"toolCalls": tool_calls,
-			"toolResults": tool_results,
-			"totalMessages": total_messages,
+			"sessionId": stats.session_id,
+			"userMessages": stats.user_messages,
+			"assistantMessages": stats.assistant_messages,
+			"toolCalls": stats.tool_calls,
+			"toolResults": stats.tool_results,
+			"totalMessages": stats.total_messages,
 			"tokens": {
-				"input": input,
-				"output": output,
-				"cacheRead": cache_read,
-				"cacheWrite": cache_write,
-				"total": input + output + cache_read + cache_write,
+				"input": stats.input,
+				"output": stats.output,
+				"cacheRead": stats.cache_read,
+				"cacheWrite": stats.cache_write,
+				"total": stats.input + stats.output + stats.cache_read + stats.cache_write,
 			},
 		})
 	}

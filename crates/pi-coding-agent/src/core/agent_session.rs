@@ -1664,6 +1664,88 @@ struct ReplacementContext<'a> {
 /// task state (`teardownCurrent` → `createRuntime` upstream). The teardown
 /// either lands whole or leaves the current session untouched. Returns the
 /// new agent and its event receiver for the caller's loop locals.
+/// Session statistics for `/session` and RPC `get_session_stats` (upstream
+/// `getSessionStats`): message counts plus usage summed over assistant
+/// messages, tool-result usage, and the model-attributed usage entries.
+pub(crate) struct SessionStats {
+	pub session_file: Option<PathBuf>,
+	pub session_id: String,
+	pub user_messages: u64,
+	pub assistant_messages: u64,
+	pub tool_calls: u64,
+	pub tool_results: u64,
+	pub total_messages: u64,
+	pub input: u64,
+	pub output: u64,
+	pub cache_read: u64,
+	pub cache_write: u64,
+}
+
+pub(crate) fn compute_session_stats(
+	session: &SessionManager,
+	session_file: Option<PathBuf>,
+) -> SessionStats {
+	use super::session_manager::EntryKind;
+	let mut stats = SessionStats {
+		session_file,
+		session_id: session
+			.session_id()
+			.or_else(|| session.header_id().map(str::to_owned))
+			.unwrap_or_default(),
+		user_messages: 0,
+		assistant_messages: 0,
+		tool_calls: 0,
+		tool_results: 0,
+		total_messages: 0,
+		input: 0,
+		output: 0,
+		cache_read: 0,
+		cache_write: 0,
+	};
+	let mut add_usage = |usage: &pi_ai::Usage| {
+		stats.input += usage.input;
+		stats.output += usage.output;
+		stats.cache_read += usage.cache_read;
+		stats.cache_write += usage.cache_write;
+	};
+	for entry in session.entries() {
+		match &entry.kind {
+			EntryKind::Usage { usage, .. } => add_usage(usage),
+			// Model-attributed usage carried by summaries counts too.
+			EntryKind::BranchSummary {
+				usage: Some(usage), ..
+			}
+			| EntryKind::Compaction {
+				usage: Some(usage), ..
+			} => add_usage(usage),
+			EntryKind::Message { message } => {
+				stats.total_messages += 1;
+				match message.as_ref() {
+					pi_ai::Message::User(_) => stats.user_messages += 1,
+					pi_ai::Message::ToolResult(result) => {
+						stats.tool_results += 1;
+						if let Some(usage) = &result.usage {
+							add_usage(usage);
+						}
+					}
+					pi_ai::Message::Assistant(assistant) => {
+						stats.assistant_messages += 1;
+						stats.tool_calls += assistant
+							.content
+							.iter()
+							.filter(|block| matches!(block, pi_ai::AssistantContent::ToolCall(_)))
+							.count() as u64;
+						add_usage(&assistant.usage);
+					}
+					pi_ai::Message::System(_) => {}
+				}
+			}
+			_ => {}
+		}
+	}
+	stats
+}
+
 /// A user prompt as a `Message`: text only when there are no image
 /// attachments, otherwise content blocks (text first, then the images).
 fn user_message_with_images(text: &str, images: &[pi_ai::ImageContent]) -> pi_ai::Message {
