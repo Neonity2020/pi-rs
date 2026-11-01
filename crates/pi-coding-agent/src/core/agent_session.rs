@@ -362,6 +362,25 @@ pub struct SessionHandle {
 	pub(crate) auto_retry: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl SessionHandle {
+	/// The live agent — swapped by the session task on session replacement,
+	/// so TUI probes (model, snapshot, tool names) always observe the
+	/// current session's agent (`self.agent` stays the startup agent).
+	pub fn live_agent(&self) -> Agent {
+		self.shared.live_agent.lock().unwrap().clone()
+	}
+
+	/// File of the live session (`None` when persistence is disabled).
+	pub fn current_session_file(&self) -> Option<std::path::PathBuf> {
+		self.shared.current_session_file.lock().unwrap().clone()
+	}
+
+	/// Display name of the live session (latest `session_info` entry).
+	pub fn session_name(&self) -> Option<String> {
+		self.shared.session_name.lock().unwrap().clone()
+	}
+}
+
 /// Build and spawn the session task.
 pub fn spawn_agent_session(
 	agent: Agent,

@@ -65,6 +65,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		"list recent sessions (stub)",
 		SlashCommandSource::Builtin,
 	),
+	info(
+		"resume",
+		"open the session selector (switch/delete/rename)",
+		SlashCommandSource::Builtin,
+	),
 ];
 
 const fn info(

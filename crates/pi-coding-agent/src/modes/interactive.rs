@@ -34,8 +34,12 @@ use pi_tui::{Editor, ScrollView, TerminalGuard, Theme};
 
 use crate::core::agent_session::{SessionCommand, SessionEvent, SessionHandle};
 use crate::core::model_registry::{ModelRegistry, add_provider};
+use crate::core::session_manager::SessionInfo;
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
 use crate::core::ui_config::UiConfig;
+use crate::modes::session_selector::{
+	SelectorAction, SessionScope, SessionSelectorOverlay, StatusKind,
+};
 
 #[derive(Default)]
 struct ProviderWizard {
@@ -209,9 +213,34 @@ pub struct InteractiveMode {
 	overlay: Option<ModelOverlay>,
 	// Slash-command autocomplete anchored above the editor (live-filtered).
 	slash_menu: Option<SlashMenu>,
+	// Session selector overlay (/resume): owns its own state; async session
+	// listing and file mutations flow through the typed channel below.
+	session_overlay: Option<SessionSelectorOverlay>,
+	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
+	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	// UI-only messages from background tasks (git branch watcher).
 	ui_rx: mpsc::UnboundedReceiver<String>,
 	ui_tx: mpsc::UnboundedSender<String>,
+}
+
+/// Session listing progress/results for the selector overlay (upstream loads
+/// inline with an AbortController; the port spawns a blocking task and
+/// streams through this channel).
+enum SessionListMsg {
+	Progress {
+		scope: SessionScope,
+		loaded: usize,
+		total: usize,
+		partial: Vec<SessionInfo>,
+	},
+	Loaded {
+		scope: SessionScope,
+		sessions: Vec<SessionInfo>,
+	},
+	Status {
+		kind: StatusKind,
+		text: String,
+	},
 }
 
 pub fn format_tokens(count: u64) -> String {
@@ -243,6 +272,100 @@ pub fn format_duration(ms: u128) -> String {
 		let hours = minutes / 60;
 		format!("{hours}h {}m {rem}s", minutes % 60)
 	}
+}
+
+/// Chat blocks for a restored/replaced session's messages: tool calls pair
+/// with their results by id (calls without a persisted result render with
+/// empty output, results without a call are skipped).
+fn blocks_from_messages(messages: &[Message]) -> Vec<ChatBlock> {
+	let results: std::collections::HashMap<&str, &pi_ai::ToolResultMessage> = messages
+		.iter()
+		.filter_map(|m| match m {
+			Message::ToolResult(result) => Some((result.tool_call_id.as_str(), result)),
+			_ => None,
+		})
+		.collect();
+	let mut blocks = Vec::new();
+	for message in messages {
+		match message {
+			Message::System(_) | Message::ToolResult(_) => {}
+			Message::User(user) => blocks.push(ChatBlock::User(user.content.as_text())),
+			Message::Assistant(assistant) => {
+				blocks.push(ChatBlock::Assistant {
+					text: assistant.text(),
+					thinking: assistant.thinking(),
+					streaming: false,
+					stop_note: None,
+					error: assistant.error_message.clone(),
+					rendered: None,
+				});
+				for call in assistant.tool_calls() {
+					let result = results.get(call.id.as_str());
+					blocks.push(ChatBlock::Tool {
+						id: call.id.clone(),
+						name: call.name.clone(),
+						args: call.arguments.clone(),
+						running: false,
+						is_error: result.is_some_and(|r| r.is_error),
+						output: result.map(|r| r.text()).unwrap_or_default(),
+						started: None,
+						duration_ms: result.and_then(|r| r.duration_ms).map(u128::from),
+						rendered: None,
+					});
+				}
+			}
+		}
+	}
+	blocks
+}
+
+/// Accumulated usage over a restored transcript (the TUI counters restart
+/// from the messages after a session replacement).
+fn usage_of_messages(messages: &[Message]) -> (u64, u64, u64, u64, f64) {
+	let mut usage = (0u64, 0u64, 0u64, 0u64, 0.0f64);
+	for message in messages {
+		if let Message::Assistant(assistant) = message {
+			usage.0 += assistant.usage.input;
+			usage.1 += assistant.usage.output;
+			usage.2 += assistant.usage.cache_read;
+			usage.3 += assistant.usage.cache_write;
+			usage.4 += assistant.usage.cost.total.unwrap_or(0.0);
+		}
+	}
+	usage
+}
+
+/// Delete a session file, trying the `trash` CLI first, then unlink
+/// (upstream `deleteSessionFile`).
+fn delete_session_file(path: &std::path::Path) -> Result<&'static str, String> {
+	let display = path.to_string_lossy();
+	let mut command = std::process::Command::new("trash");
+	if display.starts_with('-') {
+		command.arg("--");
+	}
+	command.arg(path);
+	let trash_result = command.output();
+	let trash_hint = match &trash_result {
+		Ok(output) => String::from_utf8_lossy(&output.stderr)
+			.lines()
+			.next()
+			.map(str::trim)
+			.filter(|line| !line.is_empty())
+			.map(|line| format!("trash: {}", &line[..line.len().min(200)])),
+		Err(error) => Some(format!("trash: {error}")),
+	};
+	// If trash reports success, or the file is gone afterwards, treat it as
+	// successful.
+	let gone = !path.exists();
+	let trash_ok = matches!(&trash_result, Ok(output) if output.status.success());
+	if trash_ok || gone {
+		return Ok("Session moved to trash");
+	}
+	std::fs::remove_file(path).map_err(|error| match trash_hint {
+		Some(hint) => format!("{error} ({hint})"),
+		None => error.to_string(),
+	})?;
+	Ok("Session deleted")
 }
 
 /// Footer context segment (footer.ts render): `71.4%/200k`, or `?/200k` while
@@ -289,6 +412,7 @@ enum GlobalAction {
 	ModelSelect,
 	ToolsExpand,
 	ThinkingToggle,
+	SessionResume,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -325,6 +449,9 @@ fn resolve_global_action(
 	if keybindings.matches("app.thinking.toggle", key) {
 		return Some(GlobalAction::ThinkingToggle);
 	}
+	if keybindings.matches("app.session.resume", key) {
+		return Some(GlobalAction::SessionResume);
+	}
 	None
 }
 
@@ -338,6 +465,7 @@ impl InteractiveMode {
 	) -> Self {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 		let theme = ui.theme;
+		let (session_list_tx, session_list_rx) = mpsc::unbounded_channel();
 		Self {
 			session,
 			models,
@@ -360,6 +488,9 @@ impl InteractiveMode {
 			thinking_expanded: true,
 			overlay: None,
 			slash_menu: None,
+			session_overlay: None,
+			session_list_tx,
+			session_list_rx,
 			ui_rx,
 			ui_tx,
 		}
@@ -424,12 +555,18 @@ impl InteractiveMode {
 				Some(branch) = self.ui_rx.recv() => {
 					self.branch = Some(branch);
 				}
+				Some(msg) = self.session_list_rx.recv() => {
+					self.handle_session_list_msg(msg);
+				}
 				_ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
 					self.tick = self.tick.wrapping_add(1);
 					self.branch_refresh_tick += 1;
 					if self.branch_refresh_tick >= 375 {
 						self.branch_refresh_tick = 0;
 						self.refresh_branch();
+					}
+					if let Some(overlay) = self.session_overlay.as_mut() {
+						overlay.tick();
 					}
 				}
 			}
@@ -462,6 +599,10 @@ impl InteractiveMode {
 			}
 			if self.provider_wizard.is_some() {
 				self.handle_provider_key(*key);
+				return;
+			}
+			if self.session_overlay.is_some() {
+				self.handle_session_overlay_key(*key);
 				return;
 			}
 			if self.overlay.is_some() {
@@ -661,7 +802,7 @@ impl InteractiveMode {
 			// press exits); pi-rs keeps its simpler ctrl+c exits.
 			GlobalAction::Clear | GlobalAction::Exit => self.quit = true,
 			GlobalAction::ModelSelect => {
-				let current = self.session.agent.model().key();
+				let current = self.session.live_agent().model().key();
 				self.overlay = Some(ModelOverlay::new(&self.models, &current));
 			}
 			GlobalAction::ToolsExpand => {
@@ -682,8 +823,153 @@ impl InteractiveMode {
 					}
 				}
 			}
+			GlobalAction::SessionResume => self.open_session_selector(),
 		}
 		true
+	}
+
+	// -- session selector (/resume) ------------------------------------------------
+
+	/// Open the selector and kick off the current-folder listing (upstream
+	/// `showSessionSelector` loads scope "current" immediately).
+	fn open_session_selector(&mut self) {
+		if self.session_overlay.is_some() {
+			return;
+		}
+		if self.session.session_dir.is_none() {
+			self.push_notice("no saved sessions (--no-session)".into());
+			return;
+		}
+		self.session_overlay = Some(SessionSelectorOverlay::new(
+			self.session.current_session_file(),
+		));
+		self.load_sessions(SessionScope::Current);
+	}
+
+	/// Re-list the active scope after a delete/rename (upstream
+	/// `refreshSessionsAfterMutation`).
+	fn reload_sessions(&mut self) {
+		if let Some(overlay) = self.session_overlay.as_ref() {
+			let scope = overlay.scope;
+			self.load_sessions(scope);
+		}
+	}
+
+	fn load_sessions(&mut self, scope: SessionScope) {
+		if let Some(overlay) = self.session_overlay.as_mut() {
+			overlay.set_loading(scope, true);
+		}
+		let tx = self.session_list_tx.clone();
+		let cwd = std::path::PathBuf::from(&self.cwd);
+		tokio::task::spawn_blocking(move || {
+			let root = crate::config::sessions_dir();
+			let mut progress = |loaded: usize, total: usize, partial: &[SessionInfo]| {
+				let _ = tx.send(SessionListMsg::Progress {
+					scope,
+					loaded,
+					total,
+					partial: partial.to_vec(),
+				});
+			};
+			// Current folder filters by header cwd (pi-rs keeps one sessions
+			// root; upstream has per-cwd directories), All lists everything.
+			let sessions = crate::core::session_manager::list_sessions_progress(
+				&root,
+				match scope {
+					SessionScope::Current => Some(&cwd),
+					SessionScope::All => None,
+				},
+				match scope {
+					SessionScope::Current => 10,
+					SessionScope::All => 100,
+				},
+				&mut progress,
+			);
+			let _ = tx.send(SessionListMsg::Loaded { scope, sessions });
+		});
+	}
+
+	fn handle_session_list_msg(&mut self, msg: SessionListMsg) {
+		let Some(overlay) = self.session_overlay.as_mut() else {
+			return;
+		};
+		match msg {
+			SessionListMsg::Progress {
+				scope,
+				loaded,
+				total,
+				partial,
+			} => {
+				if scope == overlay.scope {
+					overlay.set_loading_progress(scope, loaded, total);
+					if !partial.is_empty() {
+						overlay.set_sessions(scope, partial);
+					}
+				}
+			}
+			SessionListMsg::Loaded { scope, sessions } => {
+				overlay.set_sessions(scope, sessions);
+				overlay.set_loading(scope, false);
+			}
+			SessionListMsg::Status { kind, text } => {
+				let ttl = match kind {
+					StatusKind::Info => 2000,
+					StatusKind::Error => 3000,
+				};
+				overlay.set_status(kind, text, ttl);
+			}
+		}
+	}
+
+	fn handle_session_overlay_key(&mut self, key: KeyEvent) {
+		let action = match self.session_overlay.as_mut() {
+			Some(overlay) => overlay.handle_key(&key, &self.keybindings),
+			None => return,
+		};
+		match action {
+			SelectorAction::None => {}
+			SelectorAction::Cancel => self.session_overlay = None,
+			SelectorAction::Resume(path) => {
+				self.session_overlay = None;
+				let _ = self.session.cmd_tx.send(SessionCommand::SwitchSession {
+					path: path.display().to_string(),
+				});
+				// The switch notice ("session → …") arrives over the event
+				// bus and triggers the chat rebuild; a failed switch
+				// surfaces its error notice with the selector closed.
+			}
+			SelectorAction::Delete(path) => {
+				let tx = self.session_list_tx.clone();
+				tokio::task::spawn_blocking(move || {
+					let (kind, text) = match delete_session_file(&path) {
+						Ok(message) => (StatusKind::Info, message.to_string()),
+						Err(error) => (StatusKind::Error, format!("Failed to delete: {error}")),
+					};
+					let _ = tx.send(SessionListMsg::Status { kind, text });
+				});
+				self.reload_sessions();
+			}
+			SelectorAction::Rename { path, name } => {
+				let tx = self.session_list_tx.clone();
+				tokio::task::spawn_blocking(move || {
+					let (kind, text) =
+						match crate::core::session_manager::append_session_info_to_file(
+							&path, &name,
+						) {
+							Ok(()) => (StatusKind::Info, "Session renamed".to_string()),
+							Err(error) => (StatusKind::Error, format!("Failed to rename: {error}")),
+						};
+					let _ = tx.send(SessionListMsg::Status { kind, text });
+				});
+				self.reload_sessions();
+			}
+		}
+		// A scope toggle with a not-yet-loaded listing requests a load.
+		if let Some(overlay) = self.session_overlay.as_ref()
+			&& let Some(scope) = overlay.pending_load()
+		{
+			self.load_sessions(scope);
+		}
 	}
 
 	/// The action's effective bindings as a hint string (`ctrl+o/ctrl+p`
@@ -804,7 +1090,7 @@ impl InteractiveMode {
 			}
 			"model" => {
 				if args.is_empty() {
-					let current = self.session.agent.model().key();
+					let current = self.session.live_agent().model().key();
 					self.overlay = Some(ModelOverlay::new(&self.models, &current));
 				} else {
 					let _ = self.session.cmd_tx.send(SessionCommand::SetModel {
@@ -812,15 +1098,16 @@ impl InteractiveMode {
 					});
 				}
 			}
+			"resume" => self.open_session_selector(),
 			"thinking" => {
 				let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);
 			}
 			"tools" => {
-				let names = self.session.agent.tool_names().join(", ");
+				let names = self.session.live_agent().tool_names().join(", ");
 				self.push_notice(format!("active tools: {names}"));
 			}
 			"prompt" => {
-				let prompt = self.session.agent.snapshot().system_prompt;
+				let prompt = self.session.live_agent().snapshot().system_prompt;
 				let preview: Vec<&str> = prompt.lines().take(30).collect();
 				self.push_notice(format!(
 					"system prompt (first 30 lines):\n{}\n…",
@@ -862,11 +1149,29 @@ impl InteractiveMode {
 	fn handle_session_event(&mut self, event: SessionEvent) {
 		match event {
 			SessionEvent::Agent(event) => self.handle_agent_event(*event),
-			SessionEvent::Notice(text) => self.push_notice(text),
+			SessionEvent::Notice(text) => {
+				// Session replacement (selector /resume, RPC) rebuilds the
+				// chat view from the live agent's messages — upstream
+				// re-renders the restored session on session_start.
+				if text.starts_with("session → ") {
+					self.rebuild_from_live_session();
+				}
+				self.push_notice(text);
+			}
 			SessionEvent::Persisted { .. } => {}
 			// Quiescence marker; the TUI derives busy/idle from agent events.
 			SessionEvent::Settled { .. } => {}
 		}
+	}
+
+	/// Rebuild the chat view (and usage totals) from the live agent after a
+	/// session replacement.
+	fn rebuild_from_live_session(&mut self) {
+		let snapshot = self.session.live_agent().snapshot();
+		self.blocks = blocks_from_messages(&snapshot.messages);
+		self.usage = usage_of_messages(&snapshot.messages);
+		self.chat.clear();
+		self.chat.scroll_to_bottom();
 	}
 
 	fn handle_agent_event(&mut self, event: AgentEvent) {
@@ -1075,6 +1380,7 @@ impl InteractiveMode {
 		self.draw_footer(frame, chunks[3]);
 		self.draw_slash_menu(frame, chunks[1], chunks[2]);
 		self.draw_overlay(frame, chunks[1]);
+		self.draw_session_overlay(frame, chunks[1]);
 		if let Some(wizard) = &self.provider_wizard {
 			let area = chunks[1];
 			let height = area
@@ -1119,7 +1425,7 @@ impl InteractiveMode {
 	}
 
 	fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-		let model = self.session.agent.model();
+		let model = self.session.live_agent().model();
 		let cwd_short = shorten_path(&self.cwd, 32);
 		let line = Line::from(vec![
 			Span::styled(
@@ -1209,14 +1515,15 @@ impl InteractiveMode {
 		// Context usage via the unified algorithm (core/context_usage.rs, the
 		// footer.ts getSessionStats path): provider usage preferred with
 		// trailing estimation; None after compaction until the next response.
-		let usage = crate::core::context_usage::compute(&self.session.agent);
-		let model_window = self.session.agent.model().context_window;
+		let live = self.session.live_agent();
+		let usage = crate::core::context_usage::compute(&live);
+		let model_window = live.model().context_window;
 		let auto_compaction = self.session.auto_compaction.load(Ordering::Relaxed);
 		let (context_text, context_style) =
 			footer_context_segment(usage, model_window, auto_compaction, &self.theme);
 
-		let model = self.session.agent.model();
-		let thinking = self.session.agent.thinking_level();
+		let model = self.session.live_agent().model();
+		let thinking = self.session.live_agent().thinking_level();
 		let mut right = model.id.clone();
 		if model.reasoning {
 			right.push_str(&format!(" • thinking {}", thinking_label(thinking)));
@@ -1332,6 +1639,48 @@ impl InteractiveMode {
 		)));
 		// Pad/trim to the inner height.
 		lines.resize(inner.height as usize, Line::default());
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	/// Session selector overlay (/resume): a large bordered panel over the
+	/// chat area — title/status header, search line, the filtered session
+	/// list and hint lines (upstream renders the component full-screen; the
+	/// port floats it over the chat like the other overlays).
+	fn draw_session_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some(overlay) = self.session_overlay.as_mut() else {
+			return;
+		};
+		let width = chat_area.width.clamp(60, 100).min(chat_area.width);
+		let height = chat_area.height.saturating_sub(4).max(10);
+		if chat_area.width < width || chat_area.height < height {
+			return;
+		}
+		let x = chat_area.x + (chat_area.width - width) / 2;
+		let y = chat_area.y + (chat_area.height - height) / 2;
+		let area = Rect {
+			x,
+			y,
+			width,
+			height,
+		};
+
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				" Resume session ",
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = overlay.render(
+			&self.theme,
+			&self.keybindings,
+			inner.width as usize,
+			inner.height as usize,
+		);
 		frame.render_widget(Paragraph::new(lines), inner);
 	}
 
@@ -2096,6 +2445,146 @@ mod tests {
 		assert_eq!(
 			resolve_global_action(&keybindings, &key_event("ctrl+o"), false),
 			None
+		);
+	}
+}
+
+#[cfg(test)]
+mod session_selector_tests {
+	use super::*;
+	use pi_ai::types::{AssistantMessage, StopReason, TextContent, ToolResultMessage, UserMessage};
+
+	fn assistant_with_call_and_text(call_id: &str, text: &str) -> AssistantMessage {
+		AssistantMessage {
+			content: vec![
+				pi_ai::AssistantContent::Text(TextContent {
+					text: text.into(),
+					text_signature: None,
+				}),
+				pi_ai::AssistantContent::ToolCall(pi_ai::ToolCall {
+					id: call_id.into(),
+					name: "bash".into(),
+					arguments: serde_json::json!({"command": "ls"}),
+					thought_signature: None,
+					namespace: None,
+					arguments_error: None,
+				}),
+			],
+			api: "openai-completions".into(),
+			provider: "mimo".into(),
+			model: "mimo-v2.6".into(),
+			response_model: None,
+			response_id: None,
+			thinking_level: None,
+			usage: pi_ai::Usage {
+				input: 100,
+				output: 10,
+				..pi_ai::Usage::default()
+			},
+			stop_reason: StopReason::Stop,
+			error_message: None,
+			raw_stop_reason: None,
+			end_turn: None,
+			timestamp: 0,
+			duration_ms: None,
+		}
+	}
+
+	#[test]
+	fn blocks_from_messages_pairs_tool_calls_with_results() {
+		let messages = vec![
+			Message::User(UserMessage::text("run ls")),
+			Message::Assistant(assistant_with_call_and_text("call-1", "doing it")),
+			Message::ToolResult(ToolResultMessage::text_result(
+				"call-1", "bash", "file.txt", false,
+			)),
+		];
+		let blocks = blocks_from_messages(&messages);
+		assert_eq!(blocks.len(), 3, "user + assistant + tool");
+		let ChatBlock::User(text) = &blocks[0] else {
+			panic!("user block");
+		};
+		assert_eq!(text, "run ls");
+		let ChatBlock::Tool {
+			id,
+			output,
+			running,
+			..
+		} = &blocks[2]
+		else {
+			panic!("tool block");
+		};
+		assert_eq!(id, "call-1");
+		assert_eq!(output, "file.txt");
+		assert!(!running);
+		// A call without a persisted result renders with empty output.
+		let messages = vec![Message::Assistant(assistant_with_call_and_text(
+			"call-2", "lost",
+		))];
+		let ChatBlock::Tool {
+			output, is_error, ..
+		} = &blocks_from_messages(&messages)[1]
+		else {
+			panic!("tool block");
+		};
+		assert_eq!(output, "");
+		assert!(!is_error);
+	}
+
+	#[test]
+	fn usage_of_messages_sums_assistant_usage() {
+		let messages = vec![
+			Message::User(UserMessage::text("hi")),
+			Message::Assistant(assistant_with_call_and_text("c", "a")),
+			Message::Assistant(assistant_with_call_and_text("d", "b")),
+		];
+		let usage = usage_of_messages(&messages);
+		assert_eq!(usage.0, 200);
+		assert_eq!(usage.1, 20);
+	}
+
+	#[test]
+	fn delete_session_file_removes_and_reports() {
+		let path = std::env::temp_dir().join(format!(
+			"pi-rs-delete-{}-{}.jsonl",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::write(&path, "{}\n").unwrap();
+		let outcome = delete_session_file(&path).expect("delete succeeds");
+		assert!(
+			outcome == "Session moved to trash" || outcome == "Session deleted",
+			"{outcome}"
+		);
+		assert!(!path.exists());
+		// Deleting an already-gone file reports success (upstream treats a
+		// vanished file as trashed, `!existsSync` branch).
+		assert!(delete_session_file(&path).is_ok());
+	}
+
+	#[test]
+	fn resolve_global_action_maps_the_session_resume_action() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		// app.session.resume has no default chord (upstream: unbound); it is
+		// reachable via keybindings.json, so verify dispatch through a
+		// synthetic override instead.
+		let mut kb = kb;
+		kb.set_user_bindings(
+			[(
+				"app.session.resume".to_string(),
+				vec!["ctrl+shift+r".to_string()],
+			)]
+			.into_iter()
+			.collect(),
+		)
+		.unwrap();
+		let key = KeyEvent::new(
+			KeyCode::Char('r'),
+			KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+		);
+		assert_eq!(
+			resolve_global_action(&kb, &key, true),
+			Some(GlobalAction::SessionResume)
 		);
 	}
 }

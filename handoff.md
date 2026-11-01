@@ -130,3 +130,17 @@ cargo fmt --all -- --check
 **验证（本轮实测）**：`cargo test --workspace --locked` **521 项全绿**（444→521）、fmt/clippy -D warnings 干净；difftest 6/6 IDENTICAL。已知推迟：RPC session 替换后 MCP 工具表不重建（待扩展阶段）；retry 的 maxRetries/baseDelay 待 settings 扩键；RPC 模式差分场景（事件顺序已由 json 场景覆盖主要面）；`--mode json` 的 stdout 背压/信号处理；@file 图片附件。
 
 改动已分批提交至 main（等用户指令推送）。
+
+## 第九轮：TUI 会话选择器（2026-10-31，主会话单线）
+
+基线 `fc8e942`（上游 `/resume` + `SessionSelectorComponent` + `session-selector-search.ts` 全量移植）：
+
+- **会话列举**（`core/session_manager.rs`）：`SessionInfo`（path/id/cwd/name/parentSessionPath/created/modified/messageCount/firstMessage/allMessagesText，对照 session-manager.ts:229 `buildSessionInfo`）+ `list_sessions_in`/`list_sessions_progress`（每 10/100 个发布排序部分列表；pi-rs 单一 sessions 根目录，"当前文件夹"范围按 header cwd 匹配 = `paths_equivalent`，即上游自定义 dir 时的 `sessionCwdMatches` 语义）；`parse_iso_timestamp_ms`（`iso_timestamp` 的逆，含 `Z`/`±HH:MM` 偏移）+ `append_session_info_to_file`（任意会话文件追加 `session_info` 条目，空名清除——选择器 rename 路径，活动会话仍走 `SessionManager::append_session_info`）。
+- **搜索与树**（新模块 `modes/session_selector.rs`）：`parse_search_query`（`re:` 正则大小写不敏感、`"phrase"` 短语、引号失衡回退空白分词）、分层评分（name 命中 > id/messages/cwd 文本命中 > 散乱 fuzzy，`TIER_WEIGHT=1e6`，复用 pi-tui `fuzzy_match`；小写语料随列表缓存）、`filter_sessions`（recent 只滤保序 / relevance 按分+最近平局）、`build_session_tree`/`flatten_session_tree`（parentSession 系缘树，子树最新活动排序，`│ ├ └` 前缀；canonicalize 缺失路径回退原串）。
+- **选择器浮层**（同模块 `SessionSelectorOverlay`）：纯状态机 + 渲染（键处理返回 `SelectorAction`，文件变更与会话切换由 interactive 执行）。范围 Tab 切换（current/all，按需加载 + Loading n/t）、排序 ctrl+s 循环（Threaded/Recent/"Fuzzy"=relevance）、命名过滤 ctrl+n、路径显示 ctrl+p、删除确认 ctrl+d（活动会话拒绝；trash CLI 优先、失败回退 unlink、已消失视为成功——上游 `deleteSessionFile` 语义）、重命名 ctrl+r（预填现名）、ctrl+backspace 空查询快捷删除；↑↓/pgup/pgdn/enter/esc + 其余键进搜索行（与 model overlay 一致硬编码编辑键）；标题行（范围◉/○ + Name + Sort + 进度）、双 hint 行、状态行（删/改名结果 2s/3s 过期）、空态文案、`(i/n)` 滚动指示、选中行 REVERSED+粗体、命名行 warning 色（用 tool 色位）、当前会话 accent 色。
+- **接线**（`modes/interactive.rs`）：`/resume` 命令 + `app.session.resume`（默认无键，可经 keybindings.json 绑定）经 `resolve_global_action` 打开浮层；列表加载走 `spawn_blocking` + 类型化 mpsc（`SessionListMsg::Progress/Loaded/Status`，过期范围消息丢弃）；选中 → `SessionCommand::SwitchSession`（复用 RPC 轮会话替换），`session → …` notice 到达时从 `live_agent` 快照重建聊天块（`blocks_from_messages`：assistant toolCall 与 toolResult 按 id 配对，孤立 call 空输出、孤立 result 跳过；usage 重算自消息）；TUI 探针全部改 `SessionHandle::live_agent()`（新 pub 方法，替换后 model/snapshot/tool_names 观察当前会话）+ `current_session_file()`/`session_name()`。删除/改名在 `spawn_blocking` 执行后重载当前范围。
+- **声明偏差**：浮层浮于聊天区（上游全屏容器）；重命名/删除后整列表重载而非原地更新单行；relevance 排序的语料逐会话缓存于浮层（上游 WeakMap）；删除/改名结果无 `trash` 时直接 unlink（macOS 无预装 trash 常见）。
+
+**验证**：576 项测试全绿（521→576，+55：查询解析/分层评分/树投影/浮层状态机 15 项、SessionInfo/ISO/列举/rename 4 项、块重建/usage/删除/键位分发 4 项等）；fmt/clippy -D warnings 干净。pty 端到端冒烟：`/resume` 打开浮层、行渲染（命名/首条消息/计数/时长）、搜索过滤、Down 光标移动（帧 diff 实证）、Enter 切换（`session → ` notice + 干净退出，连跑 4 次 exit 0）。注意：ratatui 光标寻址帧经 naive 去 escape 拼接会产生幻影词，冒烟断言要用帧 diff 或状态（会话文件/进程退出码）验证，勿用拼接文本。
+
+**交接事项**：设置选择器（settings-selector.ts）未做；树选择器（tree-selector.ts）未做；`--continue` 启动时 TUI 仍不回放历史（仅切换/替换后重建）；`fork`/`new_session` 尚无 UI 入口（RPC 已有）；上游 `/rename` 无独立斜杠命令，rename 仅在选择器内。

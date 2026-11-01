@@ -862,6 +862,88 @@ fn chrono_like_timestamp() -> String {
 	format!("{y:04}{mth:02}{d:02}-{h:02}{m:02}{s:02}")
 }
 
+/// Inverse of [`iso_timestamp`] for the shapes pi writes (and upstream JS
+/// `new Date(iso).getTime()` accepts with the same precision): parse
+/// `YYYY-MM-DDTHH:MM:SS(.fff)?(Z|±HH:MM)?` and return epoch milliseconds.
+/// `None` on anything it cannot fully parse.
+pub fn parse_iso_timestamp_ms(iso: &str) -> Option<u64> {
+	let rest = iso.trim();
+	let (date, time_and_tz) = rest.split_once('T')?;
+	let (time, tz) = match time_and_tz.find(['Z', '+', '-']) {
+		// Time chars are digits/`:`/`.` only, so the first sign/Z is the zone.
+		Some(i) => (&time_and_tz[..i], Some(&time_and_tz[i..])),
+		None => (time_and_tz, None),
+	};
+	let mut date_parts = date.split('-');
+	let (y, mth, d) = (
+		date_parts.next()?.parse::<i64>().ok()?,
+		date_parts.next()?.parse::<u32>().ok()?,
+		date_parts.next()?.parse::<u32>().ok()?,
+	);
+	if date_parts.next().is_some() || !(1..=12).contains(&mth) || !(1..=31).contains(&d) {
+		return None;
+	}
+	let mut time_parts = time.split(':');
+	let (h, mi) = (
+		time_parts.next()?.parse::<u32>().ok()?,
+		time_parts.next()?.parse::<u32>().ok()?,
+	);
+	let (sec, millis) = match time_parts.next() {
+		Some(sec) => {
+			let (whole, frac) = match sec.split_once('.') {
+				Some((w, f)) => (w, f),
+				None => (sec, ""),
+			};
+			let s = whole.parse::<u32>().ok()?;
+			// Milliseconds precision; longer fractions truncate (JS semantics).
+			let mut frac = frac.to_string();
+			while frac.len() < 3 {
+				frac.push('0');
+			}
+			let ms: u32 = frac[..3].parse().ok()?;
+			(s, ms)
+		}
+		None => (0, 0),
+	};
+	if time_parts.next().is_some() || h > 23 || mi > 59 || sec > 60 {
+		return None;
+	}
+	let offset_secs: i64 = match tz {
+		None => 0,
+		Some("Z") => 0,
+		// `+HH:MM`/`-HH:MM`: local time is UTC ± offset.
+		Some(zone) => {
+			let (sign, rest) = zone.split_at(1);
+			let (zh, zm) = rest.split_once(':')?;
+			let total = zh.parse::<i64>().ok()? * 3600 + zm.parse::<i64>().ok()? * 60;
+			match sign {
+				"+" => total,
+				"-" => -total,
+				_ => return None,
+			}
+		}
+	};
+	let days = days_from_civil(y, mth, d)?;
+	let day_ms = (days as i128 * 86_400_000)
+		+ (h as i128 * 3_600_000)
+		+ (mi as i128 * 60_000)
+		+ (sec as i128 * 1_000)
+		+ millis as i128;
+	u64::try_from(day_ms - offset_secs as i128 * 1000).ok()
+}
+
+/// Civil date → days since epoch (Howard Hinnant's algorithm, inverse of
+/// [`civil_from_days`]).
+fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
+	let y = if m <= 2 { y - 1 } else { y };
+	let era = y.div_euclid(400);
+	let yoe = y - era * 400;
+	let mp = (m as i64 + 9) % 12;
+	let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	Some(era * 146_097 + doe - 719_468)
+}
+
 /// Days since epoch → civil date (Howard Hinnant's algorithm).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
 	let z = days + 719_468;
@@ -2012,6 +2094,225 @@ fn count_entries(dir: &Path) -> Result<u64, SessionError> {
 		// A partial line from a crash mid-write is not a recovered entry.
 		.filter(|l| serde_json::from_str::<Value>(l).is_ok())
 		.count() as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Session listing (upstream `buildSessionInfo` / `SessionManager.list`,
+// core/session-manager.ts:799-975) — everything the session selector needs
+// without opening a full log.
+// ---------------------------------------------------------------------------
+
+/// One listed session (upstream `SessionInfo`, session-manager.ts:229).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInfo {
+	/// Path of the `session.jsonl` file.
+	pub path: PathBuf,
+	/// Header id (uuid v7).
+	pub id: String,
+	/// Working directory the session was started in (empty for legacy files).
+	pub cwd: String,
+	/// Latest `session_info` name (`None` when unnamed or cleared).
+	pub name: Option<String>,
+	/// Source session of a forked log (`parentSession` header field).
+	pub parent_session_path: Option<String>,
+	/// Header timestamp in epoch ms.
+	pub created_ms: u64,
+	/// Last message activity, else header time, else file mtime.
+	pub modified_ms: u64,
+	pub message_count: u64,
+	/// First user text message, `"(no messages)"` when the log has none.
+	pub first_message: String,
+	/// All user/assistant text joined with spaces — the search corpus.
+	pub all_messages_text: String,
+}
+
+/// Text of a message for listing purposes: user and assistant text blocks
+/// only (upstream `extractTextContent` on the same roles).
+fn message_listing_text(message: &Message) -> Option<String> {
+	match message {
+		Message::User(user) => {
+			let text = user.content.as_text();
+			(!text.is_empty()).then_some(text)
+		}
+		Message::Assistant(assistant) => {
+			let text = assistant.text();
+			(!text.is_empty()).then_some(text)
+		}
+		_ => None,
+	}
+}
+
+/// Scan one session file into its [`SessionInfo`]; `None` for files without a
+/// valid `type:"session"` header (parse errors skip the line, like upstream's
+/// line reader) or unreadable ones.
+pub fn build_session_info(path: &Path) -> Option<SessionInfo> {
+	let text = std::fs::read_to_string(path).ok()?;
+	let mut header: Option<SessionHeader> = None;
+	let mut name: Option<String> = None;
+	let mut message_count = 0u64;
+	let mut first_message = String::new();
+	let mut all_messages: Vec<String> = Vec::new();
+	let mut last_activity_ms: Option<u64> = None;
+
+	for line in text.lines() {
+		let Ok(value) = serde_json::from_str::<Value>(line) else {
+			continue;
+		};
+		if header.is_none() {
+			// First valid line must be the header.
+			if value.get("type").and_then(Value::as_str) != Some("session") {
+				return None;
+			}
+			header = Some(SessionHeader::from_value(&value)?);
+			continue;
+		}
+		match value.get("type").and_then(Value::as_str) {
+			Some("session_info") => {
+				// Latest wins, including explicit clears (empty → None).
+				name = value
+					.get("name")
+					.and_then(Value::as_str)
+					.map(str::trim)
+					.filter(|n| !n.is_empty())
+					.map(str::to_owned);
+			}
+			Some("message") => {
+				message_count += 1;
+				let timestamp = value
+					.get("timestamp")
+					.and_then(Value::as_str)
+					.and_then(parse_iso_timestamp_ms);
+				if let Some(ts) = timestamp {
+					last_activity_ms = Some(last_activity_ms.unwrap_or(0).max(ts));
+				}
+				let Ok(message) = serde_json::from_value::<Message>(
+					value.get("message").cloned().unwrap_or(Value::Null),
+				) else {
+					continue;
+				};
+				if !matches!(message, Message::User(_) | Message::Assistant(_)) {
+					continue;
+				}
+				let Some(text_content) = message_listing_text(&message) else {
+					continue;
+				};
+				all_messages.push(text_content);
+				if first_message.is_empty() && matches!(message, Message::User(_)) {
+					first_message = all_messages.last().unwrap().clone();
+				}
+			}
+			_ => {}
+		}
+	}
+
+	let header = header?;
+	let mtime_ms = std::fs::metadata(path)
+		.and_then(|m| m.modified())
+		.ok()
+		.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+		.map(|d| d.as_millis() as u64)
+		.unwrap_or(0);
+	let header_ms = parse_iso_timestamp_ms(&header.timestamp).unwrap_or(0);
+	let modified_ms = last_activity_ms
+		.filter(|ts| *ts > 0)
+		.or((header_ms > 0).then_some(header_ms))
+		.unwrap_or(mtime_ms);
+	Some(SessionInfo {
+		path: path.to_path_buf(),
+		id: header.id,
+		cwd: header.cwd,
+		name,
+		parent_session_path: header.parent_session,
+		created_ms: header_ms,
+		modified_ms,
+		message_count,
+		first_message: if first_message.is_empty() {
+			"(no messages)".into()
+		} else {
+			first_message
+		},
+		all_messages_text: all_messages.join(" "),
+	})
+}
+
+/// Every `session.jsonl` under `root`'s immediate subdirectories (the pi-rs
+/// layout; plain `*.jsonl` files directly under `root` also count), newest
+/// first. With `cwd`, only sessions started in that directory (upstream
+/// `SessionManager.list`'s cwd filter, [`paths_equivalent`] matching).
+pub fn list_sessions_in(root: &Path, cwd: Option<&Path>) -> Vec<SessionInfo> {
+	list_sessions_progress(root, cwd, usize::MAX, &mut |_, _, _| {})
+}
+
+/// [`list_sessions_in`] with progress publication every `publish_every`
+/// files (upstream publishes sorted partials every 10/100 loads); the
+/// callback receives `(loaded, total, sorted_partial)`.
+pub fn list_sessions_progress(
+	root: &Path,
+	cwd: Option<&Path>,
+	publish_every: usize,
+	on_progress: &mut dyn FnMut(usize, usize, &[SessionInfo]),
+) -> Vec<SessionInfo> {
+	let Ok(entries) = std::fs::read_dir(root) else {
+		return Vec::new();
+	};
+	let mut files: Vec<PathBuf> = Vec::new();
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			let candidate = path.join("session.jsonl");
+			if candidate.is_file() {
+				files.push(candidate);
+			}
+		} else if path.extension().is_some_and(|ext| ext == "jsonl") {
+			files.push(path);
+		}
+	}
+	let total = files.len();
+	let mut sessions: Vec<SessionInfo> = Vec::new();
+	let mut loaded = 0;
+	for path in &files {
+		if let Some(info) = build_session_info(path)
+			&& match cwd {
+				None => true,
+				Some(cwd) => !info.cwd.is_empty() && paths_equivalent(Path::new(&info.cwd), cwd),
+			} {
+			sessions.push(info);
+		}
+		loaded += 1;
+		if publish_every != usize::MAX
+			&& (loaded == 1 || loaded % publish_every == 0 || loaded == total)
+		{
+			let mut partial = sessions.clone();
+			partial.sort_by_key(|info| std::cmp::Reverse(info.modified_ms));
+			on_progress(loaded, total, &partial);
+		}
+	}
+	sessions.sort_by_key(|info| std::cmp::Reverse(info.modified_ms));
+	sessions
+}
+
+/// Append a `session_info` entry to an arbitrary session file — the session
+/// selector's rename path (the live session goes through
+/// [`SessionManager::append_session_info`] instead). Empty `name` clears the
+/// display name (upstream reads the latest entry, empty → unnamed).
+pub fn append_session_info_to_file(path: &Path, name: &str) -> Result<(), SessionError> {
+	if !path.is_file() {
+		return Err(SessionError::InvalidFormat(format!(
+			"no session file at {}",
+			path.display()
+		)));
+	}
+	let sanitized = sanitize_session_name(name);
+	let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+	let mut entry = SessionEntry::new(EntryKind::SessionInfo {
+		name: (!sanitized.is_empty()).then_some(sanitized),
+	});
+	entry.base.id = Some(generate_entry_id(&|_| false));
+	entry.base.timestamp = Some(iso_timestamp(pi_ai::types::now_ms()));
+	use std::io::Write;
+	writeln!(file, "{}", serde_json::to_string(&entry.to_value())?)
+		.and_then(|_| file.sync_data())
+		.map_err(SessionError::Io)
 }
 
 #[cfg(test)]
@@ -3582,5 +3883,165 @@ mod tests {
 		let good = make_session(&root, "20260101-000000-1", Path::new("/p"), "one");
 		assert!(validate_session_dir(&good).is_ok());
 		std::fs::remove_dir_all(root).unwrap();
+	}
+
+	use pi_ai::types::{AssistantMessage, TextContent};
+
+	#[test]
+	fn parse_iso_timestamp_ms_roundtrips_iso_timestamp() {
+		let ms = 1_733_241_600_123u64;
+		assert_eq!(parse_iso_timestamp_ms(&iso_timestamp(ms)), Some(ms));
+		assert_eq!(
+			parse_iso_timestamp_ms("2024-12-03T16:00:00.123Z"),
+			Some(1_733_241_600_123)
+		);
+		assert_eq!(
+			parse_iso_timestamp_ms("2024-12-03T16:00:00Z"),
+			Some(1_733_241_600_000)
+		);
+		// +02:00 → local minus offset.
+		assert_eq!(
+			parse_iso_timestamp_ms("2024-12-03T18:00:00+02:00"),
+			Some(1_733_241_600_000)
+		);
+		assert_eq!(parse_iso_timestamp_ms("not a time"), None);
+		assert_eq!(parse_iso_timestamp_ms("2024-13-03T16:00:00Z"), None);
+	}
+
+	fn sample_assistant(text: &str, ts: u64) -> Message {
+		Message::Assistant(AssistantMessage {
+			content: vec![pi_ai::AssistantContent::Text(TextContent {
+				text: text.to_string(),
+				text_signature: None,
+			})],
+			api: "openai-completions".into(),
+			provider: "mimo".into(),
+			model: "mimo-v2.6".into(),
+			response_model: None,
+			response_id: None,
+			thinking_level: None,
+			usage: pi_ai::Usage::default(),
+			stop_reason: pi_ai::StopReason::Stop,
+			error_message: None,
+			raw_stop_reason: None,
+			end_turn: None,
+			timestamp: ts,
+			duration_ms: None,
+		})
+	}
+
+	fn write_line(file: &Path, value: &Value) {
+		use std::io::Write;
+		let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+		writeln!(f, "{value}").unwrap();
+	}
+
+	#[test]
+	fn build_session_info_reads_header_name_and_messages() {
+		let dir = temp_session_dir("listing-build");
+		std::fs::create_dir_all(&dir).unwrap();
+		let manager = create_in(&dir, Path::new("/tmp/work"));
+		let file = dir.join("session.jsonl");
+
+		let mut message_entry = SessionEntry::new(EntryKind::Message {
+			message: Box::new(user_message("first user prompt")),
+		});
+		message_entry.base.timestamp = Some("2024-12-03T16:00:01.000Z".into());
+		write_line(&file, &message_entry.to_value());
+		let mut assistant_entry = SessionEntry::new(EntryKind::Message {
+			message: Box::new(sample_assistant("answer text", 1_733_241_600_002)),
+		});
+		assistant_entry.base.timestamp = Some("2024-12-03T16:00:02.000Z".into());
+		write_line(&file, &assistant_entry.to_value());
+		write_line(
+			&file,
+			&SessionEntry::new(EntryKind::SessionInfo {
+				name: Some("my session".into()),
+			})
+			.to_value(),
+		);
+
+		let info = build_session_info(&file).expect("parses");
+		assert_eq!(info.id, manager.header.clone().unwrap().id);
+		assert_eq!(info.cwd, "/tmp/work");
+		assert_eq!(info.name.as_deref(), Some("my session"));
+		assert_eq!(info.message_count, 2);
+		assert_eq!(info.first_message, "first user prompt");
+		assert!(info.all_messages_text.contains("answer text"));
+		assert_eq!(
+			info.modified_ms, 1_733_241_602_000,
+			"last message activity wins"
+		);
+
+		// Latest session_info wins; an empty name clears it.
+		write_line(
+			&file,
+			&SessionEntry::new(EntryKind::SessionInfo {
+				name: Some("renamed".into()),
+			})
+			.to_value(),
+		);
+		assert_eq!(
+			build_session_info(&file).unwrap().name.as_deref(),
+			Some("renamed")
+		);
+		write_line(
+			&file,
+			&SessionEntry::new(EntryKind::SessionInfo {
+				name: Some(String::new()),
+			})
+			.to_value(),
+		);
+		assert_eq!(build_session_info(&file).unwrap().name, None);
+
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn list_sessions_filters_by_cwd_and_sorts_newest_first() {
+		let root = temp_session_dir("listing-root");
+		let dir_a = root.join("a");
+		let dir_b = root.join("b");
+		let dir_c = root.join("c");
+		for dir in [&dir_a, &dir_b, &dir_c] {
+			std::fs::create_dir_all(dir).unwrap();
+		}
+		let _ = create_in(&dir_a, Path::new("/tmp/work"));
+		std::thread::sleep(std::time::Duration::from_millis(5));
+		let _ = create_in(&dir_b, Path::new("/tmp/other"));
+		std::thread::sleep(std::time::Duration::from_millis(5));
+		let _ = create_in(&dir_c, Path::new("/tmp/work"));
+
+		let all = list_sessions_in(&root, None);
+		assert_eq!(all.len(), 3);
+		assert!(all[0].modified_ms >= all[1].modified_ms, "newest first");
+
+		let current = list_sessions_in(&root, Some(Path::new("/tmp/work")));
+		assert_eq!(current.len(), 2);
+		assert!(current.iter().all(|s| s.cwd == "/tmp/work"));
+
+		// No sessions root at all → empty, not an error.
+		assert!(list_sessions_in(Path::new("/nonexistent-root-xyz"), None).is_empty());
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn append_session_info_to_file_renames_and_clears() {
+		let dir = temp_session_dir("listing-rename");
+		let _ = create_in(&dir, Path::new("/tmp/work"));
+		let file = dir.join("session.jsonl");
+		append_session_info_to_file(&file, "picked name").unwrap();
+		assert_eq!(
+			build_session_info(&file).unwrap().name.as_deref(),
+			Some("picked name")
+		);
+		append_session_info_to_file(&file, "").unwrap();
+		assert_eq!(
+			build_session_info(&file).unwrap().name,
+			None,
+			"empty clears"
+		);
+		assert!(append_session_info_to_file(&dir.join("missing.jsonl"), "x").is_err());
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
