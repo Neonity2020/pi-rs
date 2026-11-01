@@ -750,6 +750,23 @@ impl InteractiveMode {
 			self.session.events.recv().await,
 			Err(tokio::sync::broadcast::error::RecvError::Closed)
 		) {}
+		guard.restore();
+		// Upstream `formatResumeCommand` prints the resume invocation on
+		// exit; the port points at the session directory name, which
+		// `--resume` resolves by prefix (upstream's `--session <id>` flag
+		// and the `--session-dir` argument have no port counterpart — a
+		// custom `PI_RS_SESSION_DIR` must be re-exported by the user).
+		if let Some(session_dir) = self
+			.session
+			.current_session_file()
+			.and_then(|file| file.parent().map(std::path::Path::to_path_buf))
+			&& let Some(name) = session_dir.file_name()
+		{
+			println!(
+				"\x1b[2mTo resume this session:\x1b[22m pi-rs --resume {}",
+				name.to_string_lossy()
+			);
+		}
 		Ok(())
 	}
 

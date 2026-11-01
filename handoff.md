@@ -266,3 +266,7 @@ cargo fmt --all -- --check
 ## 第三十轮：app.session.tree/fork 键位分发（2026-10-31，主会话单线）
 
 基线 `3e039e9`：`GlobalAction::SessionTree/SessionFork` 接 resolve_global_action（默认无键，keybindings.json 可绑——如 `super+t`/`super+f`）分别触发只读 /tree 视图与编号 /fork。app.session.* 动作组至此全接线（new/resume/tree/fork）。632 项测试全绿（+1 分发测试），fmt/clippy 干净。坑：chord 解析器不认 "ctrl+meta+"，meta 用 `super+` 前缀。
+
+## 第三十一轮：退出恢复提示（2026-10-31，主会话单线）
+
+基线 `88b062b`（上游 `formatResumeCommand` + 退出打印）：interactive 退出（终端还原后）打印 dim 色 `To resume this session: pi-rs --resume <目录名>`——端口指向会话目录名（`--resume` 按目录名前缀解析，pty 冒烟实证解析成功）；上游 `--session <id>` 旗标与 `--session-dir` 参数无对应（自定义 PI_RS_SESSION_DIR 需用户重导出，声明偏差）；内存会话不打印。632 项测试维持全绿，fmt/clippy 干净。
