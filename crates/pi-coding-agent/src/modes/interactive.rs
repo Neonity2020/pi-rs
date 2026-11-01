@@ -216,6 +216,8 @@ pub struct InteractiveMode {
 	// Session selector overlay (/resume): owns its own state; async session
 	// listing and file mutations flow through the typed channel below.
 	session_overlay: Option<SessionSelectorOverlay>,
+	// /trust confirm overlay (a SelectList with two items).
+	trust_overlay: Option<(SelectList, std::path::PathBuf)>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -611,6 +613,7 @@ impl InteractiveMode {
 			overlay: None,
 			slash_menu: None,
 			session_overlay: None,
+			trust_overlay: None,
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -753,6 +756,10 @@ impl InteractiveMode {
 			}
 			if self.session_overlay.is_some() {
 				self.handle_session_overlay_key(*key);
+				return;
+			}
+			if self.trust_overlay.is_some() {
+				self.handle_trust_overlay_key(*key);
 				return;
 			}
 			if self.overlay.is_some() {
@@ -1223,6 +1230,79 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/trust` (upstream opens the trust selector): with a project MCP
+	/// config and no trust decision, asks inline. Trusting here does not
+	/// load the servers (MCP assembly ran at startup) — a restart applies
+	/// it, mirroring the declared "MCP tools not rebuilt on replacement".
+	fn handle_trust_command(&mut self) {
+		let project_config = std::path::Path::new(&self.cwd).join(".pi").join("mcp.json");
+		if !project_config.exists() {
+			self.push_notice(format!(
+				"No project MCP config at {}",
+				project_config.display()
+			));
+			return;
+		}
+		if crate::core::trust::is_trusted(std::path::Path::new(&self.cwd)) {
+			self.push_notice(format!("{} is trusted", project_config.display()));
+			return;
+		}
+		let list = SelectList::new(
+			vec![
+				SelectItem {
+					value: "trust".into(),
+					label: "Trust".into(),
+					description: Some(format!("load {} on restart", project_config.display())),
+				},
+				SelectItem {
+					value: "skip".into(),
+					label: "Don't trust".into(),
+					description: Some("skip its MCP servers".into()),
+				},
+			],
+			2,
+		);
+		self.trust_overlay = Some((list, project_config));
+	}
+
+	fn handle_trust_overlay_key(&mut self, key: KeyEvent) {
+		let action = match self.trust_overlay.as_mut() {
+			Some((list, _)) => list.handle_key_with(key, &self.keybindings),
+			None => return,
+		};
+		let choice = match action {
+			SelectAction::Select(index) => self
+				.trust_overlay
+				.as_ref()
+				.and_then(|(list, _)| list.filtered().get(index).map(|item| item.value.clone())),
+			SelectAction::Cancel => Some("cancel".into()),
+			SelectAction::Handled | SelectAction::Ignored => None,
+		};
+		let Some(choice) = choice else {
+			return;
+		};
+		let (_, project_config) = self.trust_overlay.take().unwrap();
+		match choice.as_str() {
+			"trust" => {
+				if let Err(error) = crate::core::trust::trust(std::path::Path::new(&self.cwd)) {
+					self.push_notice(format!("Failed to record trust: {error}"));
+				} else {
+					self.push_notice(format!(
+						"{} trusted — restart to load its MCP servers",
+						project_config.display()
+					));
+				}
+			}
+			"skip" => {
+				self.push_notice(format!(
+					"{} not trusted; its MCP servers stay skipped",
+					project_config.display()
+				));
+			}
+			_ => {}
+		}
+	}
+
 	/// `/import <path.jsonl>` (upstream `handleImportCommand`, minus the
 	/// confirm dialog): import the export into a fresh session directory and
 	/// switch to it.
@@ -1596,6 +1676,7 @@ impl InteractiveMode {
 			"hotkeys" => self.handle_hotkeys_command(),
 			"fork" => self.handle_fork_command(args),
 			"import" => self.handle_import_command(args),
+			"trust" => self.handle_trust_command(),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "
@@ -1936,6 +2017,7 @@ impl InteractiveMode {
 		self.draw_slash_menu(frame, chunks[1], chunks[2]);
 		self.draw_overlay(frame, chunks[1]);
 		self.draw_session_overlay(frame, chunks[1]);
+		self.draw_trust_overlay(frame, chunks[1]);
 		if let Some(wizard) = &self.provider_wizard {
 			let area = chunks[1];
 			let height = area
@@ -2194,6 +2276,35 @@ impl InteractiveMode {
 		)));
 		// Pad/trim to the inner height.
 		lines.resize(inner.height as usize, Line::default());
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	/// /trust confirm: a small bordered select list, centered like the model
+	/// overlay.
+	fn draw_trust_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some((list, project_config)) = self.trust_overlay.as_ref() else {
+			return;
+		};
+		let width = chat_area.width.clamp(56, 84).min(chat_area.width);
+		let height = 8.min(chat_area.height);
+		let area = Rect {
+			x: chat_area.x + (chat_area.width - width) / 2,
+			y: chat_area.y + (chat_area.height - height) * 2 / 5,
+			width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				format!(" Trust {} ", project_config.display()),
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = list.render_lines(inner.width as usize, &self.theme);
 		frame.render_widget(Paragraph::new(lines), inner);
 	}
 

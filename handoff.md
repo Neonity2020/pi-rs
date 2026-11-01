@@ -238,3 +238,7 @@ cargo fmt --all -- --check
 ## 第二十四轮：/import 命令（2026-10-31，主会话单线）
 
 基线 `bcc6c07`（上游 `handleImportCommand`，去确认对话框）：`core/session_export.rs` 增 `import_session_from_jsonl`（校验首行 session 头 → 新建目录（新 session id 防双目录同 id——声明偏差，上游替换活会话）→ 逐条 append 线性重链、条目 id 保留；根/子路径错误均带文件名文案）；interactive `/import <path.jsonl>`（非 .jsonl 报 usage）导入即 `SwitchSession` 到新目录（"Session imported:" + "session → " 通知触发聊天重建，与导出/导入往返 pty 冒烟实证：2 个新目录、双通知）。628 项测试全绿（+1 导入往返），fmt/clippy 干净。坑：`items after a test module`（clippy）——追加函数落到 tests 模块后要移回前面；孤立 doc 注释残留会 parse fail。
+
+## 第二十五轮：/trust 命令（2026-10-31，主会话单线）
+
+基线 `a6bacef`（上游 `showTrustSelector` 首片）：`/trust` 在项目 `.pi/mcp.json` 存在且未信任时弹出两选项 SelectList 浮层（Trust / Don't trust，模型选择器同款面板）；Trust 落 trust.json（信任持久化）+ "restart to load its MCP servers"（MCP 装配在启动时已完成，与"MCP 不随会话替换重建"同口径）；无配置/已信任分别提示；Don't trust 提示保持跳过。628 项测试维持全绿，pty 冒烟（启动 y/N 拒绝 → /trust → 选 Trust → 通知），fmt/clippy 干净。
