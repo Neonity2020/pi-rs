@@ -76,6 +76,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info(
+		"tree",
+		"show the session entry tree (read-only)",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"trust",
 		"review the project MCP config trust decision",
 		SlashCommandSource::Builtin,

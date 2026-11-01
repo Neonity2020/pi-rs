@@ -242,3 +242,7 @@ cargo fmt --all -- --check
 ## 第二十五轮：/trust 命令（2026-10-31，主会话单线）
 
 基线 `a6bacef`（上游 `showTrustSelector` 首片）：`/trust` 在项目 `.pi/mcp.json` 存在且未信任时弹出两选项 SelectList 浮层（Trust / Don't trust，模型选择器同款面板）；Trust 落 trust.json（信任持久化）+ "restart to load its MCP servers"（MCP 装配在启动时已完成，与"MCP 不随会话替换重建"同口径）；无配置/已信任分别提示；Don't trust 提示保持跳过。628 项测试维持全绿，pty 冒烟（启动 y/N 拒绝 → /trust → 选 Trust → 通知），fmt/clippy 干净。
+
+## 第二十六轮：/tree 只读视图（2026-10-31，主会话单线）
+
+基线 `c14e9d1`（上游 `showTreeSelector` 只读首片）：`/tree` 渲染 get_tree 的条目树（`├─/└─/│` 前缀 + 每条目单行摘要：user/assistant 文本 48 字符、toolResult 工具名、其余为 type_name；多根依序）；叶切换选择器 UI 推迟。628 项测试维持全绿，pty 冒烟（--resume alpha-1 后 user/assistant 条目渲染），fmt/clippy 干净。

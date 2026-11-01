@@ -1230,6 +1230,71 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/tree` (upstream `showTreeSelector`, read-only first slice): the
+	/// entry tree with `├─`/`└─` prefixes and one-line entry summaries. The
+	/// interactive leaf-switching selector is deferred.
+	fn handle_tree_command(&mut self) {
+		let tree = { self.session.log.lock().unwrap().session.get_tree() };
+		if tree.is_empty() {
+			self.push_notice("No session entries yet.".into());
+			return;
+		}
+		let mut text = String::from("Session tree:\n");
+		fn walk(
+			node: &crate::core::session_manager::SessionTreeNode,
+			prefix: &str,
+			is_last: bool,
+			out: &mut String,
+		) {
+			let branch = if prefix.is_empty() {
+				String::new()
+			} else if is_last {
+				"└─ ".to_string()
+			} else {
+				"├─ ".to_string()
+			};
+			let entry = &node.entry;
+			let summary = match &entry.kind {
+				crate::core::session_manager::EntryKind::Message { message } => {
+					match message.as_ref() {
+						pi_ai::Message::User(user) => {
+							format!(
+								"user: {}",
+								user.content.as_text().chars().take(48).collect::<String>()
+							)
+						}
+						pi_ai::Message::Assistant(assistant) => {
+							format!(
+								"assistant: {}",
+								assistant.text().chars().take(48).collect::<String>()
+							)
+						}
+						pi_ai::Message::ToolResult(result) => {
+							format!("toolResult: {}", result.tool_name)
+						}
+						pi_ai::Message::System(_) => "system".to_string(),
+					}
+				}
+				other => other.type_name().to_string(),
+			};
+			out.push_str(&format!("{prefix}{branch}{summary}\n"));
+			let child_prefix = if prefix.is_empty() {
+				String::new()
+			} else if is_last {
+				format!("{prefix}   ")
+			} else {
+				format!("{prefix}│  ")
+			};
+			for (index, child) in node.children.iter().enumerate() {
+				walk(child, &child_prefix, index == node.children.len() - 1, out);
+			}
+		}
+		for (index, root) in tree.iter().enumerate() {
+			walk(root, "", index == tree.len() - 1, &mut text);
+		}
+		self.push_notice(text);
+	}
+
 	/// `/trust` (upstream opens the trust selector): with a project MCP
 	/// config and no trust decision, asks inline. Trusting here does not
 	/// load the servers (MCP assembly ran at startup) — a restart applies
@@ -1677,6 +1742,7 @@ impl InteractiveMode {
 			"fork" => self.handle_fork_command(args),
 			"import" => self.handle_import_command(args),
 			"trust" => self.handle_trust_command(),
+			"tree" => self.handle_tree_command(),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "
