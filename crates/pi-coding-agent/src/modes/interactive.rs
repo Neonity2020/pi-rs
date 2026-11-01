@@ -1288,6 +1288,15 @@ impl InteractiveMode {
 				}
 			}
 			"resume" => self.open_session_selector(),
+			"new" => {
+				// Upstream `handleClearCommand`: a fresh session (queued
+				// prompts are discarded by the replacement); the "session → "
+				// notice rebuilds the chat view.
+				let _ = self.session.cmd_tx.send(SessionCommand::NewSession {
+					parent_session: None,
+				});
+				self.push_notice("New session started".into());
+			}
 			"export" => self.handle_export_command(args),
 			"thinking" => {
 				let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);

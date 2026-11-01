@@ -194,3 +194,7 @@ cargo fmt --all -- --check
 - **新模块 `core/session_export.rs`**：`serialize_session_branch`（新导出头 `type:"session"` + 同 id/cwd + 分支条目 parentId 重链——对照上游 `serializeSessionBranch`，getBranch=build_session_path）、`export_session_to_jsonl`（默认名 `session-<ISO>.jsonl` 解析到 cwd、嵌套父目录创建；内存会话也可导出）。
 - **interactive `/export [path]`**：`.jsonl`→JSONL 分支导出；其余（含无参默认路径）→HTML（`write_session_html`，内存会话报 "Cannot export in-memory session to HTML"）；参数支持成对引号剥离；成功/失败均走聊天通知（上游 showStatus/showError）。
 - **验证**：623 项测试全绿（621→623，+2：分支重链序列化、默认/显式路径导出）；pty 冒烟：无参 HTML 导出落盘 + `/export out/session.jsonl` 嵌套路径导出成功；fmt/clippy -D warnings 干净。RPC `export_html` 命令与 CLI 共用 `write_session_html`，行为一致。
+
+## 第十五轮：/new 命令（2026-10-31，主会话单线）
+
+基线 `097ea20`（上游 `handleClearCommand` / `app.session.new` 的斜杠入口）：`/new` 发送 `SessionCommand::NewSession`（排队 prompt 由替换逻辑丢弃），"New session started" 通知 + "session → " 通知触发既有聊天重建；新会话文件落盘经 pty 冒烟实证。623 项测试维持全绿（无新增单测——命令入口由 pty 冒烟覆盖），fmt/clippy 干净。会话命令组现状：/new ✅、/resume 选择器 ✅、/export ✅、/tree 与 /fork 需树/消息选择器（推迟）。
