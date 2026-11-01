@@ -300,3 +300,7 @@ cargo fmt --all -- --check
 - 声明推迟：metadata-server 凭据（GCE/GKE）、toolChoice、constrained sampling、请求重试、模型目录个性化（openrouter 同款）。
 - **新依赖**：pi-ai 增 base64/rsa 0.9/sha2。
 641 项测试全绿（+3：express URL、placeholder 判定、RS256 签名往返），fmt/clippy 干净。providers 完成 7/10+（剩 mistral-conversations、bedrock-converse-stream、openai-codex-responses）。
+
+## 差分回归（2026-10-31，第二十九至三十三轮之后）
+
+google-generative-ai 流处理重构（process_payload_streamed）、google-vertex、pi-messages、azure、Prompt images、retry settings、bash 透传等改动后重跑：**六场景双侧 6/6 IDENTICAL（canonical view，f9daca34）**——继续零 wire 回归。
