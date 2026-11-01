@@ -218,6 +218,13 @@ pub struct InteractiveMode {
 	session_overlay: Option<SessionSelectorOverlay>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
+	// External editor (ctrl+g): the terminal is suspended while the editor
+	// runs; the outcome comes back through the channel.
+	external_editor_cmd: String,
+	suspended: bool,
+	pending_external_editor: bool,
+	editor_tx: mpsc::UnboundedSender<ExternalEditorOutcome>,
+	editor_rx: mpsc::UnboundedReceiver<ExternalEditorOutcome>,
 	// UI-only messages from background tasks (git branch watcher).
 	ui_rx: mpsc::UnboundedReceiver<String>,
 	ui_tx: mpsc::UnboundedSender<String>,
@@ -335,6 +342,89 @@ fn usage_of_messages(messages: &[Message]) -> (u64, u64, u64, u64, f64) {
 	usage
 }
 
+/// Terminal input reader, restartable: the editor suspension pauses it by
+/// closing this sender's counterpart (dropping the EventStream releases the
+/// stdin read so the external editor owns keystrokes).
+fn spawn_term_reader(tx: mpsc::UnboundedSender<TermEvent>) -> mpsc::UnboundedSender<()> {
+	let (pause_tx, mut pause_rx) = mpsc::unbounded_channel();
+	tokio::spawn(async move {
+		let mut stream = crossterm::event::EventStream::new();
+		use futures::StreamExt;
+		loop {
+			tokio::select! {
+				event = stream.next() => {
+					match event {
+						Some(Ok(event)) => {
+							if tx.send(event).is_err() {
+								break;
+							}
+						}
+						_ => break,
+					}
+				}
+				_ = pause_rx.recv() => break,
+			}
+		}
+	});
+	pause_tx
+}
+
+/// External editor outcome (upstream `ExternalEditorResult`): edited
+/// content on success; failure leaves the prompt untouched.
+enum ExternalEditorOutcome {
+	Complete(String),
+	Failed,
+}
+
+/// Port of `editInExternalEditor` (`external-editor.ts`): write the prompt
+/// into a fresh `pi-editor-*` temp dir, run the editor with inherited
+/// stdio (the caller has suspended the TUI), read back on success. BOM and
+/// one trailing newline are stripped; spawn errors, non-zero exits and
+/// unreadable files all count as failed (upstream propagates the read
+/// throw; the port degrades to "failed").
+async fn run_external_editor(command: &str, content: &str) -> ExternalEditorOutcome {
+	let nanos = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.subsec_nanos();
+	let directory =
+		std::env::temp_dir().join(format!("pi-editor-{}-{}", std::process::id(), nanos));
+	if std::fs::create_dir_all(&directory).is_err() {
+		return ExternalEditorOutcome::Failed;
+	}
+	let file_path = directory.join("prompt.md");
+	let attempt = async {
+		std::fs::write(&file_path, content).map_err(|e| e.to_string())?;
+		let mut parts = command.split_whitespace();
+		let program = parts
+			.next()
+			.ok_or_else(|| "empty editor command".to_string())?;
+		let status = tokio::process::Command::new(program)
+			.args(parts)
+			.arg(&file_path)
+			.stdin(std::process::Stdio::inherit())
+			.stdout(std::process::Stdio::inherit())
+			.stderr(std::process::Stdio::inherit())
+			.status()
+			.await
+			.map_err(|e| e.to_string())?;
+		if !status.success() {
+			return Err("editor exited non-zero".to_string());
+		}
+		let text = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+		Ok(ExternalEditorOutcome::Complete(strip_editor_text(&text)))
+	}
+	.await;
+	let _ = std::fs::remove_dir_all(&directory);
+	attempt.unwrap_or(ExternalEditorOutcome::Failed)
+}
+
+/// `stripBom` + one trailing newline (upstream `.replace(/\n$/, "")`).
+fn strip_editor_text(text: &str) -> String {
+	let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+	text.strip_suffix('\n').unwrap_or(text).to_string()
+}
+
 /// Delete a session file, trying the `trash` CLI first, then unlink
 /// (upstream `deleteSessionFile`).
 fn delete_session_file(path: &std::path::Path) -> Result<&'static str, String> {
@@ -413,6 +503,7 @@ enum GlobalAction {
 	ToolsExpand,
 	ThinkingToggle,
 	SessionResume,
+	EditorExternal,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -452,6 +543,9 @@ fn resolve_global_action(
 	if keybindings.matches("app.session.resume", key) {
 		return Some(GlobalAction::SessionResume);
 	}
+	if keybindings.matches("app.editor.external", key) {
+		return Some(GlobalAction::EditorExternal);
+	}
 	None
 }
 
@@ -466,6 +560,8 @@ impl InteractiveMode {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 		let theme = ui.theme;
 		let (session_list_tx, session_list_rx) = mpsc::unbounded_channel();
+		let (editor_tx, editor_rx) = mpsc::unbounded_channel();
+		let external_editor_cmd = ui.external_editor.clone();
 		Self {
 			session,
 			models,
@@ -491,6 +587,11 @@ impl InteractiveMode {
 			session_overlay: None,
 			session_list_tx,
 			session_list_rx,
+			external_editor_cmd,
+			suspended: false,
+			pending_external_editor: false,
+			editor_tx,
+			editor_rx,
 			ui_rx,
 			ui_tx,
 		}
@@ -521,18 +622,27 @@ impl InteractiveMode {
 		}
 
 		let (term_tx, mut term_rx) = mpsc::unbounded_channel::<TermEvent>();
-		tokio::spawn(async move {
-			let mut stream = crossterm::event::EventStream::new();
-			use futures::StreamExt;
-			while let Some(Ok(event)) = stream.next().await {
-				if term_tx.send(event).is_err() {
-					break;
-				}
-			}
-		});
+		let mut term_pause = spawn_term_reader(term_tx.clone());
 
 		loop {
-			guard.terminal.draw(|frame| self.draw(frame))?;
+			if !self.suspended {
+				guard.terminal.draw(|frame| self.draw(frame))?;
+			}
+
+			// ctrl+g: pause the input reader first (an EventStream alive in
+			// the background would race the editor for keystrokes), hand the
+			// terminal over, then run the editor in the background.
+			if self.pending_external_editor {
+				self.pending_external_editor = false;
+				let _ = term_pause.send(());
+				guard.suspend();
+				self.suspended = true;
+				println!(
+					"Launching external editor: {}\nPi will resume when the editor exits.",
+					self.external_editor_cmd
+				);
+				self.spawn_external_editor();
+			}
 
 			tokio::select! {
 				event = term_rx.recv() => {
@@ -557,6 +667,19 @@ impl InteractiveMode {
 				}
 				Some(msg) = self.session_list_rx.recv() => {
 					self.handle_session_list_msg(msg);
+				}
+				Some(outcome) = self.editor_rx.recv() => {
+					// The editor exited: bring the terminal back before any
+					// draw, then apply the edited prompt (failed edits leave
+					// the editor content unchanged, like upstream).
+					if self.suspended {
+						guard.resume()?;
+						self.suspended = false;
+						term_pause = spawn_term_reader(term_tx.clone());
+					}
+					if let ExternalEditorOutcome::Complete(content) = outcome {
+						self.editor.set_text(content);
+					}
 				}
 				_ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
 					self.tick = self.tick.wrapping_add(1);
@@ -824,8 +947,23 @@ impl InteractiveMode {
 				}
 			}
 			GlobalAction::SessionResume => self.open_session_selector(),
+			// Handled in run(): suspending the terminal must happen where
+			// the TerminalGuard lives.
+			GlobalAction::EditorExternal => self.pending_external_editor = true,
 		}
 		true
+	}
+
+	// -- external editor (ctrl+g, external-editor.ts) ------------------------------
+
+	fn spawn_external_editor(&mut self) {
+		let command = self.external_editor_cmd.clone();
+		let content = self.editor.text().to_string();
+		let tx = self.editor_tx.clone();
+		tokio::spawn(async move {
+			let outcome = run_external_editor(&command, &content).await;
+			let _ = tx.send(outcome);
+		});
 	}
 
 	// -- session selector (/resume) ------------------------------------------------
@@ -2586,5 +2724,80 @@ mod session_selector_tests {
 			resolve_global_action(&kb, &key, true),
 			Some(GlobalAction::SessionResume)
 		);
+	}
+}
+
+#[cfg(test)]
+mod external_editor_tests {
+	use super::*;
+
+	#[test]
+	fn strip_editor_text_removes_bom_and_one_trailing_newline() {
+		assert_eq!(strip_editor_text("hello\n"), "hello");
+		assert_eq!(
+			strip_editor_text("hello\n\n"),
+			"hello\n",
+			"only one newline"
+		);
+		assert_eq!(strip_editor_text("\u{feff}bom\n"), "bom");
+		assert_eq!(strip_editor_text("no-newline"), "no-newline");
+		assert_eq!(strip_editor_text("multi\nline\n"), "multi\nline");
+	}
+
+	#[tokio::test]
+	async fn external_editor_success_returns_edited_content() {
+		let dir = std::env::temp_dir().join(format!(
+			"pi-editor-test-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.subsec_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let script = dir.join("append-editor.sh");
+		std::fs::write(&script, "#!/bin/sh\nprintf 'edited\\n' >> \"$1\"\n").unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let outcome = run_external_editor(script.to_str().unwrap(), "original\n").await;
+		let _ = std::fs::remove_dir_all(&dir);
+		match outcome {
+			ExternalEditorOutcome::Complete(content) => assert_eq!(content, "original\nedited"),
+			ExternalEditorOutcome::Failed => panic!("expected success"),
+		}
+	}
+
+	#[tokio::test]
+	async fn external_editor_nonzero_exit_and_bad_command_fail() {
+		assert!(matches!(
+			run_external_editor("false", "content").await,
+			ExternalEditorOutcome::Failed
+		));
+		assert!(matches!(
+			run_external_editor("definitely-not-a-real-editor-xyz", "content").await,
+			ExternalEditorOutcome::Failed
+		));
+	}
+
+	#[test]
+	fn ctrl_g_resolves_the_external_editor_action() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+		assert_eq!(
+			resolve_global_action(&kb, &key, false),
+			Some(GlobalAction::EditorExternal)
+		);
+	}
+
+	#[test]
+	fn external_editor_resolution_prefers_configured_value() {
+		assert_eq!(
+			crate::core::ui_config::resolve_external_editor(Some("  my-edit-or ")),
+			"my-edit-or"
+		);
+		assert!(!crate::core::ui_config::resolve_external_editor(Some("   ")).is_empty());
 	}
 }

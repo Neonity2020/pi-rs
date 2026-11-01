@@ -144,3 +144,13 @@ cargo fmt --all -- --check
 **验证**：576 项测试全绿（521→576，+55：查询解析/分层评分/树投影/浮层状态机 15 项、SessionInfo/ISO/列举/rename 4 项、块重建/usage/删除/键位分发 4 项等）；fmt/clippy -D warnings 干净。pty 端到端冒烟：`/resume` 打开浮层、行渲染（命名/首条消息/计数/时长）、搜索过滤、Down 光标移动（帧 diff 实证）、Enter 切换（`session → ` notice + 干净退出，连跑 4 次 exit 0）。注意：ratatui 光标寻址帧经 naive 去 escape 拼接会产生幻影词，冒烟断言要用帧 diff 或状态（会话文件/进程退出码）验证，勿用拼接文本。
 
 **交接事项**：设置选择器（settings-selector.ts）未做；树选择器（tree-selector.ts）未做；`--continue` 启动时 TUI 仍不回放历史（仅切换/替换后重建）；`fork`/`new_session` 尚无 UI 入口（RPC 已有）；上游 `/rename` 无独立斜杠命令，rename 仅在选择器内。
+
+## 第十轮：外部编辑器 ctrl+g（2026-10-31，主会话单线）
+
+基线 `c0ab58e`（上游 `external-editor.ts` + `getExternalEditorCommand` + `ui.stop()/start()` 生命周期移植）：
+
+- **pi-tui**：`TerminalGuard::suspend/resume`——suspend 走 `restore_terminal`（退备屏、关 raw/鼠标/键盘 flags），resume 重进并 `Terminal::clear()` 强制全量重绘（备屏重进后是空白，不清屏会花屏）。
+- **interactive**：`app.editor.external`（ctrl+g）→ `GlobalAction::EditorExternal` 只置 pending 标记；run() 循环在 draw 后处理：先停输入读取器（`spawn_term_reader` 可重启化——EventStream 存活会与编辑器抢键盘，select! 对 pause 通道退出即 drop 流），再 `guard.suspend()`，打两行提示，spawn 后台任务执行编辑器；结束帧经 `editor_rx` 回到主循环 resume + 重启读取器 + `editor.set_text`（失败不改内容，同上游）。`run_external_editor`：`pi-editor-<pid>-<nanos>` 临时目录写 prompt.md、空白分词命令 + stdio inherit、成功读回并 `strip_editor_text`（BOM + 恰一个尾换行）；命令不存在/非零退出/读不回都按失败处理（上游读失败会抛未捕获，移植降级为 failed）。命令解析 `resolve_external_editor`：settings `externalEditor` → `$VISUAL`/`$EDITOR` → nano（经 UiConfig.external_editor 传入，settings 管理器不进 interactive）。
+- **声明偏差**：上游 Windows `shell:true` 未移植（直接 exec）；上游 spawn error 静默，移植同样静默不改内容。
+
+**验证**：581 项测试全绿（576→581，+5：BOM/尾换行剥离、脚本编辑器往返、非零退出与坏命令失败、ctrl+g 分发、配置优先级）；fmt/clippy -D warnings 干净。pty 冒烟：EDITOR=脚本 → ctrl+g → 两行提示 → 编辑内容进 editor → 提交后会话文件含编辑后文本。教训延续：pty 冒烟用会话文件断言状态，勿用去 escape 拼接文本。

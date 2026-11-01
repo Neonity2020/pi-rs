@@ -577,6 +577,7 @@ async fn main() -> anyhow::Result<()> {
 	// agent dir; `--light` only picks the built-in fallback theme. MCP
 	// assembly and resume notices surface as chat notices inside the TUI.
 	let mut ui = ui_config::load(settings.theme.as_deref(), cli.light);
+	ui.external_editor = ui_config::resolve_external_editor(settings.external_editor.as_deref());
 	ui.notices
 		.extend(mcp.notices.drain(..).map(|notice| format!("mcp: {notice}")));
 	ui.notices.extend(startup_notices);

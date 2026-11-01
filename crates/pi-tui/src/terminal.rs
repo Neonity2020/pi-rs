@@ -39,6 +39,31 @@ impl TerminalGuard {
 			restore_terminal();
 		}
 	}
+
+	/// Temporarily hand the terminal to an external program (upstream
+	/// `ui.stop()`): leave the alternate screen, drop raw mode, mouse
+	/// capture, and keyboard flags. [`TerminalGuard::resume`] undoes this.
+	pub fn suspend(&mut self) {
+		restore_terminal();
+	}
+
+	/// Re-enter after [`TerminalGuard::suspend`] (upstream `ui.start()`):
+	/// raw mode + alternate screen + capture again, then force the next
+	/// draw to repaint everything (the alternate screen is blank on
+	/// re-entry).
+	pub fn resume(&mut self) -> io::Result<()> {
+		let mut stdout = io::stdout();
+		crossterm::terminal::enable_raw_mode()?;
+		crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+		let _ = crossterm::execute!(
+			stdout,
+			crossterm::event::EnableMouseCapture,
+			crossterm::event::PushKeyboardEnhancementFlags(
+				KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+			)
+		);
+		self.terminal.clear()
+	}
 }
 
 impl Drop for TerminalGuard {

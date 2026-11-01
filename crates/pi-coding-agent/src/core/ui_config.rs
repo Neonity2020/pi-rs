@@ -226,6 +226,11 @@ pub struct UiConfig {
 	/// Config problems to show the user at startup (bad keybindings.json,
 	/// missing/broken theme file).
 	pub notices: Vec<String>,
+	/// External editor command for ctrl+g (`settings.externalEditor` →
+	/// `$VISUAL`/`$EDITOR` → `nano`, upstream `getExternalEditorCommand`;
+	/// resolved by the caller since the settings manager is not threaded
+	/// into interactive mode).
+	pub external_editor: String,
 }
 
 /// Load from the agent dir: `themes/<name>.json` for the theme named by
@@ -282,12 +287,38 @@ fn colorfgbg_is_light(value: &str) -> bool {
 pub fn load(theme_setting: Option<&str>, light: bool) -> UiConfig {
 	let light = light || std::env::var("COLORFGBG").is_ok_and(|value| colorfgbg_is_light(&value));
 	let agent_dir = config::agent_dir();
-	load_from(
+	let mut ui = load_from(
 		&agent_dir.join("keybindings.json"),
 		&config::themes_dir(),
 		theme_setting,
 		light,
-	)
+	);
+	ui.external_editor = resolve_external_editor(None);
+	ui
+}
+
+/// External editor command (upstream `getExternalEditorCommand`):
+/// configured value → `$VISUAL`/`$EDITOR` → `nano` (non-Windows default).
+/// `configured` is `settings.externalEditor`.
+pub fn resolve_external_editor(configured: Option<&str>) -> String {
+	if let Some(editor) = configured.map(str::trim).filter(|e| !e.is_empty()) {
+		return editor.to_string();
+	}
+	if let Ok(editor) = std::env::var("VISUAL")
+		&& !editor.trim().is_empty()
+	{
+		return editor;
+	}
+	if let Ok(editor) = std::env::var("EDITOR")
+		&& !editor.trim().is_empty()
+	{
+		return editor;
+	}
+	if cfg!(windows) {
+		"notepad".to_string()
+	} else {
+		"nano".to_string()
+	}
 }
 
 /// Path-parameterized core of [`load`] so tests can point at a temp dir.
@@ -310,6 +341,7 @@ fn load_from(
 		theme,
 		keybindings,
 		notices,
+		external_editor: resolve_external_editor(None),
 	}
 }
 
