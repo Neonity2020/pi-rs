@@ -1055,8 +1055,11 @@ impl InteractiveMode {
 		};
 		match action {
 			GlobalAction::Interrupt => {
-				// Escape always aborts/consumes (pi behavior), even idle.
-				if self.working {
+				// Escape always aborts/consumes (pi behavior), even idle: a
+				// passthrough bash command first, then the agent run.
+				if self.bash_running {
+					let _ = self.session.cmd_tx.send(SessionCommand::AbortBash);
+				} else if self.working {
 					let _ = self.session.cmd_tx.send(SessionCommand::Abort);
 				}
 			}

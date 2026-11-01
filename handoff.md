@@ -277,4 +277,4 @@ cargo fmt --all -- --check
 
 ## 第三十三轮：!cmd bash 透传（2026-10-31，主会话单线）
 
-基线 `1e09fce`（上游 bash mode：`!cmd` 入 transcript、`!!cmd` 排除上下文）：handle_submit 识别 `!`/`!!` 前缀 → `SessionCommand::ExecuteBash`（RPC 轮底层复用）；新增 `ChatBlock::Bash`（`bash: <cmd> (status)` 头 + 输出预览，运行中尾 20 行、完成后首 10 行 + done/exit N/cancelled/truncated 状态着色）——TUI select 循环新增 `session.wire_events` 臂，`BashExecutionUpdate` 追加增量、`BashExecutionDone` 终结（bash_running 标志置回，重复提交报上游同文案警告）。Esc 取消走既有 AbortBash？未接——推迟（wire_events 臂只读 done；abort 需把 esc 分流）。632 项测试维持全绿，pty 冒烟（块渲染/输出/完成状态），fmt/clippy 干净。
+基线 `1e09fce`（上游 bash mode：`!cmd` 入 transcript、`!!cmd` 排除上下文）：handle_submit 识别 `!`/`!!` 前缀 → `SessionCommand::ExecuteBash`（RPC 轮底层复用）；新增 `ChatBlock::Bash`（`bash: <cmd> (status)` 头 + 输出预览，运行中尾 20 行、完成后首 10 行 + done/exit N/cancelled/truncated 状态着色）——TUI select 循环新增 `session.wire_events` 臂，`BashExecutionUpdate` 追加增量、`BashExecutionDone` 终结（bash_running 标志置回，重复提交报上游同文案警告）。Esc 中止已接：Interrupt 分流 bash_running → AbortBash（优先于 agent abort）。632 项测试维持全绿，pty 冒烟（块渲染/输出/完成状态），fmt/clippy 干净。
