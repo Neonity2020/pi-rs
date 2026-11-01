@@ -11,6 +11,7 @@ mod json_repair;
 pub mod mock;
 pub mod openai_completions;
 pub mod openai_responses;
+pub mod pi_messages;
 
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
 		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
 		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
+		Api::PI_MESSAGES => pi_messages::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {
 			let error = crate::types::AssistantMessage::error(

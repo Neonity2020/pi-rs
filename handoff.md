@@ -278,3 +278,7 @@ cargo fmt --all -- --check
 ## 第三十三轮：!cmd bash 透传（2026-10-31，主会话单线）
 
 基线 `1e09fce`（上游 bash mode：`!cmd` 入 transcript、`!!cmd` 排除上下文）：handle_submit 识别 `!`/`!!` 前缀 → `SessionCommand::ExecuteBash`（RPC 轮底层复用）；新增 `ChatBlock::Bash`（`bash: <cmd> (status)` 头 + 输出预览，运行中尾 20 行、完成后首 10 行 + done/exit N/cancelled/truncated 状态着色）——TUI select 循环新增 `session.wire_events` 臂，`BashExecutionUpdate` 追加增量、`BashExecutionDone` 终结（bash_running 标志置回，重复提交报上游同文案警告）。Esc 中止已接：Interrupt 分流 bash_running → AbortBash（优先于 agent abort）。632 项测试维持全绿，pty 冒烟（块渲染/输出/完成状态），fmt/clippy 干净。
+
+## 第三十轮补充：pi-messages provider（2026-10-31，主会话单线）
+
+基线 `88b062b` 前后（上游 `api/pi-messages.ts` 456 行全量移植，路线图 providers 项）：**新模块 `pi-ai/src/providers/pi_messages.rs`**——协议最薄的适配器：POST `{base}/messages` 带 `{model, context:{messages}, options:{temperature,maxTokens,reasoning,sessionId}}`（context 走 Message serde 原样序列化，转换在后端）；响应为已序列化的 assistant-message 事件流（`contentIndex` 寻址的 text/thinking/toolcall 槽位、contentSignature/redacted、toolCall 终态覆盖 + ToolArgsStream 容错增量——自 openai_responses 提为 pub(crate) 复用），终态 `done`/`error` 携 usage/responseId/responseModel；无终态事件→流失败；HTTP 错误体 `{error:{message,code}}` 格式化。model_registry 白名单扩入 pi-messages。声明推迟：gateway rewrite 诊断（无 sidecar 字段）、debug 旗标、toolChoice、identity 头。**坑：终态事件的 events 向量在提前 return 前忘记 forward，Done 静默丢失——pty/单测都抓到了（"done event, got [Start, Error]" 形状）**。635 项测试全绿（+4：wire/索引槽位流/无终态失败 + 既有），fmt/clippy 干净。providers 完成 5/10+。

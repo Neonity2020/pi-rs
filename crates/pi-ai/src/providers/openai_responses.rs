@@ -591,20 +591,20 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 /// Raw argument text of one streaming tool call, with the tolerant partial
 /// preview (upstream `ToolCallArgumentsStream`: append consumes each piece
 /// once, `replace` continues or restarts, `finish` does the one full parse).
-struct ToolArgsStream {
+pub(crate) struct ToolArgsStream {
 	text: String,
 	arguments: Value,
 }
 
 impl ToolArgsStream {
-	fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self {
 			text: String::new(),
 			arguments: json!({}),
 		}
 	}
 
-	fn append(&mut self, delta: &str) -> Value {
+	pub(crate) fn append(&mut self, delta: &str) -> Value {
 		self.text.push_str(delta);
 		self.arguments = lenient_partial_json(&self.text);
 		self.arguments.clone()
@@ -612,7 +612,7 @@ impl ToolArgsStream {
 
 	/// Returns the missing piece when `text` continues the received text;
 	/// `None` on restart or when nothing new arrived.
-	fn replace(&mut self, text: &str) -> Option<String> {
+	pub(crate) fn replace(&mut self, text: &str) -> Option<String> {
 		if text.starts_with(&self.text) {
 			let delta = text[self.text.len()..].to_string();
 			if delta.is_empty() {
@@ -627,7 +627,7 @@ impl ToolArgsStream {
 		None
 	}
 
-	fn finish(&self) -> (Value, Option<String>) {
+	pub(crate) fn finish(&self) -> (Value, Option<String>) {
 		parse_tool_call_arguments(&self.text)
 	}
 }
