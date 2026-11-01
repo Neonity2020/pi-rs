@@ -529,6 +529,8 @@ enum GlobalAction {
 	SessionResume,
 	EditorExternal,
 	CopyMessage,
+	ModelCycleForward,
+	ModelCycleBackward,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -573,6 +575,12 @@ fn resolve_global_action(
 	}
 	if keybindings.matches("app.message.copy", key) {
 		return Some(GlobalAction::CopyMessage);
+	}
+	if keybindings.matches("app.model.cycleForward", key) {
+		return Some(GlobalAction::ModelCycleForward);
+	}
+	if keybindings.matches("app.model.cycleBackward", key) {
+		return Some(GlobalAction::ModelCycleBackward);
 	}
 	None
 }
@@ -985,6 +993,8 @@ impl InteractiveMode {
 			// the TerminalGuard lives.
 			GlobalAction::EditorExternal => self.pending_external_editor = true,
 			GlobalAction::CopyMessage => self.handle_copy_command(),
+			GlobalAction::ModelCycleForward => self.cycle_model(1),
+			GlobalAction::ModelCycleBackward => self.cycle_model(-1),
 		}
 		true
 	}
@@ -1616,6 +1626,29 @@ impl InteractiveMode {
 		// requested one (upstream reads back synchronously and warns on
 		// normalization — the port's notice would race the session task).
 		self.push_notice(format!("Session name set: {name}"));
+	}
+
+	/// ctrl+p / alt+p (upstream `cycleModel`, available-models variant): move
+	/// ±1 through the registry list with wraparound. The scoped-models
+	/// variant has no port counterpart.
+	fn cycle_model(&mut self, step: isize) {
+		if self.models.len() < 2 {
+			self.push_notice("Only one model available".into());
+			return;
+		}
+		let current = self.session.live_agent().model().key();
+		let count = self.models.len() as isize;
+		let index = self
+			.models
+			.iter()
+			.position(|model| model.key() == current)
+			.map(|index| ((index as isize + step).rem_euclid(count)) as usize)
+			.unwrap_or(0);
+		let next = self.models[index].key();
+		let _ = self
+			.session
+			.cmd_tx
+			.send(SessionCommand::SetModel { query: next });
 	}
 
 	/// `/copy` / ctrl+x (upstream `handleCopyCommand`): copy the last
@@ -3296,6 +3329,29 @@ mod session_selector_tests {
 		// Deleting an already-gone file reports success (upstream treats a
 		// vanished file as trashed, `!existsSync` branch).
 		assert!(delete_session_file(&path).is_ok());
+	}
+
+	#[test]
+	fn resolve_global_action_maps_the_model_cycle_chords() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+		assert_eq!(
+			resolve_global_action(&kb, &ctrl_p, true),
+			Some(GlobalAction::ModelCycleForward)
+		);
+		// The backward chord is platform-dependent (shift+ctrl+p on darwin).
+		let backward = if cfg!(target_os = "macos") {
+			KeyEvent::new(
+				KeyCode::Char('p'),
+				KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+			)
+		} else {
+			KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)
+		};
+		assert_eq!(
+			resolve_global_action(&kb, &backward, true),
+			Some(GlobalAction::ModelCycleBackward)
+		);
 	}
 
 	#[test]

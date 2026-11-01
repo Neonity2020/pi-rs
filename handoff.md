@@ -258,3 +258,7 @@ cargo fmt --all -- --check
 ## 第二十八轮：RPC compact customInstructions（2026-10-31，主会话单线）
 
 基线 `fbf056d`：`RpcCommand::Compact` 增可选 `customInstructions`（serde rename 到上游 camelCase 字段，缺省 None——additive，旧帧不受影响）并传入 SessionCommand；+1 wire 测试（"compact" 命令帧形状）。630 项测试全绿，fmt/clippy 干净。坑：字符串手术修补测试尾部两次失败后，按精确文本 replace + 手工核对括号结构修复（教训：测试插入用 Edit 工具锚定模块内位置，勿用 rindex 猜括号）。
+
+## 第二十九轮：ctrl+p/alt+p 模型循环（2026-10-31，主会话单线）
+
+基线 `dd953f5`（上游 `cycleModel` 的 available-models 变体）：`GlobalAction::ModelCycleForward/Backward`（ctrl+p / 平台相关 backward 弦——darwin shift+ctrl+p、其他 alt+p）接 resolve_global_action；interactive `cycle_model(±1)` 对 registry 模型列表环绕取下一个并发 `SetModel`，单模型提示 "Only one model available"；scoped-models 变体无对应（推迟）。**坑：MODEL_CYCLE_BACKWARD 是平台相关常量（darwin=shift+ctrl+p），测试用 alt+p 在 mac 上必挂；调试用 panic!() 测试用完必须删（fmt 会重排行导致正则删除失配，二次清理）。** 631 项测试全绿（+2 cycle 弦分发），pty 冒烟（单步 ctrl+p → "model → mimo/mimo-v2.6-flash" 通知），fmt/clippy 干净。
