@@ -1223,6 +1223,84 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/fork [n]` (upstream `showUserMessageSelector`, first slice): no
+	/// argument lists the transcript's user messages with 1-based indexes;
+	/// `/fork <n>` forks before that message (the new branch re-roots at its
+	/// parent and the message text returns via the switch notice for
+	/// pre-filling). The interactive selector UI is deferred.
+	fn handle_fork_command(&mut self, args: &str) {
+		let arg = args.trim();
+		if arg.is_empty() {
+			let mut listed = 0usize;
+			let mut text = String::from("Fork points (user messages):\n");
+			for (index, user) in self
+				.session
+				.live_agent()
+				.snapshot()
+				.messages
+				.iter()
+				.filter_map(|message| match message {
+					Message::User(user) => Some(user),
+					_ => None,
+				})
+				.enumerate()
+			{
+				let preview: String = user.content.as_text().chars().take(60).collect();
+				text.push_str(&format!("{:>3}. {}\n", index + 1, preview));
+				listed += 1;
+			}
+			if listed == 0 {
+				self.push_notice("No user messages to fork from yet.".into());
+			} else {
+				text.push_str("Use /fork <n> to fork before message n.");
+				self.push_notice(text);
+			}
+			return;
+		}
+		let Ok(entry_index) = arg.parse::<usize>() else {
+			self.push_notice(format!("Usage: /fork <n> ({arg} is not a number)"));
+			return;
+		};
+		let users: Vec<(usize, &String)> = {
+			let snapshot = self.session.live_agent().snapshot();
+			let _ = snapshot; // borrow scope helper
+			Vec::new()
+		};
+		let _ = users;
+		// Resolve the nth user message's entry id from the session log.
+		let fork_target = {
+			let guard = self.session.log.lock().unwrap();
+			let user_entries: Vec<Option<String>> = guard
+				.session
+				.entries()
+				.iter()
+				.filter(|entry| {
+					matches!(
+						&entry.kind,
+						crate::core::session_manager::EntryKind::Message { message }
+							if matches!(message.as_ref(), pi_ai::Message::User(_))
+					)
+				})
+				.map(|entry| entry.id().map(str::to_string))
+				.collect();
+			// `/fork <n>` is 1-based.
+			entry_index
+				.checked_sub(1)
+				.and_then(|index| user_entries.get(index).cloned().flatten())
+		};
+		let Some(entry_id) = fork_target else {
+			self.push_notice(format!(
+				"No user message {} — /fork lists the valid indexes.",
+				entry_index + 1
+			));
+			return;
+		};
+		let _ = self.session.cmd_tx.send(SessionCommand::Fork {
+			entry_id,
+			position: crate::core::agent_session::ForkPosition::Before,
+		});
+	}
+
 	/// `/hotkeys` (upstream `handleHotkeysCommand`): the resolved keybinding
 	/// rows in a plain-text two-column layout (notices render as plain
 	/// lines, not markdown tables).
@@ -1487,6 +1565,7 @@ impl InteractiveMode {
 			"name" => self.handle_name_command(args),
 			"session" => self.handle_session_command(),
 			"hotkeys" => self.handle_hotkeys_command(),
+			"fork" => self.handle_fork_command(args),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "

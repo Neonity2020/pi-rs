@@ -222,3 +222,7 @@ cargo fmt --all -- --check
 ## 第二十轮：/hotkeys 命令（2026-10-31，主会话单线）
 
 基线 `dc085d1`（上游 `handleHotkeysCommand`）：`/hotkeys` 渲染解析后的键位两列对齐表（Navigation/Editing/Other 三组 24 行，经 `keybinding_hint` 走 keybindings.json 覆盖；Notices 是纯文本行渲染故用对齐文本而非上游 markdown 表）。626 项测试维持全绿，pty 冒烟（表格 + 已解析键位 esc/ctrl+l），fmt/clippy 干净。
+
+## 第二十一轮：/fork 首片（2026-10-31，主会话单线）
+
+基线 `844a248`（上游 `showUserMessageSelector` 的最小可用替身）：`/fork` 无参列出 transcript 中的 user 消息（1 基编号 + 60 字符预览），`/fork <n>` 定位该消息的会话条目并发 `SessionCommand::Fork { position: Before }`（分支根在消息父节点，消息文本经替换 notice 回流供预填——上游 selectedText 语义）；交互式选择器 UI 推迟。**坑：/fork <n> 是 1 基索引，0 基取值会静默错位（pty 冒烟实证）。** 626 项测试维持全绿，pty 冒烟列表 + 分叉落盘（新分支会话文件），fmt/clippy 干净。

@@ -71,6 +71,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info(
+		"fork",
+		"fork the session at a user message (/fork lists, /fork <n>)",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"hotkeys",
 		"show the resolved keybindings",
 		SlashCommandSource::Builtin,
