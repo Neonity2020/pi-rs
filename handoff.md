@@ -270,3 +270,7 @@ cargo fmt --all -- --check
 ## 第三十一轮：退出恢复提示（2026-10-31，主会话单线）
 
 基线 `88b062b`（上游 `formatResumeCommand` + 退出打印）：interactive 退出（终端还原后）打印 dim 色 `To resume this session: pi-rs --resume <目录名>`——端口指向会话目录名（`--resume` 按目录名前缀解析，pty 冒烟实证解析成功）；上游 `--session <id>` 旗标与 `--session-dir` 参数无对应（自定义 PI_RS_SESSION_DIR 需用户重导出，声明偏差）；内存会话不打印。632 项测试维持全绿，fmt/clippy 干净。
+
+## 第三十二轮：--session-dir 旗标（2026-10-31，主会话单线）
+
+基线 `249b0c0`（上游 `--session-dir`）：CLI 增 `--session-dir <DIR>`，解析后立即写 `PI_RS_SESSION_DIR` 环境变量（edition-2024 下 unsafe set_var，单线程早期调用；`config::sessions_dir()` 已读该变量）——自定义根下的会话落盘与退出恢复提示均实证。632 项测试维持全绿（测试 Cli 构造补 None），fmt/clippy 干净。上一轮声明的偏差（恢复提示的自定义根）就此闭合。

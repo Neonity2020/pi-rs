@@ -68,6 +68,11 @@ struct Cli {
 	#[arg(long, value_name = "ID|PATH", conflicts_with = "no_session")]
 	resume: Option<String>,
 
+	/// Override the sessions root directory (upstream `--session-dir`; the
+	/// exit hint re-exports it as PI_RS_SESSION_DIR when set).
+	#[arg(long, value_name = "DIR")]
+	session_dir: Option<PathBuf>,
+
 	/// Disable session persistence.
 	#[arg(long)]
 	no_session: bool,
@@ -325,6 +330,15 @@ async fn main() -> anyhow::Result<()> {
 	let stdin_is_tty = is_tty();
 	let stdout_is_tty = std::io::stdout().is_terminal();
 	let app_mode = resolve_app_mode(&cli, stdin_is_tty, stdout_is_tty)?;
+
+	// `--session-dir` overrides the sessions root (upstream flag): set the
+	// same env override `config::sessions_dir()` already honors. Rendezvous
+	// with the exit hint through the process environment before any session
+	// I/O; edition-2024 set_var is unsafe, so gate it behind a one-time call.
+	if let Some(dir) = &cli.session_dir {
+		// SAFETY: single-threaded at this point (before tokio spawns).
+		unsafe { std::env::set_var(crate::config::SESSION_DIR_ENV, dir) };
+	}
 
 	// `@file` extraction (`args.ts:247-248`): positionals starting with `@`
 	// become file arguments (the `@` is stripped; no escape exists). The rest
@@ -656,6 +670,7 @@ mod tests {
 
 	fn cli(mode: Option<&str>, print: bool, rpc: bool) -> Cli {
 		Cli {
+			session_dir: None,
 			print,
 			mode: mode.map(str::to_string),
 			rpc,
