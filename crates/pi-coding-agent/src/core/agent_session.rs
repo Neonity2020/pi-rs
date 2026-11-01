@@ -118,7 +118,9 @@ pub enum SessionCommand {
 		level: ThinkingLevel,
 	},
 	CycleThinking,
-	Compact,
+	Compact {
+		instructions: Option<String>,
+	},
 	/// Toggle automatic threshold compaction (RPC `set_auto_compaction`).
 	SetAutoCompaction {
 		enabled: bool,
@@ -643,7 +645,7 @@ impl MidRunHook {
 			return;
 		};
 		self.emit(SessionEvent::Notice("auto-compaction (mid-run)…".into()));
-		match compaction::compact_prefix(&self.agent, Some(cut)).await {
+		match compaction::compact_prefix(&self.agent, Some(cut), None).await {
 			Ok(outcome) => {
 				let mut guard = self.log.lock().unwrap();
 				// The log entry leads the swap (upstream
@@ -765,7 +767,7 @@ async fn session_task(
 							pending.push_back((text, images));
 							notice(&event_bus, "auto-compaction (threshold)…".into());
 							let agent = agent.clone();
-							compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+							compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
 						} else {
 							overflow_attempted = false;
 							abort_requested = false;
@@ -843,7 +845,7 @@ async fn session_task(
 						persist_thinking_level(&log, next, &event_bus);
 						notice(&event_bus, format!("thinking → {next:?}"));
 					}
-					SessionCommand::Compact => {
+					SessionCommand::Compact { instructions } => {
 						// A finished-but-unreaped run is select-order lag, not an
 						// active run; reap it so acceptance reflects the agent.
 						if run.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
@@ -878,7 +880,7 @@ async fn session_task(
 							notice(&event_bus, "compacting…".into());
 							let agent = agent.clone();
 							compacting = Some(tokio::spawn(async move {
-								compaction::compact_agent(&agent).await
+								compaction::compact_prefix(&agent, None, instructions.as_deref()).await
 							}));
 						}
 					}
@@ -1105,7 +1107,7 @@ async fn session_task(
 								recovery_compaction = true;
 								notice(&event_bus, "context overflow: compacting before one retry".into());
 								let agent = agent.clone();
-								compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+								compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
 							} else {
 								notice(&event_bus, "overflow recovery unavailable: no durable compaction boundary".into());
 							}
@@ -1126,7 +1128,7 @@ async fn session_task(
 				{
 					notice(&event_bus, "auto-compaction (threshold)…".into());
 					let agent = agent.clone();
-					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
 				}
 				// Auto-retry (upstream `_handlePostAgentRun` + `_prepareRetry`):
 				// a run that ended in a retryable error schedules one repeat
@@ -3119,7 +3121,9 @@ mod tests {
 			auto_compaction_cut(&agent, &mut guard, 20_000).expect("safe boundary")
 		};
 		assert_eq!(cut.first_kept, 1);
-		let outcome = compaction::compact_prefix(&agent, Some(cut)).await.unwrap();
+		let outcome = compaction::compact_prefix(&agent, Some(cut), None)
+			.await
+			.unwrap();
 		let bus = EventBus::new();
 		apply_compaction(&agent, &log, &bus, outcome);
 		let actual: Vec<_> = agent
@@ -3282,7 +3286,10 @@ mod tests {
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				if let Ok(SessionEvent::Notice(text)) = handle.events.recv().await
@@ -3327,7 +3334,10 @@ mod tests {
 		});
 		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
 		let mut handle = spawn_agent_session(agent.clone(), SessionManager::in_memory(), registry);
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				if let Ok(SessionEvent::Notice(text)) = handle.events.recv().await
@@ -3371,7 +3381,10 @@ mod tests {
 		session.fail_next_sync();
 		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
 		let mut handle = spawn_agent_session(agent.clone(), session, registry);
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
@@ -3813,7 +3826,10 @@ mod tests {
 			wait_for_agent_ends(&mut handle, 1).await;
 			assert_eq!(agent.snapshot().messages.len(), 3);
 
-			handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+			handle
+				.cmd_tx
+				.send(SessionCommand::Compact { instructions: None })
+				.unwrap();
 			tokio::time::timeout(Duration::from_secs(20), async {
 				loop {
 					match handle.events.recv().await {
@@ -3975,7 +3991,10 @@ mod tests {
 		.await
 		.unwrap();
 
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				match handle.events.recv().await {
@@ -3996,7 +4015,10 @@ mod tests {
 		// Finish the run, then compact; queue a prompt while compacting.
 		gate_tx.send(true).unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {

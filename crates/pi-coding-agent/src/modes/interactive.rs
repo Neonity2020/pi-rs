@@ -1799,7 +1799,11 @@ impl InteractiveMode {
 				));
 			}
 			"compact" => {
-				let _ = self.session.cmd_tx.send(SessionCommand::Compact);
+				let instructions = (!args.is_empty()).then(|| args.to_string());
+				let _ = self
+					.session
+					.cmd_tx
+					.send(SessionCommand::Compact { instructions });
 			}
 			"sessions" => {
 				// Upstream has no /sessions slash command (the selector covers

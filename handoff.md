@@ -250,3 +250,7 @@ cargo fmt --all -- --check
 ## 回归验证（2026-10-31，第九至二十六轮之后）
 
 本会话 15 个 feat 全部落地后重跑差分套件：**六场景（单轮/ bash 往返/ 多轮工具/ 阈值压缩/ json 单轮/ json 工具调用）双侧 6/6 IDENTICAL（canonical view，上游快照 f9daca34）**——@file 图片、Prompt images 字段、会话导出/导入、retry settings 等改动未引入任何 wire 回归。
+
+## 第二十七轮：/compact <instructions>（2026-10-31，主会话单线）
+
+基线 `c14e9d1` 前后连推（上游 compaction.ts:714-716）：`SessionCommand::Compact` 增 `instructions: Option<String>`，`compact_prefix` 增第三参（None=全部既有路径），自定义指令在基础提示词后追加 `\n\nAdditional focus: …`（UPDATE 路径同）；interactive `/compact [focus]` 传参、RPC `compact` 传 None（wire 无字段）、阈值/mid-run/溢出路径均 None。629 项测试全绿（+1 提示词含 Additional focus 断言），pty 冒烟（空会话拒绝路径证明参数贯通），fmt/clippy 干净。

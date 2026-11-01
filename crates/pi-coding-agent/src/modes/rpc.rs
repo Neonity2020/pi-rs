@@ -561,7 +561,9 @@ impl RpcSession {
 				} else {
 					"started"
 				};
-				let _ = self.cmd_tx.send(SessionCommand::Compact);
+				let _ = self
+					.cmd_tx
+					.send(SessionCommand::Compact { instructions: None });
 				success_frame(&id, "compact", json!({ "disposition": disposition }))
 			}
 			RpcCommand::SetAutoCompaction { enabled } => {

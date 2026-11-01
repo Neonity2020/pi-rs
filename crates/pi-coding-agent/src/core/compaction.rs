@@ -232,10 +232,14 @@ pub struct Cut {
 }
 
 pub async fn compact_agent(agent: &Agent) -> anyhow::Result<CompactionOutcome> {
-	compact_prefix(agent, None).await
+	compact_prefix(agent, None, None).await
 }
 
-pub async fn compact_prefix(agent: &Agent, cut: Option<Cut>) -> anyhow::Result<CompactionOutcome> {
+pub async fn compact_prefix(
+	agent: &Agent,
+	cut: Option<Cut>,
+	custom_instructions: Option<&str>,
+) -> anyhow::Result<CompactionOutcome> {
 	let snapshot = agent.snapshot();
 	let transcript: Vec<Message> = snapshot
 		.messages
@@ -327,6 +331,9 @@ pub async fn compact_prefix(agent: &Agent, cut: Option<Cut>) -> anyhow::Result<C
 			Some(_) => UPDATE_SUMMARIZATION_PROMPT,
 			None => SUMMARIZATION_PROMPT,
 		});
+		if let Some(instructions) = custom_instructions {
+			prompt_text.push_str(&format!("\n\nAdditional focus: {instructions}"));
+		}
 		let response = complete_summarization(&model, &stream_fn, prompt_text).await?;
 		check_summary_response(&response, "Summarization")?;
 		response.text()
@@ -767,6 +774,7 @@ mod tests {
 				turn_start: Some(2),
 				first_kept_id: Some("kept-entry".into()),
 			}),
+			None,
 		)
 		.await
 		.unwrap();
@@ -820,6 +828,7 @@ mod tests {
 				turn_start: Some(0),
 				first_kept_id: None,
 			}),
+			None,
 		)
 		.await
 		.unwrap();
@@ -890,5 +899,33 @@ mod tests {
 		assert!(second_prompt.contains("[User]: newer work"));
 		assert!(second_prompt.ends_with(UPDATE_SUMMARIZATION_PROMPT));
 		assert_eq!(second.summary, "[mock summary]");
+	}
+
+	#[tokio::test]
+	async fn custom_focus_appends_to_the_summary_prompt() {
+		use std::sync::Arc;
+		let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let agent = Agent::new(pi_agent::AgentOptions {
+			stream_fn: Some(split_turn_stream_fn(prompts.clone())),
+			..Default::default()
+		});
+		agent
+			.replace_messages(vec![
+				Message::System(pi_ai::SystemMessage::prompt("prompt")),
+				Message::user("old work"),
+				assistant_with_text("old reply"),
+			])
+			.unwrap();
+		compact_prefix(&agent, None, Some("keep the file paths"))
+			.await
+			.unwrap();
+		let captured = prompts.lock().unwrap();
+		assert_eq!(captured.len(), 1);
+		assert!(captured[0].contains(SUMMARIZATION_PROMPT));
+		assert!(
+			captured[0].ends_with("\n\nAdditional focus: keep the file paths"),
+			"prompt: {}",
+			captured[0]
+		);
 	}
 }
