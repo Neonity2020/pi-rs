@@ -7,6 +7,7 @@
 
 pub mod anthropic;
 pub mod google_generative_ai;
+pub mod google_vertex;
 mod json_repair;
 pub mod mock;
 pub mod openai_completions;
@@ -28,6 +29,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
 		Api::AZURE_OPENAI_RESPONSES => openai_responses::azure_stream_fn(),
 		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
+		Api::GOOGLE_VERTEX => google_vertex::stream_fn(),
 		Api::PI_MESSAGES => pi_messages::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {

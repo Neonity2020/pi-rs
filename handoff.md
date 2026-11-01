@@ -290,3 +290,13 @@ cargo fmt --all -- --check
 ## 第三十二轮补充：settings retry.enabled（2026-10-31，主会话单线）
 
 基线 `bef0cd5`：`RetrySettings` 增 `enabled: Option<bool>`（字段级合并），spawn 时播种 auto_retry 原子量（缺省仍 RETRY_ENABLED_DEFAULT=true）——settings `{"retry":{"enabled":false}}` 可关闭自动重试（此前只有 RPC 开关）。638 项测试维持全绿，fmt/clippy 干净。剩余声明缺口：maxAgentDelayMs（上游 agent 级重试上限，与 provider 级 maxRetryDelayMs 分开）。
+
+## 第三十三轮补充：google-vertex provider（2026-10-31，主会话单线）
+
+基线 `93742de`（上游 `google-vertex.ts` 561 行首片，复用 google_generative_ai 的 `GoogleSession`/`request_body`——process_payload 加 `process_payload_streamed` 包装）：**新模块 `pi-ai/src/providers/google_vertex.rs`**——
+- **Express API-key 模式**（options.api_key 为真实 key：非空、非 `gcp-vertex-credentials` 标记、非 `<placeholder>`）：POST `https://aiplatform.googleapis.com/v1/publishers/google/models/{id}:streamGenerateContent?alt=sse` + `x-goog-api-key`。
+- **ADC 模式**（key 缺失/为标记）：要求 `GOOGLE_CLOUD_PROJECT`（或 GCLOUD_PROJECT）与 `GOOGLE_CLOUD_LOCATION`；URL `https://{location}-aiplatform.googleapis.com/v1/projects/{p}/locations/{l}/publishers/google/models/{id}:...`；`GOOGLE_APPLICATION_CREDENTIALS` 支持 `service_account`（RS256 JWT 签名换 token，rsa+sha2 纯 Rust）与 `authorized_user`（refresh_token grant）两种 JSON；token 进程内缓存至过期前 60s。
+- 自定义 model.baseUrl 作区域前缀（`{location}` 占位符替换）。流处理与 generative-ai 完全同构（thought 块切换/签名保留/toolcall id 合成/finishReason 映射）。
+- 声明推迟：metadata-server 凭据（GCE/GKE）、toolChoice、constrained sampling、请求重试、模型目录个性化（openrouter 同款）。
+- **新依赖**：pi-ai 增 base64/rsa 0.9/sha2。
+641 项测试全绿（+3：express URL、placeholder 判定、RS256 签名往返），fmt/clippy 干净。providers 完成 7/10+（剩 mistral-conversations、bedrock-converse-stream、openai-codex-responses）。

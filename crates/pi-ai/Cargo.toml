@@ -11,6 +11,10 @@ pi-telemetry = { workspace = true }
 # "net" is only exercised by the integration tests' local mock SSE server.
 tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
+# Vertex ADC: base64url JWT segments, RS256 service-account signing.
+base64 = "0.22"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

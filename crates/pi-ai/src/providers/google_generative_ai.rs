@@ -655,7 +655,11 @@ fn resolve_thought_signature(
 	Some(signature.to_string())
 }
 
-fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOptions) -> Value {
+pub(crate) fn request_body(
+	model: &Model,
+	context: &TranscriptContext,
+	options: &StreamOptions,
+) -> Value {
 	let mut body = json!({
 		"model": model.id,
 		"contents": convert_contents(model, context),
@@ -739,14 +743,14 @@ enum OpenBlock {
 	Thinking { content_index: usize },
 }
 
-struct GoogleSession {
+pub(crate) struct GoogleSession {
 	message: AssistantMessage,
 	/// The currently open text/thinking block (upstream `currentBlock`).
 	open_block: Option<OpenBlock>,
 }
 
 impl GoogleSession {
-	fn new(model: &Model) -> Self {
+	pub(crate) fn new(model: &Model) -> Self {
 		Self {
 			message: AssistantMessage {
 				content: Vec::new(),
@@ -768,11 +772,11 @@ impl GoogleSession {
 		}
 	}
 
-	fn partial(&self) -> AssistantMessage {
+	pub(crate) fn partial(&self) -> AssistantMessage {
 		self.message.clone()
 	}
 
-	fn into_message(self) -> AssistantMessage {
+	pub(crate) fn into_message(self) -> AssistantMessage {
 		self.message
 	}
 
@@ -835,7 +839,20 @@ impl GoogleSession {
 		}
 	}
 
-	fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
+	pub(crate) async fn process_payload_streamed(
+		&mut self,
+		payload: &str,
+		tx: &Sender<Event>,
+	) -> Result<bool, String> {
+		let events = self.process_payload(payload)?;
+		let terminal = events
+			.iter()
+			.any(|event| matches!(event, Event::Done { .. } | Event::Error { .. }));
+		super::google_vertex::forward(tx, events).await;
+		Ok(terminal)
+	}
+
+	pub(crate) fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
 		let chunk: Value =
 			serde_json::from_str(payload).map_err(|e| format!("malformed SSE payload: {e}"))?;
 
