@@ -218,6 +218,9 @@ pub struct InteractiveMode {
 	session_overlay: Option<SessionSelectorOverlay>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
+	/// `@file` image attachments riding on the next prompt (`@file` text
+	/// files are inlined into the text; images wait for the first submit).
+	pending_images: Vec<pi_ai::ImageContent>,
 	// External editor (ctrl+g): the terminal is suspended while the editor
 	// runs; the outcome comes back through the channel.
 	external_editor_cmd: String,
@@ -587,6 +590,7 @@ impl InteractiveMode {
 			session_overlay: None,
 			session_list_tx,
 			session_list_rx,
+			pending_images: ui.initial_images,
 			external_editor_cmd,
 			suspended: false,
 			pending_external_editor: false,
@@ -1196,7 +1200,11 @@ impl InteractiveMode {
 	}
 
 	fn send_prompt(&mut self, text: String) {
-		let _ = self.session.cmd_tx.send(SessionCommand::Prompt { text });
+		let images = std::mem::take(&mut self.pending_images);
+		let _ = self
+			.session
+			.cmd_tx
+			.send(SessionCommand::Prompt { text, images });
 		self.chat.scroll_to_bottom();
 	}
 

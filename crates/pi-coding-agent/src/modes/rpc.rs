@@ -426,7 +426,10 @@ impl RpcSession {
 				} else {
 					"started"
 				};
-				let _ = self.cmd_tx.send(SessionCommand::Prompt { text: message });
+				let _ = self.cmd_tx.send(SessionCommand::Prompt {
+					text: message,
+					images: Vec::new(),
+				});
 				success_frame(&id, "prompt", json!({ "disposition": disposition }))
 			}
 			RpcCommand::Steer { message } => {

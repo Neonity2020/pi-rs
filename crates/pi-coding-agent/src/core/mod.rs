@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod context_usage;
 pub mod event_bus;
 pub mod export_html;
+pub mod image_process;
 pub mod json_event;
 pub mod mcp_config;
 pub mod model_registry;

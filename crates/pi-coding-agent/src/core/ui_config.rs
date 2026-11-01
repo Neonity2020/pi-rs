@@ -231,6 +231,9 @@ pub struct UiConfig {
 	/// resolved by the caller since the settings manager is not threaded
 	/// into interactive mode).
 	pub external_editor: String,
+	/// `@file` image attachments for the first prompt (upstream attaches
+	/// them to `messages[0]`; pi-rs folds every positional into one prompt).
+	pub initial_images: Vec<pi_ai::ImageContent>,
 }
 
 /// Load from the agent dir: `themes/<name>.json` for the theme named by
@@ -342,6 +345,7 @@ fn load_from(
 		keybindings,
 		notices,
 		external_editor: resolve_external_editor(None),
+		initial_images: Vec::new(),
 	}
 }
 

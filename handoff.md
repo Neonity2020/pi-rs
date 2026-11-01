@@ -165,3 +165,13 @@ cargo fmt --all -- --check
 - **声明偏差（compat 门控路径，上游默认关闭，推迟）**：grammar/custom 工具（`custom_tool_call`）、additional_tools/tool_search 条目、configuration_update（thinkingLevelMap 也未建模）、ChatGPT 登录特判、copilot/xai 头、service-tier 定价、长缓存 retention/24h、OpenRouter 会话亲和；cost 计算沿用全库零值口径；`sanitizeSurrogates` 在 Rust UTF-8 下为 no-op；上游 Windows shell:true 未移植。
 
 **验证**：597 项测试全绿（581→597，+16：wire/effort/off/重放/事件映射/incomplete/failed/未完成调用/视觉输出 9 项单测 + 6 项 mock HTTP+SSE 集成——增量 delta、429 错误体、response.failed、无 terminal 断连、abort、请求 wire 断言）；fmt/clippy -D warnings 干净。坑：mock 服务器 content-length 必须与 body 等长（reqwest 严格解码）；chunked body 需 `0\r\n\r\n` 终止才走干净 EOF 路径，否则 reqwest 报 decode error。
+
+## 第十二轮：@file 图片附件（2026-10-31，主会话单线）
+
+基线 `8351a39`（上游 `cli/file-processor.ts` 图片分支 + `utils/{mime,image-process,image-resize-core,exif-orientation}.ts` 的 Rust 移植）：
+
+- **新模块 `core/image_process.rs`**（依赖 `image` crate 0.25，features png/jpeg/gif/webp/bmp；`base64`）：魔数嗅探 `detect_supported_image_mime_type`（jpeg 0xFFD8FF 非 F7、png 含 IHDR 校验 + APNG acTL 排除、GIF87a/89a、RIFF/WEBP、BMP 头校验——逐字移植 mime.ts，取前 4100 字节）；EXIF 方向（JPEG APP1/ WebP EXIF chunk → TIFF IFD 0x0112，8 种方向变换——image crate 无 transpose，5/7 用 rotate90/270+fliph 组合，与上游逐位一致）；`process_image`（限额内 2000×2000 且 base64 < 4.5MB：png/jpeg/gif/webp **原始字节透传**（上游 `resizeImageInProcess` 限额分支返回 inputBytes，EXIF 不烘焙——保真镜像），其余类型解码+定向+重编码 PNG 带转换提示；超限：Lanczos3 缩至 2000 内 → PNG + JPEG[80,85,70,55,40] 候选取第一个低于预算 → 0.75 递缩到 1×1，尺寸注记 `Multiply coordinates by …`）。
+- **Prompt 链路**：`SessionCommand::Prompt` 增 `images: Vec<ImageContent>`；session 任务 pending 队列改存 `(text, images)` 元组，四条 pop_front 出队路径统一经 `user_message_with_images`（无图 → `Message::user(text)`，有图 → `UserContent::Blocks` 文本+图片块）；print 模式 `run_print` 增 `initial_images`（首条 prompt 携带，上游附在 messages[0]）；interactive 经 `UiConfig.initial_images` → `pending_images` 首次 send_prompt 携带；main.rs `process_file_arguments` 返回 `(text, images)`——图片按 `<file name="…">hints</file>` 文本引用 + 附件入列，失败走上游 `[Image omitted: …]` 文本形态。
+- **声明偏差**：透传路径不烘焙 EXIF（上游同行为，旋转显示仅在重缩/转换时生效）；上游 Photon WASM 用原生 image crate 替代（Lanczos3 同款滤波）；上游保留 jpeg/gif/webp 原始容器的字节，端口同（不做容器归一化）；图片只进首条 prompt（上游同），steer/follow-up 仍纯文本。
+
+**验证**：605 项测试全绿（597→605，+8：嗅探/APNG/TIFF 方向读取/透传/重缩注记/auto-resize off/garbage/EXIF 变换 + main.rs 图片参数接线 2 项）；fmt/clippy -D warnings 干净。坑：mock 夹具三连——APNG 夹具漏 IHDR CRC、TIFF IFD entry 的 count 是 4 字节（SHORT 值在前 2 字节）、JPEG APP1 标记是 FF E1 两字节（u16 to_be_bytes 会写成 00 E1）。
