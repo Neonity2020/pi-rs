@@ -21,5 +21,3 @@ pub mod tool_selection;
 pub mod tools;
 pub mod trust;
 pub mod ui_config;
-
-pub use session_manager::SessionManager;

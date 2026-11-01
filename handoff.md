@@ -230,3 +230,7 @@ cargo fmt --all -- --check
 ## 第二十二轮：retry settings 键（2026-10-31，主会话单线）
 
 基线 `d207bd6`（第八轮遗留：maxRetries/baseDelay 进 settings.json）：`Settings` 增 `retry: Option<RetrySettings>`（camelCase maxRetries/baseDelayMs，字段级 project>global 合并，两层都无 → None → 引擎常量默认）；`RetryRuntime` 增 `max_retries`，自动重试引擎的上限与退避基数从 settings 读取（WireEvent max_attempts 同步）；`spawn_agent_session_with_settings` 增 RetrySettings 参数，main 传入 `settings.retry`。**事故：`shared.retry.lock().unwrap().attempt < shared.retry.lock().unwrap().max_retries` 同一 std Mutex 单表达式双锁死锁，cargo test 挂起——改单守卫块。** 627 项测试全绿（+1 解析/合并测试），fmt/clippy 干净。上游 retry.enabled 与 maxAgentDelayMs 仍是运行时开关（settings 键未接）。
+
+## 第二十三轮：/sessions 升级（2026-10-31，主会话单线）
+
+基线 `9e5b996`：`/sessions` 从 dir+条目计数 stub 升级为 SessionInfo 摘要（年龄右对齐 + 名字或首条消息预览 70 字符 + 消息计数，`list_sessions_in` 全量列举取最新 10；上游无此命令，pi-rs 扩展对齐新管线）；core/mod.rs 的未用 SessionManager 再导出移除。627 项测试全绿，pty 冒烟（名字/预览/时长——注意冒烟目录会积累每次运行的空会话，截断断言前先清理），fmt/clippy 干净。

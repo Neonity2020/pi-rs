@@ -1625,24 +1625,42 @@ impl InteractiveMode {
 				let _ = self.session.cmd_tx.send(SessionCommand::Compact);
 			}
 			"sessions" => {
-				let sessions = crate::core::SessionManager::list_recent(10);
+				// Upstream has no /sessions slash command (the selector covers
+				// it); this pi-rs listing uses the SessionInfo pipeline.
+				let sessions = crate::core::session_manager::list_sessions_in(
+					&crate::config::sessions_dir(),
+					None,
+				);
 				if sessions.is_empty() {
 					self.push_notice("no saved sessions yet".into());
 				} else {
-					let text = sessions
-						.iter()
-						.map(|(dir, entries)| {
-							format!(
-								"  {:<28} {} entries",
-								dir.file_name()
-									.map(|n| n.to_string_lossy().into_owned())
-									.unwrap_or_default(),
-								entries
-							)
-						})
-						.collect::<Vec<_>>()
-						.join("\n");
-					self.push_notice(format!("recent sessions:\n{text}"));
+					let mut text = String::from("Recent sessions:\n");
+					for session in sessions.iter().take(10) {
+						let age = {
+							let diff = pi_ai::types::now_ms().saturating_sub(session.modified_ms);
+							let days = diff / 86_400_000;
+							if diff < 3_600_000 {
+								format!("{}m", diff / 60_000)
+							} else if days < 1 {
+								format!("{}h", diff / 3_600_000)
+							} else if days < 30 {
+								format!("{}d", days)
+							} else {
+								format!("{}mo", days / 30)
+							}
+						};
+						let title = session
+							.name
+							.clone()
+							.unwrap_or_else(|| session.first_message.clone());
+						text.push_str(&format!(
+							"  {:>4}  {}  ({} msgs)\n",
+							age,
+							title.chars().take(70).collect::<String>(),
+							session.message_count
+						));
+					}
+					self.push_notice(text);
 				}
 			}
 			other => {
