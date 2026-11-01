@@ -77,6 +77,43 @@ pub fn export_session_to_jsonl(
 	Ok(file_path)
 }
 
+pub fn import_session_from_jsonl(path: &Path, root: &Path, cwd: &Path) -> Result<PathBuf, String> {
+	let text = std::fs::read_to_string(path)
+		.map_err(|error| format!("Could not read file {path:?}: {error}"))?;
+	let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+	let header_line = lines
+		.next()
+		.ok_or_else(|| format!("Not a session export (empty file): {path:?}"))?;
+	let header_value: serde_json::Value = serde_json::from_str(header_line)
+		.map_err(|error| format!("Not a session export (bad header): {error}"))?;
+	if header_value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
+		return Err(format!(
+			"Not a session export (missing session header): {path:?}"
+		));
+	}
+	let entries: Vec<crate::core::session_manager::SessionEntry> = lines
+		.map(|line| {
+			let value: serde_json::Value = serde_json::from_str(line)
+				.map_err(|error| format!("Malformed entry in {path:?}: {error}"))?;
+			crate::core::session_manager::SessionEntry::from_value(&value)
+				.ok_or_else(|| format!("Unrecognized entry in {path:?}"))
+		})
+		.collect::<Result<_, _>>()?;
+
+	let mut manager =
+		crate::core::session_manager::SessionManager::create_with_parent_in(root, cwd, None)
+			.map_err(|error| format!("Could not create the import directory: {error}"))?;
+	for entry in entries {
+		manager
+			.append(entry)
+			.map_err(|error| format!("Import failed while writing: {error}"))?;
+	}
+	Ok(manager
+		.session_dir()
+		.map(Path::to_path_buf)
+		.unwrap_or_else(|| root.to_path_buf()))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -151,6 +188,42 @@ mod tests {
 			export_session_to_jsonl(&manager, Some(Path::new("out/log.jsonl")), &cwd).unwrap();
 		assert_eq!(path, cwd.join("out/log.jsonl"));
 		assert!(path.exists());
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn import_round_trips_an_export_into_a_fresh_directory() {
+		let dir = temp_dir("import");
+		let cwd = dir.join("cwd");
+		std::fs::create_dir_all(&cwd).unwrap();
+		let mut manager =
+			SessionManager::create_with_parent_in(&dir, Path::new("/tmp/work"), None).unwrap();
+		manager
+			.append(SessionEntry::new(
+				crate::core::session_manager::EntryKind::Message {
+					message: Box::new(Message::user("exported one")),
+				},
+			))
+			.unwrap();
+		let export_path = export_session_to_jsonl(&manager, None, &cwd).unwrap();
+		let exported_header_id = crate::core::session_manager::build_session_info(&export_path)
+			.unwrap()
+			.id;
+
+		let imported_dir =
+			import_session_from_jsonl(&export_path, &dir, Path::new("/tmp/other")).unwrap();
+		let (header, entries) =
+			crate::core::session_manager::load_session_file(&imported_dir.join("session.jsonl"));
+		let header = header.expect("valid imported header");
+		assert_ne!(header.id, exported_header_id, "fresh session id on import");
+		assert_eq!(header.cwd, "/tmp/other");
+		assert_eq!(entries.len(), 1, "the exported entry survives");
+		let entry_value = entries[0].to_value();
+		let text = entry_value
+			.pointer("/message/content/0/text")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or_default();
+		assert_eq!(text, "exported one");
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }

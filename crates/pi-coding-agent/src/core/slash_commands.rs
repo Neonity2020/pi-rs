@@ -76,6 +76,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info(
+		"import",
+		"import a session from a JSONL export (/import <path>)",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"hotkeys",
 		"show the resolved keybindings",
 		SlashCommandSource::Builtin,

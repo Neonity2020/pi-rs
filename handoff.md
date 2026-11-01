@@ -234,3 +234,7 @@ cargo fmt --all -- --check
 ## 第二十三轮：/sessions 升级（2026-10-31，主会话单线）
 
 基线 `9e5b996`：`/sessions` 从 dir+条目计数 stub 升级为 SessionInfo 摘要（年龄右对齐 + 名字或首条消息预览 70 字符 + 消息计数，`list_sessions_in` 全量列举取最新 10；上游无此命令，pi-rs 扩展对齐新管线）；core/mod.rs 的未用 SessionManager 再导出移除。627 项测试全绿，pty 冒烟（名字/预览/时长——注意冒烟目录会积累每次运行的空会话，截断断言前先清理），fmt/clippy 干净。
+
+## 第二十四轮：/import 命令（2026-10-31，主会话单线）
+
+基线 `bcc6c07`（上游 `handleImportCommand`，去确认对话框）：`core/session_export.rs` 增 `import_session_from_jsonl`（校验首行 session 头 → 新建目录（新 session id 防双目录同 id——声明偏差，上游替换活会话）→ 逐条 append 线性重链、条目 id 保留；根/子路径错误均带文件名文案）；interactive `/import <path.jsonl>`（非 .jsonl 报 usage）导入即 `SwitchSession` 到新目录（"Session imported:" + "session → " 通知触发聊天重建，与导出/导入往返 pty 冒烟实证：2 个新目录、双通知）。628 项测试全绿（+1 导入往返），fmt/clippy 干净。坑：`items after a test module`（clippy）——追加函数落到 tests 模块后要移回前面；孤立 doc 注释残留会 parse fail。

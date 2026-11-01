@@ -1223,6 +1223,35 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/import <path.jsonl>` (upstream `handleImportCommand`, minus the
+	/// confirm dialog): import the export into a fresh session directory and
+	/// switch to it.
+	fn handle_import_command(&mut self, args: &str) {
+		let path = args.trim().trim_matches('"').trim_matches('\'');
+		if path.is_empty() {
+			self.push_notice("Usage: /import <path.jsonl>".into());
+			return;
+		}
+		if !path.ends_with(".jsonl") {
+			self.push_notice("Usage: /import <path.jsonl>".into());
+			return;
+		}
+		let outcome = crate::core::session_export::import_session_from_jsonl(
+			std::path::Path::new(path),
+			&crate::config::sessions_dir(),
+			std::path::Path::new(&self.cwd),
+		);
+		match outcome {
+			Ok(dir) => {
+				let _ = self.session.cmd_tx.send(SessionCommand::SwitchSession {
+					path: dir.display().to_string(),
+				});
+				self.push_notice(format!("Session imported: {}", dir.display()));
+			}
+			Err(error) => self.push_notice(format!("Failed to import session: {error}")),
+		}
+	}
+
 	/// `/fork [n]` (upstream `showUserMessageSelector`, first slice): no
 	/// argument lists the transcript's user messages with 1-based indexes;
 	/// `/fork <n>` forks before that message (the new branch re-roots at its
@@ -1566,6 +1595,7 @@ impl InteractiveMode {
 			"session" => self.handle_session_command(),
 			"hotkeys" => self.handle_hotkeys_command(),
 			"fork" => self.handle_fork_command(args),
+			"import" => self.handle_import_command(args),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "
