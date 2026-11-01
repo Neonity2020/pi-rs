@@ -1223,6 +1223,73 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
+	/// `/hotkeys` (upstream `handleHotkeysCommand`): the resolved keybinding
+	/// rows in a plain-text two-column layout (notices render as plain
+	/// lines, not markdown tables).
+	fn handle_hotkeys_command(&mut self) {
+		let rows: [(&str, &str); 24] = [
+			(
+				"Move cursor / browse history",
+				"tui.editor.cursorUp+tui.editor.cursorDown+tui.editor.cursorLeft+tui.editor.cursorRight",
+			),
+			(
+				"Move by word",
+				"tui.editor.cursorWordLeft+tui.editor.cursorWordRight",
+			),
+			(
+				"Start / end of line",
+				"tui.editor.cursorLineStart+tui.editor.cursorLineEnd",
+			),
+			("Page up / down", "tui.editor.pageUp+tui.editor.pageDown"),
+			("Send message", "tui.input.submit"),
+			("New line", "tui.input.newLine"),
+			(
+				"Delete word backward / forward",
+				"tui.editor.deleteWordBackward+tui.editor.deleteWordForward",
+			),
+			(
+				"Delete to line start / end",
+				"tui.editor.deleteToLineStart+tui.editor.deleteToLineEnd",
+			),
+			("Yank / yank pop", "tui.editor.yank+tui.editor.yankPop"),
+			("Undo", "tui.editor.undo"),
+			("Tab / autocomplete", "tui.input.tab"),
+			("Abort run / cancel", "app.interrupt"),
+			("Exit (empty editor)", "app.exit"),
+			("Suspend to background", "app.suspend"),
+			("Cycle thinking level", "app.thinking.cycle"),
+			(
+				"Cycle models",
+				"app.model.cycleForward+app.model.cycleBackward",
+			),
+			("Open model selector", "app.model.select"),
+			("Toggle tool output", "app.tools.expand"),
+			("Toggle thinking blocks", "app.thinking.toggle"),
+			("External editor", "app.editor.external"),
+			("Copy last agent message", "app.message.copy"),
+			("Queue follow-up", "app.message.followUp"),
+			("Restore queued messages", "app.message.dequeue"),
+			("Session selector", "app.session.resume"),
+		];
+		let hint = |actions: &str| -> String {
+			actions
+				.split('+')
+				.map(|action| self.keybinding_hint(action, "-"))
+				.collect::<Vec<_>>()
+				.join("/")
+		};
+		let rows: Vec<(String, String)> = rows
+			.iter()
+			.map(|(label, actions)| ((*label).to_string(), hint(actions)))
+			.collect();
+		let width = rows.iter().map(|(keys, _)| keys.len()).max().unwrap_or(0) + 2;
+		let mut text = String::from("Keybindings\n");
+		for (label, keys) in rows {
+			text.push_str(&format!("{:<width$} {}\n", keys, label, width = width));
+		}
+		self.push_notice(text);
+	}
+
 	/// `/session` (upstream `handleSessionCommand`): name, file, id, message
 	/// counts, and the token/cost totals with the cached/uncached split. The
 	/// cache-warming and per-model breakdown sections have no port
@@ -1419,6 +1486,7 @@ impl InteractiveMode {
 			"copy" => self.handle_copy_command(),
 			"name" => self.handle_name_command(args),
 			"session" => self.handle_session_command(),
+			"hotkeys" => self.handle_hotkeys_command(),
 			"new" => {
 				// Upstream `handleClearCommand`: a fresh session (queued
 				// prompts are discarded by the replacement); the "session → "

@@ -218,3 +218,7 @@ cargo fmt --all -- --check
 ## 第十九轮：/session 信息命令（2026-10-31，主会话单线）
 
 基线 `0115b24`（上游 `handleSessionCommand` + `getSessionStats`）：统计逻辑从 rpc.rs 抽出为 `core/agent_session::compute_session_stats`（消息计数 + assistant/toolResult/usage 条目的用量求和），RPC `get_session_stats` 与 interactive `/session` 共用；`/session` 渲染 Name/File/ID、消息计数、Token 总量与 cached/uncached 拆分（上游 cache-warming 与按模型分解节无对应物，声明推迟）。**事故与恢复：用 `s.index("\n\tfn ")` 找方法边界时吞掉了 rpc.rs 后续方法与测试嵌套，靠 `git checkout -- rpc.rs` 还原后按真实方法边界（首个 `\n\t}\n`）重做手术式替换**——大块文本替换前先确认锚点唯一性。626 项测试维持全绿（RPC 45 项含 stats 聚合仍过），pty 冒烟渲染完整信息块，fmt/clippy 干净。
+
+## 第二十轮：/hotkeys 命令（2026-10-31，主会话单线）
+
+基线 `dc085d1`（上游 `handleHotkeysCommand`）：`/hotkeys` 渲染解析后的键位两列对齐表（Navigation/Editing/Other 三组 24 行，经 `keybinding_hint` 走 keybindings.json 覆盖；Notices 是纯文本行渲染故用对齐文本而非上游 markdown 表）。626 项测试维持全绿，pty 冒烟（表格 + 已解析键位 esc/ctrl+l），fmt/clippy 干净。

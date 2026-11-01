@@ -71,6 +71,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info(
+		"hotkeys",
+		"show the resolved keybindings",
+		SlashCommandSource::Builtin,
+	),
+	info(
 		"session",
 		"show session info and stats",
 		SlashCommandSource::Builtin,
