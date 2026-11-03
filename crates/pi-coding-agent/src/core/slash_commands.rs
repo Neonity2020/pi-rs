@@ -218,15 +218,19 @@ pub fn prefixed_description(description: &str, tag: &str) -> String {
 
 /// Build the dynamic command list from loaded resources: one
 /// `/<template-name>` entry per prompt template (description = template
-/// description with the source tag) and, when `enable_skill_commands` is on
-/// (upstream `settingsManager.getEnableSkillCommands()`), one
-/// `/skill:<name>` entry per skill (description = skill description).
-/// Submission needs no registration: slash names that match no builtin fall
-/// through to the prompt path where the session expands them.
+/// description with the source tag), one `/skill:<name>` entry per skill when
+/// `enable_skill_commands` is on (upstream
+/// `settingsManager.getEnableSkillCommands()`), and one entry per registered
+/// extension command (`name → description`, source [`SlashCommandSource::Extension`]).
+/// Submission needs no registration for templates/skills: slash names that
+/// match no builtin fall through to the prompt path where the session expands
+/// them; extension commands route through the session's extension-command
+/// execution (upstream `registerCommand`).
 pub fn dynamic_slash_commands(
 	templates: &[crate::core::prompt_templates::PromptTemplate],
 	skills: &[crate::core::skills::Skill],
 	enable_skill_commands: bool,
+	extension_commands: &[(String, String)],
 ) -> Vec<DynamicSlashCommand> {
 	let mut commands = Vec::new();
 	for template in templates {
@@ -246,6 +250,14 @@ pub fn dynamic_slash_commands(
 				argument_hint: None,
 			});
 		}
+	}
+	for (name, description) in extension_commands {
+		commands.push(DynamicSlashCommand {
+			name: name.clone(),
+			description: description.clone(),
+			source: SlashCommandSource::Extension,
+			argument_hint: None,
+		});
 	}
 	commands
 }
@@ -329,6 +341,7 @@ mod tests {
 			std::slice::from_ref(&template),
 			std::slice::from_ref(&skill),
 			true,
+			&[("session-name".into(), "Set or show session name".into())],
 		);
 		let rendered: Vec<(String, String, &str)> = commands
 			.iter()
@@ -336,6 +349,7 @@ mod tests {
 				let source = match command.source {
 					SlashCommandSource::Prompt => "prompt",
 					SlashCommandSource::Skill => "skill",
+					SlashCommandSource::Extension => "extension",
 					_ => "builtin",
 				};
 				(command.name.clone(), command.description.clone(), source)
@@ -346,6 +360,11 @@ mod tests {
 			vec![
 				("review".into(), "[p] Review code".into(), "prompt"),
 				("skill:demo".into(), "[u] Demo skill".into(), "skill"),
+				(
+					"session-name".into(),
+					"Set or show session name".into(),
+					"extension"
+				),
 			]
 		);
 		assert_eq!(commands[0].argument_hint.as_deref(), Some("<path>"));
@@ -356,12 +375,13 @@ mod tests {
 			std::slice::from_ref(&template),
 			std::slice::from_ref(&skill),
 			false,
+			&[],
 		);
 		assert_eq!(commands.len(), 1);
 		assert_eq!(commands[0].name, "review");
 
 		// Empty resources → empty dynamic list; BUILTIN stays untouched.
-		assert!(dynamic_slash_commands(&[], &[], false).is_empty());
+		assert!(dynamic_slash_commands(&[], &[], false, &[]).is_empty());
 		assert!(
 			BUILTIN_SLASH_COMMANDS
 				.iter()

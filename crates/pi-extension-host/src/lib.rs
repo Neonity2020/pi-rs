@@ -75,6 +75,10 @@ impl Default for HostConfig {
 }
 
 /// A registration announcement from the factory phase.
+///
+/// `description` (pi-extension-host round 14): command registrations carry
+/// their description as a top-level frame field (host.mjs `registerCommand`),
+/// so the slash-command table can render it. Absent for other capabilities.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Registration {
 	pub capability: String,
@@ -84,6 +88,8 @@ pub struct Registration {
 	pub event: Option<String>,
 	#[serde(default)]
 	pub api: Option<String>,
+	#[serde(default)]
+	pub description: Option<String>,
 	#[serde(default)]
 	pub definition: Option<Value>,
 }
@@ -423,6 +429,14 @@ impl ExtensionHost {
 			.collect()
 	}
 
+	/// Whether the host process has already exited (crash detection for the
+	/// failure-isolation wiring: a dispatch error against a dead host means
+	/// the extension is gone, not slow — pi-coding-agent round 14).
+	pub async fn has_exited(&self) -> bool {
+		let mut child = self.inner.child.lock().await;
+		matches!(child.try_wait(), Ok(Some(_)))
+	}
+
 	/// One-way `action` frames from the host (sync-API setters, appendEntry).
 	pub async fn actions(&self) -> Vec<HostCall> {
 		self.inner.actions.lock().await.clone()
@@ -492,6 +506,16 @@ impl ExtensionHost {
 			.await
 			.ok()
 			.flatten()
+	}
+
+	/// Non-blocking variant: take a host-initiated call if one is already
+	/// queued (pi-coding-agent round 14 — handlers may fire dialogs without
+	/// awaiting them, so the caller must drain the queue after the request
+	/// future completes; the frames are on the wire before the return frame,
+	/// so a queued call is deterministic).
+	pub async fn try_next_host_call(&self) -> Option<HostCall> {
+		let mut receiver = self.inner.host_calls.lock().await;
+		receiver.try_recv().ok()
 	}
 
 	/// Answer a host-initiated call.

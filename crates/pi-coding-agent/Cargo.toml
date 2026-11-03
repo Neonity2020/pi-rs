@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 pi-ai = { workspace = true }
 pi-agent = { workspace = true }
+pi-extension-host = { path = "../pi-extension-host" }
 pi-mcp = { workspace = true }
 pi-env = { workspace = true }
 pi-tui = { workspace = true }

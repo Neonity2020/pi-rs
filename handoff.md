@@ -359,3 +359,14 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - 集成：全工作区 **816 项测试**（809→816，+7 PoC）、fmt/clippy -D warnings 干净、difftest 6/6 IDENTICAL。
 
 **交接事项**：生产桥接线清单在实验文档 §6 末尾（-e 旗标/扩展目录/信任门→桥产物入会话→jiti 兜底→事件面补齐→runner 顺序审计）。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+
+## 第三十九轮：扩展桥生产接线（2026-11-04，主会话调研 + 1 个子 agent 纵向切片 + 主会话集成）
+
+基线 `e590940`（PoC 通过并推送，CI 全绿）。
+
+- **子 agent 纵向切片**：`core/extensions.rs`（发现顺序 项目→用户→CLI、index 入口、信任门 resolve_project_trust_gate 与 mcp.json 共用、ExtensionAssembly 逐扩展 spawn 20s 预算/失败隔离 notice/node 缺失整体禁用/teardown 三退出路径）；`-ne` 语义**纠正**：上游 noExtensions 跳过发现目录、显式 -e 仍加载（resource-loader.ts 实证）；ExtensionTool 实现 AgentTool（content/details/isError 映射、重名跳过）；before_tool_call 同步钩子经**专用 dispatcher 线程**（tokio worker 内 block_on 会 panic——实测）聚合 block/terminate；事件面 session_start(reason)/shutdown/turn/agent 生命周期/agent_settled/tool_result/before_agent_start+input（只通知，声明差异）；SessionCommand::ExtensionCommand + prompt() 顺序扩展命令最先（全模式）；ui.notify→Notice；interactive 斜杠菜单路由。
+- **修掉的两个真 bug**：桥持强 EventBus 令 print/rpc 在 session task 退出后等不到通道关闭而挂起（改 weak）；handler 不 await notify 时请求完成后帧滞留队列（with_host_answers + try_next_host_call drain）。
+- **集成（主会话）**：全工作区 **836 项测试**（816→836）、fmt/clippy -D warnings 干净、difftest 六场景 **6/6 IDENTICAL**（空 Assembly 不涉场景）。
+- 声明差异（代码注释）：ui.select/confirm/input 答复 null（TUI 对话框路由为下轮增量）、无 package.json manifest、会话替换 host 存活重发 session_start（上游重建运行时）、tool_result 不 await、每扩展一进程 spawn 延迟 20s 预算。
+
+**交接事项**：TUI 对话框路由 + sendMessage→prompt 注入（下轮自然增量）；jiti 兜底；包管理子命令；对照上游 runner 的事件顺序审计。改动未提交，等用户指令。

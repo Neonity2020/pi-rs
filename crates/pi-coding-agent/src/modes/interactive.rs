@@ -428,11 +428,13 @@ impl SlashMenu {
 
 /// The slash menu listing: the static builtin table plus the dynamic
 /// resource commands (prompt templates as `/<name>`, skills as
-/// `/skill:<name>` gated on the `enableSkillCommands` setting) — upstream
+/// `/skill:<name>` gated on the `enableSkillCommands` setting) and the
+/// registered extension commands — upstream
 /// `createBaseAutocompleteProvider` (interactive-mode.ts:788-821).
 fn slash_menu_items(
 	resources: &crate::core::agent_session::SessionResources,
 	enable_skill_commands: bool,
+	extension_commands: &[(String, String)],
 ) -> Vec<SelectItem> {
 	let mut items: Vec<SelectItem> = BUILTIN_SLASH_COMMANDS
 		.iter()
@@ -446,6 +448,7 @@ fn slash_menu_items(
 		&resources.prompt_templates,
 		&resources.skills,
 		enable_skill_commands,
+		extension_commands,
 	) {
 		let mut description = command.description;
 		if let Some(hint) = &command.argument_hint {
@@ -1870,6 +1873,7 @@ impl InteractiveMode {
 			self.slash_menu = Some(SlashMenu::new(slash_menu_items(
 				self.session.resources(),
 				enable_skill_commands,
+				&self.session.extension_commands(),
 			)));
 		}
 		let menu = self.slash_menu.as_mut().unwrap();
@@ -2619,8 +2623,9 @@ impl InteractiveMode {
 				for info in BUILTIN_SLASH_COMMANDS {
 					text.push_str(&format!("  /{:<10} {}\n", info.name, info.description));
 				}
-				// Dynamic resource commands (templates, skills) join the
-				// listing like upstream's /help reads the command registry.
+				// Dynamic resource commands (templates, skills) and the
+				// registered extension commands join the listing like
+				// upstream's /help reads the command registry.
 				let enable_skill_commands = crate::core::settings_manager::SettingsManager::load(
 					Some(std::path::Path::new(&self.cwd)),
 				)
@@ -2629,6 +2634,7 @@ impl InteractiveMode {
 					&self.session.resources().prompt_templates,
 					&self.session.resources().skills,
 					enable_skill_commands,
+					&self.session.extension_commands(),
 				) {
 					text.push_str(&format!(
 						"  /{:<10} {}\n",
@@ -2813,6 +2819,25 @@ impl InteractiveMode {
 				}
 			}
 			other => {
+				// Extension commands execute through the session task
+				// immediately — even during a run, like upstream
+				// `prompt()`'s extension-command branch. The response
+				// channel is dropped: outcomes surface as notices
+				// (`ui.notify` → chat notice) from the execution itself.
+				if self
+					.session
+					.extension_commands()
+					.iter()
+					.any(|(name, _)| name == other)
+				{
+					let (tx, _rx) = tokio::sync::oneshot::channel();
+					let _ = self.session.cmd_tx.send(SessionCommand::ExtensionCommand {
+						name: other.to_string(),
+						args: args.to_string(),
+						response: tx,
+					});
+					return;
+				}
 				// Template (`/<name>`) and skill (`/skill:<name>`) commands
 				// ride the prompt expansion path (upstream `prompt()` expands
 				// them; an unknown name passes through as an ordinary

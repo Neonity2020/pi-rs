@@ -16,7 +16,7 @@
 | `--thinking <level>` | args.ts:167-176 | CLI 优先于模型后缀和 settings；非法值警告 | 部分 | 尚未按具体模型能力裁剪档位 |
 | `-t --tools`（含 +name/-name）/ `-xt` / `-nt` / `-nbt` | args.ts:147-166 | `-t/--tools`、`-xt/--exclude-tools`、`-nt/--no-tools`、`-nbt/--no-builtin-tools`（组合短旗标经 argv 预处理），settings `defaultTools` 两层合并 | 已验证 | 第七轮 tool_selection 移植；无效 `--tools` 诊断 exit 1 |
 | `--system-prompt` / `--append-system-prompt` | args.ts:121-125 | 支持文本、文件及多次追加；会话替换时保留 | 部分 | 原有系统提示词仍是 pi-rs 简化版本，非上游结构化 sections |
-| `-e --extension` / `-ne --no-extensions` | args.ts:186-190 | 无 | 未实现 | 依赖扩展系统（P3） |
+| `-e --extension` / `-ne --no-extensions` | args.ts:186-190 | `-e <文件\|目录>` 可重复（目录 index 入口）、`-ne` 跳过发现目录而显式路径仍加载（对照 resource-loader noExtensions 语义）；发现顺序 项目→用户→CLI；信任门共用 resolve_project_trust_gate；每扩展一 node 进程、失败隔离 notice（tests/extensions_cli.rs 2026-11-04） | 已验证(部分) | 无 package.json `pi.extensions` manifest；仅 node 运行时；会话替换 host 存活（上游重建运行时，声明偏差） |
 | `--no-mcp` | args.ts:191-192 | `main.rs` 跳过 MCP 信任、配置加载及服务启动 | 已验证 | `tests/no_mcp.rs` 以真实子进程验证禁用及默认启用路径（2026-10-31） |
 | `--skill` / `--prompt-template` 系 | args.ts:193-198,210-213 | `--skill <路径>` 与 `--prompt-template <路径>` 可重复 + `--no-skills`/`-ns`、`--no-prompt-templates`/`-np`（跳默认目录显式路径仍加载）；skills.rs/prompt_templates.rs 全量移植（发现/校验/冲突 first-wins/symlink 去重/gitignore-aware；模板 bash 风格参数替换）；`/skill:<name>` 与 `/模板` 展开有真子进程测试（tests/skills_prompts_cli.rs 2026-11-03） | 已验证 | 上游 input handlers/extension interception 未移植（无扩展 runner）；SourceInfo 简化为作用域标记；排序确定性 first-wins（Node 为 OS 序） |
 | `--theme` / `--use-theme` / `--no-themes` | args.ts:199-209,214-215 | `--theme <path>` 可重复加载额外主题文件；`--use-theme <name>` 运行期覆盖（对照 applyOverrides，不落盘）；`--no-themes` 跳过用户主题；另有 `--light`（上游无） | 已验证(部分) | 主题文件解析失败回退内置并 notice |

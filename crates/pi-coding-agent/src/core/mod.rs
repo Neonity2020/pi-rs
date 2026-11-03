@@ -9,6 +9,7 @@ pub mod context_usage;
 pub mod diagnostics;
 pub mod event_bus;
 pub mod export_html;
+pub mod extensions;
 pub mod frontmatter;
 pub mod image_process;
 pub mod json_event;

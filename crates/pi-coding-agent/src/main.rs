@@ -209,6 +209,18 @@ struct Cli {
 	#[arg(long, value_name = "PATH")]
 	skill: Vec<String>,
 
+	/// Load an extension file or directory (can be repeated; upstream
+	/// `--extension`, `-e`). Relative paths resolve against the cwd; a
+	/// directory loads its `index.ts`/`index.js` entry or, without one, is
+	/// discovered like the default directories.
+	#[arg(short = 'e', long, value_name = "PATH")]
+	extension: Vec<String>,
+
+	/// Disable extension discovery (the user/project directories) — explicit
+	/// `--extension` paths still load (upstream `--no-extensions`, `-ne`).
+	#[arg(long)]
+	no_extensions: bool,
+
 	/// Disable skills discovery and loading — the default directories are
 	/// skipped while explicit `--skill` paths still load (upstream
 	/// `--no-skills`, `-ns`).
@@ -464,6 +476,9 @@ fn rewrite_combined_short_args(args: Vec<String>) -> Vec<String> {
 				"-na" => "--no-approve".into(),
 				"-ns" => "--no-skills".into(),
 				"-np" => "--no-prompt-templates".into(),
+				// `-ne` is `--no-extensions` (upstream args.ts:189), not
+				// `-n` with value `e`.
+				"-ne" => "--no-extensions".into(),
 				other => other.to_string(),
 			}
 		})
@@ -1245,28 +1260,28 @@ async fn main() -> anyhow::Result<()> {
 	// project's, gated on project trust. One server failing becomes a notice;
 	// all servers failing does not block startup. The assembly must outlive
 	// the agent so the server processes stay owned until exit.
+	// Project trust — one decision for every project-local resource
+	// (upstream `resolveProjectTrusted`): `-a`/`-na` decide for this run
+	// without prompting or storing (upstream `projectTrustOverride`);
+	// otherwise the stored decision applies and an interactive TTY is
+	// prompted once when project-local resources exist. Print/json/rpc never
+	// prompt — project resources are skipped with notices. The decision
+	// gates the project `.pi/mcp.json` AND the project `.pi/extensions/`
+	// (extension trust gate, round 14).
+	let project_trust_override = if cli.no_approve {
+		Some(false)
+	} else if cli.approve {
+		Some(true)
+	} else {
+		None
+	};
+	let mut trust_notices: Vec<String> = Vec::new();
+	let project_trusted =
+		resolve_project_trust_gate(&cwd, app_mode, project_trust_override, &mut trust_notices)?;
 	let mut mcp = if cli.no_mcp {
 		crate::core::tools::McpAssembly::default()
 	} else {
-		// Trust gate: a project `.pi/mcp.json` loads only for trusted
-		// projects. `-a`/`-na` override the decision for this run without
-		// prompting or storing (upstream `projectTrustOverride`); otherwise
-		// interactive runs get a one-time prompt whose answer is stored, and
-		// print/rpc skip project servers with a notice instead.
-		let project_trust_override = if cli.no_approve {
-			Some(false)
-		} else if cli.approve {
-			Some(true)
-		} else {
-			None
-		};
-		let mut trust_notices: Vec<String> = Vec::new();
-		resolve_project_mcp_trust(&cwd, app_mode, project_trust_override, &mut trust_notices)?;
-		let mut config = mcp_config::load_mcp_config_with(
-			&cwd,
-			trust::resolve_project_trusted(&cwd, project_trust_override),
-		)
-		.await;
+		let mut config = mcp_config::load_mcp_config_with(&cwd, project_trusted).await;
 		for server in &mut config.servers {
 			let server_cwd = server
 				.cwd
@@ -1302,6 +1317,62 @@ async fn main() -> anyhow::Result<()> {
 			.as_ref()
 			.is_some_and(|matcher| matcher.matches(name))
 	});
+	// Extension bridge (round 14): discover entries and spawn the host
+	// processes. Discovery order mirrors upstream `discoverAndLoadExtensions`:
+	// project `.pi/extensions/` (trust-gated via the decision above), the
+	// user `extensions/` directory, then the CLI paths; `-ne` skips the two
+	// default directories while explicit `-e` paths still load (upstream
+	// resource-loader `noExtensions` semantics).
+	let mut extensions = {
+		let cli_paths: Vec<PathBuf> = cli
+			.extension
+			.iter()
+			.map(|path| resolve_file_argument(path, &startup_cwd))
+			.collect();
+		let mut discovered = crate::core::extensions::discover_extension_paths(
+			crate::core::extensions::DiscoveryOptions {
+				cli_paths: &cli_paths,
+				cwd: &cwd,
+				agent_dir: &crate::config::agent_dir(),
+				include_defaults: !cli.no_extensions,
+				project_trusted,
+			},
+		);
+		let mut assembly = crate::core::extensions::spawn_extensions(
+			discovered.entries,
+			&crate::core::extensions::SpawnOptions {
+				cwd: cwd.clone(),
+				// `ctx.hasUI`: true only where dialog-capable UI exists.
+				// Upstream also reports true for RPC (dialog forwarding);
+				// pi-rs has no RPC extension-UI channel yet — declared
+				// difference, extensions see hasUI=false in rpc mode.
+				has_ui: app_mode == AppMode::Interactive,
+				runtime: "node".to_string(),
+			},
+		)
+		.await;
+		assembly
+			.notices
+			.splice(..0, std::mem::take(&mut discovered.notices));
+		assembly
+	};
+	// Bridged tools join the union after MCP (a bridged tool named like an
+	// existing builtin/MCP tool is skipped with a notice — first registration
+	// wins, matching the tool-table behavior).
+	{
+		let mut names: std::collections::HashSet<String> =
+			tools.iter().map(|tool| tool.name().to_string()).collect();
+		for tool in extensions.bridge.extension_tools() {
+			if !names.insert(tool.name().to_string()) {
+				extensions.notices.push(format!(
+					"extension tool \"{}\" conflicts with an already-registered tool; skipped",
+					tool.name()
+				));
+				continue;
+			}
+			tools.push(tool);
+		}
+	}
 	// Skills + prompt templates (upstream loadResources in main.ts): user
 	// `agentDir/{skills,prompts}` and project `.pi/{skills,prompts}` defaults
 	// — skipped by `--no-skills`/`--no-prompt-templates` — then explicit
@@ -1343,6 +1414,9 @@ async fn main() -> anyhow::Result<()> {
 		crate::core::agent_session::SessionResources {
 			skills: skills.skills,
 			prompt_templates: prompt_templates.templates,
+			// The bridge rides with the resources so it is in place before
+			// the session task's first loop pass fires `session_start`.
+			extensions: Some(extensions.bridge.clone()),
 		}
 	};
 	let prompt_options = crate::core::system_prompt::SystemPromptOptions {
@@ -1457,6 +1531,16 @@ async fn main() -> anyhow::Result<()> {
 		stream_fn: Some(authed_stream_fn(registry.clone())),
 		..AgentOptions::default()
 	});
+	// Extension hooks (`tool_call`/`tool_result`/`before_agent_start`) ride
+	// on the startup agent; session replacement re-installs them on the
+	// rebuilt agent (agent_session.rs `apply_replacement`).
+	if !extensions.bridge.is_empty() {
+		extensions.bridge.install_hooks(&agent);
+	}
+	// The bridge Arc outlives the assembly move below so the three exit
+	// paths can run the teardown (session_shutdown → host shutdown ladder).
+	let extension_bridge = extensions.bridge.clone();
+	let mut extension_notices = std::mem::take(&mut extensions.notices);
 
 	// Upstream print-mode.ts:122-127 opens the JSON stream with the session
 	// header line; capture it before the manager moves into the session task
@@ -1490,11 +1574,17 @@ async fn main() -> anyhow::Result<()> {
 		for notice in mcp_notices.drain(..) {
 			eprintln!("mcp: {notice}");
 		}
+		for notice in extension_notices.drain(..) {
+			eprintln!("extensions: {notice}");
+		}
 		for notice in startup_notices.drain(..) {
 			eprintln!("{notice}");
 		}
 		let result = modes::rpc::run_rpc(handle, registry).await;
-		// Session shutdown: close the MCP server transports before returning.
+		// Session shutdown: tear the extension hosts down (session_shutdown
+		// dispatch → graceful host ladder), then close the MCP server
+		// transports before returning.
+		extension_bridge.shutdown().await;
 		if let Some(runtime) = &mcp_runtime {
 			runtime.lock().await.assembly.shutdown().await;
 		}
@@ -1526,6 +1616,9 @@ async fn main() -> anyhow::Result<()> {
 		for notice in mcp_notices.drain(..) {
 			eprintln!("mcp: {notice}");
 		}
+		for notice in extension_notices.drain(..) {
+			eprintln!("extensions: {notice}");
+		}
 		for notice in startup_notices.drain(..) {
 			eprintln!("{notice}");
 		}
@@ -1544,9 +1637,11 @@ async fn main() -> anyhow::Result<()> {
 			file_images,
 		)
 		.await?;
-		// Close the MCP transports before the forced exit —
-		// std::process::exit skips destructors, so the graceful close ladder
-		// (and the orphan guard's SIGKILL) must run explicitly here.
+		// Tear the extension hosts down, then close the MCP transports before
+		// the forced exit — std::process::exit skips destructors, so the
+		// graceful close ladders (and the orphan guard's SIGKILL) must run
+		// explicitly here.
+		extension_bridge.shutdown().await;
 		if let Some(runtime) = &mcp_runtime {
 			runtime.lock().await.assembly.shutdown().await;
 		}
@@ -1590,6 +1685,11 @@ async fn main() -> anyhow::Result<()> {
 	ui.initial_images = file_images;
 	ui.notices
 		.extend(mcp_notices.drain(..).map(|notice| format!("mcp: {notice}")));
+	ui.notices.extend(
+		extension_notices
+			.drain(..)
+			.map(|notice| format!("extensions: {notice}")),
+	);
 	ui.notices.extend(startup_notices);
 	let mode = modes::interactive::InteractiveMode::with_session_root(
 		handle,
@@ -1600,8 +1700,11 @@ async fn main() -> anyhow::Result<()> {
 		session_root,
 	);
 	let result = mode.run(initial_prompt).await;
-	// Session shutdown: close the MCP server transports (graceful ladder,
-	// process group reaped) before main drops the assembly.
+	// Session shutdown: tear the extension hosts down (session_shutdown
+	// dispatch → graceful host ladder), then close the MCP server transports
+	// (graceful ladder, process group reaped) before main drops the
+	// assemblies.
+	extension_bridge.shutdown().await;
 	if let Some(runtime) = &mcp_runtime {
 		runtime.lock().await.assembly.shutdown().await;
 	}
@@ -1613,52 +1716,75 @@ fn is_tty() -> bool {
 	std::io::stdin().is_terminal()
 }
 
-/// Trust gate for the project-level `.pi/mcp.json` — the pi-rs cut of
-/// upstream `resolveProjectTrusted` (which gates every project resource).
+/// Trust gate for project-local resources — the pi-rs cut of upstream
+/// `resolveProjectTrusted` (which gates every project resource), covering the
+/// project `.pi/mcp.json` and the project `.pi/extensions/` directory.
 /// `-a`/`-na` (`projectTrustOverride`, main.ts:741-770) decide for this run
-/// without prompting or touching the trust store. Trusted or absent projects
-/// pass through; an interactive TTY gets a one-time prompt whose answer is
-/// stored in the trust file; print/rpc/json (non-interactive) never prompt —
-/// the project file is skipped with a notice. Ctrl+C at the prompt errors
-/// out of startup.
-fn resolve_project_mcp_trust(
+/// without prompting or touching the trust store. Trusted projects pass
+/// through; an interactive TTY gets a one-time prompt (the raw-mode prompt
+/// when the MCP config exists, a line-based confirm for extensions-only
+/// projects) whose answer is stored in the shared trust file; print/rpc/json
+/// (non-interactive) never prompt — project resources are skipped with a
+/// notice. A project with no local resources is not prompted about and never
+/// writes the store. Returns the decision. Ctrl+C at the prompt errors out
+/// of startup.
+fn resolve_project_trust_gate(
 	cwd: &Path,
 	app_mode: AppMode,
 	project_trust_override: Option<bool>,
 	notices: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
 	let project_config = cwd.join(".pi").join("mcp.json");
-	if !project_config.exists() {
-		return Ok(());
+	let project_extensions = cwd.join(".pi").join("extensions");
+	if !project_config.exists() && !project_extensions.is_dir() {
+		// Nothing project-local to gate: no prompt, no store write.
+		return Ok(false);
 	}
 	let Some(trusted_override) = project_trust_override else {
 		if trust::is_trusted(cwd) {
-			return Ok(());
+			return Ok(true);
 		}
 		let interactive_tty = app_mode == AppMode::Interactive;
 		if !interactive_tty {
-			notices.push(format!(
-				"project {} exists but the project is not trusted; project MCP servers are skipped",
-				project_config.display()
-			));
-			return Ok(());
+			if project_config.exists() {
+				notices.push(format!(
+					"project {} exists but the project is not trusted; project MCP servers are skipped",
+					project_config.display()
+				));
+			}
+			return Ok(false);
 		}
-		match trust::prompt_trust(&project_config)? {
-			true => trust::trust(cwd)?,
-			false => notices.push(format!(
-				"project {} was not trusted; project MCP servers are skipped",
-				project_config.display()
-			)),
+		let answer = if project_config.exists() {
+			trust::prompt_trust(&project_config)?
+		} else {
+			prompt_confirm(&format!(
+				"Trust project extensions ({})?",
+				project_extensions.display()
+			))
+		};
+		match answer {
+			true => {
+				trust::trust(cwd)?;
+				return Ok(true);
+			}
+			false => {
+				if project_config.exists() {
+					notices.push(format!(
+						"project {} was not trusted; project MCP servers are skipped",
+						project_config.display()
+					));
+				}
+				return Ok(false);
+			}
 		}
-		return Ok(());
 	};
-	if !trusted_override {
+	if !trusted_override && project_config.exists() {
 		notices.push(format!(
 			"project {} is ignored because the project is not trusted (--no-approve); project MCP servers are skipped",
 			project_config.display()
 		));
 	}
-	Ok(())
+	Ok(trusted_override)
 }
 
 #[cfg(test)]
@@ -1741,6 +1867,8 @@ mod tests {
 			offline: false,
 			skill: Vec::new(),
 			no_skills: false,
+			extension: Vec::new(),
+			no_extensions: false,
 			prompt_template: Vec::new(),
 			no_prompt_templates: false,
 			prompt: Vec::new(),

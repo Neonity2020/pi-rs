@@ -211,6 +211,16 @@ pub enum SessionCommand {
 	SetSessionName {
 		name: String,
 	},
+	/// Run a registered extension command directly (interactive `/name`).
+	/// The prompt path reaches the same handler through the `Prompt` branch's
+	/// extension-command check (upstream `prompt()` order), so this variant
+	/// exists for the interactive slash router, which must not send an
+	/// "unknown command" prompt before the session task can match.
+	ExtensionCommand {
+		name: String,
+		args: String,
+		response: tokio::sync::oneshot::Sender<Result<(), String>>,
+	},
 	Exit,
 }
 
@@ -350,11 +360,14 @@ pub(crate) type SharedLogRef = Arc<std::sync::Mutex<SharedLog>>;
 /// `resourceLoader.getSkills()` and `session.promptTemplates`). The session
 /// task consults them to expand `/skill:<name>` commands and `/<template>`
 /// commands on the `Prompt` path; the interactive mode reads the same lists
-/// for the slash menu.
+/// for the slash menu. `extensions` carries the spawned extension bridge
+/// (round 14): it rides here because it must be in place before the session
+/// task's first loop pass fires `session_start`.
 #[derive(Clone, Default)]
 pub struct SessionResources {
 	pub skills: Vec<super::skills::Skill>,
 	pub prompt_templates: Vec<super::prompt_templates::PromptTemplate>,
+	pub extensions: Option<Arc<super::extensions::ExtensionBridge>>,
 }
 
 /// State shared between the session task and the mode handles. The task
@@ -472,6 +485,23 @@ impl SessionHandle {
 	/// Startup skills and prompt templates (slash menu, help listing).
 	pub fn resources(&self) -> &SessionResources {
 		&self.shared.resources
+	}
+
+	/// Bridged extension commands (`/name → description`) for the slash menu,
+	/// help listing, and the `handle_slash` router. Empty without extensions.
+	pub fn extension_commands(&self) -> Vec<(String, String)> {
+		self.shared
+			.resources
+			.extensions
+			.as_ref()
+			.map(|bridge| {
+				bridge
+					.command_defs()
+					.into_iter()
+					.map(|command| (command.name, command.description))
+					.collect()
+			})
+			.unwrap_or_default()
 	}
 
 	pub fn configure_mcp(
@@ -924,6 +954,22 @@ async fn session_task(
 		bus.emit(SessionEvent::Notice(text));
 	};
 
+	// Extension bridge (round 14): publish the bus so `ui.notify` calls reach
+	// the mode channels, then fire `session_start{reason:"startup"}` — the
+	// upstream runner fires it when the runtime is created, before any prompt.
+	let extensions = shared.resources.extensions.clone();
+	if let Some(bridge) = &extensions {
+		bridge.set_bus(event_bus.clone());
+		bridge
+			.dispatch_event_all(
+				"session_start",
+				json!({"type": "session_start", "reason": "startup"}),
+				super::extensions::EXT_EVENT_TIMEOUT,
+			)
+			.await;
+		apply_extension_actions(bridge, &log, &shared, &event_bus).await;
+	}
+
 	loop {
 		// Derived probes, refreshed each iteration before awaiting: the flag
 		// updates lag a spawn by one loop pass at most (microseconds — the
@@ -945,6 +991,17 @@ async fn session_task(
 		// they are re-emitted — only the settle waits for the drain.
 		let settled = idle && agent_rx.is_empty();
 		if settled && !was_idle {
+			// `agent_settled` to the bridge before the mode event so a
+			// reacting extension's notices land with the run's own tail.
+			if let Some(bridge) = &extensions {
+				bridge
+					.dispatch_event_all(
+						"agent_settled",
+						json!({"type": "agent_settled", "aborted": abort_requested}),
+						super::extensions::EXT_EVENT_TIMEOUT,
+					)
+					.await;
+			}
 			event_bus.emit(SessionEvent::Settled {
 				aborted: abort_requested,
 			});
@@ -958,6 +1015,48 @@ async fn session_task(
 				let Some(command) = command else { break };
 				match command {
 					SessionCommand::Prompt { text, images } => {
+						// Upstream `prompt()` order (agent-session.ts:2101-2136):
+						// extension commands execute first — before the
+						// expansion and before the queueing decisions — even
+						// during streaming. An executed command is not a prompt.
+						if text.starts_with('/')
+							&& let Some(bridge) = &extensions
+							&& let Some((name, args)) = bridge.match_command(&text)
+						{
+							match bridge.execute_command(&name, &args).await {
+								Ok(()) => {}
+								Err(error) => notice(&event_bus, error),
+							}
+							apply_extension_actions(bridge, &log, &shared, &event_bus).await;
+							// Upstream `prompt()` returns ("handled") once the
+							// command executed; the print-mode await-equivalent
+							// is the settle boundary, so an idle session emits
+							// it here — the loop-top tracking never left idle,
+							// and during a run the run's own settle fires.
+							let idle = run.is_none()
+								&& compacting.is_none()
+								&& nav.is_none()
+								&& pending.is_empty()
+								&& !agent.is_streaming();
+							if idle {
+								event_bus.emit(SessionEvent::Settled { aborted: false });
+							}
+							continue;
+						}
+						// `input` event: fired after the extension-command
+						// check, before skill/template expansion. Upstream
+						// handlers may transform or swallow the input — the
+						// bridge dispatches and ignores the outcomes (declared
+						// limitation).
+						if let Some(bridge) = &extensions {
+							bridge
+								.dispatch_event_all(
+									"input",
+									json!({"type": "input", "text": text}),
+									super::extensions::EXT_EVENT_TIMEOUT,
+								)
+								.await;
+						}
 						// Expand `/skill:<name>` and `/<template>` commands
 						// before queueing decisions (upstream `prompt()` runs
 						// the expansions before the streaming/compaction
@@ -1146,6 +1245,7 @@ async fn session_task(
 									shared: &shared,
 									settings: &settings,
 									plan,
+									session_start_reason: Some("new"),
 									navigate: None,
 								})
 								.await;
@@ -1175,6 +1275,7 @@ async fn session_task(
 									shared: &shared,
 									settings: &settings,
 									plan,
+									session_start_reason: Some("resume"),
 									navigate: None,
 								})
 								.await;
@@ -1204,6 +1305,7 @@ async fn session_task(
 									shared: &shared,
 									settings: &settings,
 									plan,
+									session_start_reason: Some("fork"),
 									navigate: None,
 								})
 								.await;
@@ -1214,17 +1316,17 @@ async fn session_task(
 						}
 					}
 					SessionCommand::RpcReplacement { operation, response } => {
-						let planned = match operation {
-							RpcReplacement::New { parent_session } => plan_new_session(&log, parent_session).map(|plan| (plan, None)),
-							RpcReplacement::Switch { path } => plan_switch_session(&path).map(|plan| (plan, None)),
-							RpcReplacement::Fork { entry_id } => plan_fork(&log, &entry_id, ForkPosition::Before),
+						let (planned, session_start_reason) = match operation {
+							RpcReplacement::New { parent_session } => (plan_new_session(&log, parent_session).map(|plan| (plan, None)), "new"),
+							RpcReplacement::Switch { path } => (plan_switch_session(&path).map(|plan| (plan, None)), "resume"),
+							RpcReplacement::Fork { entry_id } => (plan_fork(&log, &entry_id, ForkPosition::Before), "fork"),
 							RpcReplacement::Clone => {
 								let leaf = log.lock().unwrap().session.leaf_id().map(str::to_owned);
-								leaf.ok_or_else(|| "Cannot clone session: no current entry selected".to_string()).and_then(|id| plan_fork(&log, &id, ForkPosition::At))
+								(leaf.ok_or_else(|| "Cannot clone session: no current entry selected".to_string()).and_then(|id| plan_fork(&log, &id, ForkPosition::At)), "fork")
 							}
 							RpcReplacement::Import { path } => {
 								let current_dir = log.lock().unwrap().session.session_dir().map(Path::to_path_buf);
-								plan_import_session(&path, current_dir.as_deref()).map(|plan| (plan, None))
+								(plan_import_session(&path, current_dir.as_deref()).map(|plan| (plan, None)), "resume")
 							}
 						};
 						let result = match planned {
@@ -1236,7 +1338,8 @@ async fn session_task(
 									compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
 									agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
 									overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
-									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan, navigate: None,
+									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan,
+									session_start_reason: Some(session_start_reason), navigate: None,
 								}).await;
 								agent = new_agent;
 								agent_rx = new_rx;
@@ -1341,7 +1444,8 @@ async fn session_task(
 								compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
 								agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
 								overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
-								retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan, navigate: None,
+								retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan,
+								session_start_reason: None, navigate: None,
 							}).await;
 							agent = new_agent;
 							agent_rx = new_rx;
@@ -1428,6 +1532,20 @@ async fn session_task(
 							}
 							Err(error) => notice(&event_bus, format!("session write failed: {error}")),
 						}
+					}
+					SessionCommand::ExtensionCommand { name, args, response } => {
+						// Same execution path as the `Prompt` branch check
+						// (upstream `_tryExecuteExtensionCommand`); the
+						// response channel serves the interactive router.
+						let result = match &extensions {
+							Some(bridge) => {
+								let outcome = bridge.execute_command(&name, &args).await;
+								apply_extension_actions(bridge, &log, &shared, &event_bus).await;
+								outcome
+							}
+							None => Err("no extensions loaded".into()),
+						};
+						let _ = response.send(result);
 					}
 					SessionCommand::Exit => break,
 				}
@@ -1673,7 +1791,8 @@ async fn session_task(
 									compacting_flag: &compacting_flag, compacting: &mut compacting, run: &mut run,
 									agent_rx: &mut agent_rx, pending: &mut pending, abort_requested: &mut abort_requested,
 									overflow_attempted: &mut overflow_attempted, recovery_compaction: &mut recovery_compaction,
-									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan, navigate: None,
+									retry_cancel: &mut retry_cancel, shared: &shared, settings: &settings, plan,
+									session_start_reason: None, navigate: None,
 								}).await;
 								agent = new_agent;
 								agent_rx = new_rx;
@@ -1759,6 +1878,17 @@ async fn session_task(
 								.unwrap()
 								.push_back(will_retry);
 						}
+						// turn_start/turn_end/agent_start/agent_end reach the
+						// bridge (upstream runner dispatches the same
+						// lifecycle events; payloads use the upstream field
+						// names reduced to what pi-agent emits).
+						if let Some(bridge) = &extensions
+							&& let Some((event, payload)) = extension_agent_event_payload(&agent_event)
+						{
+							bridge
+								.dispatch_event_all(event, payload, super::extensions::EXT_EVENT_TIMEOUT)
+								.await;
+						}
 						event_bus.emit(SessionEvent::Agent(Box::new(agent_event)));
 					}
 					Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
@@ -1804,6 +1934,54 @@ async fn session_task(
 		if persist_messages(&agent, &mut guard, &event_bus) {
 			flush_pending_bash(&agent, &mut guard, &event_bus);
 		}
+	}
+}
+
+/// Apply the one-way `action` frames the extension hosts recorded since the
+/// last drain. Only `pi.setSessionName` is honored (it maps onto the
+/// `SetSessionName` command's entry write + wire event);
+/// `appendEntry`/`setActiveTools`/`setThinkingLevel` are acknowledged and
+/// ignored (declared bridge limitation).
+async fn apply_extension_actions(
+	bridge: &super::extensions::ExtensionBridge,
+	log: &SharedLogRef,
+	shared: &Arc<SessionShared>,
+	bus: &EventBus<SessionEvent>,
+) {
+	for name in bridge.drain_actions().await {
+		let result = log.lock().unwrap().session.append_session_info(&name);
+		match result {
+			Ok(_) => {
+				let current = log.lock().unwrap().session.session_name();
+				*shared.session_name.lock().unwrap() = current.clone();
+				shared.emit(WireEvent::SessionInfoChanged { name: current });
+			}
+			Err(error) => bus.emit(SessionEvent::Notice(format!(
+				"session write failed: {error}"
+			))),
+		}
+	}
+}
+
+/// Map an agent event onto the extension event name + payload. `None` for
+/// events the bridge does not forward (message_* / tool_execution_* — the
+/// tool face crosses the hooks, and message deltas would be per-chunk noise).
+fn extension_agent_event_payload(event: &AgentEvent) -> Option<(&'static str, Value)> {
+	match event {
+		AgentEvent::AgentStart => Some(("agent_start", json!({"type": "agent_start"}))),
+		AgentEvent::AgentEnd { messages } => Some((
+			"agent_end",
+			json!({"type": "agent_end", "messages": messages}),
+		)),
+		AgentEvent::TurnStart => Some(("turn_start", json!({"type": "turn_start"}))),
+		AgentEvent::TurnEnd {
+			message,
+			tool_results,
+		} => Some((
+			"turn_end",
+			json!({"type": "turn_end", "message": message, "toolResults": tool_results}),
+		)),
+		_ => None,
 	}
 }
 
@@ -2597,6 +2775,10 @@ struct ReplacementContext<'a> {
 	shared: &'a Arc<SessionShared>,
 	settings: &'a CompactionSettings,
 	plan: ReplacementPlan,
+	/// `session_start.reason` re-fired on the surviving extension hosts after
+	/// the swap (`new`/`resume`/`fork`; `None` for tree navigation, which is
+	/// not a session start upstream).
+	session_start_reason: Option<&'static str>,
 	/// `/tree` navigation: the log mutation applied after the teardown (so
 	/// the old branch is fully persisted first) replaces `plan`.
 	navigate: Option<NavPlan>,
@@ -2843,6 +3025,23 @@ async fn apply_replacement(
 			tools.extend(runtime.assembly.tools.iter().cloned());
 		}
 	}
+	// Extension tools rejoin the rebuilt table: the bridge hosts stay alive
+	// across replacement (declared deviation — upstream rebuilds the whole
+	// extension runtime per session), so their tools are re-created against
+	// the same registrations. Conflicts with the rebuilt builtin/MCP names
+	// are skipped with a notice.
+	if let Some(bridge) = ctx.shared.resources.extensions.as_ref() {
+		for tool in bridge.extension_tools() {
+			if tools.iter().any(|existing| existing.name() == tool.name()) {
+				ctx.event_bus.emit(SessionEvent::Notice(format!(
+					"extension tool \"{}\" conflicts with an active tool; skipped",
+					tool.name()
+				)));
+				continue;
+			}
+			tools.push(tool);
+		}
+	}
 	if let Some(index) = tools.iter().position(|tool| tool.name() == "bash") {
 		let session = &plan.new_session;
 		let context = super::tools::bash::SessionToolContext {
@@ -2888,6 +3087,11 @@ async fn apply_replacement(
 		ctx.settings.clone(),
 		ctx.event_bus.downgrade(),
 	);
+	// The replacement builds a fresh agent: re-install the extension hooks
+	// (`tool_call`/`tool_result`/`before_agent_start`) on it.
+	if let Some(bridge) = ctx.shared.resources.extensions.as_ref() {
+		bridge.install_hooks(&new_agent);
+	}
 
 	// -- swap the shared state ---------------------------------------------
 	{
@@ -2903,6 +3107,24 @@ async fn apply_replacement(
 	ctx.shared
 		.publish_session(&ctx.log.lock().unwrap().session, &new_agent);
 	ctx.event_bus.emit(SessionEvent::SessionReplaced);
+	// Upstream rebuilds the extension runtime per replacement and fires
+	// `session_start(reason)` on the new one; the bridge keeps the hosts
+	// alive across the swap and re-fires `session_start(reason)` on them
+	// instead (declared deviation — no `session_shutdown` on the hosts here,
+	// matching the "runtime persists" choice).
+	if let (Some(reason), Some(bridge)) = (
+		ctx.session_start_reason,
+		ctx.shared.resources.extensions.as_ref(),
+	) {
+		bridge
+			.dispatch_event_all(
+				"session_start",
+				json!({"type": "session_start", "reason": reason}),
+				super::extensions::EXT_EVENT_TIMEOUT,
+			)
+			.await;
+		apply_extension_actions(bridge, ctx.log, ctx.shared, ctx.event_bus).await;
+	}
 	let destination = ctx
 		.shared
 		.current_session_file
@@ -3462,6 +3684,87 @@ mod tests {
 			stream_fn: Some(agent_stream_fn()),
 			..Default::default()
 		})
+	}
+
+	/// Session replacement re-fires `session_start` on the surviving
+	/// extension bridge with the replacement reason (declared deviation from
+	/// upstream, which rebuilds the extension runtime entirely).
+	#[tokio::test(flavor = "multi_thread")]
+	async fn session_start_is_refired_on_replacement_with_the_reason() {
+		let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/extensions/session-start-log.ts");
+		if std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.is_err()
+		{
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let cwd = std::env::temp_dir().join(format!(
+			"pi-rs-ext-replace-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let _ = std::fs::remove_dir_all(&cwd);
+		std::fs::create_dir_all(&cwd).unwrap();
+		let assembly = crate::core::extensions::spawn_extensions(
+			vec![(fixture.display().to_string(), fixture)],
+			&crate::core::extensions::SpawnOptions {
+				cwd: cwd.clone(),
+				has_ui: false,
+				runtime: "node".to_string(),
+			},
+		)
+		.await;
+		assert!(assembly.notices.is_empty(), "{:?}", assembly.notices);
+
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let resources = SessionResources {
+			extensions: Some(assembly.bridge.clone()),
+			..Default::default()
+		};
+		let mut handle = spawn_agent_session_with_options(
+			mock_agent(),
+			SessionManager::in_memory(),
+			registry,
+			CompactionSettings::default(),
+			crate::core::system_prompt::SystemPromptOptions::default(),
+			crate::core::settings_manager::RetrySettings::default(),
+			resources,
+		);
+		handle
+			.cmd_tx
+			.send(SessionCommand::NewSession {
+				parent_session: None,
+			})
+			.unwrap();
+
+		// Collect until both reasons surfaced (the bridge answers the notify
+		// dialogs with notices on the session bus). Generous budget: the host
+		// spawn shares the machine with every other test in the suite.
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		let mut seen = Vec::new();
+		while tokio::time::Instant::now() < deadline
+			&& !seen.iter().any(|text: &String| text.contains("start:new"))
+		{
+			match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+				Ok(Ok(SessionEvent::Notice(text))) => seen.push(text),
+				Ok(Ok(_)) => {}
+				Ok(Err(_)) | Err(_) => break,
+			}
+		}
+		assert!(
+			seen.iter().any(|text| text.contains("start:startup")),
+			"startup reason missing: {seen:?}"
+		);
+		assert!(
+			seen.iter().any(|text| text.contains("start:new")),
+			"replacement reason missing: {seen:?}"
+		);
+		assembly.bridge.shutdown().await;
+		drop(handle);
+		std::fs::remove_dir_all(&cwd).unwrap();
 	}
 
 	fn agent_stream_fn() -> pi_ai::StreamFn {

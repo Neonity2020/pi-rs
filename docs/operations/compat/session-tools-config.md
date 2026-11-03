@@ -66,7 +66,7 @@
 | 动态命令（第十二轮） | `/skill:<name>` / `/<模板名>` | skills 与提示词模板注册为斜杠命令（SlashCommandSource 的 Skill/Prompt 变体首次通路）；`skill:` 命令受 settings `enableSkillCommands` 门控；展开语义对照上游 prompt()（`/skill:` 先于模板展开，展开文本作为用户消息落盘） |
 | 未实现（导出/分享） | /share /bug | 依赖 pi.dev/Radius/gist 上传服务（声明差异，P3 后） |
 | 未实现（资源/登录） | /login /logout /llama | OAuth 未实现（约 1900 行 TS，依赖 pi.dev 端点） |
-| SlashCommandSource | extension/prompt/skill 注册通路 | prompt/skill 已通路（第十二轮）；extension 通路待扩展宿主 PoC（实验设计 docs/operations/extensions-host-experiment.md） |
+| SlashCommandSource | extension/prompt/skill 注册通路 | 三者全通路：prompt/skill（第十二轮）、extension（第十四轮——桥注册命令进 dynamic_slash_commands，prompt() 顺序扩展命令最先，全模式可执行） |
 
 `/tree` 声明差异（interactive.rs 模块注释）：分支总结完成 LLM 生成与 entry 落盘但无 readFiles/modifiedFiles 追踪；树选择器无折叠/标签编辑/复制/水平滚动；abort 时 steer 队列消息不能还原编辑器。
 

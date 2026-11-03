@@ -1327,6 +1327,7 @@ dependencies = [
  "pi-agent",
  "pi-ai",
  "pi-env",
+ "pi-extension-host",
  "pi-mcp",
  "pi-tui",
  "ratatui",
