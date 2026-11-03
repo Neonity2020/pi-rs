@@ -34,6 +34,10 @@ ignore = "0.4"
 # rg-compatible `--glob` matching (`*` crosses `/`), which the ignore crate's
 # gitignore-style overrides do not provide.
 globset = "0.4"
+# @file image attachments: decode/resize/re-encode for the inline image
+# pipeline (upstream uses Photon WASM; image crate is the native stand-in).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
 clap = { workspace = true }
 dirs = { workspace = true }
 unicode-width = { workspace = true }

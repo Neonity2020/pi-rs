@@ -6,9 +6,14 @@
 //! unknown APIs return an explicit error.
 
 pub mod anthropic;
+pub mod google_generative_ai;
+pub mod google_vertex;
 mod json_repair;
+pub mod mistral_conversations;
 pub mod mock;
 pub mod openai_completions;
+pub mod openai_responses;
+pub mod pi_messages;
 
 use std::sync::Arc;
 
@@ -22,6 +27,12 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 	match model.api.as_str() {
 		Api::ANTHROPIC_MESSAGES => anthropic::stream_fn(),
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
+		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
+		Api::AZURE_OPENAI_RESPONSES => openai_responses::azure_stream_fn(),
+		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
+		Api::GOOGLE_VERTEX => google_vertex::stream_fn(),
+		Api::MISTRAL_CONVERSATIONS => mistral_conversations::stream_fn(),
+		Api::PI_MESSAGES => pi_messages::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {
 			let error = crate::types::AssistantMessage::error(

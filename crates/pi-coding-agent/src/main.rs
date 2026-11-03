@@ -266,27 +266,15 @@ fn resolve_file_argument(arg: &str, cwd: &Path) -> PathBuf {
 	normalized
 }
 
-/// Extensions this build treats as images for `@file` (upstream
-/// `detectSupportedImageMimeTypeFromFile` sniffs magic bytes for png/jpeg/
-/// webp/gif; the extension key is the pi-rs stand-in — no image pipeline).
-fn is_image_extension(path: &Path) -> bool {
-	matches!(
-		path.extension()
-			.map(|ext| ext.to_string_lossy().to_lowercase())
-			.as_deref(),
-		Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" | "heic" | "heif")
-	)
-}
-
-/// Port of `cli/file-processor.ts` `processFileArguments` (text path only):
-/// each argument is resolved against the cwd, BOM-stripped, and appended as a
-/// `<file name="absolute path">\ncontent\n</file>\n` block. Missing files and
-/// read failures print the upstream stderr line and exit 1; empty files are
-/// skipped. Image attachments are not implemented in this build — image
-/// extensions take the upstream `processImage`-failure text shape with a
-/// not-implemented message.
-fn process_file_arguments(file_args: &[String], cwd: &Path) -> String {
+/// Port of `cli/file-processor.ts` `processFileArguments`: each argument is
+/// resolved against the cwd; image files (magic-number sniffed) become
+/// inline attachments via `core/image_process`, text files are BOM-stripped
+/// and appended as `<file name="absolute path">\ncontent\n</file>\n` blocks.
+/// Missing files and read failures print the upstream stderr line and exit
+/// 1; empty files are skipped.
+fn process_file_arguments(file_args: &[String], cwd: &Path) -> (String, Vec<pi_ai::ImageContent>) {
 	let mut text = String::new();
+	let mut images = Vec::new();
 	for file_arg in file_args {
 		// `resolveReadPath`'s stripAtPrefix: a second `@` is stripped here
 		// (args.ts already removed one at parse time), so `@@x` and `@x`
@@ -308,12 +296,32 @@ fn process_file_arguments(file_args: &[String], cwd: &Path) -> String {
 			// Skip empty files.
 			continue;
 		}
-		if is_image_extension(&absolute_path) {
-			// Upstream failure-path shape: `text += `<file name="…">${message}</file>\n``.
-			text.push_str(&format!(
-				"<file name=\"{}\">Image attachments are not implemented in this build</file>\n",
-				absolute_path.display()
-			));
+		if let Some(mime_type) =
+			crate::core::image_process::detect_supported_image_mime_type_from_file(&absolute_path)
+		{
+			// Image attachment: process (normalize/resize) and attach; the
+			// `<file>` block carries the processing hints.
+			let bytes = std::fs::read(&absolute_path).unwrap_or_default();
+			match crate::core::image_process::process_image(&bytes, mime_type, true) {
+				Ok(processed) => {
+					images.push(pi_ai::ImageContent {
+						data: processed.data,
+						mime_type: processed.mime_type,
+					});
+					let hints = processed.hints.join("\n");
+					text.push_str(&format!(
+						"<file name=\"{}\">{hints}</file>\n",
+						absolute_path.display()
+					));
+				}
+				Err(error) => {
+					text.push_str(&format!(
+						"<file name=\"{}\">{}</file>\n",
+						absolute_path.display(),
+						error.message()
+					));
+				}
+			}
 			continue;
 		}
 		match std::fs::read_to_string(&absolute_path) {
@@ -334,7 +342,7 @@ fn process_file_arguments(file_args: &[String], cwd: &Path) -> String {
 			}
 		}
 	}
-	text
+	(text, images)
 }
 
 /// Port of `cli/initial-message.ts` `buildInitialMessage`: piped stdin
@@ -745,6 +753,14 @@ async fn main() -> anyhow::Result<()> {
 		startup_settings.effective().session_dir.as_deref(),
 		&startup_cwd,
 	);
+	// `--session-dir` overrides the sessions root (upstream flag): publish the
+	// resolved root through the environment variable `config::sessions_dir()`
+	// honors, so the helpers that resolve the default root agree with the
+	// flag (CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings
+	// `sessionDir`). Edition-2024 `set_var` is unsafe; this runs at startup,
+	// before any task is spawned on the runtime.
+	// SAFETY: startup, before the runtime spawns tasks that read the env.
+	unsafe { std::env::set_var(crate::config::SESSION_DIR_ENV, &session_root) };
 
 	// `--export` (main.ts:640-652) renders and exits before any session or
 	// runtime is built; the first positional is the output path.
@@ -1189,7 +1205,7 @@ async fn main() -> anyhow::Result<()> {
 	// `@file` injection (cli/file-processor.ts): file blocks are appended to
 	// the first prompt — stdin content, then file text, then the first
 	// message, joined with no separator (buildInitialMessage).
-	let file_text = process_file_arguments(&file_args, &startup_cwd);
+	let (file_text, file_images) = process_file_arguments(&file_args, &startup_cwd);
 	let (initial_message, remaining_messages) =
 		build_initial_message(piped_prompt, &file_text, &messages);
 
@@ -1207,8 +1223,14 @@ async fn main() -> anyhow::Result<()> {
 		} else {
 			modes::print::PrintOutputMode::Text
 		};
-		let code = modes::print::run_print(handle, output_mode, session_header_line, print_prompts)
-			.await?;
+		let code = modes::print::run_print(
+			handle,
+			output_mode,
+			session_header_line,
+			print_prompts,
+			file_images,
+		)
+		.await?;
 		// Close the MCP transports before the forced exit —
 		// std::process::exit skips destructors, so the graceful close ladder
 		// (and the orphan guard's SIGKILL) must run explicitly here.
@@ -1251,6 +1273,8 @@ async fn main() -> anyhow::Result<()> {
 		&theme_files,
 		!cli.no_themes,
 	);
+	ui.external_editor = ui_config::resolve_external_editor(settings.external_editor.as_deref());
+	ui.initial_images = file_images;
 	ui.notices
 		.extend(mcp_notices.drain(..).map(|notice| format!("mcp: {notice}")));
 	ui.notices.extend(startup_notices);
@@ -1479,7 +1503,7 @@ mod tests {
 		std::fs::write(dir.join("plain.txt"), "plain\ncontent").unwrap();
 		std::fs::write(dir.join("empty.txt"), "").unwrap();
 
-		let text = process_file_arguments(
+		let (text, images) = process_file_arguments(
 			&[
 				"bom.txt".to_string(),
 				"empty.txt".to_string(),
@@ -1487,6 +1511,7 @@ mod tests {
 			],
 			&dir,
 		);
+		assert!(images.is_empty(), "text files carry no attachments");
 		let abs_bom = dir.join("bom.txt").display().to_string();
 		let abs_plain = dir.join("plain.txt").display().to_string();
 		// The file's own trailing newline is preserved, so the wrapper adds a
@@ -1507,22 +1532,43 @@ mod tests {
 		// escape for a literal leading `@` exists.
 		let dir = temp_dir("at-at");
 		std::fs::write(dir.join("x.txt"), "found").unwrap();
-		let text = process_file_arguments(&["@x.txt".to_string()], &dir);
+		let (text, images) = process_file_arguments(&["@x.txt".to_string()], &dir);
 		assert!(text.contains("found"));
+		assert!(images.is_empty());
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]
-	fn image_arguments_take_the_upstream_failure_text_shape() {
+	fn image_arguments_attach_and_reference_the_file() {
 		let dir = temp_dir("image");
-		std::fs::write(dir.join("pic.png"), b"not really a png").unwrap();
-		let text = process_file_arguments(&["pic.png".to_string()], &dir);
+		// A real 3x2 PNG (magic-byte sniffed, not by extension).
+		let image = image::DynamicImage::new_rgb8(3, 2);
+		let mut buffer = std::io::Cursor::new(Vec::new());
+		image
+			.write_to(&mut buffer, image::ImageFormat::Png)
+			.unwrap();
+		std::fs::write(dir.join("pic.png"), buffer.get_ref()).unwrap();
+		let (text, images) = process_file_arguments(&["pic.png".to_string()], &dir);
 		let abs = dir.join("pic.png").display().to_string();
-		assert_eq!(
-			text,
-			format!(
-				"<file name=\"{abs}\">Image attachments are not implemented in this build</file>\n"
-			)
+		assert_eq!(images.len(), 1, "attachment collected");
+		assert_eq!(images[0].mime_type, "image/png");
+		assert!(
+			text.contains(&format!("<file name=\"{abs}\"></file>")),
+			"{text}"
+		);
+		// A file that sniffs as PNG (valid signature + IHDR) but fails to
+		// decode takes the upstream failure text shape.
+		let mut broken = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+		broken.extend_from_slice(&13u32.to_be_bytes());
+		broken.extend_from_slice(b"IHDR");
+		broken.extend_from_slice(&[0u8; 13]);
+		broken.extend_from_slice(&[0u8; 4]);
+		std::fs::write(dir.join("broken.png"), &broken).unwrap();
+		let (text, images) = process_file_arguments(&["broken.png".to_string()], &dir);
+		assert!(images.is_empty());
+		assert!(
+			text.contains("[Image omitted: could not be converted"),
+			"{text}"
 		);
 		std::fs::remove_dir_all(&dir).unwrap();
 	}

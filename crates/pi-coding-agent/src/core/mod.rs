@@ -2,14 +2,17 @@
 //! port of `pi/packages/coding-agent/src/core/*`.
 
 pub mod agent_session;
+pub mod clipboard;
 pub mod compaction;
 pub mod context_usage;
 pub mod event_bus;
 pub mod export_html;
+pub mod image_process;
 pub mod json_event;
 pub mod mcp_config;
 pub mod model_registry;
 pub mod retry;
+pub mod session_export;
 pub mod session_manager;
 pub mod settings_manager;
 pub mod slash_commands;
@@ -18,5 +21,3 @@ pub mod tool_selection;
 pub mod tools;
 pub mod trust;
 pub mod ui_config;
-
-pub use session_manager::SessionManager;

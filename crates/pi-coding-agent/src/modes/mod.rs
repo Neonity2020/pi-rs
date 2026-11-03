@@ -3,3 +3,4 @@
 pub mod interactive;
 pub mod print;
 pub mod rpc;
+pub mod session_selector;

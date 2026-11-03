@@ -26,7 +26,7 @@
 //! steering-queued messages cannot be restored to the editor on abort (only
 //! prompts queued while busy come back via the navigation outcome).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 use pi_agent::AgentEvent;
-use pi_ai::{Message, Model, StopReason};
+use pi_ai::{Message, Model, StopReason, ThinkingLevel};
 use pi_tui::components::{
 	Component, SelectAction, SelectItem, SelectList, TreeAction, TreeCategory, TreeFilterMode,
 	TreeItem, TreeSelector, markdown_lines,
@@ -53,9 +53,12 @@ use crate::core::agent_session::{
 	RpcReplacement, SessionCommand, SessionEvent, SessionHandle, TreeNavResult, WireEvent,
 };
 use crate::core::model_registry::{ModelRegistry, add_provider};
-use crate::core::session_manager::EntryKind;
+use crate::core::session_manager::{EntryKind, SessionInfo};
 use crate::core::slash_commands::BUILTIN_SLASH_COMMANDS;
 use crate::core::ui_config::UiConfig;
+use crate::modes::session_selector::{
+	SelectorAction, SessionScope, SessionSelectorOverlay, StatusKind,
+};
 
 #[derive(Default)]
 struct ProviderWizard {
@@ -120,6 +123,14 @@ enum ChatBlock {
 		rendered: Option<(usize, Vec<Line<'static>>)>,
 	},
 	Notice(String),
+	/// Passthrough bash (`!cmd`): live output tail while running, full text
+	/// (or the spill-file note) once done.
+	Bash {
+		command: String,
+		output: String,
+		status: String,
+		rendered: Option<(usize, Vec<Line<'static>>)>,
+	},
 }
 
 struct ModelOverlay {
@@ -314,6 +325,50 @@ type PendingTreeNav = (
 	Option<String>,
 );
 
+/// Slash-command autocomplete — the editor-typed `/` menu (upstream
+/// `tui/src/autocomplete.ts` `CombinedAutocompleteProvider` slash branch plus
+/// the interactive-mode fuzzy items): while the first token is still
+/// `/name`, the menu lists commands fuzzy-filtered by the text after the
+/// slash; confirming completes to `/name ` in the editor.
+struct SlashMenu {
+	list: SelectList,
+}
+
+impl SlashMenu {
+	fn new() -> Self {
+		let items: Vec<SelectItem> = BUILTIN_SLASH_COMMANDS
+			.iter()
+			.map(|info| SelectItem {
+				value: info.name.to_string(),
+				label: format!("/{}", info.name),
+				description: Some(info.description.to_string()),
+			})
+			.collect();
+		let mut list = SelectList::new(items, 8);
+		list.set_no_match_message("No matching commands");
+		Self { list }
+	}
+}
+
+/// The live fuzzy query when the editor text qualifies for the slash menu:
+/// starts with `/`, still a single token (no whitespace yet — argument
+/// completion has no provider in this port) and not a lone `/` line with
+/// other lines. `None` closes the menu.
+fn slash_command_query(text: &str) -> Option<&str> {
+	let command = text.strip_prefix('/')?;
+	if command.contains(char::is_whitespace) {
+		return None;
+	}
+	Some(command)
+}
+
+/// Upstream `applyCompletion` slash branch: the selected name completes the
+/// token and a trailing space cues the argument position. The qualifying
+/// editor text IS the token, so the replacement is total.
+fn apply_slash_completion(name: &str) -> String {
+	format!("/{name} ")
+}
+
 pub struct InteractiveMode {
 	session: SessionHandle,
 	models: Vec<Model>,
@@ -361,9 +416,50 @@ pub struct InteractiveMode {
 	replacement_kind: ReplacementKind,
 	replacement_error_prefix: String,
 	replacement_status: Option<String>,
+	// Slash-command autocomplete anchored above the editor (live-filtered).
+	slash_menu: Option<SlashMenu>,
+	// Session selector overlay (/resume): owns its own state; async session
+	// listing and file mutations flow through the typed channel below.
+	session_overlay: Option<SessionSelectorOverlay>,
+	// /trust confirm overlay (a SelectList with two items).
+	trust_overlay: Option<(SelectList, std::path::PathBuf)>,
+	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
+	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
+	/// `@file` image attachments riding on the next prompt (`@file` text
+	/// files are inlined into the text; images wait for the first submit).
+	pending_images: Vec<pi_ai::ImageContent>,
+	/// A passthrough bash command is in flight (upstream `isBashRunning`).
+	bash_running: bool,
+	// External editor (ctrl+g): the terminal is suspended while the editor
+	// runs; the outcome comes back through the channel.
+	external_editor_cmd: String,
+	suspended: bool,
+	pending_external_editor: bool,
+	editor_tx: mpsc::UnboundedSender<ExternalEditorOutcome>,
+	editor_rx: mpsc::UnboundedReceiver<ExternalEditorOutcome>,
 	// UI-only messages from background tasks (git branch watcher).
 	ui_rx: mpsc::UnboundedReceiver<String>,
 	ui_tx: mpsc::UnboundedSender<String>,
+}
+
+/// Session listing progress/results for the selector overlay (upstream loads
+/// inline with an AbortController; the port spawns a blocking task and
+/// streams through this channel).
+enum SessionListMsg {
+	Progress {
+		scope: SessionScope,
+		loaded: usize,
+		total: usize,
+		partial: Vec<SessionInfo>,
+	},
+	Loaded {
+		scope: SessionScope,
+		sessions: Vec<SessionInfo>,
+	},
+	Status {
+		kind: StatusKind,
+		text: String,
+	},
 }
 
 pub fn format_tokens(count: u64) -> String {
@@ -395,6 +491,254 @@ pub fn format_duration(ms: u128) -> String {
 		let hours = minutes / 60;
 		format!("{hours}h {}m {rem}s", minutes % 60)
 	}
+}
+
+/// The thinking levels the current model accepts (upstream
+/// `getAvailableThinkingLevels`): everything for reasoning models, off only
+/// otherwise.
+fn thinking_levels_for_model(model: &Model) -> Vec<ThinkingLevel> {
+	if model.reasoning {
+		vec![
+			ThinkingLevel::Off,
+			ThinkingLevel::Minimal,
+			ThinkingLevel::Low,
+			ThinkingLevel::Medium,
+			ThinkingLevel::High,
+			ThinkingLevel::Xhigh,
+			ThinkingLevel::Max,
+		]
+	} else {
+		vec![ThinkingLevel::Off]
+	}
+}
+
+/// Passthrough bash block (`!cmd`): a `bash:` header with the status, then
+/// the output preview — live tail while running (upstream
+/// `bash-execution.ts` PREVIEW_LINES), first lines once done.
+fn render_bash_block(
+	command: &str,
+	output: &str,
+	status: &str,
+	width: usize,
+	theme: &Theme,
+) -> Vec<Line<'static>> {
+	let _ = width;
+	let mut lines = Vec::new();
+	let running = status == "running";
+	let status_color = match status {
+		"running" => theme.accent,
+		"done" => theme.success,
+		_ => theme.error,
+	};
+	lines.push(Line::from(vec![
+		Span::styled("  bash: ", Style::new().fg(theme.tool)),
+		Span::styled(command.to_string(), Style::new().fg(theme.assistant)),
+		Span::styled(format!("  ({status})"), Style::new().fg(status_color)),
+	]));
+	if !output.is_empty() {
+		let out_lines: Vec<&str> = output.lines().collect();
+		let preview = if running {
+			TOOL_RUNNING_PREVIEW_LINES
+		} else {
+			TOOL_PREVIEW_LINES
+		};
+		let (start, shown) = if running && out_lines.len() > preview {
+			(out_lines.len() - preview, preview)
+		} else {
+			(0, out_lines.len().min(preview))
+		};
+		for line in out_lines.iter().skip(start).take(shown) {
+			lines.push(Line::from(Span::styled(
+				format!("    {line}"),
+				Style::new().fg(theme.tool_output),
+			)));
+		}
+		let remaining = out_lines.len() - shown;
+		if remaining > 0 {
+			lines.push(Line::from(Span::styled(
+				format!("  … ({remaining} more lines)"),
+				Style::new().fg(theme.muted),
+			)));
+		}
+	}
+	lines
+}
+
+/// Chat blocks for a restored/replaced session's messages: tool calls pair
+/// with their results by id (calls without a persisted result render with
+/// empty output, results without a call are skipped).
+fn blocks_from_messages(messages: &[Message]) -> Vec<ChatBlock> {
+	let results: std::collections::HashMap<&str, &pi_ai::ToolResultMessage> = messages
+		.iter()
+		.filter_map(|m| match m {
+			Message::ToolResult(result) => Some((result.tool_call_id.as_str(), result)),
+			_ => None,
+		})
+		.collect();
+	let mut blocks = Vec::new();
+	for message in messages {
+		match message {
+			Message::System(_) | Message::ToolResult(_) => {}
+			Message::User(user) => blocks.push(ChatBlock::User(user.content.as_text())),
+			Message::Assistant(assistant) => {
+				blocks.push(ChatBlock::Assistant {
+					text: assistant.text(),
+					thinking: assistant.thinking(),
+					streaming: false,
+					stop_note: None,
+					error: assistant.error_message.clone(),
+					rendered: None,
+				});
+				for call in assistant.tool_calls() {
+					let result = results.get(call.id.as_str());
+					blocks.push(ChatBlock::Tool {
+						id: call.id.clone(),
+						name: call.name.clone(),
+						args: call.arguments.clone(),
+						running: false,
+						is_error: result.is_some_and(|r| r.is_error),
+						output: result.map(|r| r.text()).unwrap_or_default(),
+						started: None,
+						duration_ms: result.and_then(|r| r.duration_ms).map(u128::from),
+						rendered: None,
+					});
+				}
+			}
+		}
+	}
+	blocks
+}
+
+/// Accumulated usage over a restored transcript (the TUI counters restart
+/// from the messages after a session replacement).
+fn usage_of_messages(messages: &[Message]) -> (u64, u64, u64, u64, f64) {
+	let mut usage = (0u64, 0u64, 0u64, 0u64, 0.0f64);
+	for message in messages {
+		if let Message::Assistant(assistant) = message {
+			usage.0 += assistant.usage.input;
+			usage.1 += assistant.usage.output;
+			usage.2 += assistant.usage.cache_read;
+			usage.3 += assistant.usage.cache_write;
+			usage.4 += assistant.usage.cost.total.unwrap_or(0.0);
+		}
+	}
+	usage
+}
+
+/// Terminal input reader, restartable: the editor suspension pauses it by
+/// closing this sender's counterpart (dropping the EventStream releases the
+/// stdin read so the external editor owns keystrokes).
+fn spawn_term_reader(tx: mpsc::UnboundedSender<TermEvent>) -> mpsc::UnboundedSender<()> {
+	let (pause_tx, mut pause_rx) = mpsc::unbounded_channel();
+	tokio::spawn(async move {
+		let mut stream = crossterm::event::EventStream::new();
+		use futures::StreamExt;
+		loop {
+			tokio::select! {
+				event = stream.next() => {
+					match event {
+						Some(Ok(event)) => {
+							if tx.send(event).is_err() {
+								break;
+							}
+						}
+						_ => break,
+					}
+				}
+				_ = pause_rx.recv() => break,
+			}
+		}
+	});
+	pause_tx
+}
+
+/// External editor outcome (upstream `ExternalEditorResult`): edited
+/// content on success; failure leaves the prompt untouched.
+enum ExternalEditorOutcome {
+	Complete(String),
+	Failed,
+}
+
+/// Port of `editInExternalEditor` (`external-editor.ts`): write the prompt
+/// into a fresh `pi-editor-*` temp dir, run the editor with inherited
+/// stdio (the caller has suspended the TUI), read back on success. BOM and
+/// one trailing newline are stripped; spawn errors, non-zero exits and
+/// unreadable files all count as failed (upstream propagates the read
+/// throw; the port degrades to "failed").
+async fn run_external_editor(command: &str, content: &str) -> ExternalEditorOutcome {
+	let nanos = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.subsec_nanos();
+	let directory =
+		std::env::temp_dir().join(format!("pi-editor-{}-{}", std::process::id(), nanos));
+	if std::fs::create_dir_all(&directory).is_err() {
+		return ExternalEditorOutcome::Failed;
+	}
+	let file_path = directory.join("prompt.md");
+	let attempt = async {
+		std::fs::write(&file_path, content).map_err(|e| e.to_string())?;
+		let mut parts = command.split_whitespace();
+		let program = parts
+			.next()
+			.ok_or_else(|| "empty editor command".to_string())?;
+		let status = tokio::process::Command::new(program)
+			.args(parts)
+			.arg(&file_path)
+			.stdin(std::process::Stdio::inherit())
+			.stdout(std::process::Stdio::inherit())
+			.stderr(std::process::Stdio::inherit())
+			.status()
+			.await
+			.map_err(|e| e.to_string())?;
+		if !status.success() {
+			return Err("editor exited non-zero".to_string());
+		}
+		let text = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+		Ok(ExternalEditorOutcome::Complete(strip_editor_text(&text)))
+	}
+	.await;
+	let _ = std::fs::remove_dir_all(&directory);
+	attempt.unwrap_or(ExternalEditorOutcome::Failed)
+}
+
+/// `stripBom` + one trailing newline (upstream `.replace(/\n$/, "")`).
+fn strip_editor_text(text: &str) -> String {
+	let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+	text.strip_suffix('\n').unwrap_or(text).to_string()
+}
+
+/// Delete a session file, trying the `trash` CLI first, then unlink
+/// (upstream `deleteSessionFile`).
+fn delete_session_file(path: &std::path::Path) -> Result<&'static str, String> {
+	let display = path.to_string_lossy();
+	let mut command = std::process::Command::new("trash");
+	if display.starts_with('-') {
+		command.arg("--");
+	}
+	command.arg(path);
+	let trash_result = command.output();
+	let trash_hint = match &trash_result {
+		Ok(output) => String::from_utf8_lossy(&output.stderr)
+			.lines()
+			.next()
+			.map(str::trim)
+			.filter(|line| !line.is_empty())
+			.map(|line| format!("trash: {}", &line[..line.len().min(200)])),
+		Err(error) => Some(format!("trash: {error}")),
+	};
+	// If trash reports success, or the file is gone afterwards, treat it as
+	// successful.
+	let gone = !path.exists();
+	let trash_ok = matches!(&trash_result, Ok(output) if output.status.success());
+	if trash_ok || gone {
+		return Ok("Session moved to trash");
+	}
+	std::fs::remove_file(path).map_err(|error| match trash_hint {
+		Some(hint) => format!("{error} ({hint})"),
+		None => error.to_string(),
+	})?;
+	Ok("Session deleted")
 }
 
 /// Footer context segment (footer.ts render): `71.4%/200k`, or `?/200k` while
@@ -441,6 +785,13 @@ enum GlobalAction {
 	ModelSelect,
 	ToolsExpand,
 	ThinkingToggle,
+	SessionResume,
+	EditorExternal,
+	CopyMessage,
+	ModelCycleForward,
+	ModelCycleBackward,
+	SessionTree,
+	SessionFork,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -477,6 +828,27 @@ fn resolve_global_action(
 	if keybindings.matches("app.thinking.toggle", key) {
 		return Some(GlobalAction::ThinkingToggle);
 	}
+	if keybindings.matches("app.session.resume", key) {
+		return Some(GlobalAction::SessionResume);
+	}
+	if keybindings.matches("app.editor.external", key) {
+		return Some(GlobalAction::EditorExternal);
+	}
+	if keybindings.matches("app.message.copy", key) {
+		return Some(GlobalAction::CopyMessage);
+	}
+	if keybindings.matches("app.model.cycleForward", key) {
+		return Some(GlobalAction::ModelCycleForward);
+	}
+	if keybindings.matches("app.model.cycleBackward", key) {
+		return Some(GlobalAction::ModelCycleBackward);
+	}
+	if keybindings.matches("app.session.tree", key) {
+		return Some(GlobalAction::SessionTree);
+	}
+	if keybindings.matches("app.session.fork", key) {
+		return Some(GlobalAction::SessionFork);
+	}
 	None
 }
 
@@ -511,6 +883,9 @@ impl InteractiveMode {
 	) -> Self {
 		let (ui_tx, ui_rx) = mpsc::unbounded_channel();
 		let theme = ui.theme;
+		let (session_list_tx, session_list_rx) = mpsc::unbounded_channel();
+		let (editor_tx, editor_rx) = mpsc::unbounded_channel();
+		let external_editor_cmd = ui.external_editor.clone();
 		let mut mode = Self {
 			session,
 			models,
@@ -543,6 +918,18 @@ impl InteractiveMode {
 			replacement_kind: ReplacementKind::Switch,
 			replacement_error_prefix: "Session switch failed".into(),
 			replacement_status: None,
+			slash_menu: None,
+			session_overlay: None,
+			trust_overlay: None,
+			session_list_tx,
+			session_list_rx,
+			pending_images: ui.initial_images,
+			bash_running: false,
+			external_editor_cmd,
+			suspended: false,
+			pending_external_editor: false,
+			editor_tx,
+			editor_rx,
 			ui_rx,
 			ui_tx,
 		};
@@ -575,18 +962,27 @@ impl InteractiveMode {
 		}
 
 		let (term_tx, mut term_rx) = mpsc::unbounded_channel::<TermEvent>();
-		tokio::spawn(async move {
-			let mut stream = crossterm::event::EventStream::new();
-			use futures::StreamExt;
-			while let Some(Ok(event)) = stream.next().await {
-				if term_tx.send(event).is_err() {
-					break;
-				}
-			}
-		});
+		let mut term_pause = spawn_term_reader(term_tx.clone());
 
 		loop {
-			guard.terminal.draw(|frame| self.draw(frame))?;
+			if !self.suspended {
+				guard.terminal.draw(|frame| self.draw(frame))?;
+			}
+
+			// ctrl+g: pause the input reader first (an EventStream alive in
+			// the background would race the editor for keystrokes), hand the
+			// terminal over, then run the editor in the background.
+			if self.pending_external_editor {
+				self.pending_external_editor = false;
+				let _ = term_pause.send(());
+				guard.suspend();
+				self.suspended = true;
+				println!(
+					"Launching external editor: {}\nPi will resume when the editor exits.",
+					self.external_editor_cmd
+				);
+				self.spawn_external_editor();
+			}
 
 			tokio::select! {
 				event = self.session.events.recv() => {
@@ -678,12 +1074,32 @@ impl InteractiveMode {
 					}
 				}
 				event = self.session.wire_events.recv() => {
-					if let Ok(WireEvent::SessionInfoChanged { name }) = event {
-						self.push_notice(format!("Session name: {}", name.as_deref().unwrap_or("(none)")));
+					match event {
+						Ok(wire) => self.handle_wire_event(wire),
+						Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+							self.push_notice(format!("event lag: dropped {count} wire events"));
+						}
+						Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
 					}
 				}
 				Some(branch) = self.ui_rx.recv() => {
 					self.branch = Some(branch);
+				}
+				Some(msg) = self.session_list_rx.recv() => {
+					self.handle_session_list_msg(msg);
+				}
+				Some(outcome) = self.editor_rx.recv() => {
+					// The editor exited: bring the terminal back before any
+					// draw, then apply the edited prompt (failed edits leave
+					// the editor content unchanged, like upstream).
+					if self.suspended {
+						guard.resume()?;
+						self.suspended = false;
+						term_pause = spawn_term_reader(term_tx.clone());
+					}
+					if let ExternalEditorOutcome::Complete(content) = outcome {
+						self.editor.set_text(content);
+					}
 				}
 				_ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
 					self.tick = self.tick.wrapping_add(1);
@@ -691,6 +1107,9 @@ impl InteractiveMode {
 					if self.branch_refresh_tick >= 375 {
 						self.branch_refresh_tick = 0;
 						self.refresh_branch();
+					}
+					if let Some(overlay) = self.session_overlay.as_mut() {
+						overlay.tick();
 					}
 				}
 			}
@@ -705,6 +1124,23 @@ impl InteractiveMode {
 			self.session.events.recv().await,
 			Err(tokio::sync::broadcast::error::RecvError::Closed)
 		) {}
+		guard.restore();
+		// Upstream `formatResumeCommand` prints the resume invocation on
+		// exit; the port points at the session directory name, which
+		// `--resume` resolves by prefix (upstream's `--session <id>` flag
+		// and the `--session-dir` argument have no port counterpart — a
+		// custom `PI_RS_SESSION_DIR` must be re-exported by the user).
+		if let Some(session_dir) = self
+			.session
+			.current_session_file()
+			.and_then(|file| file.parent().map(std::path::Path::to_path_buf))
+			&& let Some(name) = session_dir.file_name()
+		{
+			println!(
+				"\x1b[2mTo resume this session:\x1b[22m pi-rs --resume {}",
+				name.to_string_lossy()
+			);
+		}
 		Ok(())
 	}
 
@@ -776,6 +1212,14 @@ impl InteractiveMode {
 				self.handle_provider_key(*key);
 				return;
 			}
+			if self.session_overlay.is_some() {
+				self.handle_session_overlay_key(*key);
+				return;
+			}
+			if self.trust_overlay.is_some() {
+				self.handle_trust_overlay_key(*key);
+				return;
+			}
 			if self.overlay.is_some() {
 				self.handle_overlay_key(*key);
 				return;
@@ -795,6 +1239,12 @@ impl InteractiveMode {
 				let _ = self.session.cmd_tx.send(SessionCommand::AbortBranchSummary);
 				return;
 			}
+			// Slash menu: intercept only the completion keys — every other
+			// key (typing included) reaches the editor so the menu keeps
+			// live-filtering, like upstream's editor-driven autocomplete.
+			if self.slash_menu.is_some() && self.handle_slash_menu_key(*key) {
+				return;
+			}
 			// Global keys first, mirroring pi's keybinding manager.
 			if self.handle_global_key(*key) {
 				return;
@@ -806,6 +1256,7 @@ impl InteractiveMode {
 					self.handle_submit(line);
 				}
 			}
+			self.update_slash_menu();
 			return;
 		}
 		self.chat.handle_event(&event);
@@ -1012,8 +1463,11 @@ impl InteractiveMode {
 		};
 		match action {
 			GlobalAction::Interrupt => {
-				// Escape always aborts/consumes (pi behavior), even idle.
-				if self.working {
+				// Escape always aborts/consumes (pi behavior), even idle: a
+				// passthrough bash command first, then the agent run.
+				if self.bash_running {
+					let _ = self.session.cmd_tx.send(SessionCommand::AbortBash);
+				} else if self.working {
 					let _ = self.session.cmd_tx.send(SessionCommand::Abort);
 				}
 			}
@@ -1021,7 +1475,7 @@ impl InteractiveMode {
 			// press exits); pi-rs keeps its simpler ctrl+c exits.
 			GlobalAction::Clear | GlobalAction::Exit => self.quit = true,
 			GlobalAction::ModelSelect => {
-				let current = self.session.agent.model().key();
+				let current = self.session.live_agent().model().key();
 				self.overlay = Some(ModelOverlay::new(&self.models, &current));
 			}
 			GlobalAction::ToolsExpand => {
@@ -1042,8 +1496,173 @@ impl InteractiveMode {
 					}
 				}
 			}
+			GlobalAction::SessionResume => self.open_session_selector(),
+			// Handled in run(): suspending the terminal must happen where
+			// the TerminalGuard lives.
+			GlobalAction::EditorExternal => self.pending_external_editor = true,
+			GlobalAction::CopyMessage => self.handle_copy_command(),
+			GlobalAction::ModelCycleForward => self.cycle_model(1),
+			GlobalAction::ModelCycleBackward => self.cycle_model(-1),
+			GlobalAction::SessionTree => self.show_tree_selector(None),
+			GlobalAction::SessionFork => self.open_fork_selector(),
 		}
 		true
+	}
+
+	// -- external editor (ctrl+g, external-editor.ts) ------------------------------
+
+	fn spawn_external_editor(&mut self) {
+		let command = self.external_editor_cmd.clone();
+		let content = self.editor.text().to_string();
+		let tx = self.editor_tx.clone();
+		tokio::spawn(async move {
+			let outcome = run_external_editor(&command, &content).await;
+			let _ = tx.send(outcome);
+		});
+	}
+
+	// -- session selector (/resume) ------------------------------------------------
+
+	/// Open the selector and kick off the current-folder listing (upstream
+	/// `showSessionSelector` loads scope "current" immediately).
+	fn open_session_selector(&mut self) {
+		if self.session_overlay.is_some() {
+			return;
+		}
+		if self.session.session_dir.is_none() {
+			self.push_notice("no saved sessions (--no-session)".into());
+			return;
+		}
+		self.session_overlay = Some(SessionSelectorOverlay::new(
+			self.session.current_session_file(),
+		));
+		self.load_sessions(SessionScope::Current);
+	}
+
+	/// Re-list the active scope after a delete/rename (upstream
+	/// `refreshSessionsAfterMutation`).
+	fn reload_sessions(&mut self) {
+		if let Some(overlay) = self.session_overlay.as_ref() {
+			let scope = overlay.scope;
+			self.load_sessions(scope);
+		}
+	}
+
+	fn load_sessions(&mut self, scope: SessionScope) {
+		if let Some(overlay) = self.session_overlay.as_mut() {
+			overlay.set_loading(scope, true);
+		}
+		let tx = self.session_list_tx.clone();
+		let cwd = std::path::PathBuf::from(&self.cwd);
+		tokio::task::spawn_blocking(move || {
+			let root = crate::config::sessions_dir();
+			let mut progress = |loaded: usize, total: usize, partial: &[SessionInfo]| {
+				let _ = tx.send(SessionListMsg::Progress {
+					scope,
+					loaded,
+					total,
+					partial: partial.to_vec(),
+				});
+			};
+			// Current folder filters by header cwd (pi-rs keeps one sessions
+			// root; upstream has per-cwd directories), All lists everything.
+			let sessions = crate::core::session_manager::list_sessions_progress(
+				&root,
+				match scope {
+					SessionScope::Current => Some(&cwd),
+					SessionScope::All => None,
+				},
+				match scope {
+					SessionScope::Current => 10,
+					SessionScope::All => 100,
+				},
+				&mut progress,
+			);
+			let _ = tx.send(SessionListMsg::Loaded { scope, sessions });
+		});
+	}
+
+	fn handle_session_list_msg(&mut self, msg: SessionListMsg) {
+		let Some(overlay) = self.session_overlay.as_mut() else {
+			return;
+		};
+		match msg {
+			SessionListMsg::Progress {
+				scope,
+				loaded,
+				total,
+				partial,
+			} => {
+				if scope == overlay.scope {
+					overlay.set_loading_progress(scope, loaded, total);
+					if !partial.is_empty() {
+						overlay.set_sessions(scope, partial);
+					}
+				}
+			}
+			SessionListMsg::Loaded { scope, sessions } => {
+				overlay.set_sessions(scope, sessions);
+				overlay.set_loading(scope, false);
+			}
+			SessionListMsg::Status { kind, text } => {
+				let ttl = match kind {
+					StatusKind::Info => 2000,
+					StatusKind::Error => 3000,
+				};
+				overlay.set_status(kind, text, ttl);
+			}
+		}
+	}
+
+	fn handle_session_overlay_key(&mut self, key: KeyEvent) {
+		let action = match self.session_overlay.as_mut() {
+			Some(overlay) => overlay.handle_key(&key, &self.keybindings),
+			None => return,
+		};
+		match action {
+			SelectorAction::None => {}
+			SelectorAction::Cancel => self.session_overlay = None,
+			SelectorAction::Resume(path) => {
+				self.session_overlay = None;
+				let _ = self.session.cmd_tx.send(SessionCommand::SwitchSession {
+					path: path.display().to_string(),
+				});
+				// The switch notice ("session → …") arrives over the event
+				// bus and triggers the chat rebuild; a failed switch
+				// surfaces its error notice with the selector closed.
+			}
+			SelectorAction::Delete(path) => {
+				let tx = self.session_list_tx.clone();
+				tokio::task::spawn_blocking(move || {
+					let (kind, text) = match delete_session_file(&path) {
+						Ok(message) => (StatusKind::Info, message.to_string()),
+						Err(error) => (StatusKind::Error, format!("Failed to delete: {error}")),
+					};
+					let _ = tx.send(SessionListMsg::Status { kind, text });
+				});
+				self.reload_sessions();
+			}
+			SelectorAction::Rename { path, name } => {
+				let tx = self.session_list_tx.clone();
+				tokio::task::spawn_blocking(move || {
+					let (kind, text) =
+						match crate::core::session_manager::append_session_info_to_file(
+							&path, &name,
+						) {
+							Ok(()) => (StatusKind::Info, "Session renamed".to_string()),
+							Err(error) => (StatusKind::Error, format!("Failed to rename: {error}")),
+						};
+					let _ = tx.send(SessionListMsg::Status { kind, text });
+				});
+				self.reload_sessions();
+			}
+		}
+		// A scope toggle with a not-yet-loaded listing requests a load.
+		if let Some(overlay) = self.session_overlay.as_ref()
+			&& let Some(scope) = overlay.pending_load()
+		{
+			self.load_sessions(scope);
+		}
 	}
 
 	/// The action's effective bindings as a hint string (`ctrl+o/ctrl+p`
@@ -1060,6 +1679,20 @@ impl InteractiveMode {
 		if line.is_empty() {
 			return;
 		}
+		self.slash_menu = None;
+		// Bash passthrough (upstream bash mode): `!cmd` runs outside the
+		// agent loop and lands in the transcript; `!!cmd` additionally
+		// stays out of the model context.
+		if let Some(rest) = line.strip_prefix('!') {
+			let (exclude_from_context, command) = match rest.strip_prefix('!') {
+				Some(command) => (true, command.trim()),
+				None => (false, rest.trim()),
+			};
+			if !command.is_empty() {
+				self.run_passthrough_bash(command, exclude_from_context);
+			}
+			return;
+		}
 		if let Some(command) = line.strip_prefix('/') {
 			self.handle_slash(command.trim());
 		} else {
@@ -1067,9 +1700,418 @@ impl InteractiveMode {
 		}
 	}
 
+	/// Send a passthrough bash command; output streams into a dedicated
+	/// chat block via the wire-event channel.
+	fn run_passthrough_bash(&mut self, command: &str, exclude_from_context: bool) {
+		if self.bash_running {
+			self.push_notice(
+				"A bash command is already running. Press Esc to cancel it first.".into(),
+			);
+			return;
+		}
+		self.bash_running = true;
+		let _ = self.session.cmd_tx.send(SessionCommand::ExecuteBash {
+			command: command.to_string(),
+			exclude_from_context,
+			id: None,
+		});
+		self.blocks.push(ChatBlock::Bash {
+			command: command.to_string(),
+			output: String::new(),
+			status: "running".into(),
+			rendered: None,
+		});
+		self.chat.scroll_to_bottom();
+	}
+
+	/// Re-evaluate the slash menu against the editor text: opens while the
+	/// text is a single `/token`, closes otherwise or on zero matches
+	/// (upstream `getSuggestions` returns null → no popup).
+	fn update_slash_menu(&mut self) {
+		let query = match slash_command_query(self.editor.text()) {
+			Some(query) => query,
+			None => {
+				self.slash_menu = None;
+				return;
+			}
+		};
+		if self.slash_menu.is_none() {
+			self.slash_menu = Some(SlashMenu::new());
+		}
+		let menu = self.slash_menu.as_mut().unwrap();
+		menu.list.set_filter(query);
+		if menu.list.filtered().is_empty() {
+			self.slash_menu = None;
+		}
+	}
+
+	/// Keys the open menu consumes. Returns `false` for everything else so
+	/// typing continues in the editor (`update_slash_menu` then refilters).
+	fn handle_slash_menu_key(&mut self, key: KeyEvent) -> bool {
+		match key.code {
+			KeyCode::Esc => {
+				// custom-editor.ts: escape cancels the autocomplete first and
+				// must not abort the running turn.
+				self.slash_menu = None;
+				true
+			}
+			KeyCode::Tab | KeyCode::Enter => {
+				// Upstream `applyCompletion`'s slash branch falls through to
+				// submit: Enter completes the command AND runs it. Tab only
+				// completes (`tui.input.tab` upstream).
+				self.apply_slash_menu_selection();
+				if key.code == KeyCode::Enter {
+					let line = self.editor.text().trim().to_string();
+					if !line.is_empty() {
+						self.editor.set_text("");
+						self.handle_submit(line);
+					}
+				}
+				true
+			}
+			KeyCode::Up | KeyCode::Down => {
+				let action = match self.slash_menu.as_mut() {
+					Some(menu) => menu.list.handle_key_with(key, &self.keybindings),
+					None => return true,
+				};
+				!matches!(action, SelectAction::Ignored)
+			}
+			_ => false,
+		}
+	}
+
+	/// Complete the highlighted command into the editor (`/name `), upstream
+	/// `applyCompletion`'s slash branch. With no match under the cursor the
+	/// menu stays open (pi behavior).
+	fn apply_slash_menu_selection(&mut self) {
+		let Some(menu) = self.slash_menu.as_ref() else {
+			return;
+		};
+		let Some(item) = menu.list.selected_item() else {
+			return;
+		};
+		let name = item.value.clone();
+		let completed = apply_slash_completion(&name);
+		self.editor.set_text(completed);
+		// The trailing space disqualifies the menu; refresh to be exact.
+		self.update_slash_menu();
+	}
+
+	/// `/tree` (upstream `showTreeSelector`, read-only first slice): the
+	/// entry tree with `├─`/`└─` prefixes and one-line entry summaries. The
+	/// interactive leaf-switching selector is deferred.
+	fn handle_trust_command(&mut self) {
+		let project_config = std::path::Path::new(&self.cwd).join(".pi").join("mcp.json");
+		if !project_config.exists() {
+			self.push_notice(format!(
+				"No project MCP config at {}",
+				project_config.display()
+			));
+			return;
+		}
+		if crate::core::trust::is_trusted(std::path::Path::new(&self.cwd)) {
+			self.push_notice(format!("{} is trusted", project_config.display()));
+			return;
+		}
+		let list = SelectList::new(
+			vec![
+				SelectItem {
+					value: "trust".into(),
+					label: "Trust".into(),
+					description: Some(format!("load {} on restart", project_config.display())),
+				},
+				SelectItem {
+					value: "skip".into(),
+					label: "Don't trust".into(),
+					description: Some("skip its MCP servers".into()),
+				},
+			],
+			2,
+		);
+		self.trust_overlay = Some((list, project_config));
+	}
+
+	fn handle_trust_overlay_key(&mut self, key: KeyEvent) {
+		let action = match self.trust_overlay.as_mut() {
+			Some((list, _)) => list.handle_key_with(key, &self.keybindings),
+			None => return,
+		};
+		let choice = match action {
+			SelectAction::Select(index) => self
+				.trust_overlay
+				.as_ref()
+				.and_then(|(list, _)| list.filtered().get(index).map(|item| item.value.clone())),
+			SelectAction::Cancel => Some("cancel".into()),
+			SelectAction::Handled | SelectAction::Ignored => None,
+		};
+		let Some(choice) = choice else {
+			return;
+		};
+		let (_, project_config) = self.trust_overlay.take().unwrap();
+		match choice.as_str() {
+			"trust" => {
+				if let Err(error) = crate::core::trust::trust(std::path::Path::new(&self.cwd)) {
+					self.push_notice(format!("Failed to record trust: {error}"));
+				} else {
+					self.push_notice(format!(
+						"{} trusted — restart to load its MCP servers",
+						project_config.display()
+					));
+				}
+			}
+			"skip" => {
+				self.push_notice(format!(
+					"{} not trusted; its MCP servers stay skipped",
+					project_config.display()
+				));
+			}
+			_ => {}
+		}
+	}
+
+	/// /fork selector keys: navigation + Enter forks before the selected
+	/// user message, Esc cancels.
+	fn handle_hotkeys_command(&mut self) {
+		let rows: [(&str, &str); 24] = [
+			(
+				"Move cursor / browse history",
+				"tui.editor.cursorUp+tui.editor.cursorDown+tui.editor.cursorLeft+tui.editor.cursorRight",
+			),
+			(
+				"Move by word",
+				"tui.editor.cursorWordLeft+tui.editor.cursorWordRight",
+			),
+			(
+				"Start / end of line",
+				"tui.editor.cursorLineStart+tui.editor.cursorLineEnd",
+			),
+			("Page up / down", "tui.editor.pageUp+tui.editor.pageDown"),
+			("Send message", "tui.input.submit"),
+			("New line", "tui.input.newLine"),
+			(
+				"Delete word backward / forward",
+				"tui.editor.deleteWordBackward+tui.editor.deleteWordForward",
+			),
+			(
+				"Delete to line start / end",
+				"tui.editor.deleteToLineStart+tui.editor.deleteToLineEnd",
+			),
+			("Yank / yank pop", "tui.editor.yank+tui.editor.yankPop"),
+			("Undo", "tui.editor.undo"),
+			("Tab / autocomplete", "tui.input.tab"),
+			("Abort run / cancel", "app.interrupt"),
+			("Exit (empty editor)", "app.exit"),
+			("Suspend to background", "app.suspend"),
+			("Cycle thinking level", "app.thinking.cycle"),
+			(
+				"Cycle models",
+				"app.model.cycleForward+app.model.cycleBackward",
+			),
+			("Open model selector", "app.model.select"),
+			("Toggle tool output", "app.tools.expand"),
+			("Toggle thinking blocks", "app.thinking.toggle"),
+			("External editor", "app.editor.external"),
+			("Copy last agent message", "app.message.copy"),
+			("Queue follow-up", "app.message.followUp"),
+			("Restore queued messages", "app.message.dequeue"),
+			("Session selector", "app.session.resume"),
+		];
+		let hint = |actions: &str| -> String {
+			actions
+				.split('+')
+				.map(|action| self.keybinding_hint(action, "-"))
+				.collect::<Vec<_>>()
+				.join("/")
+		};
+		let rows: Vec<(String, String)> = rows
+			.iter()
+			.map(|(label, actions)| ((*label).to_string(), hint(actions)))
+			.collect();
+		let width = rows.iter().map(|(keys, _)| keys.len()).max().unwrap_or(0) + 2;
+		let mut text = String::from("Keybindings\n");
+		for (label, keys) in rows {
+			text.push_str(&format!("{:<width$} {}\n", keys, label, width = width));
+		}
+		self.push_notice(text);
+	}
+
+	/// `/session` (upstream `handleSessionCommand`): name, file, id, message
+	/// counts, and the token/cost totals with the cached/uncached split. The
+	/// cache-warming and per-model breakdown sections have no port
+	/// counterpart.
+	fn handle_session_command(&mut self) {
+		let (session_file, log_stats) = {
+			let guard = self.session.log.lock().unwrap();
+			(
+				self.session.current_session_file(),
+				crate::core::agent_session::compute_session_stats(&guard.session, None),
+			)
+		};
+		let model = self.session.live_agent().model();
+		let mut info = String::from("Session Info\n\n");
+		if let Some(name) = self.session.session_name() {
+			info.push_str(&format!("Name: {name}\n"));
+		}
+		info.push_str(&format!(
+			"File: {}\n",
+			session_file
+				.as_ref()
+				.map(|path| path.display().to_string())
+				.unwrap_or_else(|| "In-memory".into())
+		));
+		info.push_str(&format!("ID: {}\n\n", log_stats.session_id));
+		info.push_str("Messages\n");
+		info.push_str(&format!("Total: {}\n", log_stats.total_messages));
+		info.push_str(&format!("User: {}\n", log_stats.user_messages));
+		info.push_str(&format!("Assistant: {}\n", log_stats.assistant_messages));
+		info.push_str(&format!(
+			"Tools: {} calls, {} results\n\n",
+			log_stats.tool_calls, log_stats.tool_results
+		));
+		info.push_str("Tokens\n");
+		let prompt_tokens = log_stats.input + log_stats.cache_read + log_stats.cache_write;
+		info.push_str(&format!("Input: {prompt_tokens}\n"));
+		if prompt_tokens > 0 && (log_stats.cache_read > 0 || log_stats.cache_write > 0) {
+			info.push_str(&format!(
+				"  Cached: {} ({:.1}%)\n",
+				log_stats.cache_read,
+				log_stats.cache_read as f64 / prompt_tokens as f64 * 100.0
+			));
+			info.push_str(&format!(
+				"  Uncached: {}\n",
+				log_stats.input + log_stats.cache_write
+			));
+		}
+		info.push_str(&format!("Output: {}\n", log_stats.output));
+		let total =
+			log_stats.input + log_stats.output + log_stats.cache_read + log_stats.cache_write;
+		info.push_str(&format!("Total: {total}\n"));
+		info.push_str(&format!("\nModel: {}", model.key()));
+		self.push_notice(info);
+	}
+
+	/// `/name [name]` (upstream `handleNameCommand`): show the current
+	/// display name, or set one. The sanitized name arrives through the
+	/// session task; a mismatch surfaces as a warning.
+	fn handle_name_command(&mut self, args: &str) {
+		let name = args.trim();
+		if name.is_empty() {
+			match self.session.session_name() {
+				Some(current) => self.push_notice(format!("Session name: {current}")),
+				None => self.push_notice("Usage: /name <name>".into()),
+			}
+			return;
+		}
+		let _ = self.session.cmd_tx.send(SessionCommand::SetSessionName {
+			name: name.to_string(),
+		});
+		// The authoritative sanitized name lands asynchronously; echo the
+		// requested one (upstream reads back synchronously and warns on
+		// normalization — the port's notice would race the session task).
+		self.push_notice(format!("Session name set: {name}"));
+	}
+
+	/// ctrl+p / alt+p (upstream `cycleModel`, available-models variant): move
+	/// ±1 through the registry list with wraparound. The scoped-models
+	/// variant has no port counterpart.
+	fn cycle_model(&mut self, step: isize) {
+		if self.models.len() < 2 {
+			self.push_notice("Only one model available".into());
+			return;
+		}
+		let current = self.session.live_agent().model().key();
+		let count = self.models.len() as isize;
+		let index = self
+			.models
+			.iter()
+			.position(|model| model.key() == current)
+			.map(|index| ((index as isize + step).rem_euclid(count)) as usize)
+			.unwrap_or(0);
+		let next = self.models[index].key();
+		let _ = self
+			.session
+			.cmd_tx
+			.send(SessionCommand::SetModel { query: next });
+	}
+
+	/// `/copy` / ctrl+x (upstream `handleCopyCommand`): copy the last
+	/// assistant message to the clipboard. The alt-screen selection branch
+	/// has no port counterpart (no selection API).
+	fn handle_copy_command(&mut self) {
+		let text = self
+			.session
+			.live_agent()
+			.snapshot()
+			.messages
+			.iter()
+			.rev()
+			.find_map(|message| match message {
+				Message::Assistant(assistant) => {
+					let text = assistant.text();
+					(!text.is_empty()).then_some(text)
+				}
+				_ => None,
+			});
+		let Some(text) = text else {
+			self.push_notice("No agent messages to copy yet.".into());
+			return;
+		};
+		match crate::core::clipboard::copy_to_clipboard(&text) {
+			Ok(()) => self.push_notice("Copied last agent message to clipboard".into()),
+			Err(error) => self.push_notice(error),
+		}
+	}
+
+	/// `/export [path]` (upstream `handleExportCommand`): `.jsonl` writes the
+	/// current branch, anything else HTML; no argument takes the default
+	/// path. In-memory sessions only export JSONL.
+	fn handle_export_command(&mut self, args: &str) {
+		let arg = args.trim();
+		let arg = match (arg.chars().next(), arg.chars().last()) {
+			(Some(q), Some(last)) if (q == '"' || q == '\'') && q == last && arg.len() >= 2 => {
+				&arg[1..arg.len() - 1]
+			}
+			_ => arg,
+		};
+		let outcome: anyhow::Result<std::path::PathBuf> = (|| {
+			if arg.ends_with(".jsonl") {
+				let log = self.session.log.lock().unwrap();
+				let path = crate::core::session_export::export_session_to_jsonl(
+					&log.session,
+					(!arg.is_empty()).then_some(std::path::Path::new(arg)),
+					std::path::Path::new(&self.cwd),
+				)?;
+				return Ok(path);
+			}
+			let session_dir = self
+				.session
+				.log
+				.lock()
+				.unwrap()
+				.session
+				.session_dir()
+				.map(std::path::Path::to_path_buf);
+			let Some(session_dir) = session_dir else {
+				anyhow::bail!("Cannot export in-memory session to HTML");
+			};
+			crate::core::export_html::write_session_html(
+				&session_dir,
+				(!arg.is_empty()).then_some(std::path::Path::new(arg)),
+			)
+		})();
+		match outcome {
+			Ok(path) => self.push_notice(format!("Session exported to: {}", path.display())),
+			Err(error) => self.push_notice(format!("Failed to export session: {error}")),
+		}
+	}
+
 	fn send_prompt(&mut self, text: String) {
-		let _ = self.session.cmd_tx.send(SessionCommand::Prompt { text });
-		self.chat.scroll_to_bottom(usize::MAX);
+		let images = std::mem::take(&mut self.pending_images);
+		let _ = self
+			.session
+			.cmd_tx
+			.send(SessionCommand::Prompt { text, images });
+		self.chat.scroll_to_bottom();
 	}
 
 	fn handle_slash(&mut self, command: &str) {
@@ -1098,39 +2140,6 @@ impl InteractiveMode {
 				self.blocks.clear();
 				self.chat.clear();
 			}
-			"new" => {
-				self.begin_replacement_labeled(
-					RpcReplacement::New {
-						parent_session: None,
-					},
-					ReplacementKind::New,
-					"Session switch failed",
-					None,
-				);
-			}
-			"resume" => {
-				if args.is_empty() {
-					let (sender, receiver) = tokio::sync::oneshot::channel();
-					self.loading_sessions = Some(receiver);
-					let session_root = self.session_root.clone();
-					std::thread::spawn(move || {
-						let sessions =
-							crate::core::SessionManager::recent_paths_in(&session_root, usize::MAX);
-						let overlay = ModelOverlay::sessions(sessions, || sender.is_closed());
-						let _ = sender.send(overlay);
-					});
-				} else {
-					self.resume_session(args);
-				}
-			}
-			"fork" => {
-				let messages = self.fork_messages();
-				if messages.is_empty() {
-					self.push_notice("No messages to fork from".into());
-				} else {
-					self.overlay = Some(ModelOverlay::fork(messages));
-				}
-			}
 			"clone" => {
 				let has_leaf = self.session.log.lock().unwrap().session.leaf_id().is_some();
 				if !has_leaf {
@@ -1147,16 +2156,6 @@ impl InteractiveMode {
 			"tree" => {
 				self.show_tree_selector(None);
 			}
-			"export" => {
-				let line = format!("/export {args}");
-				let output = crate::core::slash_commands::path_command_argument(&line, "/export");
-				match self.export_session(output) {
-					Ok(path) => {
-						self.push_notice(format!("Session exported to: {}", path.display()))
-					}
-					Err(error) => self.push_notice(format!("Failed to export session: {error}")),
-				}
-			}
 			"import" => {
 				let line = format!("/import {args}");
 				match crate::core::slash_commands::path_command_argument(&line, "/import") {
@@ -1168,32 +2167,9 @@ impl InteractiveMode {
 					}
 				}
 			}
-			"name" => {
-				if args.is_empty() {
-					self.push_notice("Usage: /name <name>".into());
-				} else {
-					let _ = self.session.cmd_tx.send(SessionCommand::SetSessionName {
-						name: args.to_string(),
-					});
-				}
-			}
-			"session" => {
-				let details = {
-					let guard = self.session.log.lock().unwrap();
-					let session = &guard.session;
-					let id = session.session_id().unwrap_or_else(|| "(in-memory)".into());
-					let path = session
-						.session_dir()
-						.map(|dir| dir.join("session.jsonl").display().to_string())
-						.unwrap_or_else(|| "(not saved)".into());
-					let name = session.session_name().unwrap_or_else(|| "(unnamed)".into());
-					format!("session: {name}\nid: {id}\nfile: {path}\ncwd: {}", self.cwd)
-				};
-				self.push_notice(details);
-			}
 			"model" => {
 				if args.is_empty() {
-					let current = self.session.agent.model().key();
+					let current = self.session.live_agent().model().key();
 					self.overlay = Some(ModelOverlay::new(&self.models, &current));
 				} else {
 					let _ = self.session.cmd_tx.send(SessionCommand::SetModel {
@@ -1201,15 +2177,76 @@ impl InteractiveMode {
 					});
 				}
 			}
+			"resume" => {
+				// `/resume` opens the session selector; `/resume <id|path>`
+				// resumes that session directly (upstream `--session`).
+				if args.is_empty() {
+					self.open_session_selector();
+				} else {
+					self.resume_session(args);
+				}
+			}
+			"copy" => self.handle_copy_command(),
+			"name" => self.handle_name_command(args),
+			"session" => self.handle_session_command(),
+			"hotkeys" => self.handle_hotkeys_command(),
+			"fork" => {
+				if args.is_empty() {
+					self.open_fork_selector();
+				} else {
+					self.fork_by_index(args);
+				}
+			}
+			"trust" => self.handle_trust_command(),
+			"new" => {
+				// Upstream `handleClearCommand`: a fresh session (queued
+				// prompts are discarded by the replacement); the "session → "
+				// notice rebuilds the chat view.
+				let _ = self.session.cmd_tx.send(SessionCommand::NewSession {
+					parent_session: None,
+				});
+				self.push_notice("New session started".into());
+			}
+			"export" => self.handle_export_command(args),
 			"thinking" => {
-				let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);
+				// Upstream `handleThinkingCommand`: an argument sets that
+				// level directly; bare `/thinking` cycles.
+				if args.is_empty() {
+					let _ = self.session.cmd_tx.send(SessionCommand::CycleThinking);
+					return;
+				}
+				let levels = thinking_levels_for_model(&self.session.live_agent().model());
+				let requested = args.trim().to_lowercase();
+				let wire = |level: &ThinkingLevel| match level {
+					ThinkingLevel::Off => "off",
+					ThinkingLevel::Minimal => "minimal",
+					ThinkingLevel::Low => "low",
+					ThinkingLevel::Medium => "medium",
+					ThinkingLevel::High => "high",
+					ThinkingLevel::Xhigh => "xhigh",
+					ThinkingLevel::Max => "max",
+				};
+				match levels.iter().find(|level| wire(level) == requested) {
+					Some(level) => {
+						let _ = self
+							.session
+							.cmd_tx
+							.send(SessionCommand::SetThinking { level: *level });
+					}
+					None => {
+						let names = levels.iter().map(wire).collect::<Vec<_>>().join(", ");
+						self.push_notice(format!(
+							"Unknown thinking level \"{requested}\". Available levels: {names}."
+						));
+					}
+				}
 			}
 			"tools" => {
-				let names = self.session.agent.tool_names().join(", ");
+				let names = self.session.live_agent().tool_names().join(", ");
 				self.push_notice(format!("active tools: {names}"));
 			}
 			"prompt" => {
-				let prompt = self.session.agent.snapshot().system_prompt;
+				let prompt = self.session.live_agent().snapshot().system_prompt;
 				let preview: Vec<&str> = prompt.lines().take(30).collect();
 				self.push_notice(format!(
 					"system prompt (first 30 lines):\n{}\n…",
@@ -1217,27 +2254,49 @@ impl InteractiveMode {
 				));
 			}
 			"compact" => {
-				let _ = self.session.cmd_tx.send(SessionCommand::Compact);
+				let instructions = (!args.is_empty()).then(|| args.to_string());
+				let _ = self
+					.session
+					.cmd_tx
+					.send(SessionCommand::Compact { instructions });
 			}
 			"sessions" => {
-				let sessions = crate::core::SessionManager::list_recent(10);
+				// Upstream has no /sessions slash command (the selector covers
+				// it); this pi-rs listing uses the SessionInfo pipeline.
+				let sessions = crate::core::session_manager::list_sessions_in(
+					&crate::config::sessions_dir(),
+					None,
+				);
 				if sessions.is_empty() {
 					self.push_notice("no saved sessions yet".into());
 				} else {
-					let text = sessions
-						.iter()
-						.map(|(dir, entries)| {
-							format!(
-								"  {:<28} {} entries",
-								dir.file_name()
-									.map(|n| n.to_string_lossy().into_owned())
-									.unwrap_or_default(),
-								entries
-							)
-						})
-						.collect::<Vec<_>>()
-						.join("\n");
-					self.push_notice(format!("recent sessions:\n{text}"));
+					let mut text = String::from("Recent sessions:\n");
+					for session in sessions.iter().take(10) {
+						let age = {
+							let diff = pi_ai::types::now_ms().saturating_sub(session.modified_ms);
+							let days = diff / 86_400_000;
+							if diff < 3_600_000 {
+								format!("{}m", diff / 60_000)
+							} else if days < 1 {
+								format!("{}h", diff / 3_600_000)
+							} else if days < 30 {
+								format!("{}d", days)
+							} else {
+								format!("{}mo", days / 30)
+							}
+						};
+						let title = session
+							.name
+							.clone()
+							.unwrap_or_else(|| session.first_message.clone());
+						text.push_str(&format!(
+							"  {:>4}  {}  ({} msgs)\n",
+							age,
+							title.chars().take(70).collect::<String>(),
+							session.message_count
+						));
+					}
+					self.push_notice(text);
 				}
 			}
 			other => {
@@ -1307,6 +2366,42 @@ impl InteractiveMode {
 				}
 			})
 			.collect()
+	}
+
+	/// `/fork` selector — the user messages a fork can start from (upstream
+	/// `showUserMessageSelector`). Confirming forks before the message and
+	/// prefills the editor with its text (upstream `editor.setText`).
+	fn open_fork_selector(&mut self) {
+		let messages = self.fork_messages();
+		if messages.is_empty() {
+			self.push_notice("No messages to fork from".into());
+		} else {
+			self.overlay = Some(ModelOverlay::fork(messages));
+		}
+	}
+
+	/// `/fork <n>` — fork before the n-th user message (1-based, pi-rs
+	/// extension). The fork runs through the replacement machinery, so the
+	/// editor is prefilled with the selected message like the selector path.
+	fn fork_by_index(&mut self, args: &str) {
+		let messages = self.fork_messages();
+		let index: usize = match args.trim().parse::<usize>() {
+			Ok(index) if index >= 1 && index <= messages.len() => index - 1,
+			_ => {
+				self.push_notice(format!(
+					"No user message {} — /fork lists the valid indexes.",
+					args.trim()
+				));
+				return;
+			}
+		};
+		let (entry_id, _) = messages[index].clone();
+		self.begin_replacement_labeled(
+			RpcReplacement::Fork { entry_id },
+			ReplacementKind::Fork,
+			"Session switch failed",
+			None,
+		);
 	}
 
 	/// Open the `/tree` selector (upstream `showTreeSelector`). Returns the
@@ -1684,80 +2779,6 @@ impl InteractiveMode {
 		}
 	}
 
-	/// `/export`: `.jsonl` paths write the raw branch log
-	/// (`exportSessionToJsonl` upstream), everything else renders HTML
-	/// (`exportToHtml`; the port's exporter carries its own default theme).
-	fn export_session(&self, output: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
-		if let Some(path) = output.filter(|path| path.ends_with(".jsonl")) {
-			self.export_jsonl(path)
-		} else {
-			let dir = self
-				.session
-				.log
-				.lock()
-				.unwrap()
-				.session
-				.session_dir()
-				.map(Path::to_path_buf)
-				.ok_or_else(|| anyhow::anyhow!("Cannot export in-memory session to HTML"))?;
-			crate::core::export_html::write_session_html(&dir, output.map(std::path::Path::new))
-		}
-	}
-
-	/// Serialize the current branch as JSONL — `serializeSessionBranch`
-	/// upstream: a fresh header line followed by the leaf path with
-	/// re-chained `parentId`s. Relative paths resolve against the process
-	/// cwd; the default name is `session-<timestamp>.jsonl`.
-	fn export_jsonl(&self, output: &str) -> anyhow::Result<std::path::PathBuf> {
-		let resolved = if let Some(rest) = output.strip_prefix("~/") {
-			std::env::var_os("HOME")
-				.map(|home| std::path::PathBuf::from(home).join(rest))
-				.unwrap_or_else(|| std::path::PathBuf::from(output))
-		} else {
-			std::path::PathBuf::from(output)
-		};
-		let resolved = if resolved.is_absolute() {
-			resolved
-		} else {
-			std::env::current_dir()?.join(resolved)
-		};
-		let guard = self.session.log.lock().unwrap();
-		let session = &guard.session;
-		let header =
-			session
-				.header()
-				.cloned()
-				.unwrap_or(crate::core::session_manager::SessionHeader {
-					version: Some(crate::core::session_manager::CURRENT_SESSION_VERSION),
-					id: uuid::Uuid::now_v7().to_string(),
-					timestamp: crate::core::session_manager::iso_timestamp(pi_ai::types::now_ms()),
-					cwd: self.cwd.clone(),
-					parent_session: None,
-				});
-		let mut parent = serde_json::Value::Null;
-		let mut lines = String::new();
-		let mut header_value = header.to_value();
-		header_value["timestamp"] = serde_json::Value::String(
-			crate::core::session_manager::iso_timestamp(pi_ai::types::now_ms()),
-		);
-		lines.push_str(&header_value.to_string());
-		lines.push('\n');
-		for entry in
-			crate::core::session_manager::build_session_path(session.entries(), session.leaf_id())
-		{
-			let mut value = entry.to_value();
-			value["parentId"] = parent.clone();
-			parent = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-			lines.push_str(&value.to_string());
-			lines.push('\n');
-		}
-		if let Some(dir) = resolved.parent() {
-			std::fs::create_dir_all(dir)?;
-		}
-		std::fs::write(&resolved, lines)?;
-		Ok(resolved)
-	}
-
 	/// Drain the replacement's trailing events and report its outcome. Split
 	/// from the run-loop arm so tests can drive it through the response
 	/// channel directly.
@@ -1917,7 +2938,12 @@ impl InteractiveMode {
 	fn handle_session_event(&mut self, event: SessionEvent) {
 		match event {
 			SessionEvent::Agent(event) => self.handle_agent_event(*event),
-			SessionEvent::Notice(text) => self.push_notice(text),
+			SessionEvent::Notice(text) => {
+				// The replacement itself restores the transcript (the
+				// `SessionReplaced` event); the notice only reports the new
+				// destination ("session → …").
+				self.push_notice(text);
+			}
 			SessionEvent::SessionReplaced => {
 				if self.pending_replacement.is_some() {
 					self.replacement_event_seen = true;
@@ -1936,16 +2962,72 @@ impl InteractiveMode {
 		}
 	}
 
+	/// Passthrough bash stream: append deltas to the live Bash block and
+	/// finalize on done (output, exit code, cancellation, spill note).
+	fn handle_wire_event(&mut self, wire: WireEvent) {
+		match wire {
+			WireEvent::BashExecutionUpdate { delta, .. } => {
+				if let Some(ChatBlock::Bash {
+					output, rendered, ..
+				}) = self
+					.blocks
+					.iter_mut()
+					.rev()
+					.find(|block| matches!(block, ChatBlock::Bash { .. }))
+				{
+					output.push_str(&delta);
+					*rendered = None;
+				}
+			}
+			WireEvent::BashExecutionDone { result, .. } => {
+				self.bash_running = false;
+				if let Some(ChatBlock::Bash {
+					output,
+					status,
+					rendered,
+					..
+				}) = self
+					.blocks
+					.iter_mut()
+					.rev()
+					.find(|block| matches!(block, ChatBlock::Bash { .. }))
+				{
+					*output = result.output;
+					*status = match (result.exit_code, result.cancelled) {
+						(_, true) => "cancelled".into(),
+						(Some(0), false) => "done".into(),
+						(Some(code), false) => format!("exit {code}"),
+						(None, false) => "done".into(),
+					};
+					if result.truncated {
+						status.push_str(" (truncated — full output on disk)");
+					}
+					*rendered = None;
+				}
+				self.chat.scroll_to_bottom();
+			}
+			WireEvent::SessionInfoChanged { name } => {
+				// A session rename (upstream `session_info_changed`) surfaces
+				// as a chat notice.
+				self.push_notice(format!(
+					"Session name: {}",
+					name.as_deref().unwrap_or("(none)")
+				));
+			}
+			WireEvent::AutoRetryStart { .. } | WireEvent::AutoRetryEnd { .. } => {}
+		}
+	}
+
 	fn handle_agent_event(&mut self, event: AgentEvent) {
 		match event {
 			AgentEvent::AgentStart => {
 				self.working = true;
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::AgentEnd { .. } => {
 				self.working = false;
 				self.refresh_branch();
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::MessageStart { message } => {
 				match &message {
@@ -1964,7 +3046,7 @@ impl InteractiveMode {
 					}
 					_ => {}
 				}
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::MessageUpdate { message, .. } => {
 				if let Message::Assistant(assistant) = &message
@@ -2034,7 +3116,7 @@ impl InteractiveMode {
 					*cache_write += assistant.usage.cache_write;
 					*cost += assistant.usage.cost.total.unwrap_or(0.0);
 				}
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::ToolExecutionStart {
 				tool_call_id,
@@ -2052,7 +3134,7 @@ impl InteractiveMode {
 					duration_ms: None,
 					rendered: None,
 				});
-				self.chat.scroll_to_bottom(usize::MAX);
+				self.chat.scroll_to_bottom();
 			}
 			AgentEvent::ToolExecutionUpdate {
 				tool_call_id,
@@ -2098,7 +3180,7 @@ impl InteractiveMode {
 
 	fn push_notice(&mut self, text: String) {
 		self.blocks.push(ChatBlock::Notice(text));
-		self.chat.scroll_to_bottom(usize::MAX);
+		self.chat.scroll_to_bottom();
 	}
 
 	// -- git branch (footer data provider) ---------------------------------------
@@ -2144,6 +3226,7 @@ impl InteractiveMode {
 		self.chat.render(chunks[1], frame.buffer_mut());
 		self.draw_editor(frame, chunks[2]);
 		self.draw_footer(frame, chunks[3]);
+		self.draw_slash_menu(frame, chunks[1], chunks[2]);
 		self.draw_overlay(frame, chunks[1]);
 		self.draw_tree(frame, chunks[1]);
 		self.draw_dialog(frame, chunks[1]);
@@ -2165,6 +3248,8 @@ impl InteractiveMode {
 				panel,
 			);
 		}
+		self.draw_session_overlay(frame, chunks[1]);
+		self.draw_trust_overlay(frame, chunks[1]);
 		if let Some(wizard) = &self.provider_wizard {
 			let area = chunks[1];
 			let height = area
@@ -2209,7 +3294,7 @@ impl InteractiveMode {
 	}
 
 	fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-		let model = self.session.agent.model();
+		let model = self.session.live_agent().model();
 		let cwd_short = shorten_path(&self.cwd, 32);
 		let line = Line::from(vec![
 			Span::styled(
@@ -2309,14 +3394,15 @@ impl InteractiveMode {
 		// Context usage via the unified algorithm (core/context_usage.rs, the
 		// footer.ts getSessionStats path): provider usage preferred with
 		// trailing estimation; None after compaction until the next response.
-		let usage = crate::core::context_usage::compute(&self.session.agent);
-		let model_window = self.session.agent.model().context_window;
+		let live = self.session.live_agent();
+		let usage = crate::core::context_usage::compute(&live);
+		let model_window = live.model().context_window;
 		let auto_compaction = self.session.auto_compaction.load(Ordering::Relaxed);
 		let (context_text, context_style) =
 			footer_context_segment(usage, model_window, auto_compaction, &self.theme);
 
-		let model = self.session.agent.model();
-		let thinking = self.session.agent.thinking_level();
+		let model = self.session.live_agent().model();
+		let thinking = self.session.live_agent().thinking_level();
 		let mut right = model.id.clone();
 		if model.reasoning {
 			right.push_str(&format!(" • thinking {}", thinking_label(thinking)));
@@ -2354,6 +3440,34 @@ impl InteractiveMode {
 	}
 
 	/// Model selector overlay (model-selector.ts): bordered panel with a search
+	/// Slash-command menu floating directly above the editor, editor-width
+	/// and bottom-anchored in the chat area (upstream renders the
+	/// autocomplete list just above the input).
+	fn draw_slash_menu(&mut self, frame: &mut Frame, chat_area: Rect, editor_area: Rect) {
+		let Some(menu) = self.slash_menu.as_ref() else {
+			return;
+		};
+		let visible = menu.list.filtered().len().clamp(1, 8) as u16;
+		let height = (visible + 2).min(chat_area.height);
+		let area = Rect {
+			x: editor_area.x,
+			y: chat_area.y + chat_area.height.saturating_sub(height),
+			width: editor_area.width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.border))
+			.title(Span::styled(
+				" Commands ",
+				Style::new().fg(self.theme.accent),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = menu.list.render_lines(inner.width as usize, &self.theme);
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
 	/// line, the filtered list and a key hint.
 	fn draw_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
 		let Some(overlay) = self.overlay.as_ref() else {
@@ -2415,8 +3529,6 @@ impl InteractiveMode {
 		frame.render_widget(Paragraph::new(lines), inner);
 	}
 
-	/// The `/tree` selector panel (upstream `TreeSelectorComponent`: bordered
-	/// header, search line, tree rows, counter).
 	fn draw_tree(&mut self, frame: &mut Frame, chat_area: Rect) {
 		let Some(tree) = self.tree.as_ref() else {
 			return;
@@ -2473,8 +3585,6 @@ impl InteractiveMode {
 		frame.render_widget(Paragraph::new(rows), inner);
 	}
 
-	/// Centered dialog panels: `/import` confirmation, the summarize-branch
-	/// three-way choice, and the custom-prompt editor.
 	fn draw_dialog(&mut self, frame: &mut Frame, chat_area: Rect) {
 		let Some(dialog) = self.dialog.as_ref() else {
 			return;
@@ -2528,6 +3638,71 @@ impl InteractiveMode {
 				.wrap(Wrap { trim: false }),
 			area,
 		);
+	}
+
+	fn draw_trust_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some((list, project_config)) = self.trust_overlay.as_ref() else {
+			return;
+		};
+		let width = chat_area.width.clamp(56, 84).min(chat_area.width);
+		let height = 8.min(chat_area.height);
+		let area = Rect {
+			x: chat_area.x + (chat_area.width - width) / 2,
+			y: chat_area.y + (chat_area.height - height) * 2 / 5,
+			width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				format!(" Trust {} ", project_config.display()),
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = list.render_lines(inner.width as usize, &self.theme);
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	fn draw_session_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some(overlay) = self.session_overlay.as_mut() else {
+			return;
+		};
+		let width = chat_area.width.clamp(60, 100).min(chat_area.width);
+		let height = chat_area.height.saturating_sub(4).max(10);
+		if chat_area.width < width || chat_area.height < height {
+			return;
+		}
+		let x = chat_area.x + (chat_area.width - width) / 2;
+		let y = chat_area.y + (chat_area.height - height) / 2;
+		let area = Rect {
+			x,
+			y,
+			width,
+			height,
+		};
+
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				" Resume session ",
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let lines = overlay.render(
+			&self.theme,
+			&self.keybindings,
+			inner.width as usize,
+			inner.height as usize,
+		);
+		frame.render_widget(Paragraph::new(lines), inner);
 	}
 
 	fn render_blocks(&mut self, width: usize) -> Vec<Line<'static>> {
@@ -2618,6 +3793,23 @@ impl InteractiveMode {
 						*rendered = Some((width, out.clone()));
 					}
 					lines.extend(out);
+				}
+				ChatBlock::Bash {
+					command,
+					output,
+					status,
+					rendered,
+				} => {
+					if let Some((w, cached)) = rendered
+						&& *w == width
+					{
+						lines.extend(cached.iter().cloned());
+						continue;
+					}
+					let out = render_bash_block(command, output, status, width, &theme);
+					*rendered = Some((width, out.clone()));
+					lines.extend(out);
+					lines.push(Line::default());
 				}
 				ChatBlock::Notice(text) => {
 					for line in text.lines() {
@@ -2986,13 +4178,15 @@ mod tests {
 		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
 		let handle = crate::core::agent_session::spawn_agent_session(
 			agent,
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			registry.clone(),
 		);
 		let ui = UiConfig {
 			theme: Theme::dark(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		let mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
 		assert!(
@@ -3010,7 +4204,8 @@ mod tests {
 		let root = std::env::temp_dir().join(format!("pi-tui-resume-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&root).unwrap();
 		let mut saved =
-			crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+			crate::core::session_manager::SessionManager::create_with_parent_in(&root, &root, None)
+				.unwrap();
 		saved
 			.append_message(&Message::user("saved question"))
 			.unwrap();
@@ -3020,13 +4215,15 @@ mod tests {
 		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
 		let handle = crate::core::agent_session::spawn_agent_session(
 			agent,
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			registry.clone(),
 		);
 		let ui = UiConfig {
 			theme: Theme::dark(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
 		mode.handle_slash(&format!("resume {}", path.display()));
@@ -3076,7 +4273,7 @@ mod tests {
 	fn session_picker_displays_and_searches_names_projects_and_first_messages() {
 		let root = std::env::temp_dir().join(format!("pi-picker-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&root).unwrap();
-		let mut named = crate::core::SessionManager::create_with_parent_in(
+		let mut named = crate::core::session_manager::SessionManager::create_with_parent_in(
 			&root,
 			&root.join("project-alpha"),
 			None,
@@ -3102,7 +4299,7 @@ mod tests {
 			.unwrap();
 		named.append_session_info("Refactor auth").unwrap();
 		let named_path = named.session_dir().unwrap().to_path_buf();
-		let mut unnamed = crate::core::SessionManager::create_with_parent_in(
+		let mut unnamed = crate::core::session_manager::SessionManager::create_with_parent_in(
 			&root,
 			&root.join("project-beta"),
 			None,
@@ -3171,12 +4368,14 @@ mod tests {
 		let root = std::env::temp_dir().join(format!("pi-tui-trust-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(root.join(".pi")).unwrap();
 		std::fs::write(root.join(".pi/mcp.json"), "{}").unwrap();
-		let saved = crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+		let saved =
+			crate::core::session_manager::SessionManager::create_with_parent_in(&root, &root, None)
+				.unwrap();
 		let path = saved.session_dir().unwrap().to_path_buf();
 		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			registry.clone(),
 		);
 		handle.configure_mcp(crate::core::tools::McpRuntime {
@@ -3188,6 +4387,8 @@ mod tests {
 			theme: Theme::light(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
 		mode.resume_session(&path.to_string_lossy());
@@ -3220,13 +4421,15 @@ mod tests {
 		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			registry.clone(),
 		);
 		let ui = UiConfig {
 			theme: Theme::dark(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
 		let (_sender, receiver) = tokio::sync::oneshot::channel();
@@ -3257,13 +4460,15 @@ mod tests {
 		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			registry.clone(),
 		);
 		let ui = UiConfig {
 			theme: Theme::dark(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		let mut mode = InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui);
 		let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -3293,13 +4498,15 @@ mod tests {
 		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
 		let handle = crate::core::agent_session::spawn_agent_session(
 			agent,
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			registry.clone(),
 		);
 		let ui = UiConfig {
 			theme: Theme::dark(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		let mut mode = InteractiveMode::new(
 			handle,
@@ -3344,8 +4551,35 @@ mod tests {
 			Some("test session")
 		);
 		mode.handle_slash("session");
-		assert!(mode.blocks.iter().any(|block| matches!(block, ChatBlock::Notice(text) if text.contains("test session") && text.contains("(not saved)"))));
+		// `/session` renders the upstream "Session Info" panel: the session
+		// name and the (in-memory) log location.
+		assert!(mode.blocks.iter().any(|block| matches!(block, ChatBlock::Notice(text) if text.contains("test session") && text.contains("In-memory"))));
 		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
+	}
+
+	#[test]
+	fn slash_menu_query_tracks_the_single_token_rule() {
+		// Upstream getSuggestions: only a leading `/` token before any space
+		// opens the command menu.
+		assert_eq!(slash_command_query("/"), Some(""));
+		assert_eq!(slash_command_query("/mo"), Some("mo"));
+		assert_eq!(slash_command_query("/model"), Some("model"));
+		assert_eq!(
+			slash_command_query("/model x"),
+			None,
+			"argument position closes the menu"
+		);
+		assert_eq!(slash_command_query("model"), None, "no slash, no menu");
+		assert_eq!(
+			slash_command_query("say /mo"),
+			None,
+			"slash must lead the text"
+		);
+	}
+
+	#[test]
+	fn slash_menu_completion_adds_the_argument_space() {
+		assert_eq!(apply_slash_completion("model"), "/model ");
 	}
 
 	#[test]
@@ -3670,6 +4904,8 @@ mod tests {
 			theme: Theme::dark(),
 			keybindings: crate::core::ui_config::new_keybindings_manager(),
 			notices: Vec::new(),
+			external_editor: crate::core::ui_config::resolve_external_editor(None),
+			initial_images: Vec::new(),
 		};
 		InteractiveMode::new(handle, Vec::new(), registry, ".".into(), ui)
 	}
@@ -3714,7 +4950,7 @@ mod tests {
 		// /clone on a fresh session refuses with the upstream status.
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -3736,7 +4972,8 @@ mod tests {
 		let root = std::env::temp_dir().join(format!("pi-clone-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&root).unwrap();
 		let mut saved =
-			crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+			crate::core::session_manager::SessionManager::create_with_parent_in(&root, &root, None)
+				.unwrap();
 		saved
 			.append_message(&Message::user("clonable question"))
 			.unwrap();
@@ -3744,7 +4981,7 @@ mod tests {
 		drop(saved);
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -3787,7 +5024,8 @@ mod tests {
 		let root = std::env::temp_dir().join(format!("pi-fork-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&root).unwrap();
 		let mut saved =
-			crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+			crate::core::session_manager::SessionManager::create_with_parent_in(&root, &root, None)
+				.unwrap();
 		saved
 			.append_message(&Message::user("forkable question"))
 			.unwrap();
@@ -3795,7 +5033,7 @@ mod tests {
 		drop(saved);
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -3847,7 +5085,7 @@ mod tests {
 	async fn fork_without_messages_reports_status() {
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -3869,7 +5107,7 @@ mod tests {
 		std::fs::write(&source, format!("{header}\n{first}\n")).unwrap();
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -3933,7 +5171,7 @@ mod tests {
 	async fn import_dialog_escape_cancels() {
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -3953,7 +5191,7 @@ mod tests {
 		std::fs::create_dir_all(&root).unwrap();
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -4026,7 +5264,7 @@ mod tests {
 	async fn tree_selector_opens_and_reports_empty_sessions() {
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -4087,7 +5325,8 @@ mod tests {
 		let root = std::env::temp_dir().join(format!("pi-tree-tui-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&root).unwrap();
 		let mut saved =
-			crate::core::SessionManager::create_with_parent_in(&root, &root, None).unwrap();
+			crate::core::session_manager::SessionManager::create_with_parent_in(&root, &root, None)
+				.unwrap();
 		saved
 			.append_message(&Message::user("first question"))
 			.unwrap();
@@ -4098,7 +5337,7 @@ mod tests {
 		drop(saved);
 		let handle = crate::core::agent_session::spawn_agent_session(
 			pi_agent::Agent::new(pi_agent::AgentOptions::default()),
-			crate::core::SessionManager::in_memory(),
+			crate::core::session_manager::SessionManager::in_memory(),
 			Arc::new(Mutex::new(ModelRegistry::load(None))),
 		);
 		let mut mode = test_mode(handle);
@@ -4140,5 +5379,269 @@ mod tests {
 		assert!(matches!(mode.dialog, Some(Dialog::SummarizeChoice { .. })));
 		mode.session.cmd_tx.send(SessionCommand::Exit).unwrap();
 		std::fs::remove_dir_all(root).unwrap();
+	}
+}
+
+#[cfg(test)]
+mod session_selector_tests {
+	use super::*;
+	use pi_ai::types::{AssistantMessage, StopReason, TextContent, ToolResultMessage, UserMessage};
+
+	fn assistant_with_call_and_text(call_id: &str, text: &str) -> AssistantMessage {
+		AssistantMessage {
+			content: vec![
+				pi_ai::AssistantContent::Text(TextContent {
+					text: text.into(),
+					text_signature: None,
+				}),
+				pi_ai::AssistantContent::ToolCall(pi_ai::ToolCall {
+					id: call_id.into(),
+					name: "bash".into(),
+					arguments: serde_json::json!({"command": "ls"}),
+					thought_signature: None,
+					namespace: None,
+					arguments_error: None,
+				}),
+			],
+			api: "openai-completions".into(),
+			provider: "mimo".into(),
+			model: "mimo-v2.6".into(),
+			response_model: None,
+			response_id: None,
+			thinking_level: None,
+			usage: pi_ai::Usage {
+				input: 100,
+				output: 10,
+				..pi_ai::Usage::default()
+			},
+			stop_reason: StopReason::Stop,
+			error_message: None,
+			raw_stop_reason: None,
+			end_turn: None,
+			timestamp: 0,
+			duration_ms: None,
+		}
+	}
+
+	#[test]
+	fn blocks_from_messages_pairs_tool_calls_with_results() {
+		let messages = vec![
+			Message::User(UserMessage::text("run ls")),
+			Message::Assistant(assistant_with_call_and_text("call-1", "doing it")),
+			Message::ToolResult(ToolResultMessage::text_result(
+				"call-1", "bash", "file.txt", false,
+			)),
+		];
+		let blocks = blocks_from_messages(&messages);
+		assert_eq!(blocks.len(), 3, "user + assistant + tool");
+		let ChatBlock::User(text) = &blocks[0] else {
+			panic!("user block");
+		};
+		assert_eq!(text, "run ls");
+		let ChatBlock::Tool {
+			id,
+			output,
+			running,
+			..
+		} = &blocks[2]
+		else {
+			panic!("tool block");
+		};
+		assert_eq!(id, "call-1");
+		assert_eq!(output, "file.txt");
+		assert!(!running);
+		// A call without a persisted result renders with empty output.
+		let messages = vec![Message::Assistant(assistant_with_call_and_text(
+			"call-2", "lost",
+		))];
+		let ChatBlock::Tool {
+			output, is_error, ..
+		} = &blocks_from_messages(&messages)[1]
+		else {
+			panic!("tool block");
+		};
+		assert_eq!(output, "");
+		assert!(!is_error);
+	}
+
+	#[test]
+	fn usage_of_messages_sums_assistant_usage() {
+		let messages = vec![
+			Message::User(UserMessage::text("hi")),
+			Message::Assistant(assistant_with_call_and_text("c", "a")),
+			Message::Assistant(assistant_with_call_and_text("d", "b")),
+		];
+		let usage = usage_of_messages(&messages);
+		assert_eq!(usage.0, 200);
+		assert_eq!(usage.1, 20);
+	}
+
+	#[test]
+	fn delete_session_file_removes_and_reports() {
+		let path = std::env::temp_dir().join(format!(
+			"pi-rs-delete-{}-{}.jsonl",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::write(&path, "{}\n").unwrap();
+		let outcome = delete_session_file(&path).expect("delete succeeds");
+		assert!(
+			outcome == "Session moved to trash" || outcome == "Session deleted",
+			"{outcome}"
+		);
+		assert!(!path.exists());
+		// Deleting an already-gone file reports success (upstream treats a
+		// vanished file as trashed, `!existsSync` branch).
+		assert!(delete_session_file(&path).is_ok());
+	}
+
+	#[test]
+	fn resolve_global_action_maps_the_model_cycle_chords() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+		assert_eq!(
+			resolve_global_action(&kb, &ctrl_p, true),
+			Some(GlobalAction::ModelCycleForward)
+		);
+		// The backward chord is platform-dependent (shift+ctrl+p on darwin).
+		let backward = if cfg!(target_os = "macos") {
+			KeyEvent::new(
+				KeyCode::Char('p'),
+				KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+			)
+		} else {
+			KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)
+		};
+		assert_eq!(
+			resolve_global_action(&kb, &backward, true),
+			Some(GlobalAction::ModelCycleBackward)
+		);
+	}
+
+	#[test]
+	fn session_tree_and_fork_actions_dispatch_through_overrides() {
+		let mut kb = crate::core::ui_config::new_keybindings_manager();
+		// Both actions ship unbound (upstream opens selectors); keybindings.json
+		// can bind them to the read-only /tree view and the numbered /fork.
+		kb.set_user_bindings(
+			[
+				("app.session.tree".to_string(), vec!["super+t".to_string()]),
+				("app.session.fork".to_string(), vec!["super+f".to_string()]),
+			]
+			.into_iter()
+			.collect(),
+		)
+		.unwrap();
+		let tree_key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER);
+		let fork_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::SUPER);
+		assert_eq!(
+			resolve_global_action(&kb, &tree_key, true),
+			Some(GlobalAction::SessionTree)
+		);
+		assert_eq!(
+			resolve_global_action(&kb, &fork_key, true),
+			Some(GlobalAction::SessionFork)
+		);
+	}
+
+	#[test]
+	fn resolve_global_action_maps_the_session_resume_action() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		// app.session.resume has no default chord (upstream: unbound); it is
+		// reachable via keybindings.json, so verify dispatch through a
+		// synthetic override instead.
+		let mut kb = kb;
+		kb.set_user_bindings(
+			[(
+				"app.session.resume".to_string(),
+				vec!["ctrl+shift+r".to_string()],
+			)]
+			.into_iter()
+			.collect(),
+		)
+		.unwrap();
+		let key = KeyEvent::new(
+			KeyCode::Char('r'),
+			KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+		);
+		assert_eq!(
+			resolve_global_action(&kb, &key, true),
+			Some(GlobalAction::SessionResume)
+		);
+	}
+}
+
+#[cfg(test)]
+mod external_editor_tests {
+	use super::*;
+
+	#[test]
+	fn strip_editor_text_removes_bom_and_one_trailing_newline() {
+		assert_eq!(strip_editor_text("hello\n"), "hello");
+		assert_eq!(
+			strip_editor_text("hello\n\n"),
+			"hello\n",
+			"only one newline"
+		);
+		assert_eq!(strip_editor_text("\u{feff}bom\n"), "bom");
+		assert_eq!(strip_editor_text("no-newline"), "no-newline");
+		assert_eq!(strip_editor_text("multi\nline\n"), "multi\nline");
+	}
+
+	#[tokio::test]
+	async fn external_editor_success_returns_edited_content() {
+		let dir = std::env::temp_dir().join(format!(
+			"pi-editor-test-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.subsec_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let script = dir.join("append-editor.sh");
+		std::fs::write(&script, "#!/bin/sh\nprintf 'edited\\n' >> \"$1\"\n").unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let outcome = run_external_editor(script.to_str().unwrap(), "original\n").await;
+		let _ = std::fs::remove_dir_all(&dir);
+		match outcome {
+			ExternalEditorOutcome::Complete(content) => assert_eq!(content, "original\nedited"),
+			ExternalEditorOutcome::Failed => panic!("expected success"),
+		}
+	}
+
+	#[tokio::test]
+	async fn external_editor_nonzero_exit_and_bad_command_fail() {
+		assert!(matches!(
+			run_external_editor("false", "content").await,
+			ExternalEditorOutcome::Failed
+		));
+		assert!(matches!(
+			run_external_editor("definitely-not-a-real-editor-xyz", "content").await,
+			ExternalEditorOutcome::Failed
+		));
+	}
+
+	#[test]
+	fn ctrl_g_resolves_the_external_editor_action() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+		assert_eq!(
+			resolve_global_action(&kb, &key, false),
+			Some(GlobalAction::EditorExternal)
+		);
+	}
+
+	#[test]
+	fn external_editor_resolution_prefers_configured_value() {
+		assert_eq!(
+			crate::core::ui_config::resolve_external_editor(Some("  my-edit-or ")),
+			"my-edit-or"
+		);
+		assert!(!crate::core::ui_config::resolve_external_editor(Some("   ")).is_empty());
 	}
 }

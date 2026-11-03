@@ -56,8 +56,11 @@ pub fn add_provider(
 	{
 		anyhow::bail!("Provider ID must contain only letters, digits, - or _");
 	}
-	if !matches!(api, "openai-completions" | "anthropic-messages") {
-		anyhow::bail!("API must be openai-completions or anthropic-messages");
+	if !matches!(
+		api,
+		"openai-completions" | "anthropic-messages" | "openai-responses"
+	) {
+		anyhow::bail!("API must be openai-completions, anthropic-messages, or openai-responses");
 	}
 	if !model.is_empty()
 		&& (!(base_url.starts_with("https://") || base_url.starts_with("http://"))

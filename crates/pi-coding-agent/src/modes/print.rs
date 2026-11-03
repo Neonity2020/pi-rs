@@ -35,10 +35,19 @@ pub async fn run_print(
 	mode: PrintOutputMode,
 	header_line: Option<String>,
 	prompts: Vec<String>,
+	initial_images: Vec<pi_ai::ImageContent>,
 ) -> anyhow::Result<i32> {
 	let stdout = std::io::stdout();
 	let mut out = stdout.lock();
-	run_print_to(&mut out, session, mode, header_line, prompts).await
+	run_print_to(
+		&mut out,
+		session,
+		mode,
+		header_line,
+		prompts,
+		initial_images,
+	)
+	.await
 }
 
 /// Testable core of print mode: same behavior as [`run_print`] with the
@@ -49,6 +58,7 @@ async fn run_print_to<W: Write>(
 	mode: PrintOutputMode,
 	header_line: Option<String>,
 	prompts: Vec<String>,
+	initial_images: Vec<pi_ai::ImageContent>,
 ) -> anyhow::Result<i32> {
 	let mut events = session.events;
 
@@ -64,10 +74,15 @@ async fn run_print_to<W: Write>(
 	}
 
 	let mut last_message: Option<Message> = None;
+	let mut images = initial_images;
 	for prompt in prompts {
-		session
-			.cmd_tx
-			.send(SessionCommand::Prompt { text: prompt })?;
+		// The attachments ride on the first prompt (upstream attaches them
+		// to `messages[0]`).
+		let prompt_images = std::mem::take(&mut images);
+		session.cmd_tx.send(SessionCommand::Prompt {
+			text: prompt,
+			images: prompt_images,
+		})?;
 		// The settle boundary is the quiescent point after a run (and any
 		// auto-compaction it triggered), so the next prompt only starts
 		// against a settled transcript — upstream awaits each
@@ -243,6 +258,7 @@ mod tests {
 			PrintOutputMode::Json,
 			Some(r#"{"type":"session","id":"s1"}"#.into()),
 			vec!["hello".into()],
+			Vec::new(),
 		)
 		.await
 		.expect("run completes");
@@ -307,6 +323,7 @@ mod tests {
 			PrintOutputMode::Json,
 			None,
 			vec!["hi".into()],
+			Vec::new(),
 		)
 		.await
 		.expect("run completes");
@@ -328,6 +345,7 @@ mod tests {
 			PrintOutputMode::Text,
 			None,
 			vec!["hello".into()],
+			Vec::new(),
 		)
 		.await
 		.expect("run completes");

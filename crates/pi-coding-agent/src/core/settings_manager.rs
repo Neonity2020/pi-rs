@@ -299,3 +299,30 @@ mod tests {
 		assert_eq!(merged, vec!["bash", "grep"]);
 	}
 }
+
+#[cfg(test)]
+mod retry_settings_tests {
+	use super::*;
+
+	#[test]
+	fn retry_settings_parse_and_fall_through() {
+		let global: Settings =
+			serde_json::from_str(r#"{"retry":{"enabled":false,"maxRetries":5,"baseDelayMs":100}}"#)
+				.unwrap();
+		let retry = global.retry.as_ref().expect("retry parsed");
+		assert_eq!(retry.enabled, Some(false));
+		assert_eq!(retry.max_retries, Some(5));
+		assert_eq!(retry.base_delay_ms, Some(100));
+
+		// Project overrides per field; missing fields fall through to global
+		// (effective() merge, project wins).
+		let project: Settings = serde_json::from_str(r#"{"retry":{"maxRetries":2}}"#).unwrap();
+		let merged = RetrySettings::merged(project.retry.as_ref(), global.retry.as_ref());
+		assert_eq!(merged.max_retries, Some(2));
+		assert_eq!(merged.base_delay_ms, Some(100));
+
+		// No retry key anywhere → None → engine defaults.
+		let plain: Settings = serde_json::from_str("{}").unwrap();
+		assert!(plain.retry.is_none());
+	}
+}

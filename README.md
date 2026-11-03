@@ -11,8 +11,14 @@
 | 交互和 print 模式 | 可用于实验；内置工具调用、JSONL 会话记录（上游 v3 树格式，与 TS pi 会话文件双向互通）、`--continue`（cwd 过滤）/`--resume`、`/compact` 与阈值自动压缩、溢出自动恢复；print 支持多 prompt 顺序执行、管道 stdin 前置、`@file` 参数注入（文本文件包 `<file>` 标签）、上游退出码语义；`--mode text\|json`（json 事件流与上游逐事件对齐，差分场景验证） |
 | 工具集选择 | 与上游同语义：默认激活 read/bash/edit/write（grep/find/ls 内置可选）、`-t/--tools`（裸名单替换或 `+name/-name` 修饰）、`-xt/--exclude-tools`（含 `mcp__*` 模式）、`-nt/--no-tools`、`-nbt/--no-builtin-tools`、settings `defaultTools`（两层合并）；消息 wire 与上游差分全场景一致（user/toolResult content 块数组） |
 | OpenAI 兼容 Chat Completions | 增量流式（SSE）文本与工具调用、错误与取消路径；本地 HTTP mock 集成测试覆盖 |
+| OpenAI Responses | 已实现：`input` 条目转换（assistant 重放带签名/复合 toolCall id）、`output_index` 槽位流处理、usage 缓存扣减、`max_output_tokens` 钳制；compat 门控路径推迟 |
 | Anthropic Messages | 完整实现：SSE 流式（text/thinking/tool_use 分片）、thinking budget 映射、cache token 用量；本地 mock HTTP 测试覆盖 |
-| 其他 HTTP provider | mock provider 可用于本地演示 |
+| Google Generative AI | 已实现：`streamGenerateContent?alt=sse`、thoughtSignature 重放与 thought 块切换、functionResponse 合并 user turn（Gemini 3+ 图片嵌套）、const→enum schema 重写、thinkingLevel/预算表；toolChoice/VALIDATED/重试推迟 |
+| pi-messages | 已实现：`{model, context, options}` 直传 + 已序列化事件流（contentIndex 槽位、签名/redacted 重放）；gateway rewrite 诊断/debug 旗标/toolChoice 推迟 |
+| Azure OpenAI Responses | 已实现：azure `api-key` 认证、URL 归一化（`/openai/v1`）、`AZURE_OPENAI_DEPLOYMENT_NAME_MAP` deployment 名解析；复用 responses 流处理 |
+| Google Vertex AI | 已实现：express API key 与 ADC 双认证（service_account RS256 JWT / authorized_user refresh）、区域端点与自定义 baseUrl；metadata-server 凭据/toolChoice 推迟 |
+| Mistral Conversations | 已实现：原生 Chat Completions wire（thinking 块数组、index 键控工具调用、`[tool error]` 文案、x-affinity 亲和、六拼写缓存命中）；toolChoice/reasoningEffort 推迟 |
+| 其他 HTTP provider | mock provider 可用于本地演示；bedrock-converse-stream、openai-codex-responses 未移植 |
 | 会话压缩与重试 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次）；错误自动重试（可重试错误判定 + 指数退避 + `auto_retry_start/end` 事件 + `agent_end.willRetry`，RPC 可开关/中止；支持 settings 的 `retry.enabled/maxRetries/baseDelayMs/maxAgentDelayMs`） |
 | agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek）；事件顺序对齐上游（turn_start 先于消息公告、assistant 盖 thinkingLevel、turn_end.toolResults 带 role） |
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
@@ -22,6 +28,8 @@
 | `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false；跨项目切换会关闭旧 MCP 连接并按目标项目的信任状态重连 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
+| TUI 会话命令 | `/resume`（无参开选择器：范围/树形/搜索/删除/重命名；带 id/路径直接恢复）、`/export`（HTML 默认或 .jsonl 分支导出）、`/new`、`/name`、`/session`（上游 Session Info 面板）、`/hotkeys`、`/fork`（用户消息选择器，选中后回填编辑器）与 `/fork <n>`（编号分叉）、`/clone`、`/tree`、`/import`、`/trust`、`/copy`（平台剪贴板阶梯 + OSC 52）、`/thinking <level>`；ctrl+g 外部编辑器（TUI 挂起/恢复） |
+| `@file` 图片 | 已实现：魔数嗅探（png/jpeg/gif/webp/bmp + APNG 排除）、EXIF 方向、4.5MB base64 预算 Lanczos3 递缩；限额内原始字节透传 |
 
 本项目仍在开发中，运行模型生成的 shell 命令和文件修改时，请在可信环境中使用并检查结果。
 
@@ -34,7 +42,7 @@ cargo build --release
 ./target/release/pi-rs --help
 ```
 
-交互模式键位：`Enter` 发送（`\`+Enter 换行续写）· `Esc` 中止运行 · `Ctrl+C` 退出 · `PgUp/PgDn` / 滚轮 翻页 · `Ctrl+O` 展开工具完整输出 · `Ctrl+T` 折叠/展开思考 · 编辑器支持 readline 词导航（`Ctrl+←/→`、`Alt+B/F`、`Alt+Backspace`、`Ctrl+W/K/U/D`）。`/model` 打开模糊搜索的模型选择浮层（↑↓ 选择、Enter 确认、Esc 取消）。
+交互模式键位：`Enter` 发送（`\`+Enter 换行续写）· `Esc` 中止运行 · `Ctrl+C` 退出 · `PgUp/PgDn` / 滚轮 翻页 · `Ctrl+O` 展开工具完整输出 · `Ctrl+T` 折叠/展开思考 · 编辑器支持 readline 词导航（`Ctrl+←/→`、`Alt+B/F`、`Alt+Backspace`、`Ctrl+W/K/U/D`）。输入 `/` 弹出命令菜单（实时模糊过滤，↑↓ 选择、Enter 补全并执行、Tab 仅补全、Esc 关闭——补全优先于中止运行），`/model` 打开模糊搜索的模型选择浮层（↑↓ 选择、Enter 确认、Esc 取消）。
 
 交互模式可使用 `/new` 新建会话、`/name <名称>` 命名当前会话、`/session` 查看当前会话、`/resume` 选择会话或 `/resume <ID或路径>` 恢复指定会话；选择器支持搜索会话名称、项目路径及用户和助手消息。`/help` 显示其他命令。恢复含 MCP 配置的未信任项目时，可以选择信任项目、跳过项目 MCP 或取消切换。跨项目切换会应用目标项目的 `defaultTools`，并保留启动时指定的工具选项。
 
@@ -115,7 +123,7 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
 
-剩余：1. **providers** — openai-responses、google-generative-ai 等 8 个 API；模型目录/认证（auth.json/OAuth）。2. **RPC/SDK** — session-tree 族（fork/clone/get_tree/get_entries）、bash 透传、export_html、SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、外部编辑器（ctrl+g）、图片粘贴、会话/设置选择器。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
+剩余：1. **providers** — 6 个 API（openai-responses 与 google-generative-ai 已完成；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴、设置选择器（会话选择器与外部编辑器 ctrl+g 已完成：`/resume` 浮层支持范围/树形/搜索/删除/重命名；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 

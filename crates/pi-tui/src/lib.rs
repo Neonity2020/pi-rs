@@ -13,6 +13,7 @@ pub mod keybindings;
 pub mod keys;
 pub mod terminal;
 pub mod theme;
+pub mod wheel_scroll;
 
 pub use components::{Component, Editor, ScrollView, Text};
 pub use keybindings::{KeybindingsManager, TUI_KEYBINDINGS};

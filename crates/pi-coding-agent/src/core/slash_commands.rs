@@ -106,6 +106,57 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		"list recent sessions (stub)",
 		SlashCommandSource::Builtin,
 	),
+	info(
+		"resume",
+		"open the session selector (switch/delete/rename)",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"fork",
+		"fork at a user message (selector, or /fork <n>)",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"tree",
+		"show the session entry tree (read-only)",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"trust",
+		"review the project MCP config trust decision",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"import",
+		"import a session from a JSONL export (/import <path>)",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"hotkeys",
+		"show the resolved keybindings",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"session",
+		"show session info and stats",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"name",
+		"show or set the session display name",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"copy",
+		"copy the last agent message to the clipboard",
+		SlashCommandSource::Builtin,
+	),
+	info("new", "start a new session", SlashCommandSource::Builtin),
+	info(
+		"export",
+		"export session (HTML default, or specify path: .html/.jsonl)",
+		SlashCommandSource::Builtin,
+	),
 ];
 
 const fn info(

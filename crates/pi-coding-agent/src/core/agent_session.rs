@@ -131,9 +131,12 @@ pub enum TreeNavResult {
 /// Commands a mode sends to the session task.
 #[derive(Debug)]
 pub enum SessionCommand {
-	/// New prompt; queued when a run is active.
+	/// New prompt; queued when a run is active. `images` ride on the initial
+	/// message as content blocks (`@file` attachments, upstream
+	/// `processFileArguments`).
 	Prompt {
 		text: String,
+		images: Vec<pi_ai::ImageContent>,
 	},
 	/// Inject mid-run after the current assistant turn.
 	Steer {
@@ -151,7 +154,9 @@ pub enum SessionCommand {
 		level: ThinkingLevel,
 	},
 	CycleThinking,
-	Compact,
+	Compact {
+		instructions: Option<String>,
+	},
 	/// Toggle automatic threshold compaction (RPC `set_auto_compaction`).
 	SetAutoCompaction {
 		enabled: bool,
@@ -378,7 +383,10 @@ pub struct ToolRuntimeOptions {
 pub(crate) struct RetryRuntime {
 	pub(crate) attempt: u32,
 	pub(crate) base_delay_ms: u64,
+	/// `settings.retry.maxRetries` (upstream default 3).
 	pub(crate) max_retries: u32,
+	/// `settings.retry.maxAgentDelayMs` — the ceiling for the exponential
+	/// backoff delay of a single retry chain.
 	pub(crate) max_delay_ms: u64,
 }
 
@@ -457,6 +465,23 @@ impl SessionHandle {
 		*self.shared.mcp.lock().unwrap() = Some(runtime.clone());
 		runtime
 	}
+
+	/// The live agent — swapped by the session task on session replacement,
+	/// so TUI probes (model, snapshot, tool names) always observe the
+	/// current session's agent (`self.agent` stays the startup agent).
+	pub fn live_agent(&self) -> Agent {
+		self.shared.live_agent.lock().unwrap().clone()
+	}
+
+	/// File of the live session (`None` when persistence is disabled).
+	pub fn current_session_file(&self) -> Option<std::path::PathBuf> {
+		self.shared.current_session_file.lock().unwrap().clone()
+	}
+
+	/// Display name of the live session (latest `session_info` entry).
+	pub fn session_name(&self) -> Option<String> {
+		self.shared.session_name.lock().unwrap().clone()
+	}
 }
 
 /// Build and spawn the session task.
@@ -465,7 +490,13 @@ pub fn spawn_agent_session(
 	session: SessionManager,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 ) -> SessionHandle {
-	spawn_agent_session_with_settings(agent, session, registry, CompactionSettings::default())
+	spawn_agent_session_with_settings(
+		agent,
+		session,
+		registry,
+		CompactionSettings::default(),
+		crate::core::settings_manager::RetrySettings::default(),
+	)
 }
 
 pub fn spawn_agent_session_with_settings(
@@ -473,6 +504,7 @@ pub fn spawn_agent_session_with_settings(
 	session: SessionManager,
 	registry: Arc<std::sync::Mutex<ModelRegistry>>,
 	settings: CompactionSettings,
+	retry_settings: RetrySettings,
 ) -> SessionHandle {
 	spawn_agent_session_with_options(
 		agent,
@@ -480,7 +512,7 @@ pub fn spawn_agent_session_with_settings(
 		registry,
 		settings,
 		Default::default(),
-		Default::default(),
+		retry_settings,
 	)
 }
 
@@ -737,7 +769,7 @@ impl MidRunHook {
 			return;
 		};
 		self.emit(SessionEvent::Notice("auto-compaction (mid-run)…".into()));
-		match compaction::compact_prefix(&self.agent, Some(cut)).await {
+		match compaction::compact_prefix(&self.agent, Some(cut), None).await {
 			Ok(outcome) => {
 				let mut guard = self.log.lock().unwrap();
 				// The log entry leads the swap (upstream
@@ -788,7 +820,7 @@ async fn session_task(
 	auto_retry: Arc<std::sync::atomic::AtomicBool>,
 ) {
 	let mut agent_rx = agent.subscribe();
-	let mut pending = VecDeque::new();
+	let mut pending: VecDeque<(String, Vec<pi_ai::ImageContent>)> = VecDeque::new();
 	let mut run: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
 	// In-flight compaction summarization; the agent is idle while this runs.
 	let mut compacting: Option<tokio::task::JoinHandle<anyhow::Result<CompactionOutcome>>> = None;
@@ -849,9 +881,9 @@ async fn session_task(
 			command = cmd_rx.recv() => {
 				let Some(command) = command else { break };
 				match command {
-					SessionCommand::Prompt { text } => {
+					SessionCommand::Prompt { text, images } => {
 						if run.is_some() || agent.is_streaming() || compacting.is_some() || nav.is_some() {
-							pending.push_back(text);
+							pending.push_back((text, images));
 							if compacting.is_some() || nav.is_some() {
 								notice(&event_bus, "compaction running — prompt queued".into());
 							} else {
@@ -861,16 +893,16 @@ async fn session_task(
 							&& let Some((tokens, window)) = super::context_usage::compute(&agent)
 							&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
 							&& let Some(cut) = auto_compaction_cut(&agent, &mut log.lock().unwrap(), settings.keep_recent_tokens.unwrap_or(20_000)) {
-							pending.push_back(text);
+							pending.push_back((text, images));
 							notice(&event_bus, "auto-compaction (threshold)…".into());
 							let agent = agent.clone();
-							compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+							compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
 						} else {
 							overflow_attempted = false;
 							abort_requested = false;
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move {
-								agent.prompt(PromptInput::Text { text }).await
+								agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
 							}));
 						}
 					}
@@ -900,11 +932,13 @@ async fn session_task(
 						}
 						notice(&event_bus, "aborting…".into());
 						if stopped_compaction && run.is_none() && !agent.is_streaming()
-							&& let Some(text) = pending.pop_front() {
+							&& let Some((text, images)) = pending.pop_front() {
 							overflow_attempted = false;
 							abort_requested = false;
 							let agent = agent.clone();
-							run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
+							run = Some(tokio::spawn(async move {
+								agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
+							}));
 						}
 					}
 					SessionCommand::SetModel { query } => {
@@ -940,7 +974,7 @@ async fn session_task(
 						persist_thinking_level(&log, next, &event_bus);
 						notice(&event_bus, format!("thinking → {next:?}"));
 					}
-					SessionCommand::Compact => {
+					SessionCommand::Compact { instructions } => {
 						// A finished-but-unreaped run is select-order lag, not an
 						// active run; reap it so acceptance reflects the agent.
 						if run.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
@@ -975,7 +1009,7 @@ async fn session_task(
 							notice(&event_bus, "compacting…".into());
 							let agent = agent.clone();
 							compacting = Some(tokio::spawn(async move {
-								compaction::compact_agent(&agent).await
+								compaction::compact_prefix(&agent, None, instructions.as_deref()).await
 							}));
 						}
 					}
@@ -1186,7 +1220,8 @@ async fn session_task(
 								}
 							retry_cancel = None;
 							finish_cancelled_retry(&shared);
-							let drained: Vec<String> = pending.drain(..).collect();
+							let drained: Vec<String> =
+								pending.drain(..).map(|(text, _)| text).collect();
 							let mut guard = log.lock().unwrap();
 							persist_messages(&agent, &mut guard, &event_bus);
 							drop(guard);
@@ -1372,7 +1407,7 @@ async fn session_task(
 								recovery_compaction = true;
 								notice(&event_bus, "context overflow: compacting before one retry".into());
 								let agent = agent.clone();
-								compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+								compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
 							} else {
 								notice(&event_bus, "overflow recovery unavailable: no durable compaction boundary".into());
 							}
@@ -1393,7 +1428,7 @@ async fn session_task(
 				{
 					notice(&event_bus, "auto-compaction (threshold)…".into());
 					let agent = agent.clone();
-					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut)).await }));
+					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
 				}
 				// Auto-retry (upstream `_handlePostAgentRun` + `_prepareRetry`):
 				// a run that ended in a retryable error schedules one repeat
@@ -1412,7 +1447,12 @@ async fn session_task(
 					&& last_assistant.as_ref().is_some_and(|assistant| {
 						retry_policy::is_retryable_error(assistant, agent.model().context_window)
 					})
-					&& { let retry = shared.retry.lock().unwrap(); retry.attempt < retry.max_retries };
+					&& {
+						// Single lock: two lock() calls on the same std Mutex
+						// in one expression deadlock.
+						let guard = shared.retry.lock().unwrap();
+						guard.attempt < guard.max_retries
+					};
 				if will_retry && compacting.is_none() && run.is_none() && !agent.is_streaming() {
 					match omit_failed_attempt(&agent, &log) {
 						Ok(()) => {
@@ -1477,11 +1517,13 @@ async fn session_task(
 						shared.retry.lock().unwrap().attempt = 0;
 					}
 				}
-				if compacting.is_none() && run.is_none() && !agent.is_streaming() && let Some(text) = pending.pop_front() {
+				if compacting.is_none() && run.is_none() && !agent.is_streaming() && let Some((text, images)) = pending.pop_front() {
 					overflow_attempted = false;
 					abort_requested = false;
 					let agent = agent.clone();
-					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
+					run = Some(tokio::spawn(async move {
+						agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
+					}));
 				}
 			}
 
@@ -1511,12 +1553,14 @@ async fn session_task(
 				// Prompts queued while compacting start now that the agent is idle.
 				if run.is_none()
 					&& !agent.is_streaming()
-					&& let Some(text) = pending.pop_front()
+					&& let Some((text, images)) = pending.pop_front()
 				{
 					overflow_attempted = false;
 					abort_requested = false;
 					let agent = agent.clone();
-					run = Some(tokio::spawn(async move { agent.prompt(PromptInput::Text { text }).await }));
+					run = Some(tokio::spawn(async move {
+						agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
+					}));
 				}
 			}
 			result = async { nav_task.as_mut().expect("guarded navigation").await }, if nav_task.is_some() => {
@@ -2376,6 +2420,9 @@ fn plan_import_session(
 		.unwrap_or_else(crate::config::sessions_dir);
 	std::fs::create_dir_all(&root)
 		.map_err(|error| format!("cannot create session storage: {error}"))?;
+	// Upstream `importFromJsonl`: the file is copied into the session
+	// directory as-is (the imported header and ids travel with it) and the
+	// copy's name is deduped with a `-1`, `-2`, … suffix.
 	let stem = import_stem(&resolved);
 	let dir = import_destination_dir(&root, &stem);
 	std::fs::create_dir_all(&dir).map_err(|error| format!("cannot create {dir:?}: {error}"))?;
@@ -2460,7 +2507,7 @@ struct ReplacementContext<'a> {
 	compacting: &'a mut Option<tokio::task::JoinHandle<anyhow::Result<CompactionOutcome>>>,
 	run: &'a mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 	agent_rx: &'a mut tokio::sync::broadcast::Receiver<AgentEvent>,
-	pending: &'a mut VecDeque<String>,
+	pending: &'a mut VecDeque<(String, Vec<pi_ai::ImageContent>)>,
 	abort_requested: &'a mut bool,
 	overflow_attempted: &'a mut bool,
 	recovery_compaction: &'a mut bool,
@@ -2477,6 +2524,107 @@ struct ReplacementContext<'a> {
 /// task state (`teardownCurrent` → `createRuntime` upstream). The teardown
 /// either lands whole or leaves the current session untouched. Returns the
 /// new agent and its event receiver for the caller's loop locals.
+/// Session statistics for `/session` and RPC `get_session_stats` (upstream
+/// `getSessionStats`): message counts plus usage summed over assistant
+/// messages, tool-result usage, and the model-attributed usage entries.
+pub(crate) struct SessionStats {
+	pub session_file: Option<PathBuf>,
+	pub session_id: String,
+	pub user_messages: u64,
+	pub assistant_messages: u64,
+	pub tool_calls: u64,
+	pub tool_results: u64,
+	pub total_messages: u64,
+	pub input: u64,
+	pub output: u64,
+	pub cache_read: u64,
+	pub cache_write: u64,
+}
+
+pub(crate) fn compute_session_stats(
+	session: &SessionManager,
+	session_file: Option<PathBuf>,
+) -> SessionStats {
+	use super::session_manager::EntryKind;
+	let mut stats = SessionStats {
+		session_file,
+		session_id: session
+			.session_id()
+			.or_else(|| session.header_id().map(str::to_owned))
+			.unwrap_or_default(),
+		user_messages: 0,
+		assistant_messages: 0,
+		tool_calls: 0,
+		tool_results: 0,
+		total_messages: 0,
+		input: 0,
+		output: 0,
+		cache_read: 0,
+		cache_write: 0,
+	};
+	let mut add_usage = |usage: &pi_ai::Usage| {
+		stats.input += usage.input;
+		stats.output += usage.output;
+		stats.cache_read += usage.cache_read;
+		stats.cache_write += usage.cache_write;
+	};
+	for entry in session.entries() {
+		match &entry.kind {
+			EntryKind::Usage { usage, .. } => add_usage(usage),
+			// Model-attributed usage carried by summaries counts too.
+			EntryKind::BranchSummary {
+				usage: Some(usage), ..
+			}
+			| EntryKind::Compaction {
+				usage: Some(usage), ..
+			} => add_usage(usage),
+			EntryKind::Message { message } => {
+				stats.total_messages += 1;
+				match message.as_ref() {
+					pi_ai::Message::User(_) => stats.user_messages += 1,
+					pi_ai::Message::ToolResult(result) => {
+						stats.tool_results += 1;
+						if let Some(usage) = &result.usage {
+							add_usage(usage);
+						}
+					}
+					pi_ai::Message::Assistant(assistant) => {
+						stats.assistant_messages += 1;
+						stats.tool_calls += assistant
+							.content
+							.iter()
+							.filter(|block| matches!(block, pi_ai::AssistantContent::ToolCall(_)))
+							.count() as u64;
+						add_usage(&assistant.usage);
+					}
+					pi_ai::Message::System(_) => {}
+				}
+			}
+			_ => {}
+		}
+	}
+	stats
+}
+
+/// A user prompt as a `Message`: text only when there are no image
+/// attachments, otherwise content blocks (text first, then the images).
+fn user_message_with_images(text: &str, images: &[pi_ai::ImageContent]) -> pi_ai::Message {
+	if images.is_empty() {
+		return pi_ai::Message::user(text);
+	}
+	let mut blocks = vec![pi_ai::TextOrImage::text(text)];
+	blocks.extend(images.iter().map(|image| {
+		pi_ai::TextOrImage::Image(pi_ai::ImageContent {
+			data: image.data.clone(),
+			mime_type: image.mime_type.clone(),
+		})
+	}));
+	pi_ai::Message::User(pi_ai::types::UserMessage {
+		content: pi_ai::types::UserContent::Blocks(blocks),
+		timestamp: pi_ai::types::now_ms(),
+	})
+}
+
 async fn apply_replacement(
 	mut ctx: ReplacementContext<'_>,
 ) -> (Agent, tokio::sync::broadcast::Receiver<AgentEvent>) {
@@ -3444,11 +3592,13 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "first".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		// Steer while the run is active so the loop continues after turn 1
@@ -3566,11 +3716,13 @@ mod tests {
 			session,
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "x".repeat(85_000),
+				images: Vec::new(),
 			})
 			.unwrap();
 		notices_until_agent_ends(&mut handle, 1).await;
@@ -3663,11 +3815,13 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "first".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -3675,6 +3829,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "second".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		// Turn 2 ends with the overflow; the recovery compaction and the retry
@@ -3757,11 +3912,13 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "first".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -3769,6 +3926,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "second".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		// Turn 2 ends with the overflow; the recovery compaction and the retry
@@ -3815,11 +3973,13 @@ mod tests {
 			SessionManager::open(&dir).unwrap(),
 			registry,
 			recovery_settings(),
+			crate::core::settings_manager::RetrySettings::default(),
 		);
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "first".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -3827,6 +3987,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "second".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		// Turn 2 ends with the overflow; the recovery compaction and the retry
@@ -3878,7 +4039,9 @@ mod tests {
 			auto_compaction_cut(&agent, &mut guard, 20_000).expect("safe boundary")
 		};
 		assert_eq!(cut.first_kept, 1);
-		let outcome = compaction::compact_prefix(&agent, Some(cut)).await.unwrap();
+		let outcome = compaction::compact_prefix(&agent, Some(cut), None)
+			.await
+			.unwrap();
 		let bus = EventBus::new();
 		apply_compaction(&agent, &log, &bus, outcome);
 		let actual: Vec<_> = agent
@@ -3933,13 +4096,17 @@ mod tests {
 			spawn_agent_session(agent.clone(), SessionManager::open(&dir).unwrap(), registry);
 		handle
 			.cmd_tx
-			.send(SessionCommand::Prompt { text: "old".into() })
+			.send(SessionCommand::Prompt {
+				text: "old".into(),
+				images: Vec::new(),
+			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "x".repeat(85_000),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(10), async {
@@ -4033,10 +4200,14 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "original".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				if let Ok(SessionEvent::Notice(text)) = handle.events.recv().await
@@ -4081,7 +4252,10 @@ mod tests {
 		});
 		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
 		let mut handle = spawn_agent_session(agent.clone(), SessionManager::in_memory(), registry);
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				if let Ok(SessionEvent::Notice(text)) = handle.events.recv().await
@@ -4097,6 +4271,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "queued".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		handle.cmd_tx.send(SessionCommand::Abort).unwrap();
@@ -4124,11 +4299,15 @@ mod tests {
 		session.fail_next_sync();
 		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
 		let mut handle = spawn_agent_session(agent.clone(), session, registry);
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "must not run".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
@@ -4270,12 +4449,14 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "first".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "second".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
@@ -4345,6 +4526,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "hello".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
@@ -4414,6 +4596,7 @@ mod tests {
 		));
 		tx.send(SessionCommand::Prompt {
 			text: "hello".into(),
+			images: Vec::new(),
 		})
 		.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
@@ -4559,12 +4742,16 @@ mod tests {
 				.cmd_tx
 				.send(SessionCommand::Prompt {
 					text: "first question".into(),
+					images: Vec::new(),
 				})
 				.unwrap();
 			wait_for_agent_ends(&mut handle, 1).await;
 			assert_eq!(agent.snapshot().messages.len(), 3);
 
-			handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+			handle
+				.cmd_tx
+				.send(SessionCommand::Compact { instructions: None })
+				.unwrap();
 			tokio::time::timeout(Duration::from_secs(20), async {
 				loop {
 					match handle.events.recv().await {
@@ -4617,6 +4804,7 @@ mod tests {
 				.cmd_tx
 				.send(SessionCommand::Prompt {
 					text: "second question".into(),
+					images: Vec::new(),
 				})
 				.unwrap();
 			wait_for_agent_ends(&mut handle, 1).await;
@@ -4666,6 +4854,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "third question".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -4713,6 +4902,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "long running".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
@@ -4723,7 +4913,10 @@ mod tests {
 		.await
 		.unwrap();
 
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
 			loop {
 				match handle.events.recv().await {
@@ -4744,11 +4937,15 @@ mod tests {
 		// Finish the run, then compact; queue a prompt while compacting.
 		gate_tx.send(true).unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
-		handle.cmd_tx.send(SessionCommand::Compact).unwrap();
+		handle
+			.cmd_tx
+			.send(SessionCommand::Compact { instructions: None })
+			.unwrap();
 		handle
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "queued during compaction".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(20), async {
@@ -4855,7 +5052,10 @@ mod tests {
 		for text in ["one", "two", "three"] {
 			handle
 				.cmd_tx
-				.send(SessionCommand::Prompt { text: text.into() })
+				.send(SessionCommand::Prompt {
+					text: text.into(),
+					images: Vec::new(),
+				})
 				.unwrap();
 		}
 		wait_for_agent_ends(&mut handle, 3).await;
@@ -4899,6 +5099,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "hello".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 
@@ -4946,6 +5147,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "keep this conversation".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(5), async {
@@ -5298,6 +5500,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "old question".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -5333,6 +5536,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "new question".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -5402,6 +5606,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "live history".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -5440,6 +5645,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "after switch".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -5470,7 +5676,10 @@ mod tests {
 		for text in ["first question", "second question"] {
 			handle
 				.cmd_tx
-				.send(SessionCommand::Prompt { text: text.into() })
+				.send(SessionCommand::Prompt {
+					text: text.into(),
+					images: Vec::new(),
+				})
 				.unwrap();
 			wait_for_agent_ends(&mut handle, 1).await;
 		}
@@ -5535,6 +5744,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "edited question".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -5686,6 +5896,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "after bash".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -5861,7 +6072,10 @@ mod tests {
 		);
 		handle
 			.cmd_tx
-			.send(SessionCommand::Prompt { text: "try".into() })
+			.send(SessionCommand::Prompt {
+				text: "try".into(),
+				images: Vec::new(),
+			})
 			.unwrap();
 		notices_until_agent_ends(&mut handle, 2).await;
 		assert_eq!(*requests.lock().unwrap(), 2);
@@ -5916,7 +6130,10 @@ mod tests {
 			);
 			handle
 				.cmd_tx
-				.send(SessionCommand::Prompt { text: "try".into() })
+				.send(SessionCommand::Prompt {
+					text: "try".into(),
+					images: Vec::new(),
+				})
 				.unwrap();
 			notices_until_agent_ends(&mut handle, 1).await;
 			assert_eq!(*requests.lock().unwrap(), 1);
@@ -5954,6 +6171,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "first".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		let notices = notices_until_agent_ends(&mut handle, 2).await;
@@ -6040,7 +6258,10 @@ mod tests {
 
 		handle
 			.cmd_tx
-			.send(SessionCommand::Prompt { text: "go".into() })
+			.send(SessionCommand::Prompt {
+				text: "go".into(),
+				images: Vec::new(),
+			})
 			.unwrap();
 		// Three retries are scheduled, then the sequence reports failure.
 		tokio::time::timeout(Duration::from_secs(30), async {
@@ -6087,7 +6308,10 @@ mod tests {
 
 		handle
 			.cmd_tx
-			.send(SessionCommand::Prompt { text: "go".into() })
+			.send(SessionCommand::Prompt {
+				text: "go".into(),
+				images: Vec::new(),
+			})
 			.unwrap();
 		tokio::time::timeout(Duration::from_secs(10), async {
 			loop {
@@ -6143,6 +6367,7 @@ mod tests {
 				.cmd_tx
 				.send(SessionCommand::Prompt {
 					text: "old question".into(),
+					images: Vec::new(),
 				})
 				.unwrap();
 			wait_for_agent_ends(&mut handle, 1).await;
@@ -6168,6 +6393,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "new question".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;
@@ -6214,7 +6440,10 @@ mod tests {
 		for text in ["first question", "second question"] {
 			handle
 				.cmd_tx
-				.send(SessionCommand::Prompt { text: text.into() })
+				.send(SessionCommand::Prompt {
+					text: text.into(),
+					images: Vec::new(),
+				})
 				.unwrap();
 			wait_for_agent_ends(&mut handle, 1).await;
 		}
@@ -6336,6 +6565,7 @@ mod tests {
 			.cmd_tx
 			.send(SessionCommand::Prompt {
 				text: "retry".into(),
+				images: Vec::new(),
 			})
 			.unwrap();
 		wait_for_agent_ends(&mut handle, 1).await;

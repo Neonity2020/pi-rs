@@ -130,3 +130,201 @@ cargo fmt --all -- --check
 **验证（本轮实测）**：`cargo test --workspace --locked` **521 项全绿**（444→521）、fmt/clippy -D warnings 干净；difftest 6/6 IDENTICAL。已知推迟：RPC session 替换后 MCP 工具表不重建（待扩展阶段）；retry 的 maxRetries/baseDelay 待 settings 扩键；RPC 模式差分场景（事件顺序已由 json 场景覆盖主要面）；`--mode json` 的 stdout 背压/信号处理；@file 图片附件。
 
 改动已分批提交至 main（等用户指令推送）。
+
+## 第九轮：TUI 会话选择器（2026-10-31，主会话单线）
+
+基线 `fc8e942`（上游 `/resume` + `SessionSelectorComponent` + `session-selector-search.ts` 全量移植）：
+
+- **会话列举**（`core/session_manager.rs`）：`SessionInfo`（path/id/cwd/name/parentSessionPath/created/modified/messageCount/firstMessage/allMessagesText，对照 session-manager.ts:229 `buildSessionInfo`）+ `list_sessions_in`/`list_sessions_progress`（每 10/100 个发布排序部分列表；pi-rs 单一 sessions 根目录，"当前文件夹"范围按 header cwd 匹配 = `paths_equivalent`，即上游自定义 dir 时的 `sessionCwdMatches` 语义）；`parse_iso_timestamp_ms`（`iso_timestamp` 的逆，含 `Z`/`±HH:MM` 偏移）+ `append_session_info_to_file`（任意会话文件追加 `session_info` 条目，空名清除——选择器 rename 路径，活动会话仍走 `SessionManager::append_session_info`）。
+- **搜索与树**（新模块 `modes/session_selector.rs`）：`parse_search_query`（`re:` 正则大小写不敏感、`"phrase"` 短语、引号失衡回退空白分词）、分层评分（name 命中 > id/messages/cwd 文本命中 > 散乱 fuzzy，`TIER_WEIGHT=1e6`，复用 pi-tui `fuzzy_match`；小写语料随列表缓存）、`filter_sessions`（recent 只滤保序 / relevance 按分+最近平局）、`build_session_tree`/`flatten_session_tree`（parentSession 系缘树，子树最新活动排序，`│ ├ └` 前缀；canonicalize 缺失路径回退原串）。
+- **选择器浮层**（同模块 `SessionSelectorOverlay`）：纯状态机 + 渲染（键处理返回 `SelectorAction`，文件变更与会话切换由 interactive 执行）。范围 Tab 切换（current/all，按需加载 + Loading n/t）、排序 ctrl+s 循环（Threaded/Recent/"Fuzzy"=relevance）、命名过滤 ctrl+n、路径显示 ctrl+p、删除确认 ctrl+d（活动会话拒绝；trash CLI 优先、失败回退 unlink、已消失视为成功——上游 `deleteSessionFile` 语义）、重命名 ctrl+r（预填现名）、ctrl+backspace 空查询快捷删除；↑↓/pgup/pgdn/enter/esc + 其余键进搜索行（与 model overlay 一致硬编码编辑键）；标题行（范围◉/○ + Name + Sort + 进度）、双 hint 行、状态行（删/改名结果 2s/3s 过期）、空态文案、`(i/n)` 滚动指示、选中行 REVERSED+粗体、命名行 warning 色（用 tool 色位）、当前会话 accent 色。
+- **接线**（`modes/interactive.rs`）：`/resume` 命令 + `app.session.resume`（默认无键，可经 keybindings.json 绑定）经 `resolve_global_action` 打开浮层；列表加载走 `spawn_blocking` + 类型化 mpsc（`SessionListMsg::Progress/Loaded/Status`，过期范围消息丢弃）；选中 → `SessionCommand::SwitchSession`（复用 RPC 轮会话替换），`session → …` notice 到达时从 `live_agent` 快照重建聊天块（`blocks_from_messages`：assistant toolCall 与 toolResult 按 id 配对，孤立 call 空输出、孤立 result 跳过；usage 重算自消息）；TUI 探针全部改 `SessionHandle::live_agent()`（新 pub 方法，替换后 model/snapshot/tool_names 观察当前会话）+ `current_session_file()`/`session_name()`。删除/改名在 `spawn_blocking` 执行后重载当前范围。
+- **声明偏差**：浮层浮于聊天区（上游全屏容器）；重命名/删除后整列表重载而非原地更新单行；relevance 排序的语料逐会话缓存于浮层（上游 WeakMap）；删除/改名结果无 `trash` 时直接 unlink（macOS 无预装 trash 常见）。
+
+**验证**：576 项测试全绿（521→576，+55：查询解析/分层评分/树投影/浮层状态机 15 项、SessionInfo/ISO/列举/rename 4 项、块重建/usage/删除/键位分发 4 项等）；fmt/clippy -D warnings 干净。pty 端到端冒烟：`/resume` 打开浮层、行渲染（命名/首条消息/计数/时长）、搜索过滤、Down 光标移动（帧 diff 实证）、Enter 切换（`session → ` notice + 干净退出，连跑 4 次 exit 0）。注意：ratatui 光标寻址帧经 naive 去 escape 拼接会产生幻影词，冒烟断言要用帧 diff 或状态（会话文件/进程退出码）验证，勿用拼接文本。
+
+**交接事项**：设置选择器（settings-selector.ts）未做；树选择器（tree-selector.ts）未做；`--continue` 启动时 TUI 仍不回放历史（仅切换/替换后重建）；`fork`/`new_session` 尚无 UI 入口（RPC 已有）；上游 `/rename` 无独立斜杠命令，rename 仅在选择器内。
+
+## 第十轮：外部编辑器 ctrl+g（2026-10-31，主会话单线）
+
+基线 `c0ab58e`（上游 `external-editor.ts` + `getExternalEditorCommand` + `ui.stop()/start()` 生命周期移植）：
+
+- **pi-tui**：`TerminalGuard::suspend/resume`——suspend 走 `restore_terminal`（退备屏、关 raw/鼠标/键盘 flags），resume 重进并 `Terminal::clear()` 强制全量重绘（备屏重进后是空白，不清屏会花屏）。
+- **interactive**：`app.editor.external`（ctrl+g）→ `GlobalAction::EditorExternal` 只置 pending 标记；run() 循环在 draw 后处理：先停输入读取器（`spawn_term_reader` 可重启化——EventStream 存活会与编辑器抢键盘，select! 对 pause 通道退出即 drop 流），再 `guard.suspend()`，打两行提示，spawn 后台任务执行编辑器；结束帧经 `editor_rx` 回到主循环 resume + 重启读取器 + `editor.set_text`（失败不改内容，同上游）。`run_external_editor`：`pi-editor-<pid>-<nanos>` 临时目录写 prompt.md、空白分词命令 + stdio inherit、成功读回并 `strip_editor_text`（BOM + 恰一个尾换行）；命令不存在/非零退出/读不回都按失败处理（上游读失败会抛未捕获，移植降级为 failed）。命令解析 `resolve_external_editor`：settings `externalEditor` → `$VISUAL`/`$EDITOR` → nano（经 UiConfig.external_editor 传入，settings 管理器不进 interactive）。
+- **声明偏差**：上游 Windows `shell:true` 未移植（直接 exec）；上游 spawn error 静默，移植同样静默不改内容。
+
+**验证**：581 项测试全绿（576→581，+5：BOM/尾换行剥离、脚本编辑器往返、非零退出与坏命令失败、ctrl+g 分发、配置优先级）；fmt/clippy -D warnings 干净。pty 冒烟：EDITOR=脚本 → ctrl+g → 两行提示 → 编辑内容进 editor → 提交后会话文件含编辑后文本。教训延续：pty 冒烟用会话文件断言状态，勿用去 escape 拼接文本。
+
+## 第十一轮：openai-responses provider（2026-10-31，主会话单线）
+
+基线 `9b5bc57`（上游 `api/openai-responses.ts` 453 行 + `openai-responses-shared.ts` 891 行的 Rust 移植首片，路线图 providers 项）：
+
+- **新模块 `pi-ai/src/providers/openai_responses.rs`**：POST `{base}/responses`（bearer + session_id/x-client-request-id 亲和头）；请求 wire（`input` 条目数组、`store:false`、`prompt_cache_key` 64 字符截断、`max_output_tokens` 最低 16 钳制、temperature、function tools 无 strict、`reasoning:{effort,summary:"auto"}` + `include:["reasoning.encrypted_content"]`、Off→`effort:"none"`）；消息转换（系统消息塌缩为单条头部条目——非 reasoning 模型 role=system、reasoning 模型 role=developer，工具集从全部 system 的 toolsAdded/Removed 解析 current；assistant 文本→`message` 条目（textSignature `{v:1,id,phase}` 重放 id/phase，回退 `msg_pi_N[_K]`，>64 截断）；thinking 带 signature→原始 reasoning item JSON 重放；toolCall→`function_call`（`call_id|fc_*` 复合 id，非 fc 前缀/外来 id 省略 item id 跳过配对校验）；toolResult→`function_call_output`（纯文本或 input_text/input_image 数组，按模型视觉能力））。
+- **流处理**（`ResponsesSession`）：`output_index` 键控槽位（thinking/text/toolCall），事件映射 reasoning_summary_text/reasoning_text/summary_part.done(`\n\n`)/output_text/refusal delta、function_call_arguments delta/done（`ToolArgsStream`：lenient 部分预览 + replace 续传/重启 + finish 全量解析出 arguments_error，复用 json_repair）、output_item.done（reasoning: summary||content 文本 + 原始 item 作 thinkingSignature；message: 文本 + textSignature 编码；function_call: 替换+finish+namespace）、`phase:"final_answer"`→stop、response.completed/incomplete→usage（input 减 cached/cache_write）+ rawStopReason + mapStopReason（max_output_tokens→length，其余 incomplete→error，failed/cancelled→error，in_progress/queued→stop）+ 有 toolCall 时 stop 升级 toolUse；response.failed/error 事件→流失败；无 terminal event、toolUse 带未完成调用→流失败（上游 post-loop 守卫）。
+- **接线**：`providers/mod.rs` 分发 `Api::OPENAI_RESPONSES`；model_registry 的 api 校验白名单加入；`SseDecoder` 改 pub(crate) 复用。
+- **声明偏差（compat 门控路径，上游默认关闭，推迟）**：grammar/custom 工具（`custom_tool_call`）、additional_tools/tool_search 条目、configuration_update（thinkingLevelMap 也未建模）、ChatGPT 登录特判、copilot/xai 头、service-tier 定价、长缓存 retention/24h、OpenRouter 会话亲和；cost 计算沿用全库零值口径；`sanitizeSurrogates` 在 Rust UTF-8 下为 no-op；上游 Windows shell:true 未移植。
+
+**验证**：597 项测试全绿（581→597，+16：wire/effort/off/重放/事件映射/incomplete/failed/未完成调用/视觉输出 9 项单测 + 6 项 mock HTTP+SSE 集成——增量 delta、429 错误体、response.failed、无 terminal 断连、abort、请求 wire 断言）；fmt/clippy -D warnings 干净。坑：mock 服务器 content-length 必须与 body 等长（reqwest 严格解码）；chunked body 需 `0\r\n\r\n` 终止才走干净 EOF 路径，否则 reqwest 报 decode error。
+
+## 第十二轮：@file 图片附件（2026-10-31，主会话单线）
+
+基线 `8351a39`（上游 `cli/file-processor.ts` 图片分支 + `utils/{mime,image-process,image-resize-core,exif-orientation}.ts` 的 Rust 移植）：
+
+- **新模块 `core/image_process.rs`**（依赖 `image` crate 0.25，features png/jpeg/gif/webp/bmp；`base64`）：魔数嗅探 `detect_supported_image_mime_type`（jpeg 0xFFD8FF 非 F7、png 含 IHDR 校验 + APNG acTL 排除、GIF87a/89a、RIFF/WEBP、BMP 头校验——逐字移植 mime.ts，取前 4100 字节）；EXIF 方向（JPEG APP1/ WebP EXIF chunk → TIFF IFD 0x0112，8 种方向变换——image crate 无 transpose，5/7 用 rotate90/270+fliph 组合，与上游逐位一致）；`process_image`（限额内 2000×2000 且 base64 < 4.5MB：png/jpeg/gif/webp **原始字节透传**（上游 `resizeImageInProcess` 限额分支返回 inputBytes，EXIF 不烘焙——保真镜像），其余类型解码+定向+重编码 PNG 带转换提示；超限：Lanczos3 缩至 2000 内 → PNG + JPEG[80,85,70,55,40] 候选取第一个低于预算 → 0.75 递缩到 1×1，尺寸注记 `Multiply coordinates by …`）。
+- **Prompt 链路**：`SessionCommand::Prompt` 增 `images: Vec<ImageContent>`；session 任务 pending 队列改存 `(text, images)` 元组，四条 pop_front 出队路径统一经 `user_message_with_images`（无图 → `Message::user(text)`，有图 → `UserContent::Blocks` 文本+图片块）；print 模式 `run_print` 增 `initial_images`（首条 prompt 携带，上游附在 messages[0]）；interactive 经 `UiConfig.initial_images` → `pending_images` 首次 send_prompt 携带；main.rs `process_file_arguments` 返回 `(text, images)`——图片按 `<file name="…">hints</file>` 文本引用 + 附件入列，失败走上游 `[Image omitted: …]` 文本形态。
+- **声明偏差**：透传路径不烘焙 EXIF（上游同行为，旋转显示仅在重缩/转换时生效）；上游 Photon WASM 用原生 image crate 替代（Lanczos3 同款滤波）；上游保留 jpeg/gif/webp 原始容器的字节，端口同（不做容器归一化）；图片只进首条 prompt（上游同），steer/follow-up 仍纯文本。
+
+**验证**：605 项测试全绿（597→605，+8：嗅探/APNG/TIFF 方向读取/透传/重缩注记/auto-resize off/garbage/EXIF 变换 + main.rs 图片参数接线 2 项）；fmt/clippy -D warnings 干净。坑：mock 夹具三连——APNG 夹具漏 IHDR CRC、TIFF IFD entry 的 count 是 4 字节（SHORT 值在前 2 字节）、JPEG APP1 标记是 FF E1 两字节（u16 to_be_bytes 会写成 00 E1）。
+
+## 第十三轮：google-generative-ai provider（2026-10-31，主会话单线）
+
+基线 `4fb7db4`（上游 `api/google-generative-ai.ts` 466 行 + `google-shared.ts` 574 行的 Rust 移植首片）：
+
+- **新模块 `pi-ai/src/providers/google_generative_ai.rs`**：POST `{base}/models/{id}:streamGenerateContent?alt=sse`（`x-goog-api-key` 头，base 缺省 v1beta，上游 baseUrl 已含版本路径）；请求 wire（`contents` 条目、leading system→`systemInstruction.parts`、工具→`functionDeclarations` + `parametersJsonSchema`（**const→单值 enum 重写**，name-map 旗标只作用当层键名）、Gemini 3+ 离散 `thinkingLevel` vs 2.5 系 `thinkingBudget` 表（pro/flash-lite/flash，无表 → -1 动态）、Off→`thinkingBudget:0`、`generationConfig` temperature/maxOutputTokens）。
+- **消息转换**（`convert_contents`）：user text/inlineData；assistant 文本带 thoughtSignature 重放（仅同 provider+model 且合法 base64），空文本仅在有签名时保留（Gemini 签名回显规则）；同模型 thinking→`thought:true` 条目、跨模型→纯文本（防模仿）；functionCall 仅 `requiresToolCallId`（claude-/gpt-oss-/gemini≥3）带 id；toolResult→`functionResponse`（output/error 键）合并进单个 user turn，Gemini 3+ 图片嵌套 parts、<3 单独 user turn；`mapStopReason`（STOP→stop、MAX_TOKENS→length、其余安全/其他原因→error）+ 有 toolCall 时 stop 升级 toolUse。
+- **流处理**（`GoogleSession`）：`thought:true` 驱动 text/thinking 块切换（块尾事件关闭）；thoughtSignature 首个非空保留（`retainThoughtSignature`）；functionCall 缺 id/重复 id → `{name}_{now}_{counter}` 合成；usage（prompt − cached、output + thoughts、reasoning=thoughts）；无 finishReason→流失败；safety 等 error 原因→`Provider stopped with: REASON`。
+- **声明偏差**：toolChoice/constrained-sampling VALIDATED/useParameters（Cloud Code Assist）/请求重试/thinkingLevelMap（Xhigh/Max 钳到 High）推迟，均上游默认关闭或不可达；cost 沿用零值口径。
+
+**验证**：621 项测试全绿（605→621，+16：wire/thinking 配置分族/工具结果合并/跨模型 thinking/签名重放/Gemini3 id/流切换/合成 id/usage/空文本回显/inlineData 11 项单测 + 5 项 mock HTTP+SSE 集成——跨 chunk 增量、429、无 finishReason、SAFETY→error、abort）；fmt/clippy -D warnings 干净。model_registry api 白名单扩入 google-generative-ai。
+
+## 第十四轮：/export 命令（2026-10-31，主会话单线）
+
+基线 `9397cf9`（上游 `interactive-mode.ts handleExportCommand` + `core/session-export.ts` 移植）：
+
+- **新模块 `core/session_export.rs`**：`serialize_session_branch`（新导出头 `type:"session"` + 同 id/cwd + 分支条目 parentId 重链——对照上游 `serializeSessionBranch`，getBranch=build_session_path）、`export_session_to_jsonl`（默认名 `session-<ISO>.jsonl` 解析到 cwd、嵌套父目录创建；内存会话也可导出）。
+- **interactive `/export [path]`**：`.jsonl`→JSONL 分支导出；其余（含无参默认路径）→HTML（`write_session_html`，内存会话报 "Cannot export in-memory session to HTML"）；参数支持成对引号剥离；成功/失败均走聊天通知（上游 showStatus/showError）。
+- **验证**：623 项测试全绿（621→623，+2：分支重链序列化、默认/显式路径导出）；pty 冒烟：无参 HTML 导出落盘 + `/export out/session.jsonl` 嵌套路径导出成功；fmt/clippy -D warnings 干净。RPC `export_html` 命令与 CLI 共用 `write_session_html`，行为一致。
+
+## 第十五轮：/new 命令（2026-10-31，主会话单线）
+
+基线 `097ea20`（上游 `handleClearCommand` / `app.session.new` 的斜杠入口）：`/new` 发送 `SessionCommand::NewSession`（排队 prompt 由替换逻辑丢弃），"New session started" 通知 + "session → " 通知触发既有聊天重建；新会话文件落盘经 pty 冒烟实证。623 项测试维持全绿（无新增单测——命令入口由 pty 冒烟覆盖），fmt/clippy 干净。会话命令组现状：/new ✅、/resume 选择器 ✅、/export ✅、/tree 与 /fork 需树/消息选择器（推迟）。
+
+## 第十六轮：/copy 命令（2026-10-31，主会话单线）
+
+基线 `20c5674`（上游 `handleCopyCommand` + `utils/clipboard.ts` 首片）：
+
+- **新模块 `core/clipboard.rs`**：平台命令阶梯（macOS pbcopy / Windows clip / linux 按 env：termux-clipboard-set、wl-copy、xclip、xsel）+ OSC 52 回退（SSH/mosh/PI_CLIPBOARD_OSC52 远程会话与 headless Linux，100k base64 上限）；WSL PowerShell 互操作与原生 FFI 写入推迟。`copy_to_clipboard` 错误文案对齐上游。
+- **interactive**：`/copy` 命令 + `app.message.copy`（ctrl+x）→ 从 live agent 快照倒序找末条非空助手文本复制；无消息报 "No agent messages to copy yet."；成功通知。alt-screen 选区分支无对应 API（推迟）。实现时踩坑：slash_commands.rs 的 fmt 单行 info 使多行锚点替换静默失配——冒烟发现菜单缺命令后核对 git status 才补上。
+- **验证**：626 项测试全绿（623→626，+3 clipboard 单测）；pty 冒烟错误路径（空会话提示），成功路径依赖 pbcopy 旁路（单测覆盖阶梯选择）；fmt/clippy 干净。
+
+## 第十七轮：/name 命令（2026-10-31，主会话单线）
+
+基线 `93ee2eb`（上游 `handleNameCommand`）：`/name` 显示当前显示名、`/name <name>` 经 `SessionCommand::SetSessionName` 设置（RPC 同款命令；清洗后的名字异步落盘，端口回显请求名并注明与上游同步读回的偏差）。626 项测试维持全绿，pty 冒烟 set+show 双路径，fmt/clippy 干净。
+
+## 第十八轮：/thinking <level> 参数（2026-10-31，主会话单线）
+
+基线 `6dee54a`（上游 `handleThinkingCommand`）：`/thinking <level>` 按模型能力（reasoning → off..max，否则仅 off）直接 `SessionCommand::SetThinking`，未知级别报 "Unknown thinking level ... Available levels: ..."（上游文案）；裸 `/thinking` 维持循环。626 项测试维持全绿，pty 冒烟 set（thinking → Low）+ 未知级别错误路径，fmt/clippy 干净。
+
+## 第十九轮：/session 信息命令（2026-10-31，主会话单线）
+
+基线 `0115b24`（上游 `handleSessionCommand` + `getSessionStats`）：统计逻辑从 rpc.rs 抽出为 `core/agent_session::compute_session_stats`（消息计数 + assistant/toolResult/usage 条目的用量求和），RPC `get_session_stats` 与 interactive `/session` 共用；`/session` 渲染 Name/File/ID、消息计数、Token 总量与 cached/uncached 拆分（上游 cache-warming 与按模型分解节无对应物，声明推迟）。**事故与恢复：用 `s.index("\n\tfn ")` 找方法边界时吞掉了 rpc.rs 后续方法与测试嵌套，靠 `git checkout -- rpc.rs` 还原后按真实方法边界（首个 `\n\t}\n`）重做手术式替换**——大块文本替换前先确认锚点唯一性。626 项测试维持全绿（RPC 45 项含 stats 聚合仍过），pty 冒烟渲染完整信息块，fmt/clippy 干净。
+
+## 第二十轮：/hotkeys 命令（2026-10-31，主会话单线）
+
+基线 `dc085d1`（上游 `handleHotkeysCommand`）：`/hotkeys` 渲染解析后的键位两列对齐表（Navigation/Editing/Other 三组 24 行，经 `keybinding_hint` 走 keybindings.json 覆盖；Notices 是纯文本行渲染故用对齐文本而非上游 markdown 表）。626 项测试维持全绿，pty 冒烟（表格 + 已解析键位 esc/ctrl+l），fmt/clippy 干净。
+
+## 第二十一轮：/fork 首片（2026-10-31，主会话单线）
+
+基线 `844a248`（上游 `showUserMessageSelector` 的最小可用替身）：`/fork` 无参列出 transcript 中的 user 消息（1 基编号 + 60 字符预览），`/fork <n>` 定位该消息的会话条目并发 `SessionCommand::Fork { position: Before }`（分支根在消息父节点，消息文本经替换 notice 回流供预填——上游 selectedText 语义）；交互式选择器 UI 推迟。**坑：/fork <n> 是 1 基索引，0 基取值会静默错位（pty 冒烟实证）。** 626 项测试维持全绿，pty 冒烟列表 + 分叉落盘（新分支会话文件），fmt/clippy 干净。
+
+## 第二十二轮：retry settings 键（2026-10-31，主会话单线）
+
+基线 `d207bd6`（第八轮遗留：maxRetries/baseDelay 进 settings.json）：`Settings` 增 `retry: Option<RetrySettings>`（camelCase maxRetries/baseDelayMs，字段级 project>global 合并，两层都无 → None → 引擎常量默认）；`RetryRuntime` 增 `max_retries`，自动重试引擎的上限与退避基数从 settings 读取（WireEvent max_attempts 同步）；`spawn_agent_session_with_settings` 增 RetrySettings 参数，main 传入 `settings.retry`。**事故：`shared.retry.lock().unwrap().attempt < shared.retry.lock().unwrap().max_retries` 同一 std Mutex 单表达式双锁死锁，cargo test 挂起——改单守卫块。** 627 项测试全绿（+1 解析/合并测试），fmt/clippy 干净。上游 retry.enabled 与 maxAgentDelayMs 仍是运行时开关（settings 键未接）。
+
+## 第二十三轮：/sessions 升级（2026-10-31，主会话单线）
+
+基线 `9e5b996`：`/sessions` 从 dir+条目计数 stub 升级为 SessionInfo 摘要（年龄右对齐 + 名字或首条消息预览 70 字符 + 消息计数，`list_sessions_in` 全量列举取最新 10；上游无此命令，pi-rs 扩展对齐新管线）；core/mod.rs 的未用 SessionManager 再导出移除。627 项测试全绿，pty 冒烟（名字/预览/时长——注意冒烟目录会积累每次运行的空会话，截断断言前先清理），fmt/clippy 干净。
+
+## 第二十四轮：/import 命令（2026-10-31，主会话单线）
+
+基线 `bcc6c07`（上游 `handleImportCommand`，去确认对话框）：`core/session_export.rs` 增 `import_session_from_jsonl`（校验首行 session 头 → 新建目录（新 session id 防双目录同 id——声明偏差，上游替换活会话）→ 逐条 append 线性重链、条目 id 保留；根/子路径错误均带文件名文案）；interactive `/import <path.jsonl>`（非 .jsonl 报 usage）导入即 `SwitchSession` 到新目录（"Session imported:" + "session → " 通知触发聊天重建，与导出/导入往返 pty 冒烟实证：2 个新目录、双通知）。628 项测试全绿（+1 导入往返），fmt/clippy 干净。坑：`items after a test module`（clippy）——追加函数落到 tests 模块后要移回前面；孤立 doc 注释残留会 parse fail。
+
+## 第二十五轮：/trust 命令（2026-10-31，主会话单线）
+
+基线 `a6bacef`（上游 `showTrustSelector` 首片）：`/trust` 在项目 `.pi/mcp.json` 存在且未信任时弹出两选项 SelectList 浮层（Trust / Don't trust，模型选择器同款面板）；Trust 落 trust.json（信任持久化）+ "restart to load its MCP servers"（MCP 装配在启动时已完成，与"MCP 不随会话替换重建"同口径）；无配置/已信任分别提示；Don't trust 提示保持跳过。628 项测试维持全绿，pty 冒烟（启动 y/N 拒绝 → /trust → 选 Trust → 通知），fmt/clippy 干净。
+
+## 第二十六轮：/tree 只读视图（2026-10-31，主会话单线）
+
+基线 `c14e9d1`（上游 `showTreeSelector` 只读首片）：`/tree` 渲染 get_tree 的条目树（`├─/└─/│` 前缀 + 每条目单行摘要：user/assistant 文本 48 字符、toolResult 工具名、其余为 type_name；多根依序）；叶切换选择器 UI 推迟。628 项测试维持全绿，pty 冒烟（--resume alpha-1 后 user/assistant 条目渲染），fmt/clippy 干净。
+
+## 回归验证（2026-10-31，第九至二十六轮之后）
+
+本会话 15 个 feat 全部落地后重跑差分套件：**六场景（单轮/ bash 往返/ 多轮工具/ 阈值压缩/ json 单轮/ json 工具调用）双侧 6/6 IDENTICAL（canonical view，上游快照 f9daca34）**——@file 图片、Prompt images 字段、会话导出/导入、retry settings 等改动未引入任何 wire 回归。
+
+## 第二十七轮：/compact <instructions>（2026-10-31，主会话单线）
+
+基线 `c14e9d1` 前后连推（上游 compaction.ts:714-716）：`SessionCommand::Compact` 增 `instructions: Option<String>`，`compact_prefix` 增第三参（None=全部既有路径），自定义指令在基础提示词后追加 `\n\nAdditional focus: …`（UPDATE 路径同）；interactive `/compact [focus]` 传参、RPC `compact` 传 None（wire 无字段）、阈值/mid-run/溢出路径均 None。629 项测试全绿（+1 提示词含 Additional focus 断言），pty 冒烟（空会话拒绝路径证明参数贯通），fmt/clippy 干净。
+
+## 第二十八轮：RPC compact customInstructions（2026-10-31，主会话单线）
+
+基线 `fbf056d`：`RpcCommand::Compact` 增可选 `customInstructions`（serde rename 到上游 camelCase 字段，缺省 None——additive，旧帧不受影响）并传入 SessionCommand；+1 wire 测试（"compact" 命令帧形状）。630 项测试全绿，fmt/clippy 干净。坑：字符串手术修补测试尾部两次失败后，按精确文本 replace + 手工核对括号结构修复（教训：测试插入用 Edit 工具锚定模块内位置，勿用 rindex 猜括号）。
+
+## 第二十九轮：ctrl+p/alt+p 模型循环（2026-10-31，主会话单线）
+
+基线 `dd953f5`（上游 `cycleModel` 的 available-models 变体）：`GlobalAction::ModelCycleForward/Backward`（ctrl+p / 平台相关 backward 弦——darwin shift+ctrl+p、其他 alt+p）接 resolve_global_action；interactive `cycle_model(±1)` 对 registry 模型列表环绕取下一个并发 `SetModel`，单模型提示 "Only one model available"；scoped-models 变体无对应（推迟）。**坑：MODEL_CYCLE_BACKWARD 是平台相关常量（darwin=shift+ctrl+p），测试用 alt+p 在 mac 上必挂；调试用 panic!() 测试用完必须删（fmt 会重排行导致正则删除失配，二次清理）。** 631 项测试全绿（+2 cycle 弦分发），pty 冒烟（单步 ctrl+p → "model → mimo/mimo-v2.6-flash" 通知），fmt/clippy 干净。
+
+## 第三十轮：app.session.tree/fork 键位分发（2026-10-31，主会话单线）
+
+基线 `3e039e9`：`GlobalAction::SessionTree/SessionFork` 接 resolve_global_action（默认无键，keybindings.json 可绑——如 `super+t`/`super+f`）分别触发只读 /tree 视图与编号 /fork。app.session.* 动作组至此全接线（new/resume/tree/fork）。632 项测试全绿（+1 分发测试），fmt/clippy 干净。坑：chord 解析器不认 "ctrl+meta+"，meta 用 `super+` 前缀。
+
+## 第三十一轮：退出恢复提示（2026-10-31，主会话单线）
+
+基线 `88b062b`（上游 `formatResumeCommand` + 退出打印）：interactive 退出（终端还原后）打印 dim 色 `To resume this session: pi-rs --resume <目录名>`——端口指向会话目录名（`--resume` 按目录名前缀解析，pty 冒烟实证解析成功）；上游 `--session <id>` 旗标与 `--session-dir` 参数无对应（自定义 PI_RS_SESSION_DIR 需用户重导出，声明偏差）；内存会话不打印。632 项测试维持全绿，fmt/clippy 干净。
+
+## 第三十二轮：--session-dir 旗标（2026-10-31，主会话单线）
+
+基线 `249b0c0`（上游 `--session-dir`）：CLI 增 `--session-dir <DIR>`，解析后立即写 `PI_RS_SESSION_DIR` 环境变量（edition-2024 下 unsafe set_var，单线程早期调用；`config::sessions_dir()` 已读该变量）——自定义根下的会话落盘与退出恢复提示均实证。632 项测试维持全绿（测试 Cli 构造补 None），fmt/clippy 干净。上一轮声明的偏差（恢复提示的自定义根）就此闭合。
+
+## 第三十三轮：!cmd bash 透传（2026-10-31，主会话单线）
+
+基线 `1e09fce`（上游 bash mode：`!cmd` 入 transcript、`!!cmd` 排除上下文）：handle_submit 识别 `!`/`!!` 前缀 → `SessionCommand::ExecuteBash`（RPC 轮底层复用）；新增 `ChatBlock::Bash`（`bash: <cmd> (status)` 头 + 输出预览，运行中尾 20 行、完成后首 10 行 + done/exit N/cancelled/truncated 状态着色）——TUI select 循环新增 `session.wire_events` 臂，`BashExecutionUpdate` 追加增量、`BashExecutionDone` 终结（bash_running 标志置回，重复提交报上游同文案警告）。Esc 中止已接：Interrupt 分流 bash_running → AbortBash（优先于 agent abort）。632 项测试维持全绿，pty 冒烟（块渲染/输出/完成状态），fmt/clippy 干净。
+
+## 第三十轮补充：pi-messages provider（2026-10-31，主会话单线）
+
+基线 `88b062b` 前后（上游 `api/pi-messages.ts` 456 行全量移植，路线图 providers 项）：**新模块 `pi-ai/src/providers/pi_messages.rs`**——协议最薄的适配器：POST `{base}/messages` 带 `{model, context:{messages}, options:{temperature,maxTokens,reasoning,sessionId}}`（context 走 Message serde 原样序列化，转换在后端）；响应为已序列化的 assistant-message 事件流（`contentIndex` 寻址的 text/thinking/toolcall 槽位、contentSignature/redacted、toolCall 终态覆盖 + ToolArgsStream 容错增量——自 openai_responses 提为 pub(crate) 复用），终态 `done`/`error` 携 usage/responseId/responseModel；无终态事件→流失败；HTTP 错误体 `{error:{message,code}}` 格式化。model_registry 白名单扩入 pi-messages。声明推迟：gateway rewrite 诊断（无 sidecar 字段）、debug 旗标、toolChoice、identity 头。**坑：终态事件的 events 向量在提前 return 前忘记 forward，Done 静默丢失——pty/单测都抓到了（"done event, got [Start, Error]" 形状）**。635 项测试全绿（+4：wire/索引槽位流/无终态失败 + 既有），fmt/clippy 干净。providers 完成 5/10+。
+
+## 第三十一轮补充：azure-openai-responses（2026-10-31，主会话单线）
+
+基线 `7bd5096`（上游 `azure-openai-responses.ts` 255 行 + `azure-openai-config.ts`，复用 openai-responses 全部流处理）：openai_responses.rs 增 `Endpoint` 参数化（OpenAI/Azure）——auth 头 bearer vs `api-key`、key env OPENAI_API_KEY vs AZURE_OPENAI_API_KEY、URL 归一化（azure 主机 `.openai.azure.com/.cognitiveservices/.ai.azure.com` 路径归 `/openai/v1`）、deployment 名（AZURE_OPENAI_DEPLOYMENT_NAME_MAP `id=deployment,..` 按 model id 查找，未映射用 id）；body 的 model 字段用 deployment 名。`azure_stream_fn()` 注册 Api::AZURE_OPENAI_RESPONSES，model_registry 白名单扩入。声明推迟：grammar 工具、toolChoice、strict-mode 差异（与 openai-responses 首片同口径；上游 azure 的 compat 默认 supportsStrictMode=true 等——端口统一无 strict）。638 项测试全绿（+3 azure：URL 归一化/deployment 映射/body model 名），fmt/clippy 干净。providers 完成 6/10+。
+
+## 第三十二轮补充：settings retry.enabled（2026-10-31，主会话单线）
+
+基线 `bef0cd5`：`RetrySettings` 增 `enabled: Option<bool>`（字段级合并），spawn 时播种 auto_retry 原子量（缺省仍 RETRY_ENABLED_DEFAULT=true）——settings `{"retry":{"enabled":false}}` 可关闭自动重试（此前只有 RPC 开关）。638 项测试维持全绿，fmt/clippy 干净。剩余声明缺口：maxAgentDelayMs（上游 agent 级重试上限，与 provider 级 maxRetryDelayMs 分开）。
+
+## 第三十三轮补充：google-vertex provider（2026-10-31，主会话单线）
+
+基线 `93742de`（上游 `google-vertex.ts` 561 行首片，复用 google_generative_ai 的 `GoogleSession`/`request_body`——process_payload 加 `process_payload_streamed` 包装）：**新模块 `pi-ai/src/providers/google_vertex.rs`**——
+- **Express API-key 模式**（options.api_key 为真实 key：非空、非 `gcp-vertex-credentials` 标记、非 `<placeholder>`）：POST `https://aiplatform.googleapis.com/v1/publishers/google/models/{id}:streamGenerateContent?alt=sse` + `x-goog-api-key`。
+- **ADC 模式**（key 缺失/为标记）：要求 `GOOGLE_CLOUD_PROJECT`（或 GCLOUD_PROJECT）与 `GOOGLE_CLOUD_LOCATION`；URL `https://{location}-aiplatform.googleapis.com/v1/projects/{p}/locations/{l}/publishers/google/models/{id}:...`；`GOOGLE_APPLICATION_CREDENTIALS` 支持 `service_account`（RS256 JWT 签名换 token，rsa+sha2 纯 Rust）与 `authorized_user`（refresh_token grant）两种 JSON；token 进程内缓存至过期前 60s。
+- 自定义 model.baseUrl 作区域前缀（`{location}` 占位符替换）。流处理与 generative-ai 完全同构（thought 块切换/签名保留/toolcall id 合成/finishReason 映射）。
+- 声明推迟：metadata-server 凭据（GCE/GKE）、toolChoice、constrained sampling、请求重试、模型目录个性化（openrouter 同款）。
+- **新依赖**：pi-ai 增 base64/rsa 0.9/sha2。
+641 项测试全绿（+3：express URL、placeholder 判定、RS256 签名往返），fmt/clippy 干净。providers 完成 7/10+（剩 mistral-conversations、bedrock-converse-stream、openai-codex-responses）。
+
+## 差分回归（2026-10-31，第二十九至三十三轮之后）
+
+google-generative-ai 流处理重构（process_payload_streamed）、google-vertex、pi-messages、azure、Prompt images、retry settings、bash 透传等改动后重跑：**六场景双侧 6/6 IDENTICAL（canonical view，f9daca34）**——继续零 wire 回归。
+
+## 第三十四轮：mistral-conversations provider（2026-10-31，主会话单线）
+
+基线 `0fc097a`（上游 `mistral-conversations.ts` 924 行首片）：**新模块 `pi-ai/src/providers/mistral_conversations.rs`**——
+- **请求**：`{base}/v1/chat/completions`（bearer + accept SSE + `x-affinity` 会话亲和）；messages（system 文本、user text/`image_url` 块（无视觉模型图片降级文案）、assistant `{content:[{type:text|thinking}],tool_calls:[{id,type,function,index:0}],prefix:false}`、tool `{tool_call_id,name,content:[text(+image)]}` 带 `[tool error]`/图片省略文案）；tools `function.strict:false`；`max_tokens`/`prompt_cache_key` snake_case；错误体 `Mistral API error (<code>): <4000 字符截断>`。
+- **流处理**：`{data:{id,usage,choices[0]:{finish_reason,delta}}}`；delta.content 为 string 或 chunk 数组（text/thinking——GLM 空 content delta 不开新块）；tool_calls 按 `index`（无 index 用派生 id）键控累积（ToolArgsStream），收尾统一 finish() 出 arguments_error；usage 缓存命中六种字段拼写、input 扣 cached；finishReason：stop→stop、length/model_length→length、tool_calls→toolUse、error→"server error" 可重试文案、其余→error。
+- **声明推迟**：toolChoice、reasoningEffort/promptMode（thinkingLevelMap 未建模）、60s header 超时、header 覆盖、`shortHash`（std hasher 替代——id 仅需会话内稳定，不需与上游一致）。
+645 项测试全绿（+4：wire/历史重放/块切换+index 工具调用+缓存扣减/stop 映射），fmt/clippy 干净。**坑：Mistral 事件 JSON 外层是 `{data:{choices}}`，检查层级写错会全帧报 "Invalid Mistral streaming event"。** providers 完成 8/10+（剩 bedrock-converse-stream、openai-codex-responses）。
+
+## 第三十五轮：/fork 交互选择器（2026-10-31，主会话单线）
+
+基线 `891db01`（上游 `showUserMessageSelector` 的 SelectList 化）：裸 `/fork` 打开浮层（每条 user 消息一项，`n. 预览` 标签，value=条目 id），Enter 发 `Fork{position:Before}`、Esc 取消；`/fork <n>` 编号路径保留；trust 浮层同款面板与键位路由。顺手清理第二轮遗留的死代码桩（users 空向量）。645 项测试维持全绿，pty 冒烟（浮层/条目/分叉落盘/`session → ` 通知），fmt/clippy 干净。坑（重申）：pty 冒烟前必须重新 cargo build——上一轮二进制会让新 feat 看似失败。
+
+## 合并轮：origin/main（provider 轮 43 提交）并入本地会话树轮（2026-11-03）
+
+基线 `cc7530d`（本地会话树轮 6 提交：`410c617`/`3f5619e`/`e92deeb`/`f5502d9`/`56a7d76`/`cc7530d`）与 `62e0eb5`（远程 provider 轮 43 提交：google-generative-ai / google-vertex / pi-messages / azure-openai-responses / mistral-conversations + openai-responses、@file 图片、`/compact <instructions>`、retry settings、剪贴板、外部编辑器、会话选择器、`/fork` 选择器）合并，5 个文件冲突（README.md、core/settings_manager.rs、core/agent_session.rs、main.rs、modes/interactive.rs），两侧功能全部保留：
+
+- **agent_session.rs**：`RetryRuntime` 取并集（`max_retries` + 上游 `maxAgentDelayMs` 派生的 `max_delay_ms`）；`SessionHandle` 并入两侧方法（`configure_tool_options`/`mcp_enabled`/`configure_mcp` 与 `live_agent`/`current_session_file`/`session_name`）；spawn 三态统一为 `spawn_agent_session` → `_with_settings(+retry)` → `_with_options(+prompt_options)`；`Prompt{text,images}` 队列改用元组（图片随首条消息），树导航的 `pending` 排空改映射回文本。
+- **settings_manager.rs**：`RetrySettings` 两份定义合一（保留 `max_agent_delay_ms`），`effective()` 只留一个 `retry` 字段。
+- **main.rs**：`--session-dir` 取本地的 `Option<String>`（CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings `sessionDir`，相对路径按启动 cwd 解析），解析结果回写 `PI_RS_SESSION_DIR` 让 `config::sessions_dir()` 的调用点一致；`@file` 图片与 `prompt_options` 并入同一条启动链；主题加载取本地 `load_with_cli_themes` + 远端的 `externalEditor`/`initialImages`。
+- **interactive.rs**：导入、类型（`Dialog`/`ReplacementKind`/`PendingTreeNav` + `SlashMenu`）、结构体字段、按键分发、`SessionEvent` 分支、绘制函数全部取并集；命令分发按上游语义重排（`/resume` 无参开选择器、带参直恢复；`/fork` 选择器 + `/fork <n>`；`/tree` 走交互式树选择器；`/import` 确认后复制并切换；`/export`、`/name`、`/session`、`/trust`、`/copy`、`/hotkeys` 取远端实现）。
+- **合并期修掉的真实缺陷**：① 斜杠菜单的 Enter 只补全不执行（上游 `applyCompletion` 斜杠分支会继续提交）——改为补全并执行，Tab 仅补全；② 远端「session → 」通知里的 `rebuild_from_live_session` 会把替换完成后的状态通知清空（PTY 冒烟抓到 `/import` 的「Session imported from:」丢失）——改由 `SessionReplaced` 事件统一恢复 transcript；③ `core/mod.rs` 的 `pub use session_manager::SessionManager` 被远端删除导致 `crate::core::SessionManager` 不可达——调用点改用模块路径；④ `RetrySettings` 重复定义与 `Cli`/`UiConfig` 初始化缺字段（图片与外部编辑器字段）一并补齐。
+
+验证：`cargo test --workspace --locked` 731 项全绿（含 pty 冒烟：会话命令、信任与会话选择器）、`cargo fmt --all -- --check` 干净、`cargo clippy --workspace --all-targets --locked -- -D warnings` 零警告；差分框架六场景双侧 **6/6 IDENTICAL**（canonical view，f9daca34）。
