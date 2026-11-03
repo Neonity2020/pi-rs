@@ -346,11 +346,23 @@ pub(crate) struct PendingBashRecord {
 
 pub(crate) type SharedLogRef = Arc<std::sync::Mutex<SharedLog>>;
 
+/// Skills and prompt templates loaded at startup (upstream
+/// `resourceLoader.getSkills()` and `session.promptTemplates`). The session
+/// task consults them to expand `/skill:<name>` commands and `/<template>`
+/// commands on the `Prompt` path; the interactive mode reads the same lists
+/// for the slash menu.
+#[derive(Clone, Default)]
+pub struct SessionResources {
+	pub skills: Vec<super::skills::Skill>,
+	pub prompt_templates: Vec<super::prompt_templates::PromptTemplate>,
+}
+
 /// State shared between the session task and the mode handles. The task
 /// updates the slots in place on session replacement; probes read them
 /// without round-tripping a command.
 pub(crate) struct SessionShared {
 	prompt_options: super::system_prompt::SystemPromptOptions,
+	resources: SessionResources,
 	mcp: std::sync::Mutex<Option<Arc<tokio::sync::Mutex<super::tools::McpRuntime>>>>,
 	tool_options: std::sync::Mutex<Option<ToolRuntimeOptions>>,
 	/// The live agent (swapped on session replacement).
@@ -457,6 +469,11 @@ impl SessionHandle {
 		self.shared.mcp.lock().unwrap().is_some()
 	}
 
+	/// Startup skills and prompt templates (slash menu, help listing).
+	pub fn resources(&self) -> &SessionResources {
+		&self.shared.resources
+	}
+
 	pub fn configure_mcp(
 		&self,
 		runtime: super::tools::McpRuntime,
@@ -513,6 +530,7 @@ pub fn spawn_agent_session_with_settings(
 		settings,
 		Default::default(),
 		retry_settings,
+		SessionResources::default(),
 	)
 }
 
@@ -523,6 +541,7 @@ pub fn spawn_agent_session_with_options(
 	settings: CompactionSettings,
 	prompt_options: super::system_prompt::SystemPromptOptions,
 	retry_settings: RetrySettings,
+	resources: SessionResources,
 ) -> SessionHandle {
 	let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 	let event_bus = EventBus::<SessionEvent>::new();
@@ -549,6 +568,7 @@ pub fn spawn_agent_session_with_options(
 
 	let shared = Arc::new(SessionShared {
 		prompt_options,
+		resources,
 		mcp: std::sync::Mutex::new(None),
 		tool_options: std::sync::Mutex::new(None),
 		live_agent: Arc::new(std::sync::Mutex::new(agent.clone())),
@@ -618,6 +638,62 @@ pub fn spawn_agent_session_with_options(
 		wire_events: wire_rx,
 		auto_retry,
 	}
+}
+
+/// Expand extension-style prompt commands on the `Prompt` path (upstream
+/// `prompt()`'s `expandPromptTemplates` block): `/skill:<name> [args]` first,
+/// then `/<template> [args]`; anything else passes through unchanged.
+fn expand_prompt_text(
+	text: &str,
+	resources: &SessionResources,
+	bus: &EventBus<SessionEvent>,
+) -> String {
+	let expanded = expand_skill_command(text, &resources.skills, bus);
+	super::prompt_templates::expand_prompt_template(&expanded, &resources.prompt_templates)
+}
+
+/// Upstream `_expandSkillCommand`: a `/skill:<name> [args]` command reads the
+/// skill file and expands to a `<skill>` block with the args appended.
+/// Unknown skills pass through; a read failure notices and passes through.
+fn expand_skill_command(
+	text: &str,
+	skills: &[super::skills::Skill],
+	bus: &EventBus<SessionEvent>,
+) -> String {
+	let Some(rest) = text.strip_prefix("/skill:") else {
+		return text.to_string();
+	};
+	let (skill_name, args) = match rest.split_once(' ') {
+		Some((name, args)) => (name, args.trim()),
+		None => (rest, ""),
+	};
+	let Some(skill) = skills.iter().find(|s| s.name == skill_name) else {
+		// Unknown skill: pass the command through (upstream does the same).
+		return text.to_string();
+	};
+	let content = match std::fs::read_to_string(&skill.file_path) {
+		Ok(content) => content,
+		Err(error) => {
+			bus.emit(SessionEvent::Notice(format!(
+				"skill expansion failed for {}: {error}",
+				skill.file_path.display()
+			)));
+			return text.to_string();
+		}
+	};
+	let stripped = super::frontmatter::strip_frontmatter(&content);
+	let body = stripped.trim();
+	let mut skill_block = format!(
+		"<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+		skill.name,
+		skill.file_path.display(),
+		skill.base_dir.display(),
+		body
+	);
+	if !args.is_empty() {
+		skill_block.push_str(&format!("\n\n{args}"));
+	}
+	skill_block
 }
 
 /// Resume-time usage trust boundary: persisted usage measured before the
@@ -882,6 +958,12 @@ async fn session_task(
 				let Some(command) = command else { break };
 				match command {
 					SessionCommand::Prompt { text, images } => {
+						// Expand `/skill:<name>` and `/<template>` commands
+						// before queueing decisions (upstream `prompt()` runs
+						// the expansions before the streaming/compaction
+						// branches); the expanded text is what lands in the
+						// transcript.
+						let text = expand_prompt_text(&text, &shared.resources, &event_bus);
 						if run.is_some() || agent.is_streaming() || compacting.is_some() || nav.is_some() {
 							pending.push_back((text, images));
 							if compacting.is_some() || nav.is_some() {
@@ -4574,6 +4656,7 @@ mod tests {
 			CompactionSettings::default(),
 			Arc::new(SessionShared {
 				prompt_options: Default::default(),
+				resources: SessionResources::default(),
 				mcp: std::sync::Mutex::new(None),
 				tool_options: std::sync::Mutex::new(None),
 				live_agent: Arc::new(std::sync::Mutex::new(agent.clone())),
@@ -5419,6 +5502,7 @@ mod tests {
 			context_files: false,
 			custom: Some("CUSTOM_PROMPT".into()),
 			append: vec!["APPENDED_PROMPT".into()],
+			skills: Vec::new(),
 		};
 		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
 		let mut handle = spawn_agent_session_with_options(
@@ -5428,6 +5512,7 @@ mod tests {
 			CompactionSettings::default(),
 			options,
 			Default::default(),
+			SessionResources::default(),
 		);
 		handle
 			.cmd_tx
@@ -6069,6 +6154,7 @@ mod tests {
 			CompactionSettings::default(),
 			Default::default(),
 			retry,
+			SessionResources::default(),
 		);
 		handle
 			.cmd_tx
@@ -6127,6 +6213,7 @@ mod tests {
 				CompactionSettings::default(),
 				Default::default(),
 				retry,
+				SessionResources::default(),
 			);
 			handle
 				.cmd_tx

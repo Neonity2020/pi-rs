@@ -35,6 +35,9 @@ pub struct Settings {
 	/// Raw `defaultTools` selection: plain names/patterns or `+name`/`-name`
 	/// modifiers, resolved by `tool_selection::resolve_default_tools`.
 	pub default_tools: Option<Vec<String>>,
+	/// `enableSkillCommands` — whether each skill becomes a `/skill:<name>`
+	/// slash command (upstream `SETTINGS_DEFAULTS.enableSkillCommands: true`).
+	pub enable_skill_commands: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -215,7 +218,16 @@ impl SettingsManager {
 				self.global.default_tools.clone(),
 				self.project.default_tools.clone(),
 			),
+			enable_skill_commands: self
+				.project
+				.enable_skill_commands
+				.or(self.global.enable_skill_commands),
 		}
+	}
+
+	/// Upstream `getEnableSkillCommands` (default `true`).
+	pub fn enable_skill_commands(&self) -> bool {
+		self.effective().enable_skill_commands.unwrap_or(true)
 	}
 
 	pub fn global(&self) -> &Settings {
@@ -262,6 +274,9 @@ impl SettingsManager {
 		}
 		if overrides.default_tools.is_some() {
 			self.global.default_tools = overrides.default_tools.clone();
+		}
+		if overrides.enable_skill_commands.is_some() {
+			self.global.enable_skill_commands = overrides.enable_skill_commands;
 		}
 		if let Some(compaction) = &overrides.compaction {
 			let merged = self
@@ -431,6 +446,41 @@ mod tests {
 			),
 			(Some(false), Some(50), Some(200))
 		);
+	}
+
+	#[test]
+	fn enable_skill_commands_defaults_true_and_merges_per_layer() {
+		// No key anywhere → upstream SETTINGS_DEFAULTS true.
+		let plain: Settings = serde_json::from_str("{}").unwrap();
+		assert_eq!(plain.enable_skill_commands, None);
+		assert!(
+			SettingsManager {
+				global_path: std::path::PathBuf::new(),
+				project_path: None,
+				global: Settings::default(),
+				project: plain,
+				modified: Vec::new(),
+			}
+			.enable_skill_commands()
+		);
+
+		// Project wins over global; explicit false survives.
+		let manager = SettingsManager {
+			global_path: std::path::PathBuf::new(),
+			project_path: None,
+			global: serde_json::from_str::<Settings>(r#"{"enableSkillCommands":false}"#).unwrap(),
+			project: serde_json::from_str::<Settings>(r#"{"enableSkillCommands":true}"#).unwrap(),
+			modified: Vec::new(),
+		};
+		assert!(manager.enable_skill_commands());
+		let manager = SettingsManager {
+			global_path: std::path::PathBuf::new(),
+			project_path: None,
+			global: serde_json::from_str::<Settings>(r#"{"enableSkillCommands":false}"#).unwrap(),
+			project: Settings::default(),
+			modified: Vec::new(),
+		};
+		assert!(!manager.enable_skill_commands());
 	}
 
 	#[test]

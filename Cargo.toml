@@ -42,6 +42,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.2"
 regex = "1"
 walkdir = "2"
+serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 pulldown-cmark = { version = "0.13", default-features = false }

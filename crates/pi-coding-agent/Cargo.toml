@@ -28,6 +28,9 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 regex = { workspace = true }
 walkdir = { workspace = true }
+# Skill/prompt-template frontmatter (`---\nYAML\n---` blocks; upstream parses
+# with the `yaml` npm package in utils/frontmatter.ts).
+serde_yaml = { workspace = true }
 # ripgrep's own walker: .gitignore/.ignore/global git excludes + binary skipping
 # for the grep/find tools (upstream shells out to rg/fd; see tools/grep.rs).
 ignore = "0.4"

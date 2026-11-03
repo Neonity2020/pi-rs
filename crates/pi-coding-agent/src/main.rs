@@ -205,6 +205,27 @@ struct Cli {
 	#[arg(long)]
 	no_themes: bool,
 
+	/// Load a skill file or directory (can be repeated; upstream `--skill`).
+	#[arg(long, value_name = "PATH")]
+	skill: Vec<String>,
+
+	/// Disable skills discovery and loading — the default directories are
+	/// skipped while explicit `--skill` paths still load (upstream
+	/// `--no-skills`, `-ns`).
+	#[arg(long)]
+	no_skills: bool,
+
+	/// Load a prompt template file or directory (can be repeated; upstream
+	/// `--prompt-template`).
+	#[arg(long = "prompt-template", value_name = "PATH")]
+	prompt_template: Vec<String>,
+
+	/// Disable prompt template discovery and loading — the default
+	/// directories are skipped while explicit `--prompt-template` paths still
+	/// load (upstream `--no-prompt-templates`, `-np`).
+	#[arg(long)]
+	no_prompt_templates: bool,
+
 	/// Trust project-local files for this run — skips the trust prompt and
 	/// loads the project `.pi/mcp.json` (upstream `--approve`, `-a`).
 	#[arg(short = 'a', long)]
@@ -441,6 +462,8 @@ fn rewrite_combined_short_args(args: Vec<String>) -> Vec<String> {
 				// `-na` is a distinct upstream flag (`--no-approve`), not a
 				// `-n` cluster with value `a`.
 				"-na" => "--no-approve".into(),
+				"-ns" => "--no-skills".into(),
+				"-np" => "--no-prompt-templates".into(),
 				other => other.to_string(),
 			}
 		})
@@ -1279,6 +1302,49 @@ async fn main() -> anyhow::Result<()> {
 			.as_ref()
 			.is_some_and(|matcher| matcher.matches(name))
 	});
+	// Skills + prompt templates (upstream loadResources in main.ts): user
+	// `agentDir/{skills,prompts}` and project `.pi/{skills,prompts}` defaults
+	// — skipped by `--no-skills`/`--no-prompt-templates` — then explicit
+	// `--skill`/`--prompt-template` paths. Loading diagnostics surface as
+	// startup warnings (upstream prints them to the console); a bad
+	// frontmatter in a skill warns instead of failing startup.
+	let resources = {
+		let skills = crate::core::skills::load_skills(crate::core::skills::LoadSkillsOptions {
+			cwd: cwd.clone(),
+			agent_dir: crate::config::agent_dir(),
+			skill_paths: cli.skill.clone(),
+			include_defaults: !cli.no_skills,
+		});
+		for diagnostic in &skills.diagnostics {
+			match diagnostic.path() {
+				Some(path) => eprintln!("warning: skill: {} ({path})", diagnostic.message()),
+				None => eprintln!("warning: skill: {}", diagnostic.message()),
+			}
+		}
+		let prompt_templates = crate::core::prompt_templates::load_prompt_templates(
+			crate::core::prompt_templates::LoadPromptTemplatesOptions {
+				cwd: cwd.clone(),
+				agent_dir: crate::config::agent_dir(),
+				prompt_paths: cli.prompt_template.clone(),
+				include_defaults: !cli.no_prompt_templates,
+			},
+		);
+		for diagnostic in &prompt_templates.diagnostics {
+			match diagnostic.path() {
+				Some(path) => {
+					eprintln!(
+						"warning: prompt template: {} ({path})",
+						diagnostic.message()
+					)
+				}
+				None => eprintln!("warning: prompt template: {}", diagnostic.message()),
+			}
+		}
+		crate::core::agent_session::SessionResources {
+			skills: skills.skills,
+			prompt_templates: prompt_templates.templates,
+		}
+	};
 	let prompt_options = crate::core::system_prompt::SystemPromptOptions {
 		context_files: !cli.no_context_files,
 		custom: cli
@@ -1290,6 +1356,7 @@ async fn main() -> anyhow::Result<()> {
 			.iter()
 			.map(|value| crate::core::system_prompt::resolve_prompt_input(value))
 			.collect(),
+		skills: resources.skills.clone(),
 	};
 	let system_prompt =
 		crate::core::system_prompt::build_system_prompt_with_options(&cwd, &tools, &prompt_options);
@@ -1403,6 +1470,7 @@ async fn main() -> anyhow::Result<()> {
 		settings.compaction.unwrap_or_default(),
 		prompt_options,
 		settings.retry.unwrap_or_default(),
+		resources,
 	);
 	handle.configure_tool_options(crate::core::agent_session::ToolRuntimeOptions {
 		tools: tools_flag,
@@ -1617,6 +1685,24 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn resource_short_flags_rewrite_to_their_long_forms() {
+		let args = ["pi-rs", "-ns", "-np", "--skill", "/x"]
+			.into_iter()
+			.map(str::to_string)
+			.collect();
+		assert_eq!(
+			rewrite_combined_short_args(args),
+			[
+				"pi-rs",
+				"--no-skills",
+				"--no-prompt-templates",
+				"--skill",
+				"/x"
+			]
+		);
+	}
+
 	fn cli(mode: Option<&str>, print: bool, rpc: bool) -> Cli {
 		Cli {
 			print,
@@ -1653,6 +1739,10 @@ mod tests {
 			approve: false,
 			no_approve: false,
 			offline: false,
+			skill: Vec::new(),
+			no_skills: false,
+			prompt_template: Vec::new(),
+			no_prompt_templates: false,
 			prompt: Vec::new(),
 		}
 	}

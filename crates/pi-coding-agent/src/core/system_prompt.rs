@@ -8,21 +8,14 @@ use std::path::Path;
 
 use pi_agent::AgentTool;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SystemPromptOptions {
 	pub context_files: bool,
 	pub custom: Option<String>,
 	pub append: Vec<String>,
-}
-
-impl Default for SystemPromptOptions {
-	fn default() -> Self {
-		Self {
-			context_files: true,
-			custom: None,
-			append: Vec::new(),
-		}
-	}
+	/// Skills rendered into the `<skills>` section (upstream appends the
+	/// `skills` section after `project_context`, before `cwd`).
+	pub skills: Vec<super::skills::Skill>,
 }
 
 pub fn build_system_prompt(
@@ -107,6 +100,34 @@ prefer the dedicated file tools over bash for file operations.
 					path.display(),
 					content
 				));
+			}
+		}
+	}
+	// Skills section (upstream system-prompt.ts:179-182): appended after
+	// project context and before the cwd tag, with the Agent Skills XML from
+	// `formatSkillsForPrompt` used verbatim. Upstream picks the reader hint
+	// from declared tools (`read` → `bash` → indirect for selected-but-hidden
+	// readers); this port only sees the final tool set, so `read`/`bash` map
+	// directly and a set with neither reader drops the section (the model
+	// could not load skill files anyway).
+	if !options.skills.is_empty() {
+		let file_read_tool = if tools.iter().any(|tool| tool.name() == "read") {
+			Some(crate::core::skills::FileReadTool::Read)
+		} else if tools.iter().any(|tool| tool.name() == "bash") {
+			Some(crate::core::skills::FileReadTool::Bash)
+		} else {
+			// No reader available: the skill files are unreachable.
+			None
+		};
+		if let Some(file_read_tool) = file_read_tool {
+			let rendered =
+				crate::core::skills::format_skills_for_prompt(&options.skills, file_read_tool)
+					.trim()
+					.to_string();
+			if !rendered.is_empty() {
+				prompt.push_str("\n\n<skills>\n");
+				prompt.push_str(&rendered);
+				prompt.push_str("\n</skills>");
 			}
 		}
 	}
@@ -204,6 +225,7 @@ mod tests {
 			context_files: true,
 			custom: Some("CUSTOM".into()),
 			append: vec!["FIRST".into(), "SECOND".into()],
+			skills: Vec::new(),
 		};
 		let prompt = build_system_prompt_with_options(&root, &[], &options);
 		assert!(prompt.starts_with("CUSTOM\n\nFIRST\n\nSECOND"));
@@ -211,6 +233,123 @@ mod tests {
 		assert!(prompt.contains(&root.display().to_string()));
 		assert!(!prompt.contains("# Tools"));
 		std::fs::remove_dir_all(root).unwrap();
+	}
+	/// Minimal tool stub for reader-hint selection (`read`/`bash` names).
+	struct StubTool {
+		name: &'static str,
+	}
+
+	#[async_trait::async_trait]
+	impl pi_agent::AgentTool for StubTool {
+		fn name(&self) -> &str {
+			self.name
+		}
+		fn description(&self) -> &str {
+			"stub"
+		}
+		fn parameters_schema(&self) -> serde_json::Value {
+			serde_json::json!({})
+		}
+		async fn execute(
+			&self,
+			_tool_call_id: &str,
+			_params: serde_json::Value,
+			_signal: tokio_util::sync::CancellationToken,
+			_on_update: Option<pi_agent::ToolUpdate>,
+		) -> pi_agent::AgentToolResult {
+			unimplemented!("never executed")
+		}
+	}
+
+	#[test]
+	fn skills_section_sits_between_context_and_cwd() {
+		use crate::core::skills::{Skill, SkillSource};
+		let skill = Skill {
+			name: "demo".into(),
+			description: "Demo skill".into(),
+			file_path: Path::new("/tmp/skills/demo/SKILL.md").to_path_buf(),
+			base_dir: Path::new("/tmp/skills/demo").to_path_buf(),
+			source: SkillSource::User,
+			disable_model_invocation: false,
+		};
+		let read_tool: std::sync::Arc<dyn AgentTool> =
+			std::sync::Arc::new(StubTool { name: "read" });
+		let options = SystemPromptOptions {
+			context_files: false,
+			custom: Some("CUSTOM".into()),
+			append: Vec::new(),
+			skills: vec![skill.clone()],
+		};
+		let prompt =
+			build_system_prompt_with_options(Path::new("/tmp/work"), &[read_tool], &options);
+		let context_end = prompt.find("</project_instructions");
+		let skills_start = prompt.find("<skills>").expect("skills section present");
+		let cwd_start = prompt.find("<cwd>").expect("cwd tag follows skills");
+		assert!(
+			context_end.is_none(),
+			"custom prompt has no project context"
+		);
+		assert!(skills_start < cwd_start, "skills before cwd");
+		assert!(prompt.contains("<name>demo</name>"));
+		assert!(prompt.contains("<description>Demo skill</description>"));
+		assert!(prompt.contains("<location>/tmp/skills/demo/SKILL.md</location>"));
+
+		// Bash-only tool sets switch the reader hint line.
+		let bash_tool: std::sync::Arc<dyn AgentTool> =
+			std::sync::Arc::new(StubTool { name: "bash" });
+		let prompt = build_system_prompt_with_options(
+			Path::new("/tmp/work"),
+			&[bash_tool],
+			&SystemPromptOptions {
+				skills: vec![skill.clone()],
+				..Default::default()
+			},
+		);
+		assert!(prompt.contains("Use bash to load a skill's file"));
+
+		// A tool set with no reader drops the section entirely (upstream has
+		// the `indirect` wording for selected-but-hidden readers, which this
+		// port cannot distinguish).
+		let prompt = build_system_prompt_with_options(
+			Path::new("/tmp/work"),
+			&[],
+			&SystemPromptOptions {
+				skills: vec![skill.clone()],
+				..Default::default()
+			},
+		);
+		assert!(!prompt.contains("<skills>"));
+
+		// A skill marked disable-model-invocation leaves no section.
+		let mut hidden = Skill {
+			name: "hidden".into(),
+			description: "hidden".into(),
+			file_path: Path::new("/tmp/skills/h/SKILL.md").to_path_buf(),
+			base_dir: Path::new("/tmp/skills/h").to_path_buf(),
+			source: SkillSource::User,
+			disable_model_invocation: true,
+		};
+		let read_tool: std::sync::Arc<dyn AgentTool> =
+			std::sync::Arc::new(StubTool { name: "read" });
+		let prompt = build_system_prompt_with_options(
+			Path::new("/tmp/work"),
+			&[read_tool],
+			&SystemPromptOptions {
+				skills: vec![hidden.clone()],
+				..Default::default()
+			},
+		);
+		assert!(!prompt.contains("<skills>"));
+		hidden.disable_model_invocation = false;
+		let prompt = build_system_prompt_with_options(
+			Path::new("/tmp/work"),
+			&[std::sync::Arc::new(StubTool { name: "read" }) as std::sync::Arc<dyn AgentTool>],
+			&SystemPromptOptions {
+				skills: vec![hidden],
+				..Default::default()
+			},
+		);
+		assert!(prompt.contains("<skills>"));
 	}
 	#[test]
 	fn context_precedence_order_and_bom() {

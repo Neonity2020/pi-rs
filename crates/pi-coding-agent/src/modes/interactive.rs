@@ -419,19 +419,45 @@ struct SlashMenu {
 }
 
 impl SlashMenu {
-	fn new() -> Self {
-		let items: Vec<SelectItem> = BUILTIN_SLASH_COMMANDS
-			.iter()
-			.map(|info| SelectItem {
-				value: info.name.to_string(),
-				label: format!("/{}", info.name),
-				description: Some(info.description.to_string()),
-			})
-			.collect();
+	fn new(items: Vec<SelectItem>) -> Self {
 		let mut list = SelectList::new(items, 8);
 		list.set_no_match_message("No matching commands");
 		Self { list }
 	}
+}
+
+/// The slash menu listing: the static builtin table plus the dynamic
+/// resource commands (prompt templates as `/<name>`, skills as
+/// `/skill:<name>` gated on the `enableSkillCommands` setting) — upstream
+/// `createBaseAutocompleteProvider` (interactive-mode.ts:788-821).
+fn slash_menu_items(
+	resources: &crate::core::agent_session::SessionResources,
+	enable_skill_commands: bool,
+) -> Vec<SelectItem> {
+	let mut items: Vec<SelectItem> = BUILTIN_SLASH_COMMANDS
+		.iter()
+		.map(|info| SelectItem {
+			value: info.name.to_string(),
+			label: format!("/{}", info.name),
+			description: Some(info.description.to_string()),
+		})
+		.collect();
+	for command in crate::core::slash_commands::dynamic_slash_commands(
+		&resources.prompt_templates,
+		&resources.skills,
+		enable_skill_commands,
+	) {
+		let mut description = command.description;
+		if let Some(hint) = &command.argument_hint {
+			description.push_str(&format!(" ({hint})"));
+		}
+		items.push(SelectItem {
+			value: command.name.clone(),
+			label: format!("/{}", command.name),
+			description: Some(description),
+		});
+	}
+	items
 }
 
 /// The live fuzzy query when the editor text qualifies for the slash menu:
@@ -1837,7 +1863,14 @@ impl InteractiveMode {
 			}
 		};
 		if self.slash_menu.is_none() {
-			self.slash_menu = Some(SlashMenu::new());
+			let enable_skill_commands = crate::core::settings_manager::SettingsManager::load(Some(
+				std::path::Path::new(&self.cwd),
+			))
+			.enable_skill_commands();
+			self.slash_menu = Some(SlashMenu::new(slash_menu_items(
+				self.session.resources(),
+				enable_skill_commands,
+			)));
 		}
 		let menu = self.slash_menu.as_mut().unwrap();
 		menu.list.set_filter(query);
@@ -2586,6 +2619,22 @@ impl InteractiveMode {
 				for info in BUILTIN_SLASH_COMMANDS {
 					text.push_str(&format!("  /{:<10} {}\n", info.name, info.description));
 				}
+				// Dynamic resource commands (templates, skills) join the
+				// listing like upstream's /help reads the command registry.
+				let enable_skill_commands = crate::core::settings_manager::SettingsManager::load(
+					Some(std::path::Path::new(&self.cwd)),
+				)
+				.enable_skill_commands();
+				for command in crate::core::slash_commands::dynamic_slash_commands(
+					&self.session.resources().prompt_templates,
+					&self.session.resources().skills,
+					enable_skill_commands,
+				) {
+					text.push_str(&format!(
+						"  /{:<10} {}\n",
+						command.name, command.description
+					));
+				}
 				// Hints reflect keybindings.json (upstream renders hints from
 				// the keybindings manager too).
 				text.push_str(&format!(
@@ -2764,7 +2813,23 @@ impl InteractiveMode {
 				}
 			}
 			other => {
-				self.push_notice(format!("unknown command /{other} — try /help"));
+				// Template (`/<name>`) and skill (`/skill:<name>`) commands
+				// ride the prompt expansion path (upstream `prompt()` expands
+				// them; an unknown name passes through as an ordinary
+				// message, so it is only "known" when a resource matches).
+				let resources = self.session.resources();
+				let is_template = resources
+					.prompt_templates
+					.iter()
+					.any(|template| template.name == other);
+				let is_skill = other
+					.strip_prefix("skill:")
+					.is_some_and(|name| resources.skills.iter().any(|skill| skill.name == name));
+				if is_template || is_skill {
+					self.send_prompt(format!("/{command}"));
+				} else {
+					self.push_notice(format!("unknown command /{other} — try /help"));
+				}
 			}
 		}
 	}

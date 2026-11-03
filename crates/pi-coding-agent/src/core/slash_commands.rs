@@ -191,6 +191,65 @@ const fn info(
 	}
 }
 
+/// A resource-backed slash command for the menu/autocomplete listing —
+/// prompt-template commands and `skill:` commands (upstream
+/// `interactive-mode.ts` `createBaseAutocompleteProvider`, lines 788-818).
+/// `BUILTIN_SLASH_COMMANDS` stays a static table; callers append these after
+/// it.
+#[derive(Debug, Clone)]
+pub struct DynamicSlashCommand {
+	pub name: String,
+	pub description: String,
+	pub source: SlashCommandSource,
+	/// Template `argument-hint` frontmatter, for argument-position UIs.
+	pub argument_hint: Option<String>,
+}
+
+/// Upstream `prefixAutocompleteDescription` with
+/// `getAutocompleteSourceTag` reduced to the synthetic-local scope tags:
+/// user → `u`, project → `p`, explicit path → `t`.
+pub fn prefixed_description(description: &str, tag: &str) -> String {
+	if tag.is_empty() {
+		description.to_string()
+	} else {
+		format!("[{tag}] {description}")
+	}
+}
+
+/// Build the dynamic command list from loaded resources: one
+/// `/<template-name>` entry per prompt template (description = template
+/// description with the source tag) and, when `enable_skill_commands` is on
+/// (upstream `settingsManager.getEnableSkillCommands()`), one
+/// `/skill:<name>` entry per skill (description = skill description).
+/// Submission needs no registration: slash names that match no builtin fall
+/// through to the prompt path where the session expands them.
+pub fn dynamic_slash_commands(
+	templates: &[crate::core::prompt_templates::PromptTemplate],
+	skills: &[crate::core::skills::Skill],
+	enable_skill_commands: bool,
+) -> Vec<DynamicSlashCommand> {
+	let mut commands = Vec::new();
+	for template in templates {
+		commands.push(DynamicSlashCommand {
+			name: template.name.clone(),
+			description: prefixed_description(&template.description, template.source.tag()),
+			source: SlashCommandSource::Prompt,
+			argument_hint: template.argument_hint.clone(),
+		});
+	}
+	if enable_skill_commands {
+		for skill in skills {
+			commands.push(DynamicSlashCommand {
+				name: format!("skill:{}", skill.name),
+				description: prefixed_description(&skill.description, skill.source.tag()),
+				source: SlashCommandSource::Skill,
+				argument_hint: None,
+			});
+		}
+	}
+	commands
+}
+
 /// Extract the path argument of `/export`/`/import` — port of
 /// `interactive-mode.ts` `getPathCommandArgument`: a quoted argument keeps
 /// everything up to the matching quote (with no unquoting beyond the quote
@@ -243,5 +302,73 @@ mod tests {
 		// Unterminated quote: no argument (upstream returns undefined).
 		assert_eq!(path_command_argument("/export \"open", "/export"), None);
 		assert_eq!(path_command_argument("/model x", "/export"), None);
+	}
+
+	#[test]
+	fn dynamic_commands_list_templates_and_gated_skills() {
+		use crate::core::prompt_templates::{PromptTemplate, TemplateSource};
+		use crate::core::skills::{Skill, SkillSource};
+		let template = PromptTemplate {
+			name: "review".into(),
+			description: "Review code".into(),
+			argument_hint: Some("<path>".into()),
+			content: String::new(),
+			source: TemplateSource::Project,
+			file_path: std::path::PathBuf::from("/p/.pi/prompts/review.md"),
+		};
+		let skill = Skill {
+			name: "demo".into(),
+			description: "Demo skill".into(),
+			file_path: std::path::PathBuf::from("/p/.pi/skills/demo/SKILL.md"),
+			base_dir: std::path::PathBuf::from("/p/.pi/skills/demo"),
+			source: SkillSource::User,
+			disable_model_invocation: false,
+		};
+
+		let commands = dynamic_slash_commands(
+			std::slice::from_ref(&template),
+			std::slice::from_ref(&skill),
+			true,
+		);
+		let rendered: Vec<(String, String, &str)> = commands
+			.iter()
+			.map(|command| {
+				let source = match command.source {
+					SlashCommandSource::Prompt => "prompt",
+					SlashCommandSource::Skill => "skill",
+					_ => "builtin",
+				};
+				(command.name.clone(), command.description.clone(), source)
+			})
+			.collect();
+		assert_eq!(
+			rendered,
+			vec![
+				("review".into(), "[p] Review code".into(), "prompt"),
+				("skill:demo".into(), "[u] Demo skill".into(), "skill"),
+			]
+		);
+		assert_eq!(commands[0].argument_hint.as_deref(), Some("<path>"));
+		assert_eq!(commands[1].argument_hint, None);
+
+		// Disabled skill commands drop only the skill entries.
+		let commands = dynamic_slash_commands(
+			std::slice::from_ref(&template),
+			std::slice::from_ref(&skill),
+			false,
+		);
+		assert_eq!(commands.len(), 1);
+		assert_eq!(commands[0].name, "review");
+
+		// Empty resources → empty dynamic list; BUILTIN stays untouched.
+		assert!(dynamic_slash_commands(&[], &[], false).is_empty());
+		assert!(
+			BUILTIN_SLASH_COMMANDS
+				.iter()
+				.all(|info| info.source == SlashCommandSource::Builtin)
+		);
+		// The upstream tag prefixes for path-sourced resources.
+		assert_eq!(prefixed_description("d", "t"), "[t] d");
+		assert_eq!(prefixed_description("d", ""), "d");
 	}
 }
