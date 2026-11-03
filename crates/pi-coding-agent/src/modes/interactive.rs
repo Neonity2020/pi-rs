@@ -6878,14 +6878,15 @@ mod session_selector_tests {
 			resolve_global_action(&kb, &ctrl_p, true),
 			Some(GlobalAction::ModelCycleForward)
 		);
-		// The backward chord is platform-dependent (shift+ctrl+p on darwin).
-		let backward = if cfg!(target_os = "macos") {
+		// The backward chord is platform-dependent: upstream uses
+		// `windowsKeybindings ? "alt+p" : "shift+ctrl+p"` (keybindings.ts:45).
+		let backward = if cfg!(target_os = "windows") {
+			KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)
+		} else {
 			KeyEvent::new(
 				KeyCode::Char('p'),
 				KeyModifiers::SHIFT | KeyModifiers::CONTROL,
 			)
-		} else {
-			KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)
 		};
 		assert_eq!(
 			resolve_global_action(&kb, &backward, true),

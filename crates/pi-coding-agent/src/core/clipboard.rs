@@ -270,10 +270,15 @@ mod tests {
 		let _ = is_remote_session();
 		let _ = headless_linux();
 		let _ = is_wsl();
-		assert!(
-			!clipboard_command_candidates().is_empty(),
-			"every platform has a writer"
-		);
+		// macOS/Windows always have a native writer; headless Linux (no
+		// DISPLAY/WAYLAND/TERMUX) legitimately has none — OSC 52 is the
+		// writer there, so an empty candidate list is valid.
+		if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+			assert!(
+				!clipboard_command_candidates().is_empty(),
+				"macOS and Windows always have a native writer"
+			);
+		}
 	}
 
 	#[test]
