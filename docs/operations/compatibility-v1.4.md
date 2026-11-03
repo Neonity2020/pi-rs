@@ -1,6 +1,6 @@
 # Pi 1.4 兼容矩阵（P0 审计）
 
-> 2026-11-03 第十一轮增量（合并轮后）：交互命令收尾——`/copy`（clipboard 移植）/`/settings`/`/trust`（TrustSelector）/`/hotkeys`/`/changelog`/`/reload`/`/scoped-models`；CLI 收尾——`-r`/无值 `--resume` 会话选择器、跨项目 id/前缀命中改走 fork 提示（**行为变化**：不再静默用原项目 cwd 打开，路径直取保持）、`pi-rs auth check|print-api-key|print-bearer-token` 子命令（无 OAuth，api_key 面，exit 码矩阵对照上游）。`/share` `/bug`（pi.dev 服务）与 `/login` `/logout`（OAuth）声明推迟。真实进程、PTY 与单元测试覆盖；difftest 6/6 IDENTICAL 回归。此前增量（2026-10-31 第十轮）：CLI 旗标清零与会话树命令；第九轮：`--no-mcp`、系统提示词、provider/密钥选择与重试设置。下方原始审计和统计保留当时快照，不代表当前逐项状态。
+> 2026-11-03 第十二轮增量：**skills 与提示词模板全量移植**——skills.ts/prompt-templates.ts/frontmatter.ts 逐字对照（发现规则/校验/冲突 first-wins/gitignore-aware/符号链接去重、`<available_skills>` XML 注入、`/skill:<name>` 与 `/模板` bash 风格参数替换展开、`--skill`/`--prompt-template`/`-ns`/`-np` CLI 面、settings `enableSkillCommands`）；SlashCommandSource 的 prompt/skill 变体首次通路。扩展宿主兼容实验设计定稿（docs/operations/extensions-host-experiment.md：推荐外部进程桥，PoC 6 条成功标准待执行）。此前增量（2026-11-03 第十一轮）：交互命令收尾 `/copy /settings /trust /hotkeys /changelog /reload /scoped-models`、CLI `-r` 选择器/跨项目 fork 提示（行为变化）/auth 子命令；2026-10-31 第十轮：CLI 旗标清零与会话树命令。下方原始审计和统计保留当时快照，不代表当前逐项状态。
 
 审计日期：2026-10-28。上游基线：本地快照 `f9daca3480732d0042b1df3a6e27221f597a620d`，各包声明版本 1.4.0。**tag 核实结论**：上游仓库存在 `v1.4.0` 发布 tag（指向 `4a080252`），但快照 SHA **不是**该 tag 的提交——快照领先 v1.4.0 恰好 72 个提交、落后 0 个（tag 之后 "Add [Unreleased] section for next cycle" 的开发态）。因此：
 

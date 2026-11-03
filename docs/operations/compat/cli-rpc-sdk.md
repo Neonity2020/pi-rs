@@ -18,7 +18,7 @@
 | `--system-prompt` / `--append-system-prompt` | args.ts:121-125 | 支持文本、文件及多次追加；会话替换时保留 | 部分 | 原有系统提示词仍是 pi-rs 简化版本，非上游结构化 sections |
 | `-e --extension` / `-ne --no-extensions` | args.ts:186-190 | 无 | 未实现 | 依赖扩展系统（P3） |
 | `--no-mcp` | args.ts:191-192 | `main.rs` 跳过 MCP 信任、配置加载及服务启动 | 已验证 | `tests/no_mcp.rs` 以真实子进程验证禁用及默认启用路径（2026-10-31） |
-| `--skill` / `--prompt-template` 系 | args.ts:193-198,210-213 | 无 | 未实现 | |
+| `--skill` / `--prompt-template` 系 | args.ts:193-198,210-213 | `--skill <路径>` 与 `--prompt-template <路径>` 可重复 + `--no-skills`/`-ns`、`--no-prompt-templates`/`-np`（跳默认目录显式路径仍加载）；skills.rs/prompt_templates.rs 全量移植（发现/校验/冲突 first-wins/symlink 去重/gitignore-aware；模板 bash 风格参数替换）；`/skill:<name>` 与 `/模板` 展开有真子进程测试（tests/skills_prompts_cli.rs 2026-11-03） | 已验证 | 上游 input handlers/extension interception 未移植（无扩展 runner）；SourceInfo 简化为作用域标记；排序确定性 first-wins（Node 为 OS 序） |
 | `--theme` / `--use-theme` / `--no-themes` | args.ts:199-209,214-215 | `--theme <path>` 可重复加载额外主题文件；`--use-theme <name>` 运行期覆盖（对照 applyOverrides，不落盘）；`--no-themes` 跳过用户主题；另有 `--light`（上游无） | 已验证(部分) | 主题文件解析失败回退内置并 notice |
 | `-nc --no-context-files` | args.ts:216-217 | main.rs + 组合短旗标 `-nc` 预处理 | 已验证 | |
 | `--list-models` / `--export` / `--tui-mode` / `--verbose` | args.ts:218-240 | `--list-models [pattern]` 全量目录模糊搜索（不按认证过滤，已声明）；`--export <id\|path> [out]` 恒为 HTML（exportFromFile 语义，默认 `pi-rs-session-<basename>.html`） | 部分 | `--tui-mode`/`--verbose` 未实现（TUI 恒为全屏 alt-screen，推迟到 TUI 轮） |

@@ -338,3 +338,13 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **集成（主会话）**：全工作区门禁 fmt/clippy -D warnings 干净、**768 项测试全绿**（627→768）；difftest 六场景 **6/6 IDENTICAL**；README/compat 三文档同步（含行为变化标注）。
 
 **交接事项（明确推迟）**：/share /bug（pi.dev/Radius/gist 服务）；/login /logout（OAuth）；包管理子命令 install/remove/update/list/config（P3 扩展/包系统，package-manager.ts 2791 行）；`--tui-mode`/`--verbose`/quietStartup；上游 settings 选择器未覆盖的键（steeringMode/followUpMode/quietStartup 等约 40 键中 pi-rs 未有者）；扩展系统兼容实验（P3 首任务）。改动未提交，等用户指令。
+
+## 第三十七轮：skills 与提示词模板 + 扩展宿主实验设计（2026-11-03，主会话调研 + 1 个子 agent 纵向切片 + 主会话 spike）
+
+基线 `5f7186a`（第十一轮后）。
+
+- **skills + 提示词模板（子 agent 全量移植，一个纵向切片）**：`core/skills.rs`（skills.ts 逐字：SKILL.md 根不递归/根 .md 需 description/gitignore-aware 规则前缀拼接/点文件与 node_modules 跳过/同名 first-wins + collision diagnostic/canonicalize 符号链接去重/name 与 description 校验 warning 但仍加载/disable-model-invocation/formatSkillsForPrompt XML 逐字含转义顺序与头部文案）、`core/prompt_templates.rs`（非递归 .md/description 回退首行截 60/argument-hint/parseCommandArgs bash 引号/substituteArgs 全占位形态单遍不递归/expand_prompt_template）、`core/frontmatter.rs`（BOM/CRLF 归一/--- YAML --- 提取，serde_yaml 0.9 入 workspace）。通路：`SessionShared.resources` + spawn 第 7 参、Prompt 分支先 `/skill:` 后模板展开（展开文本即用户消息）、system_prompt `<skills>` 节（project context 后 cwd 前）、`dynamic_slash_commands()` 合并点（BUILTIN 静态表不动，u/p/t 源标记）、settings `enableSkillCommands`、CLI `--skill/--prompt-template/--no-skills/-ns/--no-prompt-templates/-np`。测试：单测覆盖发现/校验/XML/占位替换全形态 + `tests/skills_prompts_cli.rs` 6 条真子进程（json 模式断言展开文本/--no-skills 显式路径仍加载/坏 frontmatter warning 不崩）。声明差异：扩展命令与 input handlers 通路未移植（无 extension runner）、SourceInfo 简化为作用域标记、目录项排序确定性 first-wins（Node 为 OS 序）。
+- **扩展宿主实验设计（主会话 spike，docs/operations/extensions-host-experiment.md）**：对上游 70+ 官方示例扩展实测 API 使用分布（事件 90/命令 56/工具 39/消息注入 19/UI notify 138/custom 组件 30）；宿主三选项对比，**推荐外部进程桥**（node/bun + jiti 宿主脚本，JSONL 双向转发；逻辑面+对话框原语可兼容，TUI 组件级声明降级）；桥协议草图 + PoC 6 条成功标准（hello/notify/question/todo/flag 扩展 + 失败隔离）+ 信任边界声明。**结论待 PoC 实证，不宣称兼容**。
+- **集成（主会话）**：全工作区门禁 fmt/clippy -D warnings 干净、**809 项测试全绿**（768→809）；difftest 六场景 **6/6 IDENTICAL**。
+
+**交接事项（下一轮候选）**：扩展宿主 PoC（按实验设计执行，跑通上游 6 个代表性扩展才算证明）；包管理子命令（install/remove/update/list/config，依赖 PoC 结论）；`-e/--extension`/`-ne` 旗标（PoC 后接桥）；OAuth 登录；/share /bug；`--tui-mode`/`--verbose`；codemode 沙箱与 tool-search（上游为内置扩展，pi-rs 需决定原生实现或桥接）。改动未提交，等用户指令。
