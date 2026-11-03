@@ -28,7 +28,7 @@
 | `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false；跨项目切换会关闭旧 MCP 连接并按目标项目的信任状态重连 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
 | TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
-| TUI 会话命令 | `/resume`（无参开选择器：范围/树形/搜索/删除/重命名；带 id/路径直接恢复）、`/export`（HTML 默认或 .jsonl 分支导出）、`/new`、`/name`、`/session`（上游 Session Info 面板）、`/hotkeys`、`/fork`（用户消息选择器，选中后回填编辑器）与 `/fork <n>`（编号分叉）、`/clone`、`/tree`、`/import`、`/trust`、`/copy`（平台剪贴板阶梯 + OSC 52）、`/thinking <level>`；ctrl+g 外部编辑器（TUI 挂起/恢复） |
+| TUI 会话命令 | `/resume`（无参开选择器：范围/树形/搜索/删除/重命名；带 id/路径直接恢复）、`/export`（HTML 默认或 .jsonl 分支导出）、`/new`、`/name`、`/session`（上游 Session Info 面板）、`/hotkeys`（键位 markdown 表格）、`/fork`（用户消息选择器，选中后回填编辑器）与 `/fork <n>`（编号分叉）、`/clone`、`/tree`、`/import`、`/trust`（上游 TrustSelector：信任/信任父目录/不信任 + 重启提示）、`/copy`（平台剪贴板阶梯 + OSC 52）、`/settings`（settings 键选择器，全局层写盘，即时项热应用）、`/scoped-models`（模型多选作用域，会话级）、`/changelog`（内嵌 CHANGELOG 的 What's New）、`/reload`（重建键位/主题/模型目录与运行时）、`/thinking <level>`；ctrl+g 外部编辑器（TUI 挂起/恢复） |
 | `@file` 图片 | 已实现：魔数嗅探（png/jpeg/gif/webp/bmp + APNG 排除）、EXIF 方向、4.5MB base64 预算 Lanczos3 递缩；限额内原始字节透传 |
 
 本项目仍在开发中，运行模型生成的 shell 命令和文件修改时，请在可信环境中使用并检查结果。
@@ -48,7 +48,9 @@ cargo build --release
 
 会话树可用 `/fork`（选择一条用户消息，从其之前分支出全新会话，选中文本回填编辑器）、`/clone`（以当前叶为终点克隆新会话）、`/tree`（树形浏览条目，五种过滤模式，切换节点时可选 LLM 分支总结——三选一或自定义提示词，Esc 中止总结回树选择器）、`/import <path.jsonl>`（确认后复制进会话存储并切换）与 `/export [路径]`（`.jsonl` 导出原始分支，否则导出 HTML）。
 
-启动时可用 `-n <名称>` 命名会话，使用 `--session <ID或路径>` 恢复已有会话（与 `--resume` 等价），或 `--session-id <id>` 指定会话 id、`--fork <id|路径>` 从既有会话分支。恢复跨项目会话时使用会话原项目的设置与工作目录；原目录不存在时启动失败。
+启动时可用 `-n <名称>` 命名会话；`-r` 或无值 `--resume` 打开会话选择器（行式列表：mtime 降序，编号选择、文本过滤、空输入取消 exit 0；RPC 模式不可用）；带值 `--resume <ID或路径>` 或 `--session <ID或路径>` 直接恢复；`--session-id <id>` 指定会话 id；`--fork <id|路径>` 从既有会话分支。按 id/前缀解析到其他项目的会话时会提示 `Fork this session into current directory?`——确认则分支到当前项目，拒绝则退出；直接路径恢复保持会话原项目的设置与工作目录，原目录不存在时启动失败。
+
+`pi-rs auth check [--provider <p>] [--model <m>] [--json] [--credentials]` 校验 provider 凭证可解析（models.json 的 `$ENV`/`!cmd` 形态；无 OAuth，故恒为 api_key 型，`--no-refresh` 解析但无效），`auth print-api-key` 打印凭证，`auth print-bearer-token` 因无 OAuth 恒报错（文案对照上游）。
 
 浅色终端可使用 `cargo run -p pi-coding-agent -- --light`，或在 settings.json 中设置 `"theme": "light"`。如果终端设置了 `COLORFGBG`，程序也会按它声明的背景颜色选择默认主题；显式主题设置优先。
 
@@ -123,7 +125,7 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
 
-剩余：1. **providers** — 6 个 API（openai-responses 与 google-generative-ai 已完成；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴、设置选择器（会话选择器与外部编辑器 ctrl+g 已完成：`/resume` 浮层支持范围/树形/搜索/删除/重命名；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
+剩余：1. **providers** — 6 个 API（openai-responses 与 google-generative-ai 已完成；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth——auth 子命令已落地 api_key 面）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models` 已完成；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 

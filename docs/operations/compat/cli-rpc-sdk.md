@@ -9,7 +9,7 @@
 | `-p, --print` | `src/cli/args.ts:177-183`；docs/cli.md:45 | main.rs:41-43 | 已验证(语义部分) | 上游 `-p` 吸收非 flag 参数为 message 且可多条组合；Rust 无吸收逻辑 |
 | `--mode text\|json\|rpc` | args.ts:96-110 | main.rs `resolve_app_mode`（resolveAppMode 移植，stdout 非 TTY 也进 print） | 已验证 | difftest 05/06 场景覆盖 json 模式 |
 | `-c, --continue` | args.ts:111-112；main.ts:432-434 | main.rs `-c` 短选项 + SessionSelector::Recent（mtime 降序） | 已验证 | |
-| `-r, --resume`（无值，选择器）/ `--session <path\|id>` | args.ts:113-114,134-135；main.ts:391-430 | `--resume` / `--session` 指定 ID 或路径；交互模式 `/resume` 提供选择器 | 部分 | CLI 无 `-r` 选择器及跨项目 fork 提示（Rust 按会话原项目 cwd 恢复，已声明） |
+| `-r, --resume`（无值，选择器）/ `--session <path\|id>` | args.ts:113-114,134-135；main.ts:391-430 | `-r` 纯 flag 与无值 `--resume` 开行式选择器（mtime 降序、编号选择/文本过滤、取消 "No session selected" exit 0、RPC 拒绝）；带值 `--resume <ID\|PATH>` 保留 pi-rs 直接恢复（`--session` 独立 flag 同语义）；跨项目 id/前缀命中→"Session found in different project" + fork 提示（y→`fork_from_in`，n/EOF→"Aborted." exit 0）；路径直取保持原项目 cwd（上游 path 分支语义） | 已验证(部分) | 选择器为 stdin 行式列表（上游 TUI 选择器，声明差异；列表渲染到 stderr 保持 stdout 机器可读） |
 | `--session-id` / `--fork` / `--session-dir` / `-n --name` | args.ts:136-141,126-131 | 四者齐备：`--session-id`（校验/冲突/查重）、`--fork`（resolveSessionPath 移植 + `fork_from_in`）、`--session-dir`（CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings `sessionDir`，交互 `/resume` 与选择器同根）、`-n/--name` | 已验证 | pi-rs 会话为目录式布局（id 在 header），`--session-id` 精确匹配走 header.id（tests/cli_flags.rs 2026-10-31） |
 | `--provider` / `--api-key` / `--models` | args.ts:115-120,142-146 | `--provider` 限定 `--model` 查找；`--api-key` 非持久化凭证；`--models` 逗号模式作用域（glob nocase + 引用解析，`models()` 内部过滤，picker/RPC 零适配生效） | 已验证 | 上游跨 provider 歧义告警与 settings `enabledModels` 回退未移植（已注释）；provider 选择与 API key 请求头有真实进程测试 |
 | `--model <pattern>` | args.ts:117-118；main.ts:475-498 | 支持 provider/id、模糊匹配和 thinking 后缀 | 部分 | 支持 `-m` 短选项；模型能力约束尚未完全对齐 |
@@ -29,7 +29,7 @@
 | `@file` 参数注入首条 prompt | args.ts:247-248；src/cli/file-processor.ts | `process_file_arguments`（文本分支；缺失 exit 1；RPC 模式拒绝） | 已验证(部分) | 图片附件走上游失败文本形态（第八轮） |
 | 管道 stdin 内容前置到 prompt | main.ts:80-97,897-907 | `buildInitialMessage` 移植（stdin→@file→prompt 单消息拼接） | 已验证(部分) | |
 | 模式解析规则（stdout 非 TTY 也进 print） | main.ts:112-123 | main.rs `resolve_app_mode` | 已验证 | |
-| 子命令 install/remove/update/list/config/auth/mcp | docs/cli.md:8-16,250-333 | 无 | 未实现 | |
+| 子命令 install/remove/update/list/config/auth/mcp | docs/cli.md:8-16,250-333 | `pi-rs auth check\|print-api-key\|print-bearer-token`（cli_auth.rs，clap 前拦截 argv；exit 码矩阵与 help/usage 文案逐字对照 auth-command.ts） | 已验证(部分) | 无 OAuth/auth.json：check 恒 api_key 型、`--no-refresh`/`--min-expiry` 解析但无效、print-bearer-token 恒失败（上游自身文案）；install/remove/update/list/config 依赖扩展/包系统（P3） |
 
 **CLI 覆盖度**：上游 ~44 项 vs Rust 已验证/部分 19 项（≈43%，2026-10-31 第十轮后；完全一致项见各行状态）。
 
@@ -43,8 +43,8 @@
 | print 输出最后一条 assistant | print-mode.ts:139-159 | print.rs:28-41 输出**每条** | 部分 |
 | 信号 SIGTERM/SIGHUP → 143/129 | print-mode.ts:50-66；rpc-mode.ts:359-375 | 无信号处理（rpc.rs:49-50 自认） | 未实现 |
 | 诊断错误 → 1 | main.ts:624-631 | anyhow→1；clap 参数错→2 | 接受差异 |
-| auth check 0/1/2 | main.ts:202,206 | 无 auth 子命令 | 未实现 |
-| 会话选择取消 → 0 | main.ts:423-425 | --resume 失败→1 | 接受差异 |
+| auth check 0/1/2 | main.ts:202,206 | cli_auth.rs（ready=0/not_ready=1/AuthCommandError=2，--json/--credentials；真实子进程测试 auth_cli.rs 2026-11-03） | 已验证(部分) | 无 OAuth：authType 恒 api_key |
+| 会话选择取消 → 0 | main.ts:423-425 | "No session selected" exit 0（resume_selector_cli.rs 2026-11-03） | 已验证 | |
 | RPC stdin EOF → 0 | rpc-mode.ts:713-727 | rpc.rs:574-589（abort+settle+落盘） | 已验证 |
 
 ## 3. print 模式

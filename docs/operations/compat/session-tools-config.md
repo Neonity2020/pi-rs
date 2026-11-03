@@ -61,10 +61,10 @@
 | 已验证 | /model /thinking /compact | 3 个（/thinking 为 cycle，上游可带参） |
 | Rust 增设 | /help /exit /clear /tools /prompt /sessions | 接受差异（调试命令；/sessions 是 stub） |
 | 会话管理（第九轮） | `/new` / `/name <name>` / `/session` / `/resume [id\|path]` | 已接入交互模式；可选择或指定会话，恢复当前上下文中的消息与工具结果 |
-| 会话管理（第十轮） | `/fork` / `/clone` / `/tree` / `/import <path.jsonl>` / `/export [path]` | 已接入：fork 用户消息选择器（selectedText 回填编辑器）、clone 当前叶、树选择器（五种过滤模式 + 分支总结三选一/自定义提示词 + 导航重建视图）、import 复制进存储并替换、export jsonl/HTML 双分支；状态文案逐字对照上游 |
-| 未实现（会话管理） | /settings /scoped-models | 依赖设置 UI/作用域 UI |
-| 未实现（导出/分享） | /copy /share /bug | — |
-| 未实现（资源/信任） | /login /logout /llama /trust /mcp /reload /hotkeys /changelog | trust 有底层 API 无命令入口（/tree、/export 依赖的 settings 键 branchSummary/treeFilterMode 已接入） |
+| 会话管理（第十轮） | `/fork` / `/clone` / `/tree` / `/import <path.jsonl>` / `/export [path]` | 已接入：fork 用户消息选择器（selectedText 回填编辑器）、clone 当前叶、树选择器（五种过滤模式 + 分支总结三选一/自定义提示词 + 导航重建视图）、import 复制进存储并切换、export jsonl/HTML 双分支；状态文案逐字对照上游 |
+| 产品体验（第十一轮） | `/copy` / `/settings` / `/trust` / `/hotkeys` / `/changelog` / `/reload` / `/scoped-models` | /copy=clipboard 移植（pbcopy/clip/wl-copy/xclip/xsel 梯 + OSC52 + WSL interop，100k 上限）；/settings=键选择器（pi-rs 12 键，全局层 set_overrides+save，即时项热应用）；/trust=TrustSelector 移植（信任/信任父目录/不信任 + 重启提示）；/hotkeys=键位 markdown 表格；/changelog=parseChangelog 移植（内嵌 CHANGELOG.md）；/reload=重建键位/主题/模型目录/运行时（Switch 到自身路径）；/scoped-models=多选作用域（会话级，set_model_scope） |
+| 未实现（导出/分享） | /share /bug | 依赖 pi.dev/Radius/gist 上传服务（声明差异，P3 后） |
+| 未实现（资源/登录） | /login /logout /llama | OAuth 未实现（约 1900 行 TS，依赖 pi.dev 端点） |
 | SlashCommandSource | extension/prompt/skill 注册通路 | 部分（枚举已定义，无注册通路） |
 
 `/tree` 声明差异（interactive.rs 模块注释）：分支总结完成 LLM 生成与 entry 落盘但无 readFiles/modifiedFiles 追踪；树选择器无折叠/标签编辑/复制/水平滚动；abort 时 steer 队列消息不能还原编辑器。

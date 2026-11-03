@@ -328,3 +328,13 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **合并期修掉的真实缺陷**：① 斜杠菜单的 Enter 只补全不执行（上游 `applyCompletion` 斜杠分支会继续提交）——改为补全并执行，Tab 仅补全；② 远端「session → 」通知里的 `rebuild_from_live_session` 会把替换完成后的状态通知清空（PTY 冒烟抓到 `/import` 的「Session imported from:」丢失）——改由 `SessionReplaced` 事件统一恢复 transcript；③ `core/mod.rs` 的 `pub use session_manager::SessionManager` 被远端删除导致 `crate::core::SessionManager` 不可达——调用点改用模块路径；④ `RetrySettings` 重复定义与 `Cli`/`UiConfig` 初始化缺字段（图片与外部编辑器字段）一并补齐。
 
 验证：`cargo test --workspace --locked` 731 项全绿（含 pty 冒烟：会话命令、信任与会话选择器）、`cargo fmt --all -- --check` 干净、`cargo clippy --workspace --all-targets --locked -- -D warnings` 零警告；差分框架六场景双侧 **6/6 IDENTICAL**（canonical view，f9daca34）。
+
+## 第三十六轮：交互命令收尾 + CLI 收尾（2026-11-03，主会话调研 + 2 个子 agent 并行 + 主会话集成）
+
+基线 `cd38b57`（合并轮后）。上游 `/mcp` 斜杠命令经核实不存在（登录流程的 MCP 提示而已），未发明。
+
+- **A（interactive/slash_commands/settings_manager + 新 clipboard.rs/changelog.rs + 根 CHANGELOG.md）**：`/copy`（clipboard.ts 全移植：pbcopy/clip/termux/wl-copy/xclip/xsel 梯 5s 超时、OSC52 条件（SSH/MOSH/PI_CLIPBOARD_OSC52）+100k 上限、WSL PowerShell interop、上游错误文案）；`/settings`（12 键选择器，`SettingsManager::set_overrides`+`save` 写全局层，即时项热应用 thinking/theme/treeFilterMode，其余诚实提示重启）；`/trust`（TrustSelector 移植：Trust/Trust parent folder/Do not trust，父目录写+本目录 clear，"Saved trust decision: … Restart pi-rs…"）；`/hotkeys`（KeybindingsManager→markdown 表格，ChatBlock::Doc 渲染，上游第三节名 Other）；`/changelog`（parseChangelog 移植 + include_str! 内嵌根 CHANGELOG.md + 可执行旁回退，保留上游 .reverse() 怪癖）；`/reload`（流式/压缩拒绝文案对照，重建 ui_config/registry/外部编辑器 + 会话经替换机制 Switch 到自身路径，ReplacementKind::Reload；extensions/skills/prompts 无对应为声明差异）；`/scoped-models`（all_models 多选，Tab 应用 set_model_scope，会话级声明差异）。顺带修 PTY harness 既有脆弱点：quit 等待期不读 master 会因大 Doc 全屏重绘填满缓冲卡死——改为边等边排水。
+- **B（main.rs/session_manager/model_registry + 新 cli_auth.rs）**：`-r` 纯 flag 与无值 `--resume`→行式选择器（stderr 渲染保持 stdout 机器可读；RPC 拒绝；print 模式吃 piped stdin 首行）；`--session` 恢复独立 flag；跨项目 id/前缀命中→fork 提示（y→fork_from_in，n/EOF→"Aborted." exit 0）——**行为变化**：修正第九轮的静默原项目 cwd 恢复（对照上游 main.ts:399-407 global 分支；path 直取不提示，main.ts:397 语义）；`auth check|print-api-key|print-bearer-token`（clap 前拦截 argv，exit 码矩阵 0/1/2 与 help 文案逐字，无 OAuth 为声明差异）。过滤字段剔除 cwd（macOS /var/folders 含 "older" 字面误匹配）。
+- **集成（主会话）**：全工作区门禁 fmt/clippy -D warnings 干净、**768 项测试全绿**（627→768）；difftest 六场景 **6/6 IDENTICAL**；README/compat 三文档同步（含行为变化标注）。
+
+**交接事项（明确推迟）**：/share /bug（pi.dev/Radius/gist 服务）；/login /logout（OAuth）；包管理子命令 install/remove/update/list/config（P3 扩展/包系统，package-manager.ts 2791 行）；`--tui-mode`/`--verbose`/quietStartup；上游 settings 选择器未覆盖的键（steeringMode/followUpMode/quietStartup 等约 40 键中 pi-rs 未有者）；扩展系统兼容实验（P3 首任务）。改动未提交，等用户指令。
