@@ -61,3 +61,26 @@ host → Rust:  {"type":"return","id":7,"ok":true,"result":{...}}
 ## 5. 信任与安全边界（如实声明）
 
 上游声明扩展与 pi 同权限运行（读提示词/工具调用/凭据/会话历史）。桥形态下扩展进程权限相同（用户权限），信任门（project_trust 事件，仅个人/显式 --extension 参与）语义须在 Rust 侧保留：项目扩展仅在信任决策后加载。密钥不进桥日志/fixture。
+
+## 6. PoC 执行结果（2026-11-03）
+
+**结论：外部进程桥可行，6/6 成功标准全部实证**（`crates/pi-extension-host`，7 个集成测试全过；fixture 为上游原样扩展 + 3 个 PoC 自制）。
+
+| 标准 | 验证 | 证据 |
+|---|---|---|
+| 1. 纯命令+notify（hello/session-name） | ✅ | 命令注册、handler 回路、notify 对话框往返 |
+| 2. session_start/shutdown 事件（notify/session-name） | ✅ | agent_settled 分发；OSC 777 转义经 stderr 转发完好 |
+| 3. 对话框扩展（permission-gate） | ✅ | tool_call 事件 → ui.select 往返 → block/allow 决策回流 |
+| 4. registerTool 回路（hello.ts 原样） | ✅ | schema 以 JSON 注册、execute 返回与上游扩展体逐字一致 |
+| 5. --flag 扩展 | ✅ | registerFlag 注册 + getFlag 经 env 注入取值 |
+| 6. 失败隔离 | ✅ | 工厂抛错→硬错误上报 exit；handler 抛错→单次调用报错、host 存活续服务 |
+
+实现要点（全部实测发现，非推测）：
+
+- **零依赖 host 可行**：Node ≥ 22.6 原生 TS 类型剥离直接加载上游扩展（本轮 fixtures 均为可擦除语法）；`jiti` 对含枚举等不可擦除语法的真实扩展仍可能需要（生产桥应支持，PoC 未覆盖）。
+- **包解析**：宿主运行时物化 shim `node_modules` + `module.register` resolve 钩子，把 `@earendil-works/pi-coding-agent`（defineTool 恒等）、`@earendil-works/pi-ai`/`typebox`（最小 Type 构造器）、`@earendil-works/pi-tui`（抛错的声明性桩）映射到 shim；扩展文件保持原路径加载。
+- **同步/异步分界是协议关键**：上游同步 API（getFlag/appendEntry/set-getSessionName/get-setActiveTools/getAllTools/get-setThinkingLevel）无法 await stdio 往返——host 本地镜像状态 + 单向 `action` 帧；异步 API（ui.*/sendMessage/setModel/exec）走 id 匹配调用。
+- **扩展 stdout 必须重定向**：上游扩展直接写 stdout（OSC 777 通知等），会破坏协议帧流——host 把非帧 stdout 全部转发 stderr，Rust 侧按原始字节收尾桶（OSC 无换行）。
+- **进程内调用与请求返回交错**：Rust 侧共享状态（Arc<Mutex>）使 call future 与 host 反向调用（对话框）可同时进行。
+
+生产桥差距（下一轮接线清单，按依赖排序）：接入 pi-coding-agent（`-e/--extension`/`-ne`、扩展目录发现、信任门：项目扩展仅信任决策后加载）→ 桥产物入会话（工具注册进 registry、命令进斜杠表、事件接 agent/session 生命周期）→ jiti 兜底非可擦除语法 → sessionManager 读面与 input/session_tree/before_* 事件补齐 → 对照上游 runner 的事件顺序审计。

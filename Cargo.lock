@@ -1364,6 +1364,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-extension-host"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pi-mcp"
 version = "0.1.0"
 dependencies = [

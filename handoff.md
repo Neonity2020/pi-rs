@@ -348,3 +348,14 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **集成（主会话）**：全工作区门禁 fmt/clippy -D warnings 干净、**809 项测试全绿**（768→809）；difftest 六场景 **6/6 IDENTICAL**。
 
 **交接事项（下一轮候选）**：扩展宿主 PoC（按实验设计执行，跑通上游 6 个代表性扩展才算证明）；包管理子命令（install/remove/update/list/config，依赖 PoC 结论）；`-e/--extension`/`-ne` 旗标（PoC 后接桥）；OAuth 登录；/share /bug；`--tui-mode`/`--verbose`；codemode 沙箱与 tool-search（上游为内置扩展，pi-rs 需决定原生实现或桥接）。改动未提交，等用户指令。
+
+## 第三十八轮：扩展宿主 PoC 通过（2026-11-03，主会话单线）
+
+基线 `03b0f0f`。按实验设计（docs/operations/extensions-host-experiment.md §4）执行 PoC，**6/6 成功标准全部实证，外部进程桥可行**。
+
+- 新 crate `crates/pi-extension-host`：Rust 侧 JSONL 协议（spawn/注册收集/事件分发/id 匹配调用/动作帧/失败隔离/stderr 尾桶）；零依赖 Node 宿主 `host/host.mjs`（stdout 协议化+扩展 stdout 转 stderr、运行时物化 shim node_modules + resolve 钩子映射 @earendil-works/* 与 typebox、最小 Type 构造器、pi-tui 抛错桩、Node ≥22.6 原生 TS 剥离 + `--experimental-strip-types` 重试、`pi.exec` 走 host 内 child_process）。
+- 测试 7 个（tests/poc.rs）：上游原样 hello.ts（registerTool schema+execute 回路）、session-name.ts（命令+同步 API 镜像）、notify.ts（agent_settled+OSC777 stderr 转发）、permission-gate.ts（tool_call→ui.select 对话框→block/allow）+ 自制 flags/factory-throw/handler-throw（flag 面、工厂硬错误、handler 级隔离）；node 过旧自动跳过。
+- 实测关键发现（写进实验文档 §6）：同步/异步 API 分界决定协议形态（同步=本地镜像+单向 action 帧）；扩展 stdout 必须重定向；不可桥 API（registerProvider/渲染器/custom UI）调用时抛声明性错误。
+- 集成：全工作区 **816 项测试**（809→816，+7 PoC）、fmt/clippy -D warnings 干净、difftest 6/6 IDENTICAL。
+
+**交接事项**：生产桥接线清单在实验文档 §6 末尾（-e 旗标/扩展目录/信任门→桥产物入会话→jiti 兜底→事件面补齐→runner 顺序审计）。改动未提交（本条 handoff 与代码一起提交），等用户指令。
