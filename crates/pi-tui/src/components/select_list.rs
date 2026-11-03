@@ -139,6 +139,12 @@ impl SelectList {
 		self.selected
 	}
 
+	/// Preselect a row (clamped to the filtered list) — used by callers that
+	/// reopen a list whose decision is already recorded.
+	pub fn set_selected(&mut self, index: usize) {
+		self.selected = index.min(self.filtered.len().saturating_sub(1));
+	}
+
 	pub fn len(&self) -> usize {
 		self.items.len()
 	}

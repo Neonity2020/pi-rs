@@ -49,6 +49,32 @@ pub fn trust(cwd: &Path) -> io::Result<()> {
 	trust_at(&trust_json_path(), cwd)
 }
 
+/// Record an explicit trust decision for `cwd` — upstream `set(cwd, decision)`
+/// (`/trust` selector). Path normalized first.
+pub fn set(cwd: &Path, decision: bool) -> io::Result<()> {
+	set_decision(&trust_json_path(), cwd, decision)
+}
+
+/// Clear the decision recorded exactly for `cwd` (upstream `set(cwd, null)` —
+/// the store keeps a `null` entry so the nearest recorded ancestor decides).
+pub fn clear(cwd: &Path) -> io::Result<()> {
+	let path = trust_json_path();
+	let mut store = read_store_checked(&path)?;
+	store.insert(normalize_path(cwd).to_string_lossy().into_owned(), None);
+	write_store(&path, &store)
+}
+
+/// The nearest recorded bool decision for `cwd` with the path it was recorded
+/// under — upstream `getEntry` (`ProjectTrustStoreEntry`). `None` when no
+/// ancestor has a decision.
+pub fn saved_entry(cwd: &Path) -> Option<(PathBuf, bool)> {
+	saved_entry_at(&trust_json_path(), cwd)
+}
+
+pub(crate) fn saved_entry_at(store: &Path, cwd: &Path) -> Option<(PathBuf, bool)> {
+	nearest_entry(&read_store(store), cwd)
+}
+
 pub(crate) fn is_trusted_at(store: &Path, cwd: &Path) -> bool {
 	matches!(nearest_decision(&read_store(store), cwd), Some(true))
 }
@@ -125,10 +151,16 @@ fn set_decision(store_path: &Path, cwd: &Path, decision: bool) -> io::Result<()>
 /// Nearest recorded bool decision for `cwd`, walking up to the root —
 /// upstream `findNearestTrustEntry`. `null` entries are skipped.
 fn nearest_decision(store: &Store, cwd: &Path) -> Option<bool> {
+	nearest_entry(store, cwd).map(|(_, decision)| decision)
+}
+
+/// [`nearest_decision`] with the path the decision was recorded under
+/// (upstream `getEntry`'s `ProjectTrustStoreEntry.path`).
+fn nearest_entry(store: &Store, cwd: &Path) -> Option<(PathBuf, bool)> {
 	let mut current = normalize_path(cwd);
 	loop {
 		if let Some(Some(decision)) = store.get(current.to_string_lossy().as_ref()) {
-			return Some(*decision);
+			return Some((current, *decision));
 		}
 		if !current.pop() {
 			return None;
@@ -249,6 +281,37 @@ mod tests {
 		// Re-trusting is idempotent.
 		trust_at(&fixture.store, &project).unwrap();
 		assert!(is_trusted_at(&fixture.store, &project));
+	}
+
+	#[test]
+	fn set_and_clear_write_explicit_decisions_and_saved_entry_reports_the_path() {
+		let fixture = Fixture::new("set-clear");
+		let project = fixture.sub("project");
+		// Untrusted is a stored false, not an absence.
+		set_decision(&fixture.store, &project, false).unwrap();
+		assert!(!is_trusted_at(&fixture.store, &project));
+		let (path, decision) = saved_entry_at(&fixture.store, &project).expect("entry recorded");
+		assert_eq!(path, super::normalize_path(&project));
+		assert!(!decision);
+		// Flipping back to trusted.
+		set_decision(&fixture.store, &project, true).unwrap();
+		let (_, decision) = saved_entry_at(&fixture.store, &project).unwrap();
+		assert!(decision);
+		// Clear leaves a null entry: no saved decision and no ancestor here,
+		// so untrusted (upstream `set(cwd, null)`).
+		let mut store = read_store_checked(&fixture.store).unwrap();
+		store.insert(
+			normalize_path(&project).to_string_lossy().into_owned(),
+			None,
+		);
+		write_store(&fixture.store, &store).unwrap();
+		assert_eq!(saved_entry_at(&fixture.store, &project), None);
+		assert!(!is_trusted_at(&fixture.store, &project));
+		let text = std::fs::read_to_string(&fixture.store).unwrap();
+		assert!(
+			text.contains("null"),
+			"cleared entry stays in the store: {text}"
+		);
 	}
 
 	#[test]

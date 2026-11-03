@@ -230,6 +230,89 @@ impl SettingsManager {
 		self.global = settings;
 		Ok(())
 	}
+
+	/// Merge field-wise overrides into the global layer in memory (upstream
+	/// `SettingsManager.set`): `Some` values replace; `None` leaves the field
+	/// untouched. Sub-structs (`compaction`, `retry`, `branchSummary`) merge
+	/// per field. Persist with [`Self::save`].
+	pub fn set_overrides(&mut self, overrides: &Settings) {
+		if overrides.default_provider.is_some() {
+			self.global.default_provider = overrides.default_provider.clone();
+		}
+		if overrides.default_model.is_some() {
+			self.global.default_model = overrides.default_model.clone();
+		}
+		if overrides.default_thinking_level.is_some() {
+			self.global.default_thinking_level = overrides.default_thinking_level.clone();
+		}
+		if overrides.theme.is_some() {
+			self.global.theme = overrides.theme.clone();
+		}
+		if overrides.external_editor.is_some() {
+			self.global.external_editor = overrides.external_editor.clone();
+		}
+		if overrides.shell_path.is_some() {
+			self.global.shell_path = overrides.shell_path.clone();
+		}
+		if overrides.tree_filter_mode.is_some() {
+			self.global.tree_filter_mode = overrides.tree_filter_mode.clone();
+		}
+		if overrides.session_dir.is_some() {
+			self.global.session_dir = overrides.session_dir.clone();
+		}
+		if overrides.default_tools.is_some() {
+			self.global.default_tools = overrides.default_tools.clone();
+		}
+		if let Some(compaction) = &overrides.compaction {
+			let merged = self
+				.global
+				.compaction
+				.get_or_insert_with(CompactionSettings::default);
+			if compaction.enabled.is_some() {
+				merged.enabled = compaction.enabled;
+			}
+			if compaction.reserve_tokens.is_some() {
+				merged.reserve_tokens = compaction.reserve_tokens;
+			}
+			if compaction.keep_recent_tokens.is_some() {
+				merged.keep_recent_tokens = compaction.keep_recent_tokens;
+			}
+		}
+		if let Some(retry) = &overrides.retry {
+			let merged = self.global.retry.get_or_insert_with(RetrySettings::default);
+			if retry.enabled.is_some() {
+				merged.enabled = retry.enabled;
+			}
+			if retry.max_retries.is_some() {
+				merged.max_retries = retry.max_retries;
+			}
+			if retry.base_delay_ms.is_some() {
+				merged.base_delay_ms = retry.base_delay_ms;
+			}
+			if retry.max_agent_delay_ms.is_some() {
+				merged.max_agent_delay_ms = retry.max_agent_delay_ms;
+			}
+		}
+		if let Some(branch) = &overrides.branch_summary {
+			let merged = self
+				.global
+				.branch_summary
+				.get_or_insert_with(BranchSummarySettings::default);
+			if branch.skip_prompt.is_some() {
+				merged.skip_prompt = branch.skip_prompt;
+			}
+		}
+	}
+
+	/// Persist the in-memory global layer to `settings.json` (pretty JSON,
+	/// like [`Self::set_global`]).
+	pub fn save(&self) -> Result<(), SettingsError> {
+		let dir = self.global_path.parent().unwrap_or(&self.global_path);
+		std::fs::create_dir_all(dir)?;
+		let json = serde_json::to_string_pretty(&self.global)?;
+		std::fs::write(&self.global_path, json)?;
+		Ok(())
+	}
 }
 
 fn load_settings(path: &std::path::Path) -> Option<Settings> {
@@ -240,6 +323,77 @@ fn load_settings(path: &std::path::Path) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn overrides_save_and_reload_round_trip_through_the_global_file() {
+		let dir = std::env::temp_dir().join(format!(
+			"pi-rs-settings-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let global = dir.join("settings.json");
+		let mut manager = SettingsManager {
+			global_path: global.clone(),
+			project_path: None,
+			global: Settings::default(),
+			project: Settings::default(),
+			modified: Vec::new(),
+		};
+		// Field-wise overrides: untouched fields stay absent.
+		manager.set_overrides(
+			&serde_json::from_str(
+				r#"{"theme":"light","treeFilterMode":"user-only","defaultThinkingLevel":"high",
+				    "compaction":{"reserveTokens":4096},"branchSummary":{"skipPrompt":true}}"#,
+			)
+			.unwrap(),
+		);
+		manager.save().unwrap();
+		let text = std::fs::read_to_string(&global).unwrap();
+		let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+		assert_eq!(value["theme"], "light");
+		assert_eq!(value["treeFilterMode"], "user-only");
+		assert_eq!(value["defaultThinkingLevel"], "high");
+		assert_eq!(value["compaction"]["reserveTokens"], 4096);
+		assert_eq!(value["branchSummary"]["skipPrompt"], true);
+		// Untouched fields serialize as null (Settings is `default`-grained;
+		// the same shape `set_global` has always written) and parse back to
+		// None.
+		assert!(
+			value["defaultModel"].is_null(),
+			"no spillover value: {text}"
+		);
+
+		// A second override merges into the saved file without clobbering.
+		let mut reloaded = SettingsManager {
+			global_path: global.clone(),
+			project_path: None,
+			global: load_settings(&global).unwrap(),
+			project: Settings::default(),
+			modified: Vec::new(),
+		};
+		reloaded.set_overrides(&serde_json::from_str(r#"{"theme":"dark"}"#).unwrap());
+		reloaded.save().unwrap();
+		let value: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&global).unwrap()).unwrap();
+		assert_eq!(value["theme"], "dark");
+		assert_eq!(value["compaction"]["reserveTokens"], 4096);
+		assert_eq!(
+			SettingsManager {
+				global_path: global,
+				project_path: None,
+				global: Settings::default(),
+				project: Settings::default(),
+				modified: Vec::new(),
+			}
+			.effective()
+			.tree_filter_mode,
+			None,
+			"a fresh manager does not see the temp file (explicit-path construction only)"
+		);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
 	#[test]
 	fn retry_merges_fields_across_layers() {
 		let global: Settings = serde_json::from_str(

@@ -123,6 +123,14 @@ enum ChatBlock {
 		rendered: Option<(usize, Vec<Line<'static>>)>,
 	},
 	Notice(String),
+	/// A bordered markdown document (`DynamicBorder` + bold accent title +
+	/// `Markdown` upstream): `/changelog`'s "What's New" and `/hotkeys`'s
+	/// "Keyboard Shortcuts".
+	Doc {
+		title: String,
+		text: String,
+		rendered: Option<(usize, Vec<Line<'static>>)>,
+	},
 	/// Passthrough bash (`!cmd`): live output tail while running, full text
 	/// (or the spill-file note) once done.
 	Bash {
@@ -302,10 +310,83 @@ enum Dialog {
 	/// Custom summarization instructions (single-line editor; Esc returns to
 	/// the choice).
 	CustomPrompt { target_id: String, value: String },
+	/// `/settings` single-line value editor (upstream settings-submenu
+	/// input); Esc returns to the settings selector, Enter applies.
+	SettingInput { key: String, value: String },
 }
 
 impl Dialog {
 	const SUMMARY_CHOICES: [&str; 3] = ["No summary", "Summarize", "Summarize with custom prompt"];
+}
+
+/// `/settings` — one entry of the settings selector (upstream
+/// `SettingsSelectorComponent`'s value list, cut to the settings pi-rs
+/// actually persists).
+struct SettingEntry {
+	key: &'static str,
+	editor: SettingEditor,
+	/// Hot-applies to the running session (upstream's live callbacks:
+	/// thinking level, theme, tree filter). Everything else honestly reports
+	/// that a restart picks it up.
+	instant: bool,
+}
+
+/// How Enter edits the entry (upstream cycles enums inline and opens a
+/// single-line editor for strings/numbers).
+#[derive(Clone)]
+enum SettingEditor {
+	/// Enter cycles through the values (enums, booleans).
+	Cycle(Vec<String>),
+	/// Enter opens the single-line editor (strings, numbers).
+	Input,
+}
+
+/// `/settings` selector state: the list plus its fixed entry metadata.
+struct SettingsOverlay {
+	list: SelectList,
+	entries: Vec<SettingEntry>,
+}
+
+/// `/scoped-models` multi-select (upstream `ScopedModelsSelectorComponent`,
+/// reduced to the session scope — pi-rs persists no `enabledModels`
+/// setting, so the selection applies until the next session replacement).
+struct ScopedModelsOverlay {
+	search: String,
+	/// The full catalog (upstream refreshes model catalogs in place; pi-rs
+	/// snapshots at open).
+	all: Vec<Model>,
+	default_key: String,
+	list: SelectList,
+	checked: std::collections::BTreeSet<String>,
+}
+
+impl ScopedModelsOverlay {
+	fn new(all: &[Model], checked: std::collections::BTreeSet<String>, default_key: &str) -> Self {
+		let mut list = SelectList::new(scoped_model_items(all, &checked, default_key), 12);
+		list.set_no_match_message("No matching models");
+		list.set_mark_value(Some(default_key.to_string()));
+		Self {
+			search: String::new(),
+			all: all.to_vec(),
+			default_key: default_key.to_string(),
+			list,
+			checked,
+		}
+	}
+
+	/// Rebuild the rows after a toggle; the filter and cursor survive
+	/// (`set_items` keeps the selection index and refilters).
+	fn refresh_items(&mut self) {
+		let items = scoped_model_items(&self.all, &self.checked, &self.default_key);
+		self.list.set_items(items);
+	}
+}
+
+/// `/trust` selector context (upstream `TrustSelectorComponent`): the header
+/// lines are precomputed — cwd, saved decision, effective session state.
+struct TrustOverlayInfo {
+	cwd: std::path::PathBuf,
+	header: Vec<String>,
 }
 
 /// Which session-replacement command is in flight (`begin_replacement`).
@@ -316,6 +397,9 @@ enum ReplacementKind {
 	Fork,
 	Clone,
 	Import,
+	/// `/reload`: the same session path re-opened through the replacement
+	/// machinery (the closest port of upstream's runtime rebuild).
+	Reload,
 }
 
 /// The response channel of a running `/tree` navigation plus the entry to
@@ -421,8 +505,12 @@ pub struct InteractiveMode {
 	// Session selector overlay (/resume): owns its own state; async session
 	// listing and file mutations flow through the typed channel below.
 	session_overlay: Option<SessionSelectorOverlay>,
-	// /trust confirm overlay (a SelectList with two items).
-	trust_overlay: Option<(SelectList, std::path::PathBuf)>,
+	// /trust selector: the decision list plus the precomputed header lines.
+	trust_overlay: Option<(SelectList, TrustOverlayInfo)>,
+	// /settings selector.
+	settings_overlay: Option<SettingsOverlay>,
+	// /scoped-models multi-select.
+	scoped_overlay: Option<ScopedModelsOverlay>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -921,6 +1009,8 @@ impl InteractiveMode {
 			slash_menu: None,
 			session_overlay: None,
 			trust_overlay: None,
+			settings_overlay: None,
+			scoped_overlay: None,
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -1220,12 +1310,23 @@ impl InteractiveMode {
 				self.handle_trust_overlay_key(*key);
 				return;
 			}
-			if self.overlay.is_some() {
-				self.handle_overlay_key(*key);
-				return;
-			}
+			// The dialogs (import confirm, summarize prompts, the settings
+			// value editor) sit above every list overlay they may have been
+			// opened from.
 			if self.dialog.is_some() {
 				self.handle_dialog_key(*key);
+				return;
+			}
+			if self.settings_overlay.is_some() {
+				self.handle_settings_overlay_key(*key);
+				return;
+			}
+			if self.scoped_overlay.is_some() {
+				self.handle_scoped_models_key(*key);
+				return;
+			}
+			if self.overlay.is_some() {
+				self.handle_overlay_key(*key);
 				return;
 			}
 			if self.tree.is_some() {
@@ -1797,38 +1898,73 @@ impl InteractiveMode {
 		self.update_slash_menu();
 	}
 
-	/// `/tree` (upstream `showTreeSelector`, read-only first slice): the
-	/// entry tree with `├─`/`└─` prefixes and one-line entry summaries. The
-	/// interactive leaf-switching selector is deferred.
+	/// `/trust` (upstream `showTrustSelector` + `TrustSelectorComponent`):
+	/// show the cwd, the saved decision and the effective session state, then
+	/// save Trusted / Untrusted into the trust store for future sessions. The
+	/// parent-folder option mirrors upstream's `Trust parent folder` entry;
+	/// upstream's "session only" decisions have no port counterpart (no
+	/// in-memory trust override).
 	fn handle_trust_command(&mut self) {
-		let project_config = std::path::Path::new(&self.cwd).join(".pi").join("mcp.json");
-		if !project_config.exists() {
-			self.push_notice(format!(
-				"No project MCP config at {}",
-				project_config.display()
-			));
-			return;
+		let cwd = std::path::PathBuf::from(&self.cwd);
+		let saved = crate::core::trust::saved_entry(&cwd);
+		// Upstream `formatDecision`: "none", "trusted (path)", or
+		// "… (inherited from <path>)" when the decision was recorded for an
+		// ancestor.
+		let saved_text = match &saved {
+			None => "none".to_string(),
+			Some((path, decision)) => {
+				let label = if *decision { "trusted" } else { "untrusted" };
+				if path != &cwd {
+					format!("{label} (inherited from {})", path.display())
+				} else {
+					format!("{label} ({})", path.display())
+				}
+			}
+		};
+		let current = crate::core::trust::is_trusted(&cwd);
+		let header = vec![
+			"Project trust".to_string(),
+			cwd.display().to_string(),
+			String::new(),
+			format!("Saved decision: {saved_text}"),
+			format!(
+				"Current session: {}",
+				if current { "trusted" } else { "untrusted" }
+			),
+		];
+		let mut items = vec![SelectItem {
+			value: "trust".into(),
+			label: "Trust".into(),
+			description: Some("save this project as trusted".into()),
+		}];
+		// Upstream offers the parent folder when there is one; its update
+		// also clears the project's own entry so the ancestor decides.
+		let parent = cwd.parent().map(std::path::Path::to_path_buf);
+		if let Some(parent) = &parent {
+			items.push(SelectItem {
+				value: "trust-parent".into(),
+				label: format!("Trust parent folder ({})", parent.display()),
+				description: Some("save the parent folder as trusted".into()),
+			});
 		}
-		if crate::core::trust::is_trusted(std::path::Path::new(&self.cwd)) {
-			self.push_notice(format!("{} is trusted", project_config.display()));
-			return;
-		}
-		let list = SelectList::new(
-			vec![
-				SelectItem {
-					value: "trust".into(),
-					label: "Trust".into(),
-					description: Some(format!("load {} on restart", project_config.display())),
-				},
-				SelectItem {
-					value: "skip".into(),
-					label: "Don't trust".into(),
-					description: Some("skip its MCP servers".into()),
-				},
-			],
-			2,
-		);
-		self.trust_overlay = Some((list, project_config));
+		items.push(SelectItem {
+			value: "untrust".into(),
+			label: "Do not trust".into(),
+			description: Some("save this project as untrusted".into()),
+		});
+		let mut list = SelectList::new(items, 4);
+		// The saved decision is preselected (upstream `findIndex` over the
+		// matching `savedPath`, falling back to the first option when no
+		// option matches — e.g. an inherited untrusted decision).
+		let preselect = match &saved {
+			Some((path, true)) if path == &cwd => 0,
+			Some((path, true)) if parent.is_some() => 1,
+			Some((path, false)) if path == &cwd => list.len() - 1,
+			_ => 0,
+		};
+		list.set_selected(preselect);
+		list.set_no_match_message("No trust options");
+		self.trust_overlay = Some((list, TrustOverlayInfo { cwd, header }));
 	}
 
 	fn handle_trust_overlay_key(&mut self, key: KeyEvent) {
@@ -1847,92 +1983,416 @@ impl InteractiveMode {
 		let Some(choice) = choice else {
 			return;
 		};
-		let (_, project_config) = self.trust_overlay.take().unwrap();
-		match choice.as_str() {
-			"trust" => {
-				if let Err(error) = crate::core::trust::trust(std::path::Path::new(&self.cwd)) {
-					self.push_notice(format!("Failed to record trust: {error}"));
-				} else {
-					self.push_notice(format!(
-						"{} trusted — restart to load its MCP servers",
-						project_config.display()
-					));
+		let (mut list, info) = self.trust_overlay.take().unwrap();
+		let cwd = info.cwd.clone();
+		let result = match choice.as_str() {
+			"trust" => crate::core::trust::set(&cwd, true).map(|_| "trusted"),
+			"trust-parent" => {
+				// Upstream `updates`: parent true + the project entry nulled
+				// so the ancestor decision applies to it.
+				let parent = cwd.parent().map(std::path::Path::to_path_buf);
+				match parent {
+					Some(parent) => crate::core::trust::set(&parent, true)
+						.and_then(|()| crate::core::trust::clear(&cwd))
+						.map(|_| "trusted"),
+					None => Err(std::io::Error::other("no parent folder")),
 				}
 			}
-			"skip" => {
-				self.push_notice(format!(
-					"{} not trusted; its MCP servers stay skipped",
-					project_config.display()
-				));
+			"untrust" => crate::core::trust::set(&cwd, false).map(|_| "untrusted"),
+			_ => {
+				// Esc: reopen nothing, just close.
+				return;
 			}
-			_ => {}
+		};
+		match result {
+			Ok(decision) => self.push_notice(format!(
+				"Saved trust decision: {decision}. Restart {} for this to take effect.",
+				crate::config::APP_NAME
+			)),
+			Err(error) => {
+				// Keep the selector open on a write failure so the decision
+				// can be retried (upstream would surface the throw).
+				self.push_notice(format!("Could not save trust decision: {error}"));
+				list.set_mark_value(None);
+				self.trust_overlay = Some((list, info));
+			}
 		}
 	}
 
-	/// /fork selector keys: navigation + Enter forks before the selected
-	/// user message, Esc cancels.
+	/// `/hotkeys` (upstream `handleHotkeysCommand`): the resolved keybindings
+	/// as a markdown table in the upstream Navigation / Editing / Other
+	/// sections, rendered as a bordered markdown block. Upstream's extension
+	/// shortcut section has no port counterpart (no extension runner).
 	fn handle_hotkeys_command(&mut self) {
-		let rows: [(&str, &str); 24] = [
-			(
-				"Move cursor / browse history",
-				"tui.editor.cursorUp+tui.editor.cursorDown+tui.editor.cursorLeft+tui.editor.cursorRight",
-			),
-			(
-				"Move by word",
-				"tui.editor.cursorWordLeft+tui.editor.cursorWordRight",
-			),
-			(
-				"Start / end of line",
-				"tui.editor.cursorLineStart+tui.editor.cursorLineEnd",
-			),
-			("Page up / down", "tui.editor.pageUp+tui.editor.pageDown"),
-			("Send message", "tui.input.submit"),
-			("New line", "tui.input.newLine"),
-			(
-				"Delete word backward / forward",
-				"tui.editor.deleteWordBackward+tui.editor.deleteWordForward",
-			),
-			(
-				"Delete to line start / end",
-				"tui.editor.deleteToLineStart+tui.editor.deleteToLineEnd",
-			),
-			("Yank / yank pop", "tui.editor.yank+tui.editor.yankPop"),
-			("Undo", "tui.editor.undo"),
-			("Tab / autocomplete", "tui.input.tab"),
-			("Abort run / cancel", "app.interrupt"),
-			("Exit (empty editor)", "app.exit"),
-			("Suspend to background", "app.suspend"),
-			("Cycle thinking level", "app.thinking.cycle"),
-			(
-				"Cycle models",
-				"app.model.cycleForward+app.model.cycleBackward",
-			),
-			("Open model selector", "app.model.select"),
-			("Toggle tool output", "app.tools.expand"),
-			("Toggle thinking blocks", "app.thinking.toggle"),
-			("External editor", "app.editor.external"),
-			("Copy last agent message", "app.message.copy"),
-			("Queue follow-up", "app.message.followUp"),
-			("Restore queued messages", "app.message.dequeue"),
-			("Session selector", "app.session.resume"),
-		];
-		let hint = |actions: &str| -> String {
-			actions
-				.split('+')
-				.map(|action| self.keybinding_hint(action, "-"))
-				.collect::<Vec<_>>()
-				.join("/")
-		};
-		let rows: Vec<(String, String)> = rows
-			.iter()
-			.map(|(label, actions)| ((*label).to_string(), hint(actions)))
-			.collect();
-		let width = rows.iter().map(|(keys, _)| keys.len()).max().unwrap_or(0) + 2;
-		let mut text = String::from("Keybindings\n");
-		for (label, keys) in rows {
-			text.push_str(&format!("{:<width$} {}\n", keys, label, width = width));
+		let markdown = hotkeys_markdown(&self.keybindings);
+		self.push_doc_block("Keyboard Shortcuts", markdown);
+	}
+
+	/// `/changelog` (upstream `handleChangelogCommand`): the keepachangelog
+	/// sections newest-first, rendered as a bordered "What's New" markdown
+	/// block (`DynamicBorder` + `Markdown` upstream).
+	fn handle_changelog_command(&mut self) {
+		let markdown = crate::core::changelog::changelog_markdown();
+		self.push_doc_block("What's New", markdown);
+	}
+
+	/// Add a [`ChatBlock::Doc`] — a bordered markdown document block.
+	fn push_doc_block(&mut self, title: &str, text: String) {
+		self.blocks.push(ChatBlock::Doc {
+			title: title.to_string(),
+			text,
+			rendered: None,
+		});
+		self.chat.scroll_to_bottom();
+	}
+
+	/// Drop every block's rendered cache (theme/keybindings changed).
+	fn invalidate_rendered_blocks(&mut self) {
+		for block in &mut self.blocks {
+			match block {
+				ChatBlock::Assistant { rendered, .. }
+				| ChatBlock::Tool { rendered, .. }
+				| ChatBlock::Bash { rendered, .. }
+				| ChatBlock::Doc { rendered, .. } => *rendered = None,
+				ChatBlock::User(_) | ChatBlock::Notice(_) => {}
+			}
 		}
-		self.push_notice(text);
+	}
+
+	// -- /settings (upstream showSettingsSelector) ------------------------------
+
+	/// Open the settings selector over the effective values (upstream feeds
+	/// the component from `settingsManager` getters; pi-rs loads both layers
+	/// and shows `effective()`).
+	fn open_settings_selector(&mut self) {
+		let effective = crate::core::settings_manager::SettingsManager::load(Some(
+			std::path::Path::new(&self.cwd),
+		))
+		.effective();
+		let entries = settings_entries();
+		let items: Vec<SelectItem> = entries
+			.iter()
+			.map(|entry| SelectItem {
+				value: entry.key.to_string(),
+				label: format!("{}: {}", entry.key, setting_value(&effective, entry.key)),
+				description: Some(
+					match entry.editor {
+						SettingEditor::Cycle(_) => "enter cycles the value",
+						SettingEditor::Input => "enter edits the value",
+					}
+					.to_string(),
+				),
+			})
+			.collect();
+		let mut list = SelectList::new(items, 12);
+		list.set_no_match_message("No matching settings");
+		self.settings_overlay = Some(SettingsOverlay { list, entries });
+	}
+
+	/// Keys for the settings selector: type-to-filter, Enter cycles or opens
+	/// the value editor, Esc closes. Every change writes the global layer
+	/// immediately (upstream's setters persist per callback).
+	fn handle_settings_overlay_key(&mut self, key: KeyEvent) {
+		if !key.modifiers.contains(KeyModifiers::CONTROL)
+			&& !key.modifiers.contains(KeyModifiers::ALT)
+		{
+			let Some(overlay) = self.settings_overlay.as_mut() else {
+				return;
+			};
+			// The list's fuzzy filter doubles as the search line (a fresh
+			// query re-anchors the selection at the top row).
+			match key.code {
+				KeyCode::Char(c) => {
+					let filter = format!("{}{c}", overlay.list.filter());
+					overlay.list.set_filter(filter);
+					return;
+				}
+				KeyCode::Backspace => {
+					let mut filter = overlay.list.filter().to_string();
+					filter.pop();
+					overlay.list.set_filter(filter);
+					return;
+				}
+				_ => {}
+			}
+		}
+		let action = match self.settings_overlay.as_mut() {
+			Some(overlay) => overlay.list.handle_key_with(key, &self.keybindings),
+			None => return,
+		};
+		match action {
+			SelectAction::Select(index) => {
+				let Some((key_id, editor)) = self.settings_overlay.as_ref().and_then(|overlay| {
+					overlay.list.filtered().get(index).and_then(|item| {
+						overlay
+							.entries
+							.iter()
+							.find(|entry| entry.key == item.value)
+							.map(|entry| (entry.key.to_string(), entry.editor.clone()))
+					})
+				}) else {
+					return;
+				};
+				match editor {
+					SettingEditor::Cycle(values) => {
+						let effective = crate::core::settings_manager::SettingsManager::load(Some(
+							std::path::Path::new(&self.cwd),
+						))
+						.effective();
+						let current = setting_value(&effective, &key_id);
+						let position = values.iter().position(|value| value == &current);
+						let next = match position {
+							Some(position) => values[(position + 1) % values.len()].clone(),
+							None => values.first().cloned().unwrap_or_default(),
+						};
+						self.save_setting(&key_id, &next);
+					}
+					SettingEditor::Input => {
+						self.dialog = Some(Dialog::SettingInput {
+							key: key_id,
+							value: String::new(),
+						});
+					}
+				}
+			}
+			SelectAction::Cancel => self.settings_overlay = None,
+			SelectAction::Handled | SelectAction::Ignored => {}
+		}
+	}
+
+	/// Persist one settings override to the global layer (upstream
+	/// `applyOverrides` writes global), then hot-apply the instant keys.
+	fn save_setting(&mut self, key: &str, raw: &str) {
+		let overrides = match setting_override(key, raw) {
+			Ok(overrides) => overrides,
+			Err(error) => {
+				self.push_notice(error);
+				return;
+			}
+		};
+		let mut manager = crate::core::settings_manager::SettingsManager::load(Some(
+			std::path::Path::new(&self.cwd),
+		));
+		manager.set_overrides(&overrides);
+		if let Err(error) = manager.save() {
+			self.push_notice(format!("Could not save settings: {error}"));
+			return;
+		}
+		let instant = match key {
+			"defaultThinkingLevel" => {
+				// Hot-apply: the session's thinking level follows the saved
+				// default immediately.
+				if let Some(level) = parse_setting_thinking_level(raw) {
+					let _ = self
+						.session
+						.cmd_tx
+						.send(SessionCommand::SetThinking { level });
+				}
+				true
+			}
+			"theme" => {
+				// Hot-apply: re-resolve the theme by name (built-ins and the
+				// user themes dir, like startup).
+				let ui = crate::core::ui_config::load(Some(raw), false);
+				self.theme = ui.theme;
+				self.invalidate_rendered_blocks();
+				true
+			}
+			"treeFilterMode" => {
+				// Read fresh on every /tree open, so it is already live.
+				true
+			}
+			_ => false,
+		};
+		self.push_notice(if instant {
+			format!("{key} saved: {raw}")
+		} else {
+			format!("{key} saved (takes effect on restart)")
+		});
+		// Refresh the row labels from the saved manager.
+		if let Some(overlay) = self.settings_overlay.as_mut() {
+			let effective = manager.effective();
+			let items: Vec<SelectItem> = overlay
+				.entries
+				.iter()
+				.map(|entry| SelectItem {
+					value: entry.key.to_string(),
+					label: format!("{}: {}", entry.key, setting_value(&effective, entry.key)),
+					description: Some(
+						match entry.editor {
+							SettingEditor::Cycle(_) => "enter cycles the value",
+							SettingEditor::Input => "enter edits the value",
+						}
+						.to_string(),
+					),
+				})
+				.collect();
+			overlay.list.set_items(items);
+		}
+	}
+
+	// -- /scoped-models (upstream showModelsSelector) ---------------------------
+
+	/// Open the multi-select over the full catalog with the active scope
+	/// pre-checked and the default model marked.
+	fn open_scoped_models_selector(&mut self) {
+		let registry = self.registry.lock().unwrap();
+		let all = registry.all_models().to_vec();
+		let scoped = registry.models().to_vec();
+		let default_key = registry.default_model().key();
+		drop(registry);
+		let checked: std::collections::BTreeSet<String> = if scoped.len() < all.len() {
+			scoped.iter().map(|model| model.key()).collect()
+		} else {
+			std::collections::BTreeSet::new()
+		};
+		self.scoped_overlay = Some(ScopedModelsOverlay::new(&all, checked, &default_key));
+	}
+
+	/// Keys: Enter toggles the highlighted model, Tab applies the scope
+	/// (upstream: confirm toggles and `app.models.save` persists — pi-rs
+	/// has no `enabledModels` setting, so applying is session-only), Esc
+	/// cancels, typing filters.
+	fn handle_scoped_models_key(&mut self, key: KeyEvent) {
+		if !key.modifiers.contains(KeyModifiers::CONTROL)
+			&& !key.modifiers.contains(KeyModifiers::ALT)
+		{
+			let Some(overlay) = self.scoped_overlay.as_mut() else {
+				return;
+			};
+			match key.code {
+				KeyCode::Char(c) => {
+					overlay.search.push(c);
+					overlay.list.set_filter(overlay.search.clone());
+					return;
+				}
+				KeyCode::Backspace => {
+					overlay.search.pop();
+					overlay.list.set_filter(overlay.search.clone());
+					return;
+				}
+				_ => {}
+			}
+		}
+		// Tab (tui.input.tab) applies without toggling; Enter toggles.
+		if self.keybindings.matches("tui.input.tab", &key) {
+			self.apply_scoped_models();
+			return;
+		}
+		let action = match self.scoped_overlay.as_mut() {
+			Some(overlay) => overlay.list.handle_key_with(key, &self.keybindings),
+			None => return,
+		};
+		match action {
+			SelectAction::Select(index) => {
+				let Some(overlay) = self.scoped_overlay.as_mut() else {
+					return;
+				};
+				let filtered = overlay.list.filtered();
+				let Some(item) = filtered.get(index) else {
+					return;
+				};
+				let model_key = item.value.clone();
+				drop(filtered);
+				if overlay.checked.contains(&model_key) {
+					overlay.checked.remove(&model_key);
+				} else {
+					overlay.checked.insert(model_key);
+				}
+				overlay.refresh_items();
+			}
+			SelectAction::Cancel => self.scoped_overlay = None,
+			SelectAction::Handled | SelectAction::Ignored => {}
+		}
+	}
+
+	/// Apply the checked set as the model scope (empty set clears — upstream
+	/// treats an empty scopedModels list as "no scoping").
+	fn apply_scoped_models(&mut self) {
+		let Some(overlay) = self.scoped_overlay.take() else {
+			return;
+		};
+		let all = self.registry.lock().unwrap().all_models().to_vec();
+		let scoped = scope_models_for(&all, &overlay.checked);
+		{
+			let mut registry = self.registry.lock().unwrap();
+			registry.set_model_scope(scoped.to_vec());
+			self.models = registry.models().to_vec();
+		}
+		if scoped.is_empty() {
+			self.push_notice("Model scope cleared — all models are available".into());
+		} else {
+			// Upstream persists `enabledModels` on save; pi-rs keeps the
+			// scope session-only (no such setting yet).
+			self.push_notice(format!(
+				"Model scope set: {} models (session only; cycling and /model see these)",
+				scoped.len()
+			));
+		}
+	}
+
+	// -- /reload (upstream handleReloadCommand) ----------------------------------
+
+	/// `/reload`: rebuild the runtime — UI config (keybindings, theme),
+	/// model registry, and the session itself via the replacement machinery
+	/// re-opening the same session path. Extensions/skills/prompts have no
+	/// pi-rs counterpart, so the status text keeps upstream's wording while
+	/// those reloads are no-ops here (declared difference).
+	fn handle_reload_command(&mut self) {
+		if self.working {
+			self.push_notice("Wait for the current response to finish before reloading.".into());
+			return;
+		}
+		if self.session.compacting.load(Ordering::Relaxed) {
+			// The flag also covers tree navigation and mid-run compaction
+			// guards (upstream checks isCompacting).
+			self.push_notice("Wait for compaction to finish before reloading.".into());
+			return;
+		}
+		self.push_notice(
+			"Reloading keybindings, extensions, skills, prompts, themes, and context files..."
+				.into(),
+		);
+		// UI config: keybindings.json + the settings theme (upstream
+		// keybindings.reload() + themeController.applyFromSettings()).
+		let settings = crate::core::settings_manager::SettingsManager::load(Some(
+			std::path::Path::new(&self.cwd),
+		));
+		let effective = settings.effective();
+		let ui = crate::core::ui_config::load(effective.theme.as_deref(), false);
+		self.keybindings = ui.keybindings;
+		for notice in ui.notices {
+			self.push_notice(notice);
+		}
+		self.theme = ui.theme;
+		self.external_editor_cmd =
+			crate::core::ui_config::resolve_external_editor(effective.external_editor.as_deref());
+		// Model catalog (upstream reloads the resource loader; pi-rs re-reads
+		// models.json and re-resolves provider auth).
+		{
+			let mut registry = self.registry.lock().unwrap();
+			registry.reload(effective.default_model.as_deref());
+			self.models = registry.models().to_vec();
+		}
+		// Session rebuild: the replacement machinery re-opens the same
+		// session path, which rebuilds cwd-bound tools and the system prompt
+		// (apply_replacement) — the closest port of upstream's session
+		// reload. In-memory sessions only rebuild the view.
+		match self.session.current_session_file() {
+			Some(path) => {
+				let path = path.to_string_lossy().into_owned();
+				self.begin_replacement_labeled(
+					RpcReplacement::Switch { path },
+					ReplacementKind::Reload,
+					"Reload failed",
+					None,
+				);
+			}
+			None => {
+				self.restore_transcript();
+				self.push_notice("Reloaded".into());
+			}
+		}
 	}
 
 	/// `/session` (upstream `handleSessionCommand`): name, file, id, message
@@ -2190,6 +2650,10 @@ impl InteractiveMode {
 			"name" => self.handle_name_command(args),
 			"session" => self.handle_session_command(),
 			"hotkeys" => self.handle_hotkeys_command(),
+			"settings" => self.open_settings_selector(),
+			"changelog" => self.handle_changelog_command(),
+			"reload" => self.handle_reload_command(),
+			"scoped-models" => self.open_scoped_models_selector(),
 			"fork" => {
 				if args.is_empty() {
 					self.open_fork_selector();
@@ -2776,6 +3240,32 @@ impl InteractiveMode {
 				}
 				_ => {}
 			},
+			Dialog::SettingInput {
+				key: key_id,
+				mut value,
+			} => match key.code {
+				// Esc returns to the settings selector (upstream's submenu
+				// back navigation).
+				KeyCode::Esc => self.dialog = None,
+				KeyCode::Enter => {
+					self.dialog = None;
+					let value = value.trim().to_string();
+					self.save_setting(&key_id, &value);
+				}
+				KeyCode::Backspace => {
+					value.pop();
+					self.dialog = Some(Dialog::SettingInput { key: key_id, value });
+				}
+				KeyCode::Char(c)
+					if !key
+						.modifiers
+						.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+				{
+					value.push(c);
+					self.dialog = Some(Dialog::SettingInput { key: key_id, value });
+				}
+				_ => {}
+			},
 		}
 	}
 
@@ -2813,6 +3303,9 @@ impl InteractiveMode {
 						if let Some(status) = self.replacement_status.take() {
 							self.push_notice(status);
 						}
+					}
+					ReplacementKind::Reload => {
+						self.push_notice("Reloaded".into());
 					}
 					ReplacementKind::New | ReplacementKind::Switch => {}
 				}
@@ -3228,6 +3721,8 @@ impl InteractiveMode {
 		self.draw_footer(frame, chunks[3]);
 		self.draw_slash_menu(frame, chunks[1], chunks[2]);
 		self.draw_overlay(frame, chunks[1]);
+		self.draw_settings_overlay(frame, chunks[1]);
+		self.draw_scoped_overlay(frame, chunks[1]);
 		self.draw_tree(frame, chunks[1]);
 		self.draw_dialog(frame, chunks[1]);
 		if let Some((_, cwd)) = &self.trust_prompt {
@@ -3613,6 +4108,10 @@ impl InteractiveMode {
 				" Custom summarization instructions ",
 				format!("{value}▌\n\nEnter submit · Esc back"),
 			),
+			Dialog::SettingInput { key, value } => (
+				" Setting value ",
+				format!("{key}\n\n{value}▌\n\nEnter save · Esc back to settings"),
+			),
 		};
 		let width = chat_area.width.clamp(24, 72);
 		let height = (body.lines().count() as u16 + 2).min(chat_area.height);
@@ -3641,11 +4140,13 @@ impl InteractiveMode {
 	}
 
 	fn draw_trust_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
-		let Some((list, project_config)) = self.trust_overlay.as_ref() else {
+		let Some((list, info)) = self.trust_overlay.as_ref() else {
 			return;
 		};
 		let width = chat_area.width.clamp(56, 84).min(chat_area.width);
-		let height = 8.min(chat_area.height);
+		let height = (info.header.len() as u16 + list.filtered().len() as u16 + 3)
+			.clamp(8, 16)
+			.min(chat_area.height);
 		let area = Rect {
 			x: chat_area.x + (chat_area.width - width) / 2,
 			y: chat_area.y + (chat_area.height - height) * 2 / 5,
@@ -3656,14 +4157,117 @@ impl InteractiveMode {
 		let block = Block::bordered()
 			.border_style(Style::new().fg(self.theme.accent))
 			.title(Span::styled(
-				format!(" Trust {} ", project_config.display()),
+				" Project trust ",
 				Style::new()
 					.fg(self.theme.accent)
 					.add_modifier(Modifier::BOLD),
 			));
 		let inner = block.inner(area);
 		frame.render_widget(block, area);
-		let lines = list.render_lines(inner.width as usize, &self.theme);
+		// Header lines (cwd / saved decision / current session) in the muted
+		// info style, then the option list.
+		let mut lines: Vec<Line> = info
+			.header
+			.iter()
+			.map(|line| {
+				Line::from(Span::styled(
+					line.clone(),
+					Style::new().fg(self.theme.muted),
+				))
+			})
+			.collect();
+		lines.push(Line::default());
+		let list_limit = (inner.height as usize).saturating_sub(lines.len()).max(1);
+		lines.extend(list.render_lines_with_limit(inner.width as usize, &self.theme, list_limit));
+		lines.resize(inner.height as usize, Line::default());
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	/// `/settings` selector — the settings list in the model-overlay panel
+	/// shape (the upstream SettingsList panel).
+	fn draw_settings_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some(overlay) = self.settings_overlay.as_ref() else {
+			return;
+		};
+		let width = chat_area.width.clamp(48, 72).min(chat_area.width);
+		let height = chat_area.height.min(18);
+		let area = Rect {
+			x: chat_area.x + (chat_area.width - width) / 2,
+			y: chat_area.y + (chat_area.height - height) * 2 / 5,
+			width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				" Settings ",
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let mut lines = overlay.list.render_lines(inner.width as usize, &self.theme);
+		lines.truncate((inner.height as usize).saturating_sub(1));
+		lines.push(Line::from(Span::styled(
+			format!(
+				" {} cycle/edit · {} cancel",
+				self.keybinding_hint("tui.select.confirm", "enter"),
+				self.keybinding_hint("tui.select.cancel", "esc"),
+			),
+			Style::new().fg(self.theme.muted),
+		)));
+		lines.resize(inner.height as usize, Line::default());
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	/// `/scoped-models` multi-select with the search line and the toggle /
+	/// apply hint line (upstream ScopedModelsSelector footer).
+	fn draw_scoped_overlay(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some(overlay) = self.scoped_overlay.as_ref() else {
+			return;
+		};
+		let width = chat_area.width.clamp(48, 76).min(chat_area.width);
+		let height = chat_area.height.min(18);
+		let area = Rect {
+			x: chat_area.x + (chat_area.width - width) / 2,
+			y: chat_area.y + (chat_area.height - height) * 2 / 5,
+			width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		let block = Block::bordered()
+			.border_style(Style::new().fg(self.theme.accent))
+			.title(Span::styled(
+				" Scoped models ",
+				Style::new()
+					.fg(self.theme.accent)
+					.add_modifier(Modifier::BOLD),
+			));
+		let inner = block.inner(area);
+		frame.render_widget(block, area);
+		let search_line = Line::from(vec![
+			Span::styled("search: ", Style::new().fg(self.theme.muted)),
+			Span::raw(overlay.search.clone()),
+			Span::styled("▌", Style::new().fg(self.theme.accent)),
+		]);
+		let mut lines = vec![search_line];
+		let list_limit = (inner.height as usize).saturating_sub(3).max(1);
+		let list_lines =
+			overlay
+				.list
+				.render_lines_with_limit(inner.width as usize, &self.theme, list_limit);
+		lines.extend(list_lines);
+		lines.push(Line::from(Span::styled(
+			format!(
+				" {} toggle · tab apply · {} cancel · ✓ = current model · type to filter",
+				self.keybinding_hint("tui.select.confirm", "enter"),
+				self.keybinding_hint("tui.select.cancel", "esc"),
+			),
+			Style::new().fg(self.theme.muted),
+		)));
+		lines.resize(inner.height as usize, Line::default());
 		frame.render_widget(Paragraph::new(lines), inner);
 	}
 
@@ -3819,6 +4423,38 @@ impl InteractiveMode {
 						));
 					}
 					lines.push(Line::default());
+				}
+				ChatBlock::Doc {
+					title,
+					text,
+					rendered,
+				} => {
+					if let Some((w, cached)) = rendered
+						&& *w == width
+					{
+						lines.extend(cached.iter().cloned());
+						continue;
+					}
+					// Upstream: DynamicBorder, bold accent title, Markdown,
+					// DynamicBorder.
+					let border = "─".repeat(width.max(3));
+					let mut out = vec![Line::from(Span::styled(
+						border.clone(),
+						Style::new().fg(theme.border),
+					))];
+					out.push(Line::from(Span::styled(
+						title.clone(),
+						Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+					)));
+					out.push(Line::default());
+					out.extend(markdown_lines(text, width.saturating_sub(2).max(1), &theme));
+					out.push(Line::from(Span::styled(
+						border,
+						Style::new().fg(theme.border),
+					)));
+					out.push(Line::default());
+					*rendered = Some((width, out.clone()));
+					lines.extend(out);
 				}
 			}
 		}
@@ -4137,6 +4773,576 @@ fn shorten_path(path: &str, max: usize) -> String {
 		tail.insert(0, c);
 	}
 	format!("…{tail}")
+}
+
+// -- /hotkeys markdown (upstream handleHotkeysCommand) ------------------------
+
+/// Capitalized chord display (upstream `keyDisplayText`/`formatKeys` with
+/// `capitalize: true`): every `+`-separated segment gets an uppercase first
+/// letter, inner casing preserved (`pageUp` → `PageUp`).
+fn key_display_text(chord: &str) -> String {
+	chord
+		.split('+')
+		.map(|part| match part.chars().next() {
+			Some(first) => first.to_uppercase().collect::<String>() + &part[first.len_utf8()..],
+			None => String::new(),
+		})
+		.collect::<Vec<_>>()
+		.join("+")
+}
+
+/// The resolved keybindings as the upstream markdown table (Navigation /
+/// Editing / Other sections; the same rows and action names as
+/// `handleHotkeysCommand`). Multi-chord actions join their chords with `/`,
+/// like the upstream cells. Unbound actions render as `unbound` (upstream's
+/// `keyDisplayText` yields the empty string there). The extension-shortcut
+/// section has no port counterpart.
+fn hotkeys_markdown(keybindings: &KeybindingsManager) -> String {
+	let action_cell = |actions: &[&str]| -> String {
+		actions
+			.iter()
+			.map(|action| {
+				let keys = keybindings.formatted_keys(action).unwrap_or_default();
+				if keys.is_empty() {
+					return "unbound".to_string();
+				}
+				keys.iter()
+					.map(|chord| key_display_text(chord))
+					.collect::<Vec<_>>()
+					.join("/")
+			})
+			.map(|keys| format!("`{keys}`"))
+			.collect::<Vec<_>>()
+			.join(" / ")
+	};
+	let mut table = String::new();
+	let mut section = |title: &str, rows: &[(&str, String)]| {
+		table.push_str(&format!(
+			"\n**{title}**\n\n| Key | Action |\n|-----|--------|\n"
+		));
+		for (label, keys) in rows {
+			table.push_str(&format!("| {keys} | {label} |\n"));
+		}
+	};
+	let mut rows: Vec<(&str, String)> = vec![
+		(
+			"Move cursor / browse history",
+			action_cell(&[
+				"tui.editor.cursorUp",
+				"tui.editor.cursorDown",
+				"tui.editor.cursorLeft",
+				"tui.editor.cursorRight",
+			]),
+		),
+		(
+			"Move by word",
+			action_cell(&["tui.editor.cursorWordLeft", "tui.editor.cursorWordRight"]),
+		),
+		(
+			"Start of line",
+			action_cell(&["tui.editor.cursorLineStart"]),
+		),
+		("End of line", action_cell(&["tui.editor.cursorLineEnd"])),
+		(
+			"Jump forward to character",
+			action_cell(&["tui.editor.jumpForward"]),
+		),
+		(
+			"Jump backward to character",
+			action_cell(&["tui.editor.jumpBackward"]),
+		),
+		(
+			"Scroll by page",
+			action_cell(&["tui.editor.pageUp", "tui.editor.pageDown"]),
+		),
+	];
+	section("Navigation", &rows);
+	rows = vec![
+		("Send message", action_cell(&["tui.input.submit"])),
+		("New line", action_cell(&["tui.input.newLine"])),
+		(
+			"Delete word backwards",
+			action_cell(&["tui.editor.deleteWordBackward"]),
+		),
+		(
+			"Delete word forwards",
+			action_cell(&["tui.editor.deleteWordForward"]),
+		),
+		(
+			"Delete to start of line",
+			action_cell(&["tui.editor.deleteToLineStart"]),
+		),
+		(
+			"Delete to end of line",
+			action_cell(&["tui.editor.deleteToLineEnd"]),
+		),
+		(
+			"Paste the most-recently-deleted text",
+			action_cell(&["tui.editor.yank"]),
+		),
+		(
+			"Cycle through the deleted text after pasting",
+			action_cell(&["tui.editor.yankPop"]),
+		),
+		("Undo", action_cell(&["tui.editor.undo"])),
+	];
+	section("Editing", &rows);
+	// The literal prefix rows (upstream hardcodes `/`, `!`, `!!` in its
+	// table) close the section.
+	rows = vec![
+		(
+			"Path completion / accept autocomplete",
+			action_cell(&["tui.input.tab"]),
+		),
+		(
+			"Cancel autocomplete / abort streaming",
+			action_cell(&["app.interrupt"]),
+		),
+		(
+			"Clear editor (first) / exit (second)",
+			action_cell(&["app.clear"]),
+		),
+		("Exit (when editor is empty)", action_cell(&["app.exit"])),
+		("Suspend to background", action_cell(&["app.suspend"])),
+		("Cycle thinking level", action_cell(&["app.thinking.cycle"])),
+		(
+			"Cycle models",
+			action_cell(&["app.model.cycleForward", "app.model.cycleBackward"]),
+		),
+		("Open model selector", action_cell(&["app.model.select"])),
+		(
+			"Toggle tool output expansion",
+			action_cell(&["app.tools.expand"]),
+		),
+		(
+			"Toggle thinking block visibility",
+			action_cell(&["app.thinking.toggle"]),
+		),
+		(
+			"Edit message in external editor",
+			action_cell(&["app.editor.external"]),
+		),
+		(
+			"Copy selection or last assistant message",
+			action_cell(&["app.message.copy"]),
+		),
+		(
+			"Queue follow-up message",
+			action_cell(&["app.message.followUp"]),
+		),
+		(
+			"Restore queued messages",
+			action_cell(&["app.message.dequeue"]),
+		),
+		(
+			"Paste files on macOS, images, or text from clipboard",
+			action_cell(&["app.clipboard.pasteImage"]),
+		),
+		("Slash commands", "`/`".to_string()),
+		("Run bash command", "`!`".to_string()),
+		(
+			"Run bash command (excluded from context)",
+			"`!!`".to_string(),
+		),
+	];
+	section("Other", &rows);
+	table.trim().to_string()
+}
+
+// -- /settings entries (upstream SettingsSelectorComponent, pi-rs cut) --------
+
+/// The selector's entries: every settings key pi-rs persists, in the
+/// upstream settings-menu spirit. `instant` entries hot-apply
+/// (thinking level, theme, tree filter mode).
+fn settings_entries() -> Vec<SettingEntry> {
+	let cycle = |values: &[&str]| {
+		SettingEditor::Cycle(values.iter().map(|value| (*value).to_string()).collect())
+	};
+	vec![
+		SettingEntry {
+			key: "defaultProvider",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "defaultModel",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "defaultThinkingLevel",
+			editor: cycle(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+			instant: true,
+		},
+		SettingEntry {
+			key: "theme",
+			editor: SettingEditor::Cycle(available_theme_names()),
+			instant: true,
+		},
+		SettingEntry {
+			key: "externalEditor",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "shellPath",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "compaction.enabled",
+			editor: cycle(&["true", "false"]),
+			instant: false,
+		},
+		SettingEntry {
+			key: "compaction.reserveTokens",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "compaction.keepRecentTokens",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "retry.enabled",
+			editor: cycle(&["true", "false"]),
+			instant: false,
+		},
+		SettingEntry {
+			key: "retry.maxRetries",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "retry.baseDelayMs",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "retry.maxAgentDelayMs",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "branchSummary.skipPrompt",
+			editor: cycle(&["true", "false"]),
+			instant: false,
+		},
+		SettingEntry {
+			key: "treeFilterMode",
+			editor: cycle(&["default", "no-tools", "user-only", "labeled-only", "all"]),
+			instant: true,
+		},
+		SettingEntry {
+			key: "sessionDir",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+		SettingEntry {
+			key: "defaultTools",
+			editor: SettingEditor::Input,
+			instant: false,
+		},
+	]
+}
+
+/// Theme names available for the settings cycle: the built-ins plus the
+/// user themes directory (`getAvailableThemes` upstream).
+fn available_theme_names() -> Vec<String> {
+	let mut names = vec!["dark".to_string(), "light".to_string()];
+	let Ok(entries) = std::fs::read_dir(crate::config::themes_dir()) else {
+		return names;
+	};
+	let mut customs: Vec<String> = entries
+		.filter_map(|entry| entry.ok())
+		.filter_map(|entry| {
+			let path = entry.path();
+			(path.extension().and_then(|ext| ext.to_str()) == Some("json")).then(|| {
+				path.file_stem()
+					.map(|stem| stem.to_string_lossy().into_owned())
+			})
+		})
+		.flatten()
+		.filter(|name| name != "dark" && name != "light")
+		.collect();
+	customs.sort();
+	names.extend(customs);
+	names
+}
+
+/// The current display value of a settings key (upstream feeds the component
+/// from its getters).
+fn setting_value(effective: &crate::core::settings_manager::Settings, key: &str) -> String {
+	use crate::core::settings_manager::normalize_tree_filter_mode;
+	let text_or = |value: &Option<String>, fallback: &str| {
+		value
+			.clone()
+			.filter(|value| !value.trim().is_empty())
+			.unwrap_or_else(|| fallback.to_string())
+	};
+	let bool_or = |value: Option<bool>| match value {
+		Some(value) => value.to_string(),
+		None => "not set".to_string(),
+	};
+	let number_or = |value: Option<u64>| match value {
+		Some(value) => value.to_string(),
+		None => "not set".to_string(),
+	};
+	match key {
+		"defaultProvider" => text_or(&effective.default_provider, "not set"),
+		"defaultModel" => text_or(&effective.default_model, "not set"),
+		"defaultThinkingLevel" => text_or(&effective.default_thinking_level, "not set"),
+		"theme" => text_or(&effective.theme, "default"),
+		"externalEditor" => text_or(&effective.external_editor, "not set"),
+		"shellPath" => text_or(&effective.shell_path, "not set"),
+		"sessionDir" => text_or(&effective.session_dir, "not set"),
+		"defaultTools" => match &effective.default_tools {
+			Some(tools) if !tools.is_empty() => tools.join(" "),
+			_ => "not set".to_string(),
+		},
+		"treeFilterMode" => {
+			normalize_tree_filter_mode(effective.tree_filter_mode.as_deref()).to_string()
+		}
+		"compaction.enabled" => bool_or(effective.compaction.as_ref().and_then(|c| c.enabled)),
+		"compaction.reserveTokens" => {
+			number_or(effective.compaction.as_ref().and_then(|c| c.reserve_tokens))
+		}
+		"compaction.keepRecentTokens" => number_or(
+			effective
+				.compaction
+				.as_ref()
+				.and_then(|c| c.keep_recent_tokens),
+		),
+		"retry.enabled" => bool_or(effective.retry.as_ref().and_then(|r| r.enabled)),
+		"retry.maxRetries" => number_or(
+			effective
+				.retry
+				.as_ref()
+				.and_then(|r| r.max_retries)
+				.map(u64::from),
+		),
+		"retry.baseDelayMs" => number_or(effective.retry.as_ref().and_then(|r| r.base_delay_ms)),
+		"retry.maxAgentDelayMs" => {
+			number_or(effective.retry.as_ref().and_then(|r| r.max_agent_delay_ms))
+		}
+		"branchSummary.skipPrompt" => bool_or(
+			effective
+				.branch_summary
+				.as_ref()
+				.and_then(|b| b.skip_prompt),
+		),
+		_ => "not set".to_string(),
+	}
+}
+
+/// Parse one settings override (the validated edit): typed fields reject
+/// bad values with the same message shape the editor shows. `Settings`
+/// carries only the overridden field so [`SettingsManager::set_overrides`]
+/// merges the rest.
+fn setting_override(
+	key: &str,
+	raw: &str,
+) -> Result<crate::core::settings_manager::Settings, String> {
+	use crate::core::settings_manager::{
+		BranchSummarySettings, CompactionSettings, RetrySettings, Settings,
+		normalize_tree_filter_mode,
+	};
+	let text = |raw: &str| -> Result<String, String> {
+		let trimmed = raw.trim();
+		if trimmed.is_empty() {
+			// Clearing is not reachable through the port's overrides writer;
+			// the field must be removed from settings.json by hand.
+			return Err("A value is required (empty values are not saved; remove the key from settings.json to clear it)".into());
+		}
+		Ok(trimmed.to_string())
+	};
+	let number = |raw: &str| -> Result<u64, String> {
+		raw.trim()
+			.parse::<u64>()
+			.map_err(|_| format!("{key} expects a number (got {raw:?})"))
+	};
+	let number_u32 = |raw: &str| -> Result<u32, String> {
+		raw.trim()
+			.parse::<u32>()
+			.map_err(|_| format!("{key} expects a number (got {raw:?})"))
+	};
+	let boolean = |raw: &str| -> Result<bool, String> {
+		match raw.trim() {
+			"true" => Ok(true),
+			"false" => Ok(false),
+			other => Err(format!("{key} expects true or false (got {other:?})")),
+		}
+	};
+	let settings = match key {
+		"defaultProvider" => Settings {
+			default_provider: Some(text(raw)?),
+			..Settings::default()
+		},
+		"defaultModel" => Settings {
+			default_model: Some(text(raw)?),
+			..Settings::default()
+		},
+		"defaultThinkingLevel" => {
+			let value = text(raw)?;
+			if parse_setting_thinking_level(&value).is_none() {
+				return Err(format!(
+					"{key} expects off/minimal/low/medium/high/xhigh/max (got {value:?})"
+				));
+			}
+			Settings {
+				default_thinking_level: Some(value),
+				..Settings::default()
+			}
+		}
+		"theme" => Settings {
+			theme: Some(text(raw)?),
+			..Settings::default()
+		},
+		"externalEditor" => Settings {
+			external_editor: Some(text(raw)?),
+			..Settings::default()
+		},
+		"shellPath" => Settings {
+			shell_path: Some(text(raw)?),
+			..Settings::default()
+		},
+		"sessionDir" => Settings {
+			session_dir: Some(text(raw)?),
+			..Settings::default()
+		},
+		"defaultTools" => Settings {
+			default_tools: Some(
+				text(raw)?
+					.split_whitespace()
+					.map(str::to_string)
+					.collect::<Vec<_>>(),
+			),
+			..Settings::default()
+		},
+		"treeFilterMode" => {
+			let value = text(raw)?;
+			if normalize_tree_filter_mode(Some(value.as_str())) != value {
+				return Err(format!(
+					"{key} expects default/no-tools/user-only/labeled-only/all (got {value:?})"
+				));
+			}
+			Settings {
+				tree_filter_mode: Some(value),
+				..Settings::default()
+			}
+		}
+		"compaction.enabled" => Settings {
+			compaction: Some(CompactionSettings {
+				enabled: Some(boolean(raw)?),
+				..CompactionSettings::default()
+			}),
+			..Settings::default()
+		},
+		"compaction.reserveTokens" => Settings {
+			compaction: Some(CompactionSettings {
+				reserve_tokens: Some(number(raw)?),
+				..CompactionSettings::default()
+			}),
+			..Settings::default()
+		},
+		"compaction.keepRecentTokens" => Settings {
+			compaction: Some(CompactionSettings {
+				keep_recent_tokens: Some(number(raw)?),
+				..CompactionSettings::default()
+			}),
+			..Settings::default()
+		},
+		"retry.enabled" => Settings {
+			retry: Some(RetrySettings {
+				enabled: Some(boolean(raw)?),
+				..RetrySettings::default()
+			}),
+			..Settings::default()
+		},
+		"retry.maxRetries" => Settings {
+			retry: Some(RetrySettings {
+				max_retries: Some(number_u32(raw)?),
+				..RetrySettings::default()
+			}),
+			..Settings::default()
+		},
+		"retry.baseDelayMs" => Settings {
+			retry: Some(RetrySettings {
+				base_delay_ms: Some(number(raw)?),
+				..RetrySettings::default()
+			}),
+			..Settings::default()
+		},
+		"retry.maxAgentDelayMs" => Settings {
+			retry: Some(RetrySettings {
+				max_agent_delay_ms: Some(number(raw)?),
+				..RetrySettings::default()
+			}),
+			..Settings::default()
+		},
+		"branchSummary.skipPrompt" => Settings {
+			branch_summary: Some(BranchSummarySettings {
+				skip_prompt: Some(boolean(raw)?),
+			}),
+			..Settings::default()
+		},
+		other => return Err(format!("Unknown setting {other:?}")),
+	};
+	Ok(settings)
+}
+
+/// Setting-string → [`ThinkingLevel`] for the hot-applied default.
+fn parse_setting_thinking_level(raw: &str) -> Option<ThinkingLevel> {
+	match raw.trim().to_lowercase().as_str() {
+		"off" => Some(ThinkingLevel::Off),
+		"minimal" => Some(ThinkingLevel::Minimal),
+		"low" => Some(ThinkingLevel::Low),
+		"medium" => Some(ThinkingLevel::Medium),
+		"high" => Some(ThinkingLevel::High),
+		"xhigh" => Some(ThinkingLevel::Xhigh),
+		"max" => Some(ThinkingLevel::Max),
+		_ => None,
+	}
+}
+
+// -- /scoped-models helpers (upstream ScopedModelsSelectorComponent) ----------
+
+/// The selector's rows: `[x]`/`[ ]` checkmark prefix (the upstream
+/// component's checkbox), the `provider/id` reference as the value, and the
+/// context-window description line of the model selector.
+fn scoped_model_items(
+	all: &[Model],
+	checked: &std::collections::BTreeSet<String>,
+	default_key: &str,
+) -> Vec<SelectItem> {
+	all.iter()
+		.map(|model| {
+			let key = model.key();
+			let checkbox = if checked.contains(&key) { "[x]" } else { "[ ]" };
+			let mut description = format!("[{}]", model.provider);
+			if model.context_window > 0 {
+				description.push_str(&format!(" · {} ctx", format_tokens(model.context_window)));
+			}
+			if model.key() == default_key {
+				description.push_str(" · default");
+			}
+			SelectItem {
+				value: key,
+				label: format!("{checkbox} {}", model.id.clone()),
+				description: Some(description),
+			}
+		})
+		.collect()
+}
+
+/// The checked keys resolved against the catalog in catalog order — the
+/// `Vec<Model>` handed to [`crate::core::model_registry::ModelRegistry::set_model_scope`].
+fn scope_models_for(all: &[Model], checked: &std::collections::BTreeSet<String>) -> Vec<Model> {
+	all.iter()
+		.filter(|model| checked.contains(&model.key()))
+		.cloned()
+		.collect()
 }
 
 #[cfg(test)]
@@ -4580,6 +5786,110 @@ mod tests {
 	#[test]
 	fn slash_menu_completion_adds_the_argument_space() {
 		assert_eq!(apply_slash_completion("model"), "/model ");
+	}
+
+	// -- /hotkeys, /settings, /scoped-models helpers ------------------------------
+
+	#[test]
+	fn hotkeys_markdown_lists_the_upstream_sections_with_resolved_keys() {
+		let keybindings = crate::core::ui_config::new_keybindings_manager();
+		let markdown = hotkeys_markdown(&keybindings);
+		for section in ["**Navigation**", "**Editing**", "**Other**"] {
+			assert!(markdown.contains(section), "missing {section}: {markdown}");
+		}
+		// Resolved chords are capitalized (keyDisplayText style).
+		assert!(markdown.contains("`Ctrl+O`"), "{}", markdown);
+		assert!(markdown.contains("`Escape`"), "{}", markdown);
+		// The upstream row set: sample rows from each section.
+		assert!(markdown.contains("Move cursor / browse history"));
+		assert!(markdown.contains("Send message"));
+		assert!(markdown.contains("Copy selection or last assistant message"));
+		// The literal prefix rows survive.
+		assert!(markdown.contains("| `/` | Slash commands |"));
+		assert!(markdown.contains("| `!` | Run bash command |"));
+		assert!(markdown.contains("| `!!` | Run bash command (excluded from context) |"));
+	}
+
+	#[test]
+	fn key_display_text_capitalizes_segments_and_keeps_inner_casing() {
+		assert_eq!(key_display_text("ctrl+o"), "Ctrl+O");
+		assert_eq!(key_display_text("shift+ctrl+p"), "Shift+Ctrl+P");
+		assert_eq!(key_display_text("pageup"), "Pageup");
+		assert_eq!(key_display_text("alt+left"), "Alt+Left");
+	}
+
+	#[test]
+	fn setting_override_validates_typed_fields_and_produces_partial_settings() {
+		let overrides = setting_override("compaction.reserveTokens", " 4096 ").unwrap();
+		assert_eq!(
+			overrides.compaction.as_ref().unwrap().reserve_tokens,
+			Some(4096)
+		);
+		assert!(
+			overrides.theme.is_none(),
+			"only the overridden field is set"
+		);
+		let retry = setting_override("retry.maxRetries", "5").unwrap();
+		assert_eq!(retry.retry.as_ref().unwrap().max_retries, Some(5));
+		assert!(setting_override("retry.maxRetries", "many").is_err());
+		assert!(setting_override("retry.enabled", "yes").is_err());
+		assert!(setting_override("treeFilterMode", "everything").is_err());
+		assert!(setting_override("defaultThinkingLevel", "loud").is_err());
+		assert!(setting_override("theme", "").is_err());
+		// Whitespace-separated defaultTools split into the list.
+		let tools = setting_override("defaultTools", "read bash").unwrap();
+		assert_eq!(
+			tools.default_tools,
+			Some(vec!["read".into(), "bash".into()])
+		);
+		// Unknown keys are rejected, not silently written.
+		assert!(setting_override("showImages", "true").is_err());
+	}
+
+	#[test]
+	fn setting_value_reports_effective_defaults() {
+		use crate::core::settings_manager::{Settings, normalize_tree_filter_mode};
+		let settings = Settings::default();
+		assert_eq!(setting_value(&settings, "defaultProvider"), "not set");
+		assert_eq!(setting_value(&settings, "theme"), "default");
+		assert_eq!(setting_value(&settings, "treeFilterMode"), "default");
+		assert_eq!(setting_value(&settings, "retry.enabled"), "not set");
+		let configured: Settings = serde_json::from_str(
+			r#"{"defaultProvider":"acme","defaultTools":["read","bash"],"compaction":{"enabled":false}}"#,
+		)
+		.unwrap();
+		assert_eq!(setting_value(&configured, "defaultProvider"), "acme");
+		assert_eq!(setting_value(&configured, "defaultTools"), "read bash");
+		assert_eq!(setting_value(&configured, "compaction.enabled"), "false");
+		// normalize_tree_filter_mode participates through setting_value.
+		assert_eq!(normalize_tree_filter_mode(Some("all")), "all");
+	}
+
+	#[test]
+	fn scoped_model_items_check_and_uncheck_and_scope_models_for_resolves_catalog_order() {
+		let registry = crate::core::model_registry::ModelRegistry::load(None);
+		let all = registry.all_models().to_vec();
+		assert!(all.len() >= 2, "the builtin catalog seeds the selector");
+		let default_key = registry.default_model().key();
+		// Checked rows show [x], the default model line carries the marker.
+		let checked: std::collections::BTreeSet<String> =
+			all.iter().take(1).map(|model| model.key()).collect();
+		let items = scoped_model_items(&all, &checked, &default_key);
+		assert_eq!(items.len(), all.len());
+		assert!(items[0].label.starts_with("[x] "), "{}", items[0].label);
+		assert!(items[1].label.starts_with("[ ] "), "{}", items[1].label);
+		assert!(
+			items.iter().any(|item| item
+				.description
+				.as_deref()
+				.is_some_and(|d| d.contains("default"))),
+			"the default model line is marked"
+		);
+		// The scope resolves in catalog order; an empty set resolves empty.
+		let scoped = scope_models_for(&all, &checked);
+		assert_eq!(scoped.len(), 1);
+		assert_eq!(scoped[0].key(), all[0].key());
+		assert!(scope_models_for(&all, &std::collections::BTreeSet::new()).is_empty());
 	}
 
 	#[test]

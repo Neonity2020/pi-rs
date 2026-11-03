@@ -123,7 +123,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 	),
 	info(
 		"trust",
-		"review the project MCP config trust decision",
+		"Save project trust decision for future sessions",
 		SlashCommandSource::Builtin,
 	),
 	info(
@@ -133,7 +133,27 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 	),
 	info(
 		"hotkeys",
-		"show the resolved keybindings",
+		"Show all keyboard shortcuts",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"settings",
+		"Open settings menu",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"scoped-models",
+		"Enable/disable models for Ctrl+P cycling",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"changelog",
+		"Show changelog entries",
+		SlashCommandSource::Builtin,
+	),
+	info(
+		"reload",
+		"Reload keybindings, extensions, skills, prompts, themes, and context files",
 		SlashCommandSource::Builtin,
 	),
 	info(
@@ -148,7 +168,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 	),
 	info(
 		"copy",
-		"copy the last agent message to the clipboard",
+		"Copy last agent message to clipboard",
 		SlashCommandSource::Builtin,
 	),
 	info("new", "start a new session", SlashCommandSource::Builtin),
