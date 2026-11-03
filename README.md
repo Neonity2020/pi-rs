@@ -23,7 +23,8 @@
 | agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek）；事件顺序对齐上游（turn_start 先于消息公告、assistant 盖 thinkingLevel、turn_end.toolResults 带 role） |
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
 | MCP | 已接入 CLI：全局 `mcp.json` + 受信任项目的 `.pi/mcp.json`（首次 TUI 提示信任），stdio 与 streamable HTTP server，协议版本协商（LATEST 2025-11-25 + 旧版接受表）、30s 请求超时 + notifications/cancelled、ping；`--no-mcp` 禁用 MCP 加载和启动；OAuth 未实现 |
-| SSH、扩展系统 | 接口或骨架阶段，尚不可用于完整工作流 |
+| Skills 与提示词模板 | 已实现（对照上游 skills.ts/prompt-templates.ts）：`agentDir/skills` + 项目 `.pi/skills` + `--skill <路径>` 发现（SKILL.md 根不递归、根 .md 需 description、gitignore-aware、同名 first-wins、符号链接去重、name/description 校验 warning）、frontmatter YAML、`<available_skills>` XML 注入系统提示词（`disable-model-invocation` 排除）、`/skill:<name> [args]` 展开（settings `enableSkillCommands` 门控）；提示词模板 `agentDir/prompts` + `.pi/prompts` + `--prompt-template <路径>`（非递归 .md，description 回退首行截 60）、`/<模板> [args]` bash 风格参数替换（`$1`/`$@`/`${N:-默认}`/`${@:N:L}`）；`--no-skills`/`-ns`、`--no-prompt-templates`/`-np` 跳默认目录而显式路径仍加载 |
+| SSH、扩展系统 | 扩展宿主兼容实验设计已定（docs/operations/extensions-host-experiment.md：推荐外部进程桥，PoC 待执行）；原生扩展 trait/加载尚无，`-e/--extension` 未实现 |
 | CLI 会话与资源旗标 | `--session-id`（校验/查重，存在即打开否则按该 id 新建）、`--fork <id\|路径>`（路径→本地精确→前缀→全局解析后分支新会话）、`--session-dir <dir>`（CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings `sessionDir`，交互 `/resume` 与选择器同根）、`--models <模式,…>`（glob/模糊作用域，picker 与 RPC 同步收窄）、`--theme <文件>` 可重复 / `--use-theme <名>` / `--no-themes`、`--export <id\|路径> [输出]`（恒为 HTML）、`--offline`、`-a/--approve` 与 `-na/--no-approve`（项目 `.pi` 资源信任覆盖）；`--tui-mode`/`--verbose` 未实现（TUI 恒全屏） |
 | `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false；跨项目切换会关闭旧 MCP 连接并按目标项目的信任状态重连 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
@@ -125,7 +126,7 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
 
-剩余：1. **providers** — 6 个 API（openai-responses 与 google-generative-ai 已完成；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth——auth 子命令已落地 api_key 面）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models` 已完成；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
+剩余：1. **providers** — 6 个 API（openai-responses 与 google-generative-ai 已完成；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth——auth 子命令已落地 api_key 面）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models` 已完成；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skills 与提示词模板已完成（frontmatter 目录加载）；扩展宿主 PoC（外部进程桥，实验设计见 docs/operations/extensions-host-experiment.md）、包管理、codemode 沙箱、tool-search 待做。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 
