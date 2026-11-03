@@ -8,11 +8,12 @@
 // surfaces that later phases (providers, MCP, compaction, rpc) plug into.
 #![allow(dead_code)]
 
+mod cli_auth;
 mod config;
 mod core;
 mod modes;
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +26,8 @@ use crate::core::export_html;
 use crate::core::model_registry::{ModelRegistry, authed_stream_fn};
 use crate::core::session_manager;
 use crate::core::session_manager::{
-	SessionManager, SessionSelector, resolve_session_in, validate_session_dir,
+	ResolvedSessionRef, SessionInfo, SessionManager, SessionSelector, resolve_session_in,
+	validate_session_dir,
 };
 use crate::core::settings_manager::SettingsManager;
 use crate::core::tool_selection::{NoTools, ToolSelectionInput, resolve_tool_selection};
@@ -78,18 +80,39 @@ struct Cli {
 	thinking: Option<String>,
 
 	/// Continue the most recent session.
-	#[arg(short = 'c', long, conflicts_with_all = ["resume", "no_session"])]
+	#[arg(
+		short = 'c',
+		long,
+		conflicts_with_all = ["resume", "resume_flag", "session", "no_session"]
+	)]
 	r#continue: bool,
 
+	/// Open the session picker at startup — the pure-flag `-r` form of
+	/// upstream `--resume, -r  Select a session to resume` (args.ts:113-114).
+	/// The picker is a line-based list on stdin (upstream opens the TUI
+	/// session selector; see `select_session_cli`), unavailable in RPC mode.
+	#[arg(short = 'r', conflicts_with = "no_session")]
+	resume_flag: bool,
+
 	/// Resume a session by id (sessions-dir entry, exact or unique prefix) or
-	/// by path to its session directory.
+	/// by path to its session directory. Without a value it opens the session
+	/// picker, like upstream `--resume`. pi-rs extension kept: a valued
+	/// `--resume` resumes directly instead of only picking (a documented
+	/// difference from the upstream pure flag).
 	#[arg(
 		long,
-		visible_alias = "session",
+		num_args = 0..=1,
+		default_missing_value = "",
 		value_name = "ID|PATH",
 		conflicts_with = "no_session"
 	)]
 	resume: Option<String>,
+
+	/// Use a specific session file or partial UUID (upstream `--session
+	/// <path|id>`, split from `--resume` in this round to match the upstream
+	/// flag set; it still resolves through the same selector).
+	#[arg(long, value_name = "ID|PATH", conflicts_with = "no_session")]
+	session: Option<String>,
 
 	/// Use an exact project session id (header UUIDv7), creating the session
 	/// when missing (`main.ts` `--session-id`; conflicts with `--session`/
@@ -434,18 +457,22 @@ fn split_tool_list(value: &str) -> Vec<String> {
 }
 
 /// `validateForkFlags` (`main.ts:299-313`): `--fork` rejects the session
-/// selectors (`--session` is pi-rs's merged `--resume` flag, a documented
-/// merge) with the upstream error text, exit 1.
+/// selectors with the upstream error text, exit 1. `--session` and
+/// `--resume`/`-r` are separate flags now (upstream split restored this
+/// round), so each reports its own upstream name.
 fn validate_fork_flags(cli: &Cli) -> anyhow::Result<()> {
 	if cli.fork.is_none() {
 		return Ok(());
 	}
 	let mut conflicting = Vec::new();
-	if cli.resume.is_some() {
+	if cli.session.is_some() {
 		conflicting.push("--session");
 	}
 	if cli.r#continue {
 		conflicting.push("--continue");
+	}
+	if cli.resume.is_some() || cli.resume_flag {
+		conflicting.push("--resume");
 	}
 	if cli.no_session {
 		conflicting.push("--no-session");
@@ -457,19 +484,22 @@ fn validate_fork_flags(cli: &Cli) -> anyhow::Result<()> {
 }
 
 /// `validateSessionIdFlags` (`main.ts:315-336`): `--session-id` rejects
-/// `--session`/`--continue`/`--resume` (the merge note above applies) and the
-/// id must pass `assertValidSessionId`. `--no-session` and `--fork` are
-/// allowed (in-memory session with that id / fork into that id).
+/// `--session`/`--continue`/`--resume` and the id must pass
+/// `assertValidSessionId`. `--no-session` and `--fork` are allowed (in-memory
+/// session with that id / fork into that id).
 fn validate_session_id_flags(cli: &Cli) -> anyhow::Result<()> {
 	let Some(id) = &cli.session_id else {
 		return Ok(());
 	};
 	let mut conflicting = Vec::new();
-	if cli.resume.is_some() {
+	if cli.session.is_some() {
 		conflicting.push("--session");
 	}
 	if cli.r#continue {
 		conflicting.push("--continue");
+	}
+	if cli.resume.is_some() || cli.resume_flag {
+		conflicting.push("--resume");
 	}
 	if !conflicting.is_empty() {
 		anyhow::bail!(
@@ -618,6 +648,148 @@ fn export_session(arg: &str, output: Option<&str>, root: &Path, cwd: &Path) -> !
 	}
 }
 
+/// Upstream `promptConfirm` (`main.ts:286-297`): write "<message> [y/N] " to
+/// stdout, then read one stdin line; `y`/`yes` (case-insensitive) is true,
+/// anything else is false. A readline at EOF resolves false upstream, so
+/// piped/closed stdin (non-TTY) cancels — the caller then prints "Aborted."
+/// and exits 0.
+fn prompt_confirm(message: &str) -> bool {
+	print!("{message} [y/N] ");
+	let _ = std::io::stdout().flush();
+	let mut answer = String::new();
+	match std::io::stdin().read_line(&mut answer) {
+		Ok(0) | Err(_) => false,
+		Ok(_) => {
+			let trimmed = answer.trim().to_lowercase();
+			trimmed == "y" || trimmed == "yes"
+		}
+	}
+}
+
+/// Relative session age for the picker rows (`formatSessionDate` buckets,
+/// same shape as the TUI selector): now/1m/1h/1d/1w/1mo/1y.
+fn picker_session_age(modified_ms: u64, now_ms: u64) -> String {
+	let diff = now_ms.saturating_sub(modified_ms);
+	let mins = diff / 60_000;
+	let hours = diff / 3_600_000;
+	let days = diff / 86_400_000;
+	if mins < 1 {
+		"now".into()
+	} else if mins < 60 {
+		format!("{mins}m")
+	} else if hours < 24 {
+		format!("{hours}h")
+	} else if days < 7 {
+		format!("{days}d")
+	} else if days < 30 {
+		format!("{}w", days / 7)
+	} else if days < 365 {
+		format!("{}mo", days / 30)
+	} else {
+		format!("{}y", days / 365)
+	}
+}
+
+/// One picker row's message: the session name or first user message, control
+/// characters flattened, width-clamped (the TUI selector's row message cut).
+fn picker_row_message(session: &SessionInfo) -> String {
+	let message = session
+		.name
+		.clone()
+		.unwrap_or_else(|| session.first_message.clone());
+	let cleaned: String = message
+		.chars()
+		.map(|c| if c.is_control() { ' ' } else { c })
+		.collect();
+	let mut out: String = cleaned.chars().take(64).collect();
+	if cleaned.chars().count() > 64 {
+		out.push('…');
+	}
+	out
+}
+
+/// Line-based session picker for the valueless `-r`/`--resume` flag — the
+/// pi-rs cut of upstream `selectSession` (`cli/session-picker.ts`), which
+/// opens the TUI `SessionSelectorComponent`. Declared simplification: the
+/// picker is plain stdin/stdout so it also works with piped stdin (print and
+/// json mode); it lists the current project's sessions newest-first (upstream
+/// `SessionManager.list`), accepts a row number to resume, any other text as
+/// a case-insensitive substring filter over name/first message/id/messages
+/// (upstream is the fuzzy/phrase/`re:` search of the TUI selector, which also
+/// matches the session cwd — dropped here because path fragments
+/// false-positive across every session, e.g. "older" in `/var/folders`), and
+/// an empty line cancels — the upstream cancel path prints "No session selected"
+/// and exits 0 (`main.ts:422-425`). EOF counts as cancel. The list renders on
+/// stderr so print-mode stdout streams stay machine-readable; upstream owns
+/// the whole terminal for its TUI instead. Scope note: upstream defaults to
+/// the current folder with Tab → all projects; this picker lists the current
+/// project only. Returns the chosen session directory, `None` on cancel.
+fn select_session_cli(root: &Path, cwd: &Path) -> Option<PathBuf> {
+	let sessions = session_manager::list_sessions_in(root, Some(cwd));
+	let mut query = String::new();
+	loop {
+		let filtered: Vec<&SessionInfo> = if query.is_empty() {
+			sessions.iter().collect()
+		} else {
+			let needle = query.to_lowercase();
+			sessions
+				.iter()
+				.filter(|session| {
+					session
+						.name
+						.as_deref()
+						.unwrap_or("")
+						.to_lowercase()
+						.contains(&needle) || session.first_message.to_lowercase().contains(&needle)
+						|| session.id.to_lowercase().contains(&needle)
+						|| session.all_messages_text.to_lowercase().contains(&needle)
+				})
+				.collect()
+		};
+		eprintln!("Resume Session (Current Folder)");
+		if filtered.is_empty() {
+			eprintln!(
+				"  No sessions in current folder{}",
+				if query.is_empty() {
+					String::new()
+				} else {
+					format!(" matching \"{query}\"")
+				}
+			);
+		}
+		let now_ms = pi_ai::types::now_ms();
+		for (index, session) in filtered.iter().enumerate() {
+			eprintln!(
+				"  {}. {}  {} {}",
+				index + 1,
+				picker_row_message(session),
+				session.message_count,
+				picker_session_age(session.modified_ms, now_ms)
+			);
+		}
+		eprint!("Select a session by number, type to filter, or press Enter to cancel: ");
+		let _ = std::io::stderr().flush();
+		let mut line = String::new();
+		match std::io::stdin().read_line(&mut line) {
+			Ok(0) | Err(_) => return None,
+			Ok(_) => {}
+		}
+		let input = line.trim();
+		if input.is_empty() {
+			return None;
+		}
+		if let Ok(number) = input.parse::<usize>()
+			&& number >= 1
+			&& number <= filtered.len()
+		{
+			return filtered[number - 1].path.parent().map(Path::to_path_buf);
+		}
+		// Not a number: treat the line as the next filter (upstream narrows
+		// the list as the search query is typed).
+		query = input.to_string();
+	}
+}
+
 fn list_models(registry: &ModelRegistry, pattern: &str) -> String {
 	// `--list-models` shows the full catalog (upstream `resolveCliModel`:
 	// use *all* models — a `--models` scope only shapes cycling/picker).
@@ -691,6 +863,15 @@ async fn main() -> anyhow::Result<()> {
 	}
 	let cli = {
 		let argv: Vec<String> = std::env::args().collect();
+		// `pi-rs auth …` short-circuits before clap parsing (upstream
+		// `runAuthCommand` runs before `parseArgs`, main.ts:585; the auth
+		// flags are not Cli flags and `--provider` alone would trip clap's
+		// `requires = "model"`). dotenvy has run, so `!command` credentials
+		// see the loaded env.
+		if argv.get(1).map(String::as_str) == Some("auth") {
+			let code = cli_auth::run_auth_command(&argv[1..]);
+			std::process::exit(code);
+		}
 		Cli::parse_from(rewrite_combined_short_args(argv))
 	};
 	let startup_cwd = std::env::current_dir()?;
@@ -778,12 +959,39 @@ async fn main() -> anyhow::Result<()> {
 	// `createSessionManager` (main.ts:358-449).
 	validate_fork_flags(&cli)?;
 	validate_session_id_flags(&cli)?;
+	// Branch order (main.ts:391-430): `--session` wins over `--resume`, and a
+	// valued `--resume` wins over the valueless `-r` picker. `--continue` is
+	// kept first only because clap already rejects it alongside the others.
 	let selector = if cli.r#continue {
 		Some(SessionSelector::Recent)
 	} else {
-		cli.resume
-			.as_deref()
-			.map(|arg| SessionSelector::ByIdOrPath(arg.to_string()))
+		cli.session
+			.clone()
+			.or_else(|| cli.resume.clone().filter(|value| !value.is_empty()))
+			.map(SessionSelector::ByIdOrPath)
+	};
+	// `-r` or a valueless `--resume` (upstream `parsed.resume` boolean,
+	// args.ts:113-114): open the session picker instead of resolving an
+	// argument. Upstream runs the TUI selector in every mode; here rpc mode
+	// errors out (stdin is the RPC protocol channel) while print/json mode
+	// reads the selection from piped stdin.
+	let resume_picker =
+		!cli.r#continue && selector.is_none() && (cli.resume_flag || cli.resume.is_some());
+	let picker_dir: Option<PathBuf> = if resume_picker {
+		if app_mode == AppMode::Rpc {
+			anyhow::bail!(
+				"--resume session picker is not available in RPC mode; use --resume <id|path>"
+			);
+		}
+		match select_session_cli(&session_root, &startup_cwd) {
+			Some(dir) => Some(dir),
+			None => {
+				println!("No session selected");
+				std::process::exit(0);
+			}
+		}
+	} else {
+		None
 	};
 	let opened: Option<PathBuf> = if let Some(source_arg) = &cli.fork {
 		// Fork with an explicit target id checks for a collision before the
@@ -811,14 +1019,51 @@ async fn main() -> anyhow::Result<()> {
 		// Upstream short-circuits to an in-memory session before the
 		// selector branches — no lookup, no warning (main.ts:364-366).
 		None
+	} else if let Some(dir) = picker_dir {
+		// `-r`/valueless `--resume` picked a session from the picker
+		// (upstream `SessionManager.open(selectedPath)`, main.ts:415-429).
+		Some(dir)
 	} else {
 		match selector.as_ref() {
-			Some(selector) => {
-				let dir = resolve_session_in(&session_root, &startup_cwd, selector)
+			Some(SessionSelector::Recent) => {
+				let dir = resolve_session_in(&session_root, &startup_cwd, &SessionSelector::Recent)
 					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
 				validate_session_dir(&dir)
 					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
 				Some(dir)
+			}
+			Some(SessionSelector::ByIdOrPath(arg)) => {
+				// Upstream `parsed.session` branch (main.ts:391-413): local
+				// and path hits open directly; a global hit asks whether to
+				// fork the foreign session into the current project.
+				match session_manager::resolve_session_ref_in(&session_root, &startup_cwd, arg)
+					.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?
+				{
+					ResolvedSessionRef::Open(dir) => {
+						validate_session_dir(&dir)
+							.map_err(|e| anyhow::anyhow!("cannot resume session: {e}"))?;
+						Some(dir)
+					}
+					ResolvedSessionRef::Global {
+						dir,
+						cwd: session_cwd,
+					} => {
+						println!("Session found in different project: {session_cwd}");
+						if !prompt_confirm("Fork this session into current directory?") {
+							println!("Aborted.");
+							std::process::exit(0);
+						}
+						let forked =
+							SessionManager::fork_from_in(&session_root, &dir, &startup_cwd, None)
+								.map_err(|error| anyhow::anyhow!("{error}"))?;
+						Some(
+							forked
+								.session_dir()
+								.expect("forked session is persisted")
+								.to_path_buf(),
+						)
+					}
+				}
 			}
 			None => {
 				// `--session-id`: open the project session with that header
@@ -1384,6 +1629,8 @@ mod tests {
 			thinking: None,
 			r#continue: false,
 			resume: None,
+			resume_flag: false,
+			session: None,
 			session_id: None,
 			fork: None,
 			session_dir: None,

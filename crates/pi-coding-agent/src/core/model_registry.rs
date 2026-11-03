@@ -976,6 +976,35 @@ fn builtin_models() -> Vec<Model> {
 	vec![mimo, mock, sonnet, gpt]
 }
 
+// ---------------------------------------------------------------------------
+// Auth subcommand support (`pi-rs auth`, the cli/auth-check.ts cut) — thin
+// catalog queries on top of the existing [`ModelRegistry::resolve_api_key`].
+// ---------------------------------------------------------------------------
+
+impl ModelRegistry {
+	/// Whether any catalog model is registered under `provider` — upstream
+	/// `modelRuntime.getProvider(provider)`; `auth check` reports
+	/// `provider_not_found` when this is false.
+	pub fn has_provider(&self, provider: &str) -> bool {
+		self.all_models()
+			.iter()
+			.any(|model| model.provider == provider)
+	}
+
+	/// Distinct provider ids in catalog order — upstream
+	/// `modelRuntime.getProviders()`; drives the `--model`-only credential
+	/// scan in the auth print commands.
+	pub fn provider_ids(&self) -> Vec<String> {
+		let mut ids: Vec<String> = Vec::new();
+		for model in self.all_models() {
+			if !ids.iter().any(|id| id == &model.provider) {
+				ids.push(model.provider.clone());
+			}
+		}
+		ids
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[test]

@@ -2536,6 +2536,102 @@ pub fn append_session_info_to_file(path: &Path, name: &str) -> Result<(), Sessio
 		.map_err(SessionError::Io)
 }
 
+// ---------------------------------------------------------------------------
+// `--session`/`--resume <id|path>` resolution with the upstream local/global
+// split (`ResolvedSession`, main.ts:232-283) — the cross-project fork prompt
+// needs to know when an id/prefix hit belongs to a different project.
+// ---------------------------------------------------------------------------
+
+/// Outcome of resolving a `--session`/`--resume <id|path>` argument with the
+/// upstream classification (`main.ts` `ResolvedSession`, reduced to the two
+/// cases the resume path distinguishes; `not_found` is the `Err` arm).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedSessionRef {
+	/// A path form (contains `/` or ends with `.jsonl`) or an id/prefix hit
+	/// inside the current project (upstream `path`/`local`): open directly,
+	/// no prompt.
+	Open(PathBuf),
+	/// An id/prefix hit whose header `cwd` names a different project
+	/// (upstream `global`): the caller prints "Session found in different
+	/// project: <cwd>" and prompts "Fork this session into current
+	/// directory?" before forking (main.ts:399-407).
+	Global { dir: PathBuf, cwd: String },
+}
+
+/// Upstream `resolveSessionPath` for the resume flags: path-like arguments
+/// resolve as paths; otherwise the current project wins (exact header id /
+/// directory name, then newest-first prefix) before the global scan (exact,
+/// then prefix, newest-first). Directory names participate in matching after
+/// header ids like [`resolve_session_in`] (pi-rs extension — this port's
+/// visible session ids are directory names). Unlike [`resolve_session_in`]
+/// this reports *where* the hit came from: every root hit left after the
+/// project passes carries a foreign `cwd` and becomes
+/// [`ResolvedSessionRef::Global`], which the caller turns into the upstream
+/// fork prompt instead of silently reopening the session under its original
+/// project. Misses carry the same error text as [`resolve_session_in`].
+pub fn resolve_session_ref_in(
+	root: &Path,
+	cwd: &Path,
+	arg: &str,
+) -> Result<ResolvedSessionRef, String> {
+	// Path form (main.ts:254-256): resolve against the cwd; a session
+	// directory or its `session.jsonl` log both name the session. Checked for
+	// every argument like [`resolve_session_in`] (pi-rs keeps that first
+	// probe for bare names too), and a path never prompts — upstream's path
+	// branch opens directly.
+	let candidate = cwd.join(arg);
+	if candidate.is_dir() {
+		return Ok(ResolvedSessionRef::Open(candidate));
+	}
+	if candidate.is_file()
+		&& candidate
+			.file_name()
+			.is_some_and(|name| name == "session.jsonl")
+	{
+		return Ok(ResolvedSessionRef::Open(
+			candidate.parent().unwrap_or(cwd).to_path_buf(),
+		));
+	}
+	let matches_arg = |dir: &Path, header: &SessionHeader| -> (bool, bool) {
+		let dir_name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+		let dir_name = dir_name.as_deref().unwrap_or_default();
+		let exact = header.id == arg || dir_name == arg;
+		let prefix = header.id.starts_with(arg) || dir_name.starts_with(arg);
+		(exact, prefix)
+	};
+	// Current project first (upstream `findById` → `list().find(startsWith)`).
+	let project = list_project_session_headers(root, cwd);
+	if let Some((dir, _)) = project
+		.iter()
+		.find(|(dir, header)| matches_arg(dir, header).0)
+	{
+		return Ok(ResolvedSessionRef::Open(dir.clone()));
+	}
+	if let Some((dir, _)) = project
+		.iter()
+		.find(|(dir, header)| matches_arg(dir, header).1)
+	{
+		return Ok(ResolvedSessionRef::Open(dir.clone()));
+	}
+	// Then every project in the root (upstream `listAll`, exact before
+	// prefix). The project pass already consumed every header whose `cwd`
+	// matches, so each remaining hit is cross-project by construction.
+	let all = list_session_headers(root);
+	if let Some((dir, header)) = all.iter().find(|(dir, header)| matches_arg(dir, header).0) {
+		return Ok(ResolvedSessionRef::Global {
+			dir: dir.clone(),
+			cwd: header.cwd.clone(),
+		});
+	}
+	if let Some((dir, header)) = all.iter().find(|(dir, header)| matches_arg(dir, header).1) {
+		return Ok(ResolvedSessionRef::Global {
+			dir: dir.clone(),
+			cwd: header.cwd.clone(),
+		});
+	}
+	Err(format!("no session found matching `{arg}`"))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
