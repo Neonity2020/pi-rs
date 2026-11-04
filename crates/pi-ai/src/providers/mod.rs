@@ -6,6 +6,7 @@
 //! unknown APIs return an explicit error.
 
 pub mod anthropic;
+pub mod bedrock_converse_stream;
 pub mod google_generative_ai;
 pub mod google_vertex;
 mod json_repair;
@@ -32,6 +33,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
 		Api::GOOGLE_VERTEX => google_vertex::stream_fn(),
 		Api::MISTRAL_CONVERSATIONS => mistral_conversations::stream_fn(),
+		Api::BEDROCK_CONVERSE_STREAM => bedrock_converse_stream::stream_fn(),
 		Api::PI_MESSAGES => pi_messages::stream_fn(),
 		"mock" => Arc::new(mock::stream),
 		_ => Arc::new(|model, _, _| {
