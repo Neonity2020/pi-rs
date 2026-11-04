@@ -19,7 +19,8 @@
 | Google Vertex AI | 已实现：express API key 与 ADC 双认证（service_account RS256 JWT / authorized_user refresh）、区域端点与自定义 baseUrl；metadata-server 凭据/toolChoice 推迟 |
 | Mistral Conversations | 已实现：原生 Chat Completions wire（thinking 块数组、index 键控工具调用、`[tool error]` 文案、x-affinity 亲和、六拼写缓存命中）；toolChoice/reasoningEffort 推迟 |
 | Amazon Bedrock | 已实现：SigV4 签名（纯 Rust，含 AWS 文档参考向量测试）与 bearer token 双认证、AWS 事件流二进制分帧解码（CRC 校验）、Converse wire（cachePoint 缓存、reasoningContent 重放/redactedContent、Claude adaptive/budget thinking、gpt-oss/GPT effort、错误前缀文案）；profile 文件凭据链/代理/HTTP2/toolChoice 推迟 |
-| 其他 HTTP provider | mock provider 可用于本地演示；openai-codex-responses 未移植 |
+| OpenAI Codex (ChatGPT 后端) | 已实现：SSE 路径（`{base}/codex/responses`，URL 归一化三分支）、ChatGPT OAuth JWT 认证（Bearer + JWT claim 提取 `chatgpt-account-id`）、`originator: pi`/`OpenAI-Beta`/session-id 头、instructions 承载系统提示、`text.verbosity`/`include`/`tool_choice`/`parallel_tool_calls` 固定面、response.done→completed 事件重写（end_turn/未知 status 剔除）；WebSocket 传输/zstd 压缩/重试循环/grammar 工具/service tier 推迟 |
+| 其他 HTTP provider | mock provider 可用于本地演示；上游 10 个 wire API 至此全部移植 |
 | 会话压缩与重试 | `/compact`、阈值自动压缩（保留最近 20k token，可关）、split-turn（超长单 turn 切分 + 双摘要合并）、mid-run 检查（`prepare_next_turn` 钩子内压缩）与上下文溢出自动恢复（先省略失败轮再选切点→压缩→重试一次）；错误自动重试（可重试错误判定 + 指数退避 + `auto_retry_start/end` 事件 + `agent_end.willRetry`，RPC 可开关/中止；settings `retry.maxRetries`/`baseDelayMs` 可配） |
 | agent loop | 钩子全接线（prepare_request/finish_turn/prepare_next_turn/before-after_tool_call）、并行工具执行（start 源序→end 完成序→result 源序）、content 工具检测、length 整批失败、set_tools 公告、steering/follow-up 队列（per-queue clear/peek）；事件顺序对齐上游（turn_start 先于消息公告、assistant 盖 thinkingLevel、turn_end.toolResults 带 role） |
 | 内置工具 | 与上游同参数面：edit（`edits:[{oldText,newText}]` 数组 + BOM/行尾处理）、bash（`timeout` 秒、尾部 2000 行/50KB 截断）、grep/find（`ignore` walker，gitignore-aware，参数面全齐）、ls/read（limit/50KB 截断）；read 行号前缀与 PI_RS_* 前缀为已声明差异 |
@@ -86,7 +87,7 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 | `pi-tui` | `packages/tui` | **核心可用** | ratatui + crossterm 上的组件体系：`Component` trait、多行 emacs 风格 `Editor`（词导航/kill/`\` 续行）、`ScrollView`、pulldown-cmark `Markdown`（对照 markdown.ts）、fuzzy 匹配 + `SelectList`、`Theme`（含 md 配色）、终端生命周期 |
 | `pi-codemode` | `packages/codemode` | 占位 | 沙箱脚本执行，仅能调用注入的工具 |
 | `pi-mcp` | `packages/mcp` | 骨架 | MCP 客户端：JSON-RPC 协议类型、transport trait（stdio、streamable-http 和 in-memory 实现）、client |
-| `pi-ai` | `packages/ai` | **部分（9 个 provider API 已实现）** | 归一化消息模型、`AssistantMessageEvent` 流协议、provider 适配器注册（anthropic-messages、openai-completions/responses、azure-openai-responses、google-generative-ai/vertex、mistral-conversations、bedrock-converse-stream、pi-messages、mock）；模型目录/OAuth 认证未实现 |
+| `pi-ai` | `packages/ai` | **部分（10 个 provider API 已实现，wire 层对齐）** | 归一化消息模型、`AssistantMessageEvent` 流协议、provider 适配器注册（anthropic-messages、openai-completions/responses、azure-openai-responses、google-generative-ai/vertex、mistral-conversations、bedrock-converse-stream、pi-messages、mock）；模型目录/OAuth 认证未实现 |
 | `pi-durable` | `packages/durable` | 占位 | 持久会话 / 任务 / 文档运行时 |
 | `pi-env` | `packages/env` | **本地实现** | `EnvConnection` 抽象（exec/read/write/list/watch），本地实现完整，SSH 远程为桩 |
 | `pi-agent` | `packages/agent` | **核心可用** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent`；钩子全接线、并行工具执行、content 工具检测 |
@@ -117,7 +118,7 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
 
-剩余：1. **providers** — openai-codex（1 个 API；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴、设置选择器（会话选择器与外部编辑器 ctrl+g 已完成：`/resume` 浮层支持范围/树形/搜索/删除/重命名；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
+剩余：1. **providers** — wire 层已全部完成（10 个 API；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴、设置选择器（会话选择器与外部编辑器 ctrl+g 已完成：`/resume` 浮层支持范围/树形/搜索/删除/重命名；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — skill/提示词模板目录加载（frontmatter）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 

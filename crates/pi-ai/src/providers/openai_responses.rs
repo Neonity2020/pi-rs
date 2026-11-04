@@ -317,7 +317,7 @@ async fn forward_payloads(
 }
 
 /// Sends events to the consumer. Returns false once the receiver is gone.
-async fn forward(tx: &Sender<Event>, events: Vec<Event>) -> bool {
+pub(crate) async fn forward(tx: &Sender<Event>, events: Vec<Event>) -> bool {
 	for event in events {
 		if tx.send(event).await.is_err() {
 			return false;
@@ -389,7 +389,7 @@ async fn open_response(
 	Ok(response)
 }
 
-fn effort_string(level: ThinkingLevel) -> &'static str {
+pub(crate) fn effort_string(level: ThinkingLevel) -> &'static str {
 	match level {
 		ThinkingLevel::Off => "none",
 		ThinkingLevel::Minimal => "minimal",
@@ -501,11 +501,20 @@ fn normalize_id_part(part: &str) -> String {
 	normalized
 }
 
-fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOptions) -> Value {
+/// Shared pieces of the transcript conversion used by the OpenAI Responses
+/// wire and the Codex variant (upstream `convertResponsesMessages`):
+/// the collapsed system text, the current tool set, and the input items
+/// WITHOUT a leading system item.
+pub(crate) struct TranscriptParts {
+	pub(crate) system_parts: Vec<String>,
+	pub(crate) tools: Vec<crate::types::Tool>,
+	pub(crate) input: Vec<Value>,
+}
+
+pub(crate) fn convert_transcript(model: &Model, context: &TranscriptContext) -> TranscriptParts {
 	// No mid-conversation system messages (default compat): all system
-	// messages collapse into one leading item carrying the merged prompt
-	// text and the current tool set (upstream `collapseSystemMessages` +
-	// `getCurrentTools`).
+	// messages collapse into one leading prompt text plus the current tool
+	// set (upstream `collapseSystemMessages` + `getCurrentTools`).
 	let mut system_parts: Vec<String> = Vec::new();
 	let mut tools_by_name: Vec<crate::types::Tool> = Vec::new();
 	for message in &context.messages {
@@ -528,16 +537,7 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 		}
 	}
 
-	let instruction_role = if model.reasoning {
-		"developer"
-	} else {
-		"system"
-	};
 	let mut input: Vec<Value> = Vec::new();
-	if !system_parts.is_empty() {
-		input.push(json!({"role": instruction_role, "content": system_parts.join("\n\n")}));
-	}
-
 	let mut message_index = 0usize;
 	for message in &context.messages {
 		match message {
@@ -658,6 +658,29 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 		}
 	}
 
+	TranscriptParts {
+		system_parts,
+		tools: tools_by_name,
+		input,
+	}
+}
+
+fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOptions) -> Value {
+	let parts = convert_transcript(model, context);
+	let instruction_role = if model.reasoning {
+		"developer"
+	} else {
+		"system"
+	};
+	let mut input: Vec<Value> = Vec::new();
+	if !parts.system_parts.is_empty() {
+		input.push(json!({
+			"role": instruction_role,
+			"content": parts.system_parts.join("\n\n"),
+		}));
+	}
+	input.extend(parts.input);
+
 	let mut body = json!({
 		"model": model.id,
 		"input": input,
@@ -665,11 +688,7 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 		"store": false,
 	});
 	if let Some(session_id) = &options.session_id {
-		let clamped: String = session_id
-			.chars()
-			.take(PROMPT_CACHE_KEY_MAX_CHARS)
-			.collect();
-		body["prompt_cache_key"] = json!(clamped);
+		body["prompt_cache_key"] = json!(clamp_prompt_cache_key(session_id));
 	}
 	if let Some(tokens) = options.max_tokens {
 		body["max_output_tokens"] = json!(tokens.max(MIN_OUTPUT_TOKENS));
@@ -677,9 +696,10 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 	if let Some(temperature) = options.temperature {
 		body["temperature"] = json!(temperature);
 	}
-	if !tools_by_name.is_empty() {
+	if !parts.tools.is_empty() {
 		body["tools"] = json!(
-			tools_by_name
+			parts
+				.tools
 				.iter()
 				.map(|tool| json!({
 					"type": "function",
@@ -705,6 +725,14 @@ fn request_body(model: &Model, context: &TranscriptContext, options: &StreamOpti
 		}
 	}
 	body
+}
+
+/// `clampOpenAIPromptCacheKey` — session keys cap at 64 characters.
+pub(crate) fn clamp_prompt_cache_key(session_id: &str) -> String {
+	session_id
+		.chars()
+		.take(PROMPT_CACHE_KEY_MAX_CHARS)
+		.collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -772,8 +800,8 @@ enum Slot {
 
 /// Accumulated assistant message + event construction, mirroring the TS
 /// closure state in `processResponsesStream`.
-struct ResponsesSession {
-	message: AssistantMessage,
+pub(crate) struct ResponsesSession {
+	pub(crate) message: AssistantMessage,
 	slots: HashMap<u64, Slot>,
 	/// Tool calls whose `output_item.done` has not arrived yet.
 	unfinished_tool_calls: Vec<String>,
@@ -781,7 +809,7 @@ struct ResponsesSession {
 }
 
 impl ResponsesSession {
-	fn new(model: &Model) -> Self {
+	pub(crate) fn new(model: &Model) -> Self {
 		let message = AssistantMessage {
 			content: Vec::new(),
 			api: model.api.0.clone(),
@@ -806,11 +834,11 @@ impl ResponsesSession {
 		}
 	}
 
-	fn partial(&self) -> AssistantMessage {
+	pub(crate) fn partial(&self) -> AssistantMessage {
 		self.message.clone()
 	}
 
-	fn into_message(self) -> AssistantMessage {
+	pub(crate) fn into_message(self) -> AssistantMessage {
 		self.message
 	}
 
@@ -829,7 +857,7 @@ impl ResponsesSession {
 		}
 	}
 
-	fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
+	pub(crate) fn process_payload(&mut self, payload: &str) -> Result<Vec<Event>, String> {
 		let event: Value =
 			serde_json::from_str(payload).map_err(|e| format!("malformed SSE payload: {e}"))?;
 		let event_type = event
@@ -1237,7 +1265,7 @@ impl ResponsesSession {
 
 	/// Terminal checks (upstream: the post-loop guards in
 	/// `processResponsesStream`). `Err` carries the failure message.
-	fn finish(&self) -> Result<(), String> {
+	pub(crate) fn finish(&self) -> Result<(), String> {
 		if !self.saw_terminal_response {
 			return Err(
 				"OpenAI Responses stream ended before a terminal response event".to_string(),

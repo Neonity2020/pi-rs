@@ -14,6 +14,7 @@ impl Api {
 	pub const OPENAI_COMPLETIONS: &'static str = "openai-completions";
 	pub const OPENAI_RESPONSES: &'static str = "openai-responses";
 	pub const AZURE_OPENAI_RESPONSES: &'static str = "azure-openai-responses";
+	pub const OPENAI_CODEX_RESPONSES: &'static str = "openai-codex-responses";
 	pub const MISTRAL_CONVERSATIONS: &'static str = "mistral-conversations";
 	pub const BEDROCK_CONVERSE_STREAM: &'static str = "bedrock-converse-stream";
 	pub const GOOGLE_GENERATIVE_AI: &'static str = "google-generative-ai";
