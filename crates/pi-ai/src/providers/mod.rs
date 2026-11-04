@@ -12,6 +12,7 @@ pub mod google_vertex;
 mod json_repair;
 pub mod mistral_conversations;
 pub mod mock;
+pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;
 pub mod pi_messages;
@@ -29,6 +30,7 @@ pub fn stream_fn_for(model: &Model) -> StreamFn {
 		Api::ANTHROPIC_MESSAGES => anthropic::stream_fn(),
 		Api::OPENAI_COMPLETIONS => openai_completions::stream_fn(),
 		Api::OPENAI_RESPONSES => openai_responses::stream_fn(),
+		Api::OPENAI_CODEX_RESPONSES => openai_codex_responses::stream_fn(),
 		Api::AZURE_OPENAI_RESPONSES => openai_responses::azure_stream_fn(),
 		Api::GOOGLE_GENERATIVE_AI => google_generative_ai::stream_fn(),
 		Api::GOOGLE_VERTEX => google_vertex::stream_fn(),
