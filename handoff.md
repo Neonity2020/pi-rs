@@ -370,3 +370,14 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - 声明差异（代码注释）：ui.select/confirm/input 答复 null（TUI 对话框路由为下轮增量）、无 package.json manifest、会话替换 host 存活重发 session_start（上游重建运行时）、tool_result 不 await、每扩展一进程 spawn 延迟 20s 预算。
 
 **交接事项**：TUI 对话框路由 + sendMessage→prompt 注入（下轮自然增量）；jiti 兜底；包管理子命令；对照上游 runner 的事件顺序审计。改动未提交，等用户指令。
+
+## 第四十轮：bedrock-converse-stream provider（2026-11-04，主会话单线）
+
+基线 `62e0eb5`（上游 `api/bedrock-converse-stream.ts` 1424 行首片）：**新模块 `pi-ai/src/providers/bedrock_converse_stream.rs`**——与其他 adapter 最大的不同：不走 SSE，而是 AWS 事件流二进制分帧 + SigV4 签名，全部纯 Rust 手写（与 google_vertex 手写 RS256 同口径），新依赖仅 hmac 0.12 / crc32fast 1.4。
+- **SigV4**（`SigV4::sign_request`）：canonical request（host/x-amz-date/可选 x-amz-security-token）+ HMAC-SHA256 密钥链，**AWS 文档参考向量测试钉死**（iam 2015-08-30 例，含 content-type 头）；bearer 路径（options.api_key / `AWS_BEARER_TOKEN_BEDROCK`）与 `AWS_BEDROCK_SKIP_AUTH=1` 跳过签名。
+- **事件流解码**（`EsDecoder`）：prelude/headers/payload/CRC-32 校验、7 类头值类型、`:message-type`（event/exception/error）路由、`:exception-type`/`:error-message`；16MB 帧上限，尾部残帧报错。
+- **区域/端点**：ARN 内嵌区域 > AWS_REGION/AWS_DEFAULT_REGION > 标准端点主机（含 -fips/.cn）> us-east-1；自定义 baseUrl 非 Bedrock 主机原样使用。modelId 路径段按 AWS SDK extendedEncodeURIComponent 严格百分号编码（`:`→%3A、`/`→%2F）。
+- **Converse wire**：`/model/{id}/converse-stream`；cachePoint（系统块+末条 user，PI_CACHE_RETENTION long 加 ttl:1h，claude 判定同上游 + AWS_BEDROCK_FORCE_CACHE）；toolResult 连续合并为一条 user（claude 错误结果图片挪到整轮尾部带 caption）；assistant thinking 重放（签名→reasoningText.signature、缺失→纯文本、redacted→redactedContent base64 原样回传）；`<empty>` 占位；sanitizeBedrockDocument 滤空键。
+- **additionalModelRequestFields**：claude adaptive（opus-4-6+/sonnet-4-6+/5 系，block_binding 仅 4-7+）vs budget（默认预算表 1024/2048/8192/16384 + interleaved-thinking beta）、effort 映射（xhigh 仅 4-7+/5 系原生）、GovCloud 省 display/block_binding；gpt-oss 平铺 reasoning_effort、gpt- 嵌套 reasoning.effort。
+- **声明推迟**：HTTP/2（reqwest 走 HTTP/1.1，Bedrock 接受）、代理 agent、profile 文件/SSO/IMDS 凭据链（缺环境变量对即显式报错）、toolChoice、strict 模式、requestMetadata、onPayload/onResponse 钩子、calculateCost（与其他 adapter 一致置零）、sanitizeSurrogates（Rust String 无孤代理）。
+646 项测试全绿（+22：SigV4 参考向量/session-token 头/路径编码/UTC 日期/区域解析/事件流分帧+CRC/session 事件全链/redacted 累积/stop 映射/错误前缀+保留模式提示/wire 断言×5/mock HTTP 全链路——本地 TcpListener 回放二进制帧，断言请求行+auth 头+事件序列+usage），fmt/clippy 干净。**坑：①测试 JSON payload 手写括号层数（4 层闭合）极易数错，改用 raw string 或 json! 宏；②model_match_candidates 同时匹配 id 与 name，测试改 id 不改 name 会仍走 adaptive 分支；③AWS SigV4 参考向量的 canonical request 带 content-type 头，漏掉则签名对不上。** providers 完成 9/10+（仅剩 openai-codex）。差分回归：六场景 6/6 IDENTICAL（f9daca34）。
