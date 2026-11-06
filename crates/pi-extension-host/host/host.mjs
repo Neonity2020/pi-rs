@@ -234,7 +234,7 @@ function makeCtx(extra) {
 			confirm: (title) => callHost("ui.confirm", { title }),
 			input: (title, placeholder) => callHost("ui.input", { title, placeholder }),
 			setEditorText: (text) => callHost("ui.setEditorText", { text }),
-			setStatus: (text) => callHost("ui.setStatus", { text }),
+			setStatus: (key, text) => callHost("ui.setStatus", { key, text }),
 			setTitle: (text) => callHost("ui.setTitle", { text }),
 		},
 		sessionManager: {

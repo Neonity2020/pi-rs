@@ -210,12 +210,16 @@ pub struct RpcSession {
 	pending_replacements: std::sync::atomic::AtomicUsize,
 	replacement_tx: mpsc::UnboundedSender<String>,
 	replacement_rx: mpsc::UnboundedReceiver<String>,
+	/// The extension bridge when one is attached: `extension_ui_response`
+	/// frames resolve dialogs through it (round 44).
+	extensions: Option<Arc<crate::core::extensions::ExtensionBridge>>,
 	events_closed: bool,
 	wire_events_closed: bool,
 }
 
 impl RpcSession {
 	pub fn new(handle: SessionHandle, registry: Arc<Mutex<ModelRegistry>>) -> Self {
+		let extensions = handle.resources().extensions.clone();
 		let SessionHandle {
 			cmd_tx,
 			events,
@@ -244,6 +248,7 @@ impl RpcSession {
 			pending_replacements: std::sync::atomic::AtomicUsize::new(0),
 			replacement_tx,
 			replacement_rx,
+			extensions,
 			events_closed: false,
 			wire_events_closed: false,
 		}
@@ -280,6 +285,13 @@ impl RpcSession {
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_string();
+		// `extension_ui_response` is handled before command dispatch
+		// (upstream rpc-mode.ts:771-780): resolve the pending dialog and
+		// consume the frame silently — an unknown/expired id is ignored.
+		if command_type == "extension_ui_response" {
+			self.handle_extension_ui_response(&raw);
+			return Vec::new();
+		}
 		let command: RpcCommand = match serde_json::from_value(raw) {
 			Ok(command) => command,
 			Err(e) => {
@@ -421,14 +433,52 @@ impl RpcSession {
 					}
 					// Internal bookkeeping; not part of the wire protocol.
 					Ok(SessionEvent::Persisted { .. } | SessionEvent::SessionReplaced) => continue,
-					// Extension dialogs never fire here: RPC spawns the bridge
-					// with `has_ui: false` (upstream forwards dialog requests
-					// over the wire; declared difference), so they resolve
-					// with the no-UI defaults inside the bridge. The same
-					// holds for the fire-and-forget TUI-only ui.* events.
-					Ok(SessionEvent::ExtensionDialog(_)) => continue,
-					Ok(SessionEvent::ExtensionEditorText(_) | SessionEvent::ExtensionStatus(_) | SessionEvent::ExtensionTitle(_)) => {
-						continue;
+					// Extension UI forwarding (round 44, upstream
+					// rpc-mode.ts:60-248): dialogs surface as
+					// `extension_ui_request` frames and the client answers
+					// with `extension_ui_response` (handled in handle_line);
+					// notify/setStatus/setTitle/set_editor_text are
+					// fire-and-forget requests. The bridge only emits these
+					// with dialog-capable UI, which RPC now declares.
+					Ok(SessionEvent::ExtensionDialog(request)) => {
+						return Some(extension_ui_request_frame(&request).to_string());
+					}
+					Ok(SessionEvent::ExtensionNotify { message, level }) => {
+						return Some(extension_ui_notify_frame(&message, &level).to_string());
+					}
+					Ok(SessionEvent::ExtensionStatus { key, text }) => {
+						let mut frame = json!({
+							"type": "extension_ui_request",
+							"id": uuid::Uuid::new_v4().to_string(),
+							"method": "setStatus",
+							"statusKey": key,
+						});
+						if let Some(text) = text {
+							frame["statusText"] = json!(text);
+						}
+						return Some(frame.to_string());
+					}
+					Ok(SessionEvent::ExtensionTitle(title)) => {
+						return Some(
+							json!({
+								"type": "extension_ui_request",
+								"id": uuid::Uuid::new_v4().to_string(),
+								"method": "setTitle",
+								"title": title,
+							})
+							.to_string(),
+						);
+					}
+					Ok(SessionEvent::ExtensionEditorText(text)) => {
+						return Some(
+							json!({
+								"type": "extension_ui_request",
+								"id": uuid::Uuid::new_v4().to_string(),
+								"method": "set_editor_text",
+								"text": text,
+							})
+							.to_string(),
+						);
 					}
 					Err(broadcast::error::RecvError::Lagged(count)) => {
 						// Dropped events can include an `agent_end`, whose
@@ -488,6 +538,33 @@ impl RpcSession {
 				},
 			}
 		}
+	}
+
+	/// Resolve one `extension_ui_response` through the bridge's dialog
+	/// registry (rpc-types.ts:294-298): `cancelled` answers the no-UI default
+	/// (null), `confirmed` the boolean, `value` the string. Unknown or
+	/// expired ids are ignored (`answer_dialog` reports false).
+	fn handle_extension_ui_response(&self, raw: &Value) {
+		let Some(bridge) = self.extensions.as_ref() else {
+			return;
+		};
+		let Some(id) = raw
+			.get("id")
+			.and_then(Value::as_str)
+			.and_then(|id| id.parse::<u64>().ok())
+		else {
+			return;
+		};
+		let answer = if raw.get("cancelled").and_then(Value::as_bool) == Some(true) {
+			Value::Null
+		} else if let Some(confirmed) = raw.get("confirmed").and_then(Value::as_bool) {
+			Value::Bool(confirmed)
+		} else if let Some(value) = raw.get("value").and_then(Value::as_str) {
+			Value::String(value.to_string())
+		} else {
+			return;
+		};
+		bridge.answer_dialog(id, answer);
 	}
 
 	/// Shut the session task down (persisting any transcript tail).
@@ -904,6 +981,56 @@ impl RpcSession {
 	}
 }
 
+/// `extension_ui_request` frame for one dialog (rpc-types.ts:252-261). The
+/// bridge's numeric dialog id travels as the string `id` — upstream uses
+/// UUIDs, the client echoes whatever it receives. `confirm` carries a
+/// `message` field on the wire; the host shim forwards only the title, so it
+/// is empty (declared). Dialog `timeout` options are not passed by the host
+/// shim and stay absent.
+fn extension_ui_request_frame(request: &crate::core::extensions::ExtensionDialogRequest) -> Value {
+	let id = request.id.to_string();
+	match &request.kind {
+		crate::core::extensions::ExtensionDialogKind::Select { title, options } => json!({
+			"type": "extension_ui_request",
+			"id": id,
+			"method": "select",
+			"title": title,
+			"options": options,
+		}),
+		crate::core::extensions::ExtensionDialogKind::Confirm { title } => json!({
+			"type": "extension_ui_request",
+			"id": id,
+			"method": "confirm",
+			"title": title,
+			"message": "",
+		}),
+		crate::core::extensions::ExtensionDialogKind::Input { title, placeholder } => {
+			let mut frame = json!({
+				"type": "extension_ui_request",
+				"id": id,
+				"method": "input",
+				"title": title,
+			});
+			if let Some(placeholder) = placeholder {
+				frame["placeholder"] = json!(placeholder);
+			}
+			frame
+		}
+	}
+}
+
+/// Fire-and-forget `extension_ui_request{method:"notify"}` frame
+/// (rpc-mode.ts:152-162).
+fn extension_ui_notify_frame(message: &str, level: &str) -> Value {
+	json!({
+		"type": "extension_ui_request",
+		"id": uuid::Uuid::new_v4().to_string(),
+		"method": "notify",
+		"message": message,
+		"notifyType": level,
+	})
+}
+
 /// Rename only event envelope fields; tool payloads and arbitrary user JSON
 /// are opaque and must not be recursively rewritten.
 fn agent_event_frame(event: &pi_agent::AgentEvent) -> String {
@@ -1156,6 +1283,178 @@ mod tests {
 			registry.clone(),
 		);
 		(handle, registry)
+	}
+
+	/// RpcSession over a session with one node extension attached
+	/// (`has_ui: true`, matching production RPC after round 44).
+	async fn extension_session(
+		fixture: &str,
+	) -> (RpcSession, crate::core::extensions::ExtensionAssembly) {
+		let entry = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/extensions")
+			.join(fixture);
+		let cwd = std::env::temp_dir().join(format!(
+			"pi-rs-rpc-ext-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let _ = std::fs::remove_dir_all(&cwd);
+		std::fs::create_dir_all(&cwd).unwrap();
+		let assembly = crate::core::extensions::spawn_extensions(
+			vec![(entry.display().to_string(), entry)],
+			&crate::core::extensions::SpawnOptions {
+				cwd,
+				has_ui: true,
+				runtime: "node".to_string(),
+			},
+		)
+		.await;
+		assert!(assembly.notices.is_empty(), "{:?}", assembly.notices);
+		let stream: pi_ai::StreamFn = Arc::new(
+			|model: &pi_ai::Model,
+			 context: &pi_ai::TranscriptContext,
+			 options: pi_ai::StreamOptions| {
+				pi_ai::providers::mock::stream(model, context, options)
+			},
+		);
+		let agent = Agent::new(AgentOptions {
+			stream_fn: Some(stream),
+			..AgentOptions::default()
+		});
+		let registry = Arc::new(Mutex::new(ModelRegistry::load(None)));
+		let handle = crate::core::agent_session::spawn_agent_session_with_options(
+			agent,
+			crate::core::session_manager::SessionManager::in_memory(),
+			registry.clone(),
+			crate::core::settings_manager::CompactionSettings::default(),
+			crate::core::system_prompt::SystemPromptOptions::default(),
+			crate::core::settings_manager::RetrySettings::default(),
+			crate::core::agent_session::SessionResources {
+				extensions: Some(assembly.bridge.clone()),
+				..Default::default()
+			},
+		);
+		(RpcSession::new(handle, registry), assembly)
+	}
+
+	fn node_available() -> bool {
+		std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.is_ok()
+	}
+
+	/// A `ui.select` dialog from an extension command surfaces as an
+	/// `extension_ui_request` frame and the client's `extension_ui_response`
+	/// resolves it through the bridge registry (round 44).
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extension_dialog_round_trips_through_the_rpc_wire() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let (mut session, assembly) = extension_session("dialogs.ts").await;
+		session.handle_line(r#"{"type":"prompt","message":"/ask","id":"p1"}"#);
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		let mut answered = false;
+		let mut notify_seen = false;
+		let mut settled_seen = false;
+		while tokio::time::Instant::now() < deadline && !(notify_seen && settled_seen) {
+			let frame = match tokio::time::timeout_at(deadline, session.next_event_frame()).await {
+				Ok(Some(frame)) => frame,
+				Ok(None) => break,
+				Err(_) => break,
+			};
+			let value: Value = serde_json::from_str(&frame).unwrap();
+			if value["type"] == "extension_ui_request" && value["method"] == "select" {
+				assert_eq!(value["title"], "Pick a flavor");
+				assert_eq!(value["options"], json!(["vanilla", "chocolate"]), "{value}");
+				assert!(!answered, "the select dialog must not repeat: {value}");
+				answered = true;
+				let response = json!({
+					"type": "extension_ui_response",
+					"id": value["id"].clone(),
+					"value": "chocolate",
+				});
+				assert!(
+					session.handle_line(&response.to_string()).is_empty(),
+					"the response is consumed without output frames"
+				);
+			} else if value["type"] == "extension_ui_request" && value["method"] == "notify" {
+				assert_eq!(value["message"], "picked: chocolate", "{value}");
+				assert_eq!(value["notifyType"], "info");
+				notify_seen = true;
+			} else if value["type"] == "agent_settled" {
+				settled_seen = true;
+			}
+		}
+		assert!(answered, "select dialog never surfaced");
+		assert!(notify_seen, "notify frame never surfaced");
+		assert!(settled_seen, "settle never surfaced");
+		assembly.bridge.shutdown().await;
+	}
+
+	/// Fire-and-forget ui.* calls forward as `extension_ui_request` frames in
+	/// RPC mode (upstream rpc-mode.ts:166-246); keyed statuses carry
+	/// `statusKey`/`statusText`.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extension_decorations_forward_as_extension_ui_requests() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let (mut session, assembly) = extension_session("ui-decorations.ts").await;
+		session.handle_line(r#"{"type":"prompt","message":"/decorate","id":"p1"}"#);
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		let mut status = None;
+		let mut title = None;
+		let mut editor = None;
+		let mut notify = None;
+		while tokio::time::Instant::now() < deadline
+			&& (status.is_none() || title.is_none() || editor.is_none() || notify.is_none())
+		{
+			let frame = match tokio::time::timeout_at(deadline, session.next_event_frame()).await {
+				Ok(Some(frame)) => frame,
+				Ok(None) => break,
+				Err(_) => break,
+			};
+			let value: Value = serde_json::from_str(&frame).unwrap();
+			if value["type"] != "extension_ui_request" {
+				continue;
+			}
+			match value["method"].as_str() {
+				Some("setStatus") => {
+					status = Some((
+						value["statusKey"].as_str().unwrap_or_default().to_string(),
+						value["statusText"].as_str().map(str::to_string),
+					));
+				}
+				Some("setTitle") => {
+					title = Some(value["title"].as_str().unwrap_or_default().to_string())
+				}
+				Some("set_editor_text") => {
+					editor = Some(value["text"].as_str().unwrap_or_default().to_string())
+				}
+				Some("notify") => {
+					notify = Some((
+						value["message"].as_str().unwrap_or_default().to_string(),
+						value["notifyType"].as_str().unwrap_or_default().to_string(),
+					));
+				}
+				_ => {}
+			}
+		}
+		assert_eq!(
+			status,
+			Some(("files".to_string(), Some("watching files".to_string()))),
+			"{status:?}"
+		);
+		assert_eq!(title.as_deref(), Some("pi-ext-title"));
+		assert_eq!(editor.as_deref(), Some("prefilled text"));
+		assert_eq!(notify, Some(("decorated".to_string(), "info".to_string())));
+		assembly.bridge.shutdown().await;
 	}
 
 	fn echo_assistant_for_stats() -> pi_ai::AssistantMessage {

@@ -1342,11 +1342,11 @@ async fn main() -> anyhow::Result<()> {
 			discovered.entries,
 			&crate::core::extensions::SpawnOptions {
 				cwd: cwd.clone(),
-				// `ctx.hasUI`: true only where dialog-capable UI exists.
-				// Upstream also reports true for RPC (dialog forwarding);
-				// pi-rs has no RPC extension-UI channel yet — declared
-				// difference, extensions see hasUI=false in rpc mode.
-				has_ui: app_mode == AppMode::Interactive,
+				// `ctx.hasUI`: true where dialog-capable UI exists. Upstream
+				// also reports true for RPC — dialogs forward as
+				// `extension_ui_request` frames and the client answers with
+				// `extension_ui_response` (round 44).
+				has_ui: matches!(app_mode, AppMode::Interactive | AppMode::Rpc),
 				runtime: "node".to_string(),
 			},
 		)

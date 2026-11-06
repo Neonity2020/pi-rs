@@ -465,3 +465,16 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **坑（接线期）**：`OAuthSettings` 在 provider.rs 定义但 mod.rs 漏再导出——跨 crate 使用即 E0433。
 
 **交接事项**：`/mcp` 登录交互流（浏览器回调）+ `oauth` 配置键放开；审计 P2 payload 字段族修复；包管理子命令；RPC 对话框转发。
+
+## 第四十四轮：RPC 对话框转发（2026-11-06，主会话单线）
+
+基线 `9cf57fa`（第四十三轮全部推送后）。上游对照：rpc-mode.ts `createExtensionUIContext`（60-248 行）——对话框（select/confirm/input）发 `extension_ui_request{id,method,...}` 等 `extension_ui_response{id,value|confirmed|cancelled}` 解析（771-780 行先于命令分发处理、未知 id 静默消费）；notify/setStatus/setTitle/set_editor_text 为 fire-and-forget request 帧；RPC 的 `ctx.hasUI` 为 true。
+
+- **协议（rpc.rs）**：`next_event_frame` 新臂——对话框→`extension_ui_request{id=bridge.u64.to_string(), method, title/options|title/message|title/placeholder}`（confirm 的 message 字段恒空串：host shim 只转发 title，声明差异；timeout 字段 shim 不传恒缺）；`ExtensionNotify{message,level}`→notify 帧；`ExtensionStatus{key,text}`→setStatus 帧（statusText 缺省省略）；`ExtensionTitle`/`ExtensionEditorText`→setTitle/set_editor_text 帧（fire-and-forget 帧用 uuid v4 作 id）。`handle_line` 在命令分发**之前**截获 `extension_ui_response`：cancelled→Null、confirmed→Bool、value→String，经 `answer_dialog` 解析对话框（未知/过期 id 静默消费——与上游一致）；**无需 pending 表**：应答帧只带 id，bridge 注册表即权威。
+- **has_ui(RPC)**：main.rs `has_ui: matches!(app_mode, Interactive | Rpc)`——RPC 现在是对话框可容模式（扩展 sees hasUI=true，对照上游）。
+- **ui.notify 模式感知路由**：新 `SessionEvent::ExtensionNotify{message,level}`——has_ui 模式走事件（interactive→Notice 行为不变、RPC→notify 帧），无 UI 回退 notice 通道（print 行为不变）；通知不再对 RPC 客户端伪装成 `{"type":"notice"}`。
+- **setStatus key 修正**：host shim `setStatus:(key,text)=>…` 补回上游 key（第四十三轮 shim 丢 key 为声明差异，本轮为 RPC 帧 `statusKey` 忠实转发而修）；TUI 状态升为按键控 `BTreeMap`（footer 第三行按 key 排序 join，逐字对照 footer.ts:290-299）——第四十三轮的单槽位声明差异消除。
+- **测试**：rpc 端到端两测（`extension_session` 助手：真 node 桥 has_ui=true + mock provider + RpcSession）——select 往返（断言帧形状/options→回 extension_ui_response→notify 帧 "picked: chocolate"→settled）、decorations 四帧（setStatus 带 statusKey/statusText、setTitle、set_editor_text、notify 带 notifyType）；bridge 测试更新（keyed status + ExtensionNotify 形状、无 UI 通知回退断言）。**坑：python 批量替换把「无事件」断言补丁落进了错误的测试（dialogs_resolve_defaults 尾部多了等待 "decorated" 通知的调用——该测试根本没跑 decorate 命令），60s 超时假象像路由坏了；逐探针定位后恢复原断言。**
+- 声明差异：confirm 帧的 message 恒空串、timeout 选项缺失（host shim 不传）；setWidget/editor/custom 等上游 RPC 亦转发的方法随 shim 面未桥接（维持声明）；RPC 对话框仍受分发预算约束（客户端不答 120s 超时）。
+
+**交接事项（下一轮候选）**：`/mcp` 登录交互流（oauth 配置键随它放开）；审计 P2 payload 字段族；包管理子命令；setWidget/editor 对话框桥接。改动未提交（本条 handoff 与代码一起提交），等用户指令。

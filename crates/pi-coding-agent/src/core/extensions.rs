@@ -28,9 +28,11 @@
 //!   hook). Without dialog-capable UI (`ctx.hasUI` false — print/json/rpc)
 //!   they resolve with the upstream no-UI defaults: select/input → null,
 //!   confirm → false. `ui.setEditorText`/`ui.setStatus`/`ui.setTitle` are
-//!   fire-and-forget TUI events on the same bus (status: single slot — the
-//!   host shim drops the upstream `key`; title: OSC-0 terminal window
-//!   title).
+//!   fire-and-forget TUI events on the same bus (status: keyed items —
+//!   upstream `setStatus(key, text | undefined)`; title: OSC-0 terminal
+//!   window title). In RPC mode these surface as upstream
+//!   `extension_ui_request` frames (round 44); `ui.notify` likewise only in
+//!   dialog-capable modes, falling back to the notice channel without UI.
 //! - `pi.sendUserMessage`/`pi.sendMessage` inject a prompt through
 //!   `SessionCommand::ExtensionPrompt` — upstream `prompt(text, {source:
 //!   "extension"})` with `expandPromptTemplates` defaulting false; the host
@@ -899,7 +901,22 @@ async fn answer_host_call(
 				.and_then(Value::as_str)
 				.unwrap_or_default()
 				.to_string();
-			inner.notice(message);
+			let level = call
+				.params
+				.get("level")
+				.and_then(Value::as_str)
+				.unwrap_or("info")
+				.to_string();
+			// Dialog-capable UI modes consume notifies as events (the
+			// interactive TUI turns them back into notices; RPC forwards the
+			// upstream `extension_ui_request{method:"notify"}` frame);
+			// without UI the notice channel stands in for upstream's
+			// terminal notify.
+			if inner.has_ui {
+				inner.emit_ui_event(SessionEvent::ExtensionNotify { message, level });
+			} else {
+				inner.notice(message);
+			}
 			let _ = host.answer(call.id, Value::Null).await;
 		}
 		"ui.select" => {
@@ -993,16 +1010,21 @@ async fn answer_host_call(
 			inner.emit_ui_event(SessionEvent::ExtensionEditorText(text));
 			let _ = host.answer(call.id, Value::Null).await;
 		}
-		// The host shim drops the upstream `key` argument (host.mjs
-		// `setStatus: (text) => …`), so pi-rs keeps a single status slot;
-		// absent text clears it.
+		// Upstream `setStatus(key, text | undefined)`: keyed footer status
+		// items, missing text removes the key.
 		"ui.setStatus" => {
+			let key = call
+				.params
+				.get("key")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
 			let text = call
 				.params
 				.get("text")
 				.and_then(Value::as_str)
 				.map(str::to_string);
-			inner.emit_ui_event(SessionEvent::ExtensionStatus(text));
+			inner.emit_ui_event(SessionEvent::ExtensionStatus { key, text });
 			let _ = host.answer(call.id, Value::Null).await;
 		}
 		"ui.setTitle" => {
@@ -1724,21 +1746,31 @@ mod tests {
 		let mut editor_text = None;
 		let mut status = None;
 		let mut title = None;
-		while (editor_text.is_none() || status.is_none() || title.is_none())
+		let mut notify = None;
+		while (editor_text.is_none() || status.is_none() || title.is_none() || notify.is_none())
 			&& tokio::time::Instant::now() < deadline
 		{
 			match tokio::time::timeout_at(deadline, events.recv()).await {
 				Ok(Ok(SessionEvent::ExtensionEditorText(text))) => editor_text = Some(text),
-				Ok(Ok(SessionEvent::ExtensionStatus(text))) => status = text,
+				Ok(Ok(SessionEvent::ExtensionStatus { key, text })) => {
+					status = Some((key, text));
+				}
 				Ok(Ok(SessionEvent::ExtensionTitle(text))) => title = Some(text),
+				Ok(Ok(SessionEvent::ExtensionNotify { message, level })) => {
+					notify = Some((message, level));
+				}
 				Ok(Ok(_)) => continue,
 				Ok(Err(err)) => panic!("bus error: {err}"),
 				Err(_) => break,
 			}
 		}
 		assert_eq!(editor_text.as_deref(), Some("prefilled text"));
-		assert_eq!(status.as_deref(), Some("watching files"));
+		assert_eq!(
+			status,
+			Some(("files".to_string(), Some("watching files".to_string())))
+		);
 		assert_eq!(title.as_deref(), Some("pi-ext-title"));
+		assert_eq!(notify, Some(("decorated".to_string(), "info".to_string())));
 		assembly.bridge.shutdown().await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
@@ -1762,13 +1794,15 @@ mod tests {
 			.execute_command("decorate", "")
 			.await
 			.expect("command completes");
-		// Give the (absent) frames a moment; nothing may arrive.
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+		// The notify falls back to the notice channel without UI; the
+		// fire-and-forget ui.* calls stay silent.
+		let notice = next_notice(&mut events, "decorated").await;
+		assert_eq!(notice, "decorated");
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
 				.await
 				.is_err(),
-			"no ui.* events expected without UI"
+			"no Extension event expected without UI"
 		);
 		assembly.bridge.shutdown().await;
 		std::fs::remove_dir_all(&root).unwrap();
@@ -1796,7 +1830,9 @@ mod tests {
 		.expect("dialog request arrives")
 	}
 
-	/// Wait for a notice containing `needle`.
+	/// Wait for a notice containing `needle` — either the notice channel
+	/// (no-UI fallback) or the round-44 `ExtensionNotify` event (dialog-
+	/// capable modes route ui.notify through it).
 	async fn next_notice(
 		events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
 		needle: &str,
@@ -1805,6 +1841,11 @@ mod tests {
 			loop {
 				match events.recv().await {
 					Ok(SessionEvent::Notice(text)) if text.contains(needle) => return text,
+					Ok(SessionEvent::ExtensionNotify { message, .. })
+						if message.contains(needle) =>
+					{
+						return message;
+					}
 					Ok(_) => continue,
 					Err(err) => panic!("bus closed before the notice arrived: {err}"),
 				}
@@ -1971,12 +2012,14 @@ mod tests {
 			.join("");
 		assert_eq!(text, "blocked");
 
-		// No dialog event ever surfaced.
+		// No Extension* event ever surfaced: dialogs resolved inside the
+		// bridge with the no-UI defaults, and ui.notify fell back to the
+		// notice channel (consumed above).
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
 				.await
 				.is_err(),
-			"no dialog event expected without UI"
+			"no Extension event expected without UI"
 		);
 		assembly.bridge.shutdown().await;
 		std::fs::remove_dir_all(&root).unwrap();

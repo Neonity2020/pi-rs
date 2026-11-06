@@ -26,7 +26,7 @@
 //! steering-queued messages cannot be restored to the editor on abort (only
 //! prompts queued while busy come back via the navigation outcome).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -567,9 +567,9 @@ pub struct InteractiveMode {
 	// modal over every other overlay; answers go through the bridge registry.
 	extension_dialog: Option<ExtensionDialogState>,
 	pending_extension_dialogs: VecDeque<crate::core::extensions::ExtensionDialogRequest>,
-	// ui.setStatus slot (round 43): the host shim drops the upstream `key`,
-	// so this holds the latest text; `None` hides the footer status line.
-	extension_status: Option<String>,
+	// ui.setStatus items (upstream `setStatus(key, text | undefined)`,
+	// footer.ts): the values render sorted by key as a third footer line.
+	extension_status: BTreeMap<String, String>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -1076,7 +1076,7 @@ impl InteractiveMode {
 			scoped_overlay: None,
 			extension_dialog: None,
 			pending_extension_dialogs: VecDeque::new(),
-			extension_status: None,
+			extension_status: BTreeMap::new(),
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -3631,11 +3631,21 @@ impl InteractiveMode {
 			// ui.setEditorText (upstream interactive-mode.ts:2656): plain
 			// editor buffer replace — no paste handling on this path.
 			SessionEvent::ExtensionEditorText(text) => self.editor.set_text(text),
-			// ui.setStatus (footer.ts:146-151 + 289-299): a single slot here
-			// because the host shim drops the upstream `key`; missing text
-			// clears, empty text keeps an (empty) third footer line — same
-			// as upstream's `size > 0` gate. Footer height grows in draw().
-			SessionEvent::ExtensionStatus(text) => self.extension_status = text,
+			// ui.setStatus (footer.ts:146-151 + 289-299): keyed items;
+			// missing text removes the key, footer height grows in draw().
+			SessionEvent::ExtensionStatus { key, text } => match text {
+				Some(text) => {
+					self.extension_status.insert(key, text);
+				}
+				None => {
+					self.extension_status.remove(&key);
+				}
+			},
+			// ui.notify in a dialog-capable mode (round 44): the bridge used
+			// to route it straight to a notice; with RPC forwarding the
+			// notify arrives as an event and the TUI keeps the notice
+			// behavior (level stays dropped — pi-rs notices have no level).
+			SessionEvent::ExtensionNotify { message, .. } => self.push_notice(message),
 			// ui.setTitle (interactive-mode.ts:2653 → terminal.setTitle,
 			// terminal.ts:592-594): OSC-0 terminal window title.
 			SessionEvent::ExtensionTitle(title) => {
@@ -3978,7 +3988,7 @@ impl InteractiveMode {
 			.clamp(1, EDITOR_MAX_ROWS as u16);
 		// Footer grows to three lines while an extension status item is set
 		// (footer.ts:289-299 appends the status line when non-empty).
-		let footer_rows = 2 + u16::from(self.extension_status.is_some());
+		let footer_rows = 2 + u16::from(!self.extension_status.is_empty());
 		let chunks = Layout::vertical([
 			Constraint::Length(1),
 			Constraint::Min(3),
@@ -4209,11 +4219,15 @@ impl InteractiveMode {
 		};
 		frame.render_widget(Paragraph::new(stats_line), stats_area);
 
-		// Line 3: extension status items (footer.ts:289-299). The host shim
-		// drops the upstream `key`, so this is the single slot's text,
-		// sanitized the same way (newlines/tabs → spaces, collapsed).
-		if let Some(status) = self.extension_status.as_ref() {
-			let status = sanitize_status_text(status);
+		// Line 3: extension status items (footer.ts:289-299), sorted by key,
+		// each sanitized (newlines/tabs → spaces, collapsed).
+		if !self.extension_status.is_empty() {
+			let status = self
+				.extension_status
+				.values()
+				.map(|text| sanitize_status_text(text))
+				.collect::<Vec<_>>()
+				.join(" ");
 			if !status.is_empty() {
 				let status_area = Rect {
 					y: area.y + 2,

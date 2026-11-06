@@ -336,10 +336,21 @@ pub enum SessionEvent {
 	/// `ui.setEditorText(text)` (round 43): replace the core input editor
 	/// buffer. Fire-and-forget; only emitted with dialog-capable UI.
 	ExtensionEditorText(String),
-	/// `ui.setStatus(text)` (round 43): footer status item. The host shim
-	/// drops the upstream `key`, so this is a single slot; `None` clears
-	/// (upstream footer.ts appends statuses as a third footer line).
-	ExtensionStatus(Option<String>),
+	/// `ui.setStatus(key, text | undefined)` (rounds 43/44): keyed footer
+	/// status item; `None` removes the key (upstream footer.ts renders the
+	/// values sorted by key as a third footer line; RPC forwards the frame).
+	ExtensionStatus {
+		key: String,
+		text: Option<String>,
+	},
+	/// `ui.notify(message, level)` (round 44): routed as an event only in
+	/// dialog-capable modes — the interactive TUI turns it back into a
+	/// notice, RPC forwards the upstream `extension_ui_request` notify frame;
+	/// without UI the bridge falls back to the notice channel.
+	ExtensionNotify {
+		message: String,
+		level: String,
+	},
 	/// `ui.setTitle(text)` (round 43): OSC-0 terminal window title
 	/// (upstream `terminal.setTitle`).
 	ExtensionTitle(String),

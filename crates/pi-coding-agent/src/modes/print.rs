@@ -155,7 +155,8 @@ async fn run_print_to<W: Write>(
 				// for the fire-and-forget TUI-only ui.* events.
 				SessionEvent::ExtensionDialog(_) => {}
 				SessionEvent::ExtensionEditorText(_)
-				| SessionEvent::ExtensionStatus(_)
+				| SessionEvent::ExtensionStatus { .. }
+				| SessionEvent::ExtensionNotify { .. }
 				| SessionEvent::ExtensionTitle(_) => {}
 			}
 		}

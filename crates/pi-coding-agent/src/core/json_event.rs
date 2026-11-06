@@ -111,7 +111,8 @@ pub fn to_json_event(event: &SessionEvent) -> Option<String> {
 		// inside the bridge.
 		| SessionEvent::ExtensionDialog(_)
 		| SessionEvent::ExtensionEditorText(_)
-		| SessionEvent::ExtensionStatus(_)
+		| SessionEvent::ExtensionStatus { .. }
+		| SessionEvent::ExtensionNotify { .. }
 		| SessionEvent::ExtensionTitle(_) => None,
 	}
 }

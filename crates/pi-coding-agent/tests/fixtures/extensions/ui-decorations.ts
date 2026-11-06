@@ -10,9 +10,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("decorate", {
 		description: "Exercise ui.setStatus/setTitle/setEditorText",
 		handler: async (_args, ctx) => {
-			ctx.ui.setStatus("watching files");
+			ctx.ui.setStatus("files", "watching files");
 			ctx.ui.setTitle("pi-ext-title");
 			ctx.ui.setEditorText("prefilled text");
+			ctx.ui.notify("decorated", "info");
 		},
 	});
 }
