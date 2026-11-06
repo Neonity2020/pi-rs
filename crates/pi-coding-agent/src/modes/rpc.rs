@@ -421,6 +421,11 @@ impl RpcSession {
 					}
 					// Internal bookkeeping; not part of the wire protocol.
 					Ok(SessionEvent::Persisted { .. } | SessionEvent::SessionReplaced) => continue,
+					// Extension dialogs never fire here: RPC spawns the bridge
+					// with `has_ui: false` (upstream forwards dialog requests
+					// over the wire; declared difference), so they resolve
+					// with the no-UI defaults inside the bridge.
+					Ok(SessionEvent::ExtensionDialog(_)) => continue,
 					Err(broadcast::error::RecvError::Lagged(count)) => {
 						// Dropped events can include an `agent_end`, whose
 						// queued willRetry decision is now unpairable — drop

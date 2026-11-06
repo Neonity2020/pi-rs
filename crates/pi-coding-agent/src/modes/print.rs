@@ -149,6 +149,10 @@ async fn run_print_to<W: Write>(
 					PrintOutputMode::Json => eprintln!("{text}"),
 				},
 				SessionEvent::Persisted { .. } | SessionEvent::SessionReplaced => {}
+				// Extension dialogs never fire here: print mode spawns the
+				// bridge with `has_ui: false`, so they resolve with the
+				// upstream no-UI defaults inside the bridge.
+				SessionEvent::ExtensionDialog(_) => {}
 			}
 		}
 	}

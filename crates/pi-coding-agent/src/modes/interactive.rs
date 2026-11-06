@@ -26,6 +26,7 @@
 //! steering-queued messages cannot be restored to the editor on abort (only
 //! prompts queued while busy come back via the navigation outcome).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -319,6 +320,28 @@ impl Dialog {
 	const SUMMARY_CHOICES: [&str; 3] = ["No summary", "Summarize", "Summarize with custom prompt"];
 }
 
+/// Extension dialog (round 42): `ui.select`/`ui.confirm`/`ui.input` from an
+/// extension host, answered through the bridge's dialog registry (upstream
+/// `showExtensionSelector`/`showExtensionConfirm`/`showExtensionEditor`).
+/// Modal over every other overlay; further requests queue until it closes.
+struct ExtensionDialogState {
+	request: crate::core::extensions::ExtensionDialogRequest,
+	/// Select cursor.
+	cursor: usize,
+	/// Input editor value.
+	value: String,
+}
+
+impl ExtensionDialogState {
+	fn new(request: crate::core::extensions::ExtensionDialogRequest) -> Self {
+		Self {
+			request,
+			cursor: 0,
+			value: String::new(),
+		}
+	}
+}
+
 /// `/settings` — one entry of the settings selector (upstream
 /// `SettingsSelectorComponent`'s value list, cut to the settings pi-rs
 /// actually persists).
@@ -540,6 +563,10 @@ pub struct InteractiveMode {
 	settings_overlay: Option<SettingsOverlay>,
 	// /scoped-models multi-select.
 	scoped_overlay: Option<ScopedModelsOverlay>,
+	// Extension dialog (ui.select/confirm/input) plus its request queue —
+	// modal over every other overlay; answers go through the bridge registry.
+	extension_dialog: Option<ExtensionDialogState>,
+	pending_extension_dialogs: VecDeque<crate::core::extensions::ExtensionDialogRequest>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -1044,6 +1071,8 @@ impl InteractiveMode {
 			trust_overlay: None,
 			settings_overlay: None,
 			scoped_overlay: None,
+			extension_dialog: None,
+			pending_extension_dialogs: VecDeque::new(),
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -1333,6 +1362,12 @@ impl InteractiveMode {
 			}
 			if self.provider_wizard.is_some() {
 				self.handle_provider_key(*key);
+				return;
+			}
+			// Extension dialogs are the most modal surface: a permission gate
+			// blocks the agent run until it is answered.
+			if self.extension_dialog.is_some() {
+				self.handle_extension_dialog_key(*key);
 				return;
 			}
 			if self.session_overlay.is_some() {
@@ -3588,6 +3623,87 @@ impl InteractiveMode {
 			SessionEvent::Persisted { .. } => {}
 			// Quiescence marker; the TUI derives busy/idle from agent events.
 			SessionEvent::Settled { .. } => {}
+			SessionEvent::ExtensionDialog(request) => self.open_extension_dialog(request),
+		}
+	}
+
+	// -- extension dialogs -------------------------------------------------------
+
+	/// Open an extension dialog, or queue it when one is already on screen
+	/// (the handlers park on the bridge registry until their turn).
+	fn open_extension_dialog(&mut self, request: crate::core::extensions::ExtensionDialogRequest) {
+		if self.extension_dialog.is_some() {
+			self.pending_extension_dialogs.push_back(request);
+			return;
+		}
+		self.extension_dialog = Some(ExtensionDialogState::new(request));
+	}
+
+	/// Answer the open dialog through the bridge registry and surface the
+	/// next queued request. A missing bridge drops the answer (the waiting
+	/// handler resolves with the no-UI default when its receiver drops).
+	fn answer_extension_dialog(&mut self, value: serde_json::Value) {
+		if let Some(state) = self.extension_dialog.take()
+			&& let Some(bridge) = self.session.resources().extensions.as_ref()
+		{
+			bridge.answer_dialog(state.request.id, value);
+		}
+		if let Some(next) = self.pending_extension_dialogs.pop_front() {
+			self.extension_dialog = Some(ExtensionDialogState::new(next));
+		}
+	}
+
+	fn handle_extension_dialog_key(&mut self, key: KeyEvent) {
+		let Some(state) = self.extension_dialog.as_mut() else {
+			return;
+		};
+		match &state.request.kind {
+			crate::core::extensions::ExtensionDialogKind::Select { options, .. } => {
+				match key.code {
+					KeyCode::Up => {
+						state.cursor = state.cursor.saturating_sub(1);
+					}
+					KeyCode::Down => {
+						state.cursor = (state.cursor + 1).min(options.len().saturating_sub(1));
+					}
+					KeyCode::Enter => {
+						let value = options
+							.get(state.cursor)
+							.map(|option| serde_json::Value::String(option.clone()))
+							.unwrap_or(serde_json::Value::Null);
+						self.answer_extension_dialog(value);
+					}
+					KeyCode::Esc => self.answer_extension_dialog(serde_json::Value::Null),
+					_ => {}
+				}
+			}
+			crate::core::extensions::ExtensionDialogKind::Confirm { .. } => match key.code {
+				KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+					self.answer_extension_dialog(serde_json::Value::Bool(true));
+				}
+				KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+					self.answer_extension_dialog(serde_json::Value::Bool(false));
+				}
+				_ => {}
+			},
+			crate::core::extensions::ExtensionDialogKind::Input { .. } => match key.code {
+				KeyCode::Esc => self.answer_extension_dialog(serde_json::Value::Null),
+				KeyCode::Enter => {
+					let value = std::mem::take(&mut state.value);
+					self.answer_extension_dialog(serde_json::Value::String(value));
+				}
+				KeyCode::Backspace => {
+					state.value.pop();
+				}
+				KeyCode::Char(c)
+					if !key
+						.modifiers
+						.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+				{
+					state.value.push(c);
+				}
+				_ => {}
+			},
 		}
 	}
 
@@ -3861,6 +3977,7 @@ impl InteractiveMode {
 		self.draw_scoped_overlay(frame, chunks[1]);
 		self.draw_tree(frame, chunks[1]);
 		self.draw_dialog(frame, chunks[1]);
+		self.draw_extension_dialog(frame, chunks[1]);
 		if let Some((_, cwd)) = &self.trust_prompt {
 			let area = chunks[1];
 			let panel = Rect {
@@ -4248,6 +4365,81 @@ impl InteractiveMode {
 				" Setting value ",
 				format!("{key}\n\n{value}▌\n\nEnter save · Esc back to settings"),
 			),
+		};
+		let width = chat_area.width.clamp(24, 72);
+		let height = (body.lines().count() as u16 + 2).min(chat_area.height);
+		let area = Rect {
+			x: chat_area.x + (chat_area.width - width) / 2,
+			y: chat_area.y + (chat_area.height - height) * 2 / 5,
+			width,
+			height,
+		};
+		frame.render_widget(Clear, area);
+		frame.render_widget(
+			Paragraph::new(body)
+				.block(
+					Block::bordered()
+						.border_style(Style::new().fg(self.theme.accent))
+						.title(Span::styled(
+							title,
+							Style::new()
+								.fg(self.theme.accent)
+								.add_modifier(Modifier::BOLD),
+						)),
+				)
+				.wrap(Wrap { trim: false }),
+			area,
+		);
+	}
+
+	/// Extension dialog (`ui.select`/`ui.confirm`/`ui.input`) — the same
+	/// centered box as the core dialogs, with the extension's title.
+	fn draw_extension_dialog(&mut self, frame: &mut Frame, chat_area: Rect) {
+		let Some(state) = self.extension_dialog.as_ref() else {
+			return;
+		};
+		let (title, body) = match &state.request.kind {
+			crate::core::extensions::ExtensionDialogKind::Select { title, options } => {
+				let listed = options
+					.iter()
+					.enumerate()
+					.map(|(index, option)| {
+						let marker = if index == state.cursor { "❯ " } else { "  " };
+						format!("{marker}{option}")
+					})
+					.collect::<Vec<_>>()
+					.join("\n");
+				(
+					format!(" {title} "),
+					format!(
+						"{listed}\n\n{} select · {} cancel",
+						self.keybinding_hint("tui.select.confirm", "enter"),
+						self.keybinding_hint("tui.select.cancel", "esc"),
+					),
+				)
+			}
+			crate::core::extensions::ExtensionDialogKind::Confirm { title } => (
+				format!(" {title} "),
+				"Y/Enter confirm · N/Esc cancel".to_string(),
+			),
+			crate::core::extensions::ExtensionDialogKind::Input { title, placeholder } => {
+				let (value, cursor) = if state.value.is_empty() {
+					(
+						placeholder.clone().unwrap_or_default(),
+						if placeholder.is_some() { "" } else { "▌" },
+					)
+				} else {
+					(state.value.clone(), "▌")
+				};
+				(
+					format!(" {title} "),
+					format!(
+						"{value}{cursor}\n\n{} submit · {} cancel",
+						self.keybinding_hint("tui.input.submit", "enter"),
+						self.keybinding_hint("tui.select.cancel", "esc"),
+					),
+				)
+			}
 		};
 		let width = chat_area.width.clamp(24, 72);
 		let height = (body.lines().count() as u16 + 2).min(chat_area.height);

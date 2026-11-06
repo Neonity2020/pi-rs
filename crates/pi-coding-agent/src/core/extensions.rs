@@ -21,13 +21,26 @@
 //! - the bridge hosts stay alive across session replacement while upstream
 //!   rebuilds the extension runtime; pi-rs re-fires `session_start(reason)`
 //!   on the surviving hosts instead (see `agent_session.rs`).
-//! - ui.* dialog calls other than `ui.notify` resolve to `null` (no TUI
-//!   dialog routing this round) — permission handlers that follow the
-//!   upstream fail-closed pattern therefore block in interactive mode too.
+//! - `ui.select`/`ui.confirm`/`ui.input` route to the interactive TUI
+//!   ([`SessionEvent::ExtensionDialog`]; answers travel through the bridge
+//!   registry via [`ExtensionBridge::answer_dialog`], never the command
+//!   channel, so a dialog resolves while the agent loop is blocked inside a
+//!   hook). Without dialog-capable UI (`ctx.hasUI` false — print/json/rpc)
+//!   they resolve with the upstream no-UI defaults: select/input → null,
+//!   confirm → false. `ui.setStatus`/`ui.setTitle`/`ui.setEditorText` stay
+//!   unbridged (answered null).
+//! - `pi.sendUserMessage`/`pi.sendMessage` inject a prompt through
+//!   `SessionCommand::ExtensionPrompt` — upstream `prompt(text, {source:
+//!   "extension"})` with `expandPromptTemplates` defaulting false; the host
+//!   shim carries only the text (upstream's custom-message shape and
+//!   `deliverAs` are not modeled).
+//! - the dispatch budgets below still bound total dispatch time, so a dialog
+//!   left unanswered longer than the budget fails its request (upstream
+//!   waits forever); the notice names the timeout.
 //! - the `project_trust` *event* is not dispatched; the trust *decision*
 //!   (same store the MCP gate uses) gates whether project extensions load.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +56,9 @@ use crate::core::event_bus::{EventBus, EventBusWeak};
 // -------------------------------------------------------------------------------------------
 // Timeouts — the upstream runner awaits extension handlers without a bound; the
 // bridge needs one so a hung host cannot stall the run forever. Dialog-bearing
-// dispatches get the long budget (a future round routes them to the TUI).
+// dispatches route to the TUI but stay inside these budgets: a dialog left
+// unanswered past the budget fails the request (declared; upstream is
+// unbounded).
 // -------------------------------------------------------------------------------------------
 
 /// Fire-and-forget lifecycle events (`session_start`, `turn_*`, `agent_*`,
@@ -231,6 +246,46 @@ pub struct ExtensionCommandDef {
 	pub description: String,
 }
 
+/// One TUI dialog request from an extension host (`ui.select`/`ui.confirm`/
+/// `ui.input`): the bridge emits it on the session event bus and parks the
+/// answer in its registry until [`ExtensionBridge::answer_dialog`] resolves
+/// it (interactive TUI) or the receiver drops (no-UI defaults).
+#[derive(Debug, Clone)]
+pub struct ExtensionDialogRequest {
+	/// Correlation id — the key in the bridge's pending-dialog registry.
+	pub id: u64,
+	pub kind: ExtensionDialogKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtensionDialogKind {
+	/// `ui.select(title, options)` — answer `Some(option)` or `None`.
+	Select { title: String, options: Vec<String> },
+	/// `ui.confirm(title)` — answer `true`/`false`.
+	Confirm { title: String },
+	/// `ui.input(title, placeholder)` — answer `Some(text)` or `None`.
+	Input {
+		title: String,
+		placeholder: Option<String>,
+	},
+}
+
+/// Session-side services for host-initiated calls the bridge cannot serve
+/// alone. Dialog primitives do not ride here — `answer_host_call` emits the
+/// dialog event and parks on the bridge registry directly; only prompt
+/// injection needs the session task.
+#[async_trait::async_trait]
+pub trait HostCallRouter: Send + Sync {
+	/// `pi.sendUserMessage(text)` — upstream `prompt(text, {source:
+	/// "extension", expandPromptTemplates: false})`: queueing semantics, no
+	/// extension-command dispatch, no skill/template expansion.
+	async fn send_user_message(&self, text: String);
+	/// `pi.sendMessage(text)` — the host shim reduces the upstream custom
+	/// message to its text; pi-rs injects it like `send_user_message`
+	/// (declared difference: custom messages are not modeled).
+	async fn send_message(&self, text: String);
+}
+
 struct HostEntry {
 	label: String,
 	host: ExtensionHost,
@@ -249,6 +304,17 @@ struct BridgeInner {
 	/// would keep the broadcast channel open after the task exits — the
 	/// print/rpc modes hang waiting for it to close.
 	bus: std::sync::Mutex<Option<EventBusWeak<SessionEvent>>>,
+	/// Prompt-injection router installed at session spawn; `None` answers
+	/// `sendUserMessage`/`sendMessage` with null (no session attached).
+	router: std::sync::Mutex<Option<std::sync::Arc<dyn HostCallRouter>>>,
+	/// Dialog-capable UI is attached (`ctx.hasUI`): without it the dialog
+	/// primitives resolve with the upstream no-UI defaults.
+	has_ui: bool,
+	/// Parked dialog answers keyed by request id. The TUI resolves them
+	/// through [`ExtensionBridge::answer_dialog`]; a dropped sender (TUI exit)
+	/// resolves the waiting handler with the no-UI default.
+	pending_dialogs: std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>,
+	dialog_seq: std::sync::atomic::AtomicU64,
 }
 
 impl BridgeInner {
@@ -397,17 +463,22 @@ pub struct ExtensionBridge {
 impl ExtensionBridge {
 	/// Empty bridge (no extensions / runtime missing) — every call is a no-op.
 	pub fn empty() -> Self {
-		Self::with_hosts(Vec::new(), Vec::new(), Vec::new())
+		Self::with_hosts(Vec::new(), Vec::new(), Vec::new(), false)
 	}
 
 	fn with_hosts(
 		hosts: Vec<HostEntry>,
 		tools: Vec<ExtensionToolDef>,
 		commands: Vec<ExtensionCommandDef>,
+		has_ui: bool,
 	) -> Self {
 		let inner = Arc::new(BridgeInner {
 			hosts: std::sync::Mutex::new(hosts),
 			bus: std::sync::Mutex::new(None),
+			router: std::sync::Mutex::new(None),
+			has_ui,
+			pending_dialogs: std::sync::Mutex::new(HashMap::new()),
+			dialog_seq: std::sync::atomic::AtomicU64::new(1),
 		});
 		Self {
 			hooks: Arc::new(HookDispatcher::spawn(inner.clone())),
@@ -415,6 +486,24 @@ impl ExtensionBridge {
 			tools: Arc::new(std::sync::Mutex::new(tools)),
 			commands: Arc::new(std::sync::Mutex::new(commands)),
 		}
+	}
+
+	/// Install the prompt-injection router (session spawn; see
+	/// [`HostCallRouter`]).
+	pub fn set_router(&self, router: std::sync::Arc<dyn HostCallRouter>) {
+		*self.inner.router.lock().unwrap() = Some(router);
+	}
+
+	/// Resolve a parked dialog (TUI side). Returns `false` when the request
+	/// is gone — already answered, its dispatch timed out, or never existed.
+	pub fn answer_dialog(&self, id: u64, value: Value) -> bool {
+		self.inner
+			.pending_dialogs
+			.lock()
+			.unwrap()
+			.remove(&id)
+			.map(|sender| sender.send(value).is_ok())
+			.unwrap_or(false)
 	}
 
 	/// True when no host is enabled (nothing spawned or all disabled).
@@ -750,8 +839,8 @@ fn aggregate_tool_call_outcomes(outcomes: &[Value]) -> pi_agent::BeforeToolCallR
 
 /// Run `future` while answering the host's reverse calls (`ui.*` dialogs,
 /// session mutations) — the poc.rs select+answer loop, generalized. Dialogs
-/// beyond `ui.notify` resolve `null` (declared limitation); a `null`
-/// selection makes upstream fail-closed handlers block.
+/// route to the TUI through [`answer_host_call`]; a `null` selection makes
+/// upstream fail-closed handlers block.
 async fn with_host_answers<F, T>(
 	host: &ExtensionHost,
 	inner: &BridgeInner,
@@ -768,7 +857,7 @@ where
 				// Channel closed or quiet timeout: keep waiting on the
 				// future (it carries its own request timeout).
 				if let Some(call) = call {
-					answer_host_call(inner, &call).await;
+					answer_host_call(inner, host, &call).await;
 				}
 			}
 		}
@@ -779,29 +868,143 @@ where
 	// without blocking — `try_next_host_call` returns None immediately when
 	// nothing is queued, and chained calls keep the loop going.
 	while let Some(call) = host.try_next_host_call().await {
-		answer_host_call(inner, &call).await;
+		answer_host_call(inner, host, &call).await;
 	}
 	result
 }
 
-/// Route one host-initiated call. `ui.notify` becomes a session notice (the
-/// chat channel), everything else is acknowledged with `null` and dropped
-/// (declared limitation, see the module docs).
-async fn answer_host_call(inner: &BridgeInner, call: &pi_extension_host::HostCall) {
-	if call.method == "ui.notify" {
-		let message = call
-			.params
-			.get("message")
-			.and_then(Value::as_str)
-			.unwrap_or_default()
-			.to_string();
-		inner.notice(message);
+/// Route one host-initiated call and send its answer frame. Unrouted calls
+/// get an explicit `null` so the handler's promise resolves instead of
+/// hanging until the Rust-side request timeout.
+async fn answer_host_call(
+	inner: &BridgeInner,
+	host: &ExtensionHost,
+	call: &pi_extension_host::HostCall,
+) {
+	match call.method.as_str() {
+		"ui.notify" => {
+			let message = call
+				.params
+				.get("message")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			inner.notice(message);
+			let _ = host.answer(call.id, Value::Null).await;
+		}
+		"ui.select" => {
+			let title = call
+				.params
+				.get("title")
+				.and_then(Value::as_str)
+				.unwrap_or("Select")
+				.to_string();
+			let options = call
+				.params
+				.get("options")
+				.and_then(Value::as_array)
+				.map(|items| {
+					items
+						.iter()
+						.filter_map(Value::as_str)
+						.map(str::to_string)
+						.collect()
+				})
+				.unwrap_or_default();
+			let answer = extension_dialog(
+				inner,
+				ExtensionDialogKind::Select { title, options },
+				Value::Null,
+			)
+			.await;
+			let _ = host.answer(call.id, answer).await;
+		}
+		"ui.confirm" => {
+			let title = call
+				.params
+				.get("title")
+				.and_then(Value::as_str)
+				.unwrap_or("Confirm")
+				.to_string();
+			let answer = extension_dialog(
+				inner,
+				ExtensionDialogKind::Confirm { title },
+				Value::Bool(false),
+			)
+			.await;
+			let _ = host.answer(call.id, answer).await;
+		}
+		"ui.input" => {
+			let title = call
+				.params
+				.get("title")
+				.and_then(Value::as_str)
+				.unwrap_or("Input")
+				.to_string();
+			let placeholder = call
+				.params
+				.get("placeholder")
+				.and_then(Value::as_str)
+				.map(str::to_string);
+			let answer = extension_dialog(
+				inner,
+				ExtensionDialogKind::Input { title, placeholder },
+				Value::Null,
+			)
+			.await;
+			let _ = host.answer(call.id, answer).await;
+		}
+		"session.sendUserMessage" | "session.sendMessage" => {
+			let text = call
+				.params
+				.get("text")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let router = inner.router.lock().unwrap().clone();
+			if let Some(router) = router {
+				if call.method == "session.sendUserMessage" {
+					router.send_user_message(text).await;
+				} else {
+					router.send_message(text).await;
+				}
+			}
+			// Without a router there is no session to inject into — the
+			// message is dropped (production installs the router at spawn).
+			let _ = host.answer(call.id, Value::Null).await;
+		}
+		// ui.setStatus/ui.setTitle/ui.setEditorText and anything else: not
+		// bridged (declared limitation) — acknowledged with null.
+		_ => {
+			let _ = host.answer(call.id, Value::Null).await;
+		}
 	}
-	// Everything else — ui.select/ui.confirm/ui.input (no TUI routing this
-	// round), ui.setStatus/ui.setTitle/ui.setEditorText, and the
-	// session-mutation calls session.sendUserMessage / session.sendMessage /
-	// session.setModel — is acknowledged with `null` and dropped (declared
-	// limitation; the with_host_answers loop already answers null).
+}
+
+/// Emit a dialog request on the session bus and park the answer until the
+/// TUI resolves it. Falls back to the upstream no-UI default when there is
+/// no dialog-capable UI, no bus (no session task), or the receiver dropped.
+async fn extension_dialog(inner: &BridgeInner, kind: ExtensionDialogKind, default: Value) -> Value {
+	if !inner.has_ui {
+		return default;
+	}
+	let bus = {
+		let guard = inner.bus.lock().unwrap();
+		guard.as_ref().and_then(|bus| bus.upgrade())
+	};
+	let Some(bus) = bus else {
+		return default;
+	};
+	let id = inner
+		.dialog_seq
+		.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	let (tx, rx) = tokio::sync::oneshot::channel();
+	inner.pending_dialogs.lock().unwrap().insert(id, tx);
+	bus.emit(SessionEvent::ExtensionDialog(ExtensionDialogRequest {
+		id,
+		kind,
+	}));
+	rx.await.unwrap_or(default)
 }
 
 /// Dispatch one event to all enabled listening hosts (the dispatcher-thread
@@ -1080,7 +1283,12 @@ pub async fn spawn_extensions(
 	}
 
 	ExtensionAssembly {
-		bridge: Arc::new(ExtensionBridge::with_hosts(hosts, tools, commands)),
+		bridge: Arc::new(ExtensionBridge::with_hosts(
+			hosts,
+			tools,
+			commands,
+			options.has_ui,
+		)),
 		notices,
 	}
 }
@@ -1409,6 +1617,223 @@ mod tests {
 		// Allows everywhere → no block.
 		let decision = aggregate_tool_call_outcomes(&[serde_json::json!(null)]);
 		assert!(!decision.block);
+	}
+
+	// -- dialog routing (round 42) --------------------------------------------
+
+	/// Answering an unknown/expired request id reports failure (pure unit —
+	/// no host needed).
+	#[test]
+	fn answering_an_unknown_dialog_is_false() {
+		assert!(!ExtensionBridge::empty().answer_dialog(42, Value::Null));
+	}
+
+	fn dialog_entries() -> Vec<(String, PathBuf)> {
+		let entry = fixture("dialogs.ts");
+		vec![(entry.display().to_string(), entry)]
+	}
+
+	/// Wait for the next ExtensionDialog event (skipping notices).
+	async fn next_dialog(
+		events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+	) -> ExtensionDialogRequest {
+		tokio::time::timeout(std::time::Duration::from_secs(60), async {
+			loop {
+				match events.recv().await {
+					Ok(SessionEvent::ExtensionDialog(request)) => return request,
+					Ok(_) => continue,
+					Err(err) => panic!("bus closed before the dialog arrived: {err}"),
+				}
+			}
+		})
+		.await
+		.expect("dialog request arrives")
+	}
+
+	/// Wait for a notice containing `needle`.
+	async fn next_notice(
+		events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+		needle: &str,
+	) -> String {
+		tokio::time::timeout(std::time::Duration::from_secs(60), async {
+			loop {
+				match events.recv().await {
+					Ok(SessionEvent::Notice(text)) if text.contains(needle) => return text,
+					Ok(_) => continue,
+					Err(err) => panic!("bus closed before the notice arrived: {err}"),
+				}
+			}
+		})
+		.await
+		.expect("notice arrives")
+	}
+
+	/// `ui.select` from a command handler routes to the bus and the registry
+	/// answer flows back into the handler.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn ui_select_routes_through_the_registry() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let root = temp_root("dialog-select");
+		let assembly = spawn_extensions(
+			dialog_entries(),
+			&SpawnOptions {
+				has_ui: true,
+				..spawn_opts(&root)
+			},
+		)
+		.await;
+		let bus = EventBus::new();
+		assembly.bridge.set_bus(bus.clone());
+		let mut events = bus.subscribe();
+
+		let bridge = assembly.bridge.clone();
+		let runner = tokio::spawn(async move { bridge.execute_command("ask", "").await });
+		let request = next_dialog(&mut events).await;
+		let crate::core::extensions::ExtensionDialogKind::Select { title, options } = &request.kind
+		else {
+			panic!("expected a select dialog, got {:?}", request.kind);
+		};
+		assert_eq!(title, "Pick a flavor");
+		assert_eq!(options, &["vanilla".to_string(), "chocolate".to_string()]);
+		assert!(
+			assembly
+				.bridge
+				.answer_dialog(request.id, serde_json::json!("chocolate"))
+		);
+		tokio::time::timeout(std::time::Duration::from_secs(60), runner)
+			.await
+			.expect("command completes")
+			.unwrap()
+			.expect("command succeeds");
+		let notice = next_notice(&mut events, "picked:").await;
+		assert_eq!(notice, "picked: chocolate");
+		assembly.bridge.shutdown().await;
+		std::fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// The extension tool's `ui.confirm` round trips the same way.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn tool_confirm_routes_through_the_registry() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let root = temp_root("dialog-confirm");
+		let assembly = spawn_extensions(
+			dialog_entries(),
+			&SpawnOptions {
+				has_ui: true,
+				..spawn_opts(&root)
+			},
+		)
+		.await;
+		let bus = EventBus::new();
+		assembly.bridge.set_bus(bus.clone());
+		let mut events = bus.subscribe();
+
+		let def = assembly
+			.bridge
+			.tool_defs()
+			.into_iter()
+			.find(|def| def.name == "gate")
+			.expect("gate tool registered");
+		let tool = assembly.bridge.extension_tool(def);
+		let runner = tokio::spawn(async move {
+			tool.execute(
+				"call-1",
+				serde_json::json!({}),
+				CancellationToken::new(),
+				None,
+			)
+			.await
+		});
+		let request = next_dialog(&mut events).await;
+		let crate::core::extensions::ExtensionDialogKind::Confirm { title } = &request.kind else {
+			panic!("expected a confirm dialog, got {:?}", request.kind);
+		};
+		assert_eq!(title, "Allow?");
+		assert!(
+			assembly
+				.bridge
+				.answer_dialog(request.id, serde_json::json!(true))
+		);
+		let result = tokio::time::timeout(std::time::Duration::from_secs(60), runner)
+			.await
+			.expect("tool completes")
+			.unwrap();
+		assert!(!result.is_error);
+		let text = result
+			.content
+			.iter()
+			.filter_map(|block| block.text_content())
+			.collect::<Vec<_>>()
+			.join("");
+		assert_eq!(text, "allowed");
+		assembly.bridge.shutdown().await;
+		std::fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// `has_ui: false` (print/json/rpc): dialogs resolve with the upstream
+	/// no-UI defaults without emitting any event — select → null, confirm →
+	/// false.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn dialogs_resolve_defaults_without_ui() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let root = temp_root("dialog-defaults");
+		let assembly = spawn_extensions(dialog_entries(), &spawn_opts(&root)).await;
+		let bus = EventBus::new();
+		assembly.bridge.set_bus(bus.clone());
+		let mut events = bus.subscribe();
+
+		// Command path: the select answers null, so the handler reports
+		// "nothing".
+		assembly
+			.bridge
+			.execute_command("ask", "")
+			.await
+			.expect("command completes");
+		let notice = next_notice(&mut events, "picked:").await;
+		assert_eq!(notice, "picked: nothing");
+
+		// Tool path: the confirm answers false, so the gate blocks.
+		let def = assembly
+			.bridge
+			.tool_defs()
+			.into_iter()
+			.find(|def| def.name == "gate")
+			.expect("gate tool registered");
+		let tool = assembly.bridge.extension_tool(def);
+		let result = tool
+			.execute(
+				"call-1",
+				serde_json::json!({}),
+				CancellationToken::new(),
+				None,
+			)
+			.await;
+		let text = result
+			.content
+			.iter()
+			.filter_map(|block| block.text_content())
+			.collect::<Vec<_>>()
+			.join("");
+		assert_eq!(text, "blocked");
+
+		// No dialog event ever surfaced.
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+				.await
+				.is_err(),
+			"no dialog event expected without UI"
+		);
+		assembly.bridge.shutdown().await;
+		std::fs::remove_dir_all(&root).unwrap();
 	}
 
 	// -- spawn + bridge (real host processes) ---------------------------------

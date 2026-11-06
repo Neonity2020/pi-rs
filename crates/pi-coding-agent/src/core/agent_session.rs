@@ -221,6 +221,14 @@ pub enum SessionCommand {
 		args: String,
 		response: tokio::sync::oneshot::Sender<Result<(), String>>,
 	},
+	/// `pi.sendUserMessage`/`pi.sendMessage` from an extension (upstream
+	/// `prompt(text, {source: "extension"})` with `expandPromptTemplates`
+	/// defaulting false): the `input` event fires, but the extension-command
+	/// check and the skill/template expansion are skipped. Queueing matches
+	/// the user `Prompt` path.
+	ExtensionPrompt {
+		text: String,
+	},
 	Exit,
 }
 
@@ -318,6 +326,13 @@ pub enum SessionEvent {
 	Settled {
 		aborted: bool,
 	},
+	/// Extension dialog request (round 42): `ui.select`/`ui.confirm`/
+	/// `ui.input` routed to the interactive TUI while the originating
+	/// handler waits on the bridge's dialog registry. Answers travel
+	/// through `ExtensionBridge::answer_dialog` — never the command
+	/// channel, so a dialog resolves while the agent loop is blocked
+	/// inside a hook.
+	ExtensionDialog(super::extensions::ExtensionDialogRequest),
 }
 
 /// Session log plus the persist cursor, shared between the session task and
@@ -473,6 +488,26 @@ pub struct SessionHandle {
 	pub(crate) auto_retry: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Prompt-injection router for the extension bridge ([`HostCallRouter`]):
+/// both send APIs land on the command channel as [`SessionCommand::ExtensionPrompt`],
+/// so the session task keeps every queueing decision in one place. The
+/// channel is unbounded, so a send never blocks — including when the session
+/// task itself is running the extension command the send originates from.
+struct SessionRouter {
+	commands: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+}
+
+#[async_trait::async_trait]
+impl super::extensions::HostCallRouter for SessionRouter {
+	async fn send_user_message(&self, text: String) {
+		let _ = self.commands.send(SessionCommand::ExtensionPrompt { text });
+	}
+
+	async fn send_message(&self, text: String) {
+		let _ = self.commands.send(SessionCommand::ExtensionPrompt { text });
+	}
+}
+
 impl SessionHandle {
 	pub fn configure_tool_options(&self, options: ToolRuntimeOptions) {
 		*self.shared.tool_options.lock().unwrap() = Some(options);
@@ -624,6 +659,15 @@ pub fn spawn_agent_session_with_options(
 		})),
 	});
 	shared.publish_session(&log.lock().unwrap().session, &agent);
+
+	// Prompt-injection router (round 42): `pi.sendUserMessage`/
+	// `pi.sendMessage` travel through the same command channel as user
+	// prompts, so the queueing decisions stay in one place.
+	if let Some(bridge) = shared.resources.extensions.as_ref() {
+		bridge.set_router(std::sync::Arc::new(SessionRouter {
+			commands: cmd_tx.clone(),
+		}));
+	}
 
 	// Mid-run compaction (upstream `prepareNextTurn` between-turn check):
 	// installed before the task starts so every run of this session carries
@@ -1063,6 +1107,46 @@ async fn session_task(
 						// branches); the expanded text is what lands in the
 						// transcript.
 						let text = expand_prompt_text(&text, &shared.resources, &event_bus);
+						if run.is_some() || agent.is_streaming() || compacting.is_some() || nav.is_some() {
+							pending.push_back((text, images));
+							if compacting.is_some() || nav.is_some() {
+								notice(&event_bus, "compaction running — prompt queued".into());
+							} else {
+								notice(&event_bus, "run active — prompt queued".into());
+							}
+						} else if auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
+							&& let Some((tokens, window)) = super::context_usage::compute(&agent)
+							&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
+							&& let Some(cut) = auto_compaction_cut(&agent, &mut log.lock().unwrap(), settings.keep_recent_tokens.unwrap_or(20_000)) {
+							pending.push_back((text, images));
+							notice(&event_bus, "auto-compaction (threshold)…".into());
+							let agent = agent.clone();
+							compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
+						} else {
+							overflow_attempted = false;
+							abort_requested = false;
+							let agent = agent.clone();
+							run = Some(tokio::spawn(async move {
+								agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
+							}));
+						}
+					}
+					SessionCommand::ExtensionPrompt { text } => {
+						// `pi.sendUserMessage`/`pi.sendMessage` (upstream
+						// `prompt(text, {source: "extension"})` with
+						// expandPromptTemplates defaulting false): the
+						// `input` event fires, the extension-command check
+						// and the skill/template expansion do not.
+						if let Some(bridge) = &extensions {
+							bridge
+								.dispatch_event_all(
+									"input",
+									json!({"type": "input", "text": text}),
+									super::extensions::EXT_EVENT_TIMEOUT,
+								)
+								.await;
+						}
+						let images = Vec::new();
 						if run.is_some() || agent.is_streaming() || compacting.is_some() || nav.is_some() {
 							pending.push_back((text, images));
 							if compacting.is_some() || nav.is_some() {
@@ -3762,6 +3846,101 @@ mod tests {
 			seen.iter().any(|text| text.contains("start:new")),
 			"replacement reason missing: {seen:?}"
 		);
+		assembly.bridge.shutdown().await;
+		drop(handle);
+		std::fs::remove_dir_all(&cwd).unwrap();
+	}
+
+	/// `pi.sendUserMessage` (round 42): the extension command's prompt lands
+	/// on the command channel as `ExtensionPrompt` and starts a run against
+	/// the mock provider (upstream `prompt(text, {source: "extension"})`).
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extension_send_user_message_runs_a_prompt() {
+		let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/extensions/dialogs.ts");
+		if std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.is_err()
+		{
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let cwd = std::env::temp_dir().join(format!(
+			"pi-rs-ext-send-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let _ = std::fs::remove_dir_all(&cwd);
+		std::fs::create_dir_all(&cwd).unwrap();
+		let assembly = crate::core::extensions::spawn_extensions(
+			vec![(fixture.display().to_string(), fixture)],
+			&crate::core::extensions::SpawnOptions {
+				cwd: cwd.clone(),
+				has_ui: false,
+				runtime: "node".to_string(),
+			},
+		)
+		.await;
+		assert!(assembly.notices.is_empty(), "{:?}", assembly.notices);
+
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let resources = SessionResources {
+			extensions: Some(assembly.bridge.clone()),
+			..Default::default()
+		};
+		let mut handle = spawn_agent_session_with_options(
+			mock_agent(),
+			SessionManager::in_memory(),
+			registry,
+			CompactionSettings::default(),
+			crate::core::system_prompt::SystemPromptOptions::default(),
+			crate::core::settings_manager::RetrySettings::default(),
+			resources,
+		);
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		handle
+			.cmd_tx
+			.send(SessionCommand::ExtensionCommand {
+				name: "prompt-me".into(),
+				args: String::new(),
+				response: tx,
+			})
+			.unwrap();
+		rx.await.unwrap().expect("command executes");
+
+		// The injected prompt starts a run; wait for the settle.
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		loop {
+			match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+				Ok(Ok(SessionEvent::Settled { .. })) => break,
+				Ok(Ok(_)) => {}
+				Ok(Err(_)) | Err(_) => panic!("session ended before settling"),
+			}
+		}
+		let entries = handle.log.lock().unwrap().session.entries().to_vec();
+		let user_texts: Vec<String> = entries
+			.iter()
+			.filter_map(|entry| match &entry.kind {
+				EntryKind::Message { message } => match message.as_ref() {
+					pi_ai::Message::User(user) => Some(user.content.as_text()),
+					_ => None,
+				},
+				_ => None,
+			})
+			.collect();
+		assert!(
+			user_texts
+				.iter()
+				.any(|text| text.contains("hello from extension")),
+			"injected prompt missing from {user_texts:?}"
+		);
+		// The run produced an assistant reply after the injected message.
+		assert!(entries.iter().rev().any(|entry| matches!(
+			&entry.kind,
+			EntryKind::Message { message }
+				if matches!(message.as_ref(), pi_ai::Message::Assistant(_))
+		)));
 		assembly.bridge.shutdown().await;
 		drop(handle);
 		std::fs::remove_dir_all(&cwd).unwrap();

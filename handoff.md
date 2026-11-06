@@ -433,4 +433,16 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
   - `interactive.rs` 响应 `app.clipboard.pasteImage` 快捷键（Windows `alt+v`，其余 `ctrl+v`），按上下文边界字符智能补充空格，并在 bash 模式对文件路径进行单引号转义。
 - **验证**：全工作区 940+ 测试全绿（+8 个新单测），`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 零警告，difftest 六场景 6/6 IDENTICAL。
 
+## 第四十二轮：扩展对话框 TUI 路由 + sendUserMessage 提示词注入（2026-11-06，主会话单线）
+
+基线 `3760243`（第三十九轮交接的「下轮自然增量」）。上游对照：runner.ts `withUIPrompt`（无 UI 时 select→undefined/confirm→false/input→undefined）、agent-session.ts `sendUserMessage`（`prompt(text,{source:"extension",expandPromptTemplates:false})`——input 事件仍发，扩展命令检查与 skill/模板展开都跳过）、runner.ts 无 UI confirm 缺省 false。
+
+- **extensions.rs（bridge）**：`ExtensionDialogRequest/ExtensionDialogKind`（Select/Confirm/Input，u64 关联 id）+ `HostCallRouter` trait（send_user_message/send_message，对话框不走 router——`answer_host_call` 直发事件+等注册表）；`BridgeInner` 增 router/has_ui/pending_dialogs/dialog_seq；`answer_host_call` 重写为显式应答（**修掉一个真缺陷：此前未路由的 ui.select 等调用从不回帧，扩展侧 promise 挂死到 Rust 请求超时才失败——现在未路由调用显式回 null/false**）；`extension_dialog`：has_ui + bus 缺失时立即落无 UI 缺省，否则发 `SessionEvent::ExtensionDialog` 并等 oneshot（接收端 drop → 缺省，TUI 中途退出安全）；`answer_dialog(id,value)` 同步解析（tokio oneshot send 是同步的）。
+- **agent_session.rs**：`SessionCommand::ExtensionPrompt{text}`（input 事件分发 + 与 Prompt 相同的排队/溢出压缩/起跑三分支，跳过扩展命令检查与展开）；`SessionEvent::ExtensionDialog(request)`（枚举新臂，print/rpc/json_event 补齐忽略臂——has_ui=false 下不会发出）；`SessionRouter`（unbounded cmd_tx，spawn 时 `set_router` 安装——任务内自发自收安全，通道无界）。
+- **interactive.rs**：`ExtensionDialogState`（request+cursor+value）与请求队列（对话框开着时后续请求排队）；键位分发最顶层（provider wizard 之下，模态于全部浮层）；select Up/Down/Enter/Esc、confirm y/n/Enter/Esc、input 退格/字符/Enter/Esc；`draw_extension_dialog`（居中框 + ❯ 光标 + 键位提示，主题 accent）；应答经 `session.resources().extensions` 的 `answer_dialog`，答完弹队首。
+- **测试**：dialogs.ts fixture（ask 命令 ui.select + gate 工具 ui.confirm + prompt-me 命令 sendUserMessage）；bridge 三测（select 路由应答、confirm 工具路由、has_ui=false 缺省解析+零事件）+ 未知 id 单测；会话级 `extension_send_user_message_runs_a_prompt`（ExtensionCommand→ExtensionPrompt→mock 跑通→Settled→transcript 断言注入文本+助手回复）；pty 冒烟 `tui_extension_dialogs.rs`（`/ask`→"Pick a flavor" 对话框渲染→Enter→"picked: vanilla"）。**坑：SessionEvent 是 broadcast，对话框事件 print/rpc 也收得到——枚举臂必须补齐，好在 has_ui=false 下 bridge 根本不发。**
+- 声明差异：ui.setStatus/setTitle/setEditorText 未桥接（答 null）；sendMessage 的 custom-message 形状与 deliverAs 未建模（host shim 只传 text，pi-rs 按 sendUserMessage 同路注入）；对话框受分发预算约束（tool_call 钩子 120s/命令 120s——上游无界等待，超时后晚到的应答是 no-op）。
+
+**交接事项（下一轮候选）**：jiti 兜底（非可擦除 TS 语法）；对照上游 runner 的事件顺序审计；包管理子命令（install/remove/update/list/config）；ui.setEditorText（编辑器回填）；RPC 模式的对话框转发（upstream hasUI 对 RPC 也为 true）。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+
 
