@@ -11,6 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: node --version && python3 --version && uname -sr
       - run: cargo test --workspace --locked
   fmt:
     runs-on: ubuntu-latest

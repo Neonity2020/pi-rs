@@ -152,7 +152,10 @@ async fn session_name_command_sets_and_reads_the_name() {
 				break;
 			}
 			call = host.next_host_call(TIMEOUT) => {
-				let call = call.expect("host call arrives");
+				let Some(call) = call else {
+					let stderr = host.stderr_tail().await;
+					panic!("host call channel closed; stderr: {stderr}");
+				};
 				assert_eq!(call.method, "ui.notify");
 				notified = Some(call.params["message"].clone());
 				host.answer(call.id, Value::Null).await.unwrap();
