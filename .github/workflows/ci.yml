@@ -4,9 +4,13 @@ on:
   push:
   pull_request:
 
+# ubuntu-24.04 pinned (2026-11-06): the ubuntu-latest image drift (Python
+# 3.14 + Linux 7.0 pty behavior) broke the pty/node test harnesses on an
+# unchanged code base (9cf57fa failed identically). Revisit the harness
+# port before unpinning.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -14,7 +18,7 @@ jobs:
       - run: node --version && python3 --version && uname -sr
       - run: cargo test --workspace --locked
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,7 +26,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

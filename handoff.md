@@ -478,3 +478,9 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - 声明差异：confirm 帧的 message 恒空串、timeout 选项缺失（host shim 不传）；setWidget/editor/custom 等上游 RPC 亦转发的方法随 shim 面未桥接（维持声明）；RPC 对话框仍受分发预算约束（客户端不答 120s 超时）。
 
 **交接事项（下一轮候选）**：`/mcp` 登录交互流（oauth 配置键随它放开）；审计 P2 payload 字段族；包管理子命令；setWidget/editor 对话框桥接。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+
+### 第四十四轮补记：CI runner 环境漂移事故（2026-11-06，主会话）
+
+推送 efed392 后 Rust CI 的 test job 连续三次失败（tui_interactive 退出挂起 ×2、poc session_name host-call 通道关闭 ×1），本地（macOS，负载下）不复现。定位过程：① `git push origin 9cf57fa:refs/heads/ci-baseline-check` 用**昨天的绿色提交**在今天的 runner 上跑 CI——**同样失败**（session_name 同点位），证明与本轮代码无关；② 工作流加工具链打印：runner 已漂到 **Python 3.14.4 + Linux 7.0.0 内核 + node v24.22.2**（node 与本地一致；python 3.14 本地 5×3 场景全绿）；③ pty/subprocess 行为探针：**Linux 7.0 上 master 读在子进程退出后返回缓冲数据而不触发 EIO**——harness 的「EIO=退出」假设失效，且失败时序（136ms 内走完带 10s 预算的 quit_cleanly）表明 pty 在 runner 上早期进入异常状态。
+
+处置：`.github/workflows/ci.yml` 三 job 钉回 `ubuntu-24.04`（注释写明原因与解锁条件）；保留两条永久诊断（工具链版本打印、poc host-call 通道关闭时输出 host stderr 尾巴）。**跟进项**：pty harness 对 Python 3.14/kernel 7.0 的正式移植（退出信号改用 EOF/EIO+poll 组合判定）后再评估解钉。
