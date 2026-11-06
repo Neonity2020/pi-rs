@@ -46,6 +46,7 @@ serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 
 [profile.release]
 lto = "thin"

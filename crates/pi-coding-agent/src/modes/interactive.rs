@@ -909,6 +909,7 @@ enum GlobalAction {
 	ModelCycleBackward,
 	SessionTree,
 	SessionFork,
+	PasteClipboard,
 }
 
 /// Resolve a key to a global action, mirroring upstream
@@ -965,6 +966,9 @@ fn resolve_global_action(
 	}
 	if keybindings.matches("app.session.fork", key) {
 		return Some(GlobalAction::SessionFork);
+	}
+	if keybindings.matches("app.clipboard.pasteImage", key) {
+		return Some(GlobalAction::PasteClipboard);
 	}
 	None
 }
@@ -1635,8 +1639,50 @@ impl InteractiveMode {
 			GlobalAction::ModelCycleBackward => self.cycle_model(-1),
 			GlobalAction::SessionTree => self.show_tree_selector(None),
 			GlobalAction::SessionFork => self.open_fork_selector(),
+			GlobalAction::PasteClipboard => self.handle_clipboard_paste(),
 		}
 		true
+	}
+
+	fn handle_clipboard_paste(&mut self) {
+		match crate::core::clipboard::paste_from_clipboard() {
+			Ok(crate::core::clipboard::PasteContent::FilePaths(paths)) => {
+				let is_bash = self.editor.text().starts_with('!');
+				let text = if is_bash {
+					paths
+						.iter()
+						.map(|p| quote_if_needed(p))
+						.collect::<Vec<_>>()
+						.join(" ")
+				} else {
+					paths.join("\n")
+				};
+				self.insert_text_with_spaces(&text);
+			}
+			Ok(crate::core::clipboard::PasteContent::ImageFile(path)) => {
+				self.insert_text_with_spaces(&path.to_string_lossy());
+			}
+			Ok(crate::core::clipboard::PasteContent::Text(text)) => {
+				self.editor.insert_str(&text);
+			}
+			Ok(crate::core::clipboard::PasteContent::Empty) => {}
+			Err(err) => {
+				self.push_notice(format!("Failed to paste from clipboard: {err}"));
+			}
+		}
+	}
+
+	fn insert_text_with_spaces(&mut self, text: &str) {
+		let leading = match self.editor.char_before_cursor() {
+			Some(c) if !c.is_whitespace() => " ",
+			_ => "",
+		};
+		let trailing = match self.editor.char_after_cursor() {
+			Some(c) if !c.is_whitespace() => " ",
+			_ => "",
+		};
+		self.editor
+			.insert_str(&format!("{leading}{text}{trailing}"));
 	}
 
 	// -- external editor (ctrl+g, external-editor.ts) ------------------------------
@@ -5435,6 +5481,17 @@ fn scope_models_for(all: &[Model], checked: &std::collections::BTreeSet<String>)
 		.collect()
 }
 
+/// Quote path with single quotes if it contains spaces or shell metacharacters.
+fn quote_if_needed(s: &str) -> String {
+	if s.chars()
+		.any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '$' | '`'))
+	{
+		format!("'{}'", s.replace('\'', "'\\''"))
+	} else {
+		s.to_string()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -6917,6 +6974,34 @@ mod session_selector_tests {
 			resolve_global_action(&kb, &backward, true),
 			Some(GlobalAction::ModelCycleBackward)
 		);
+	}
+
+	#[test]
+	fn resolve_global_action_maps_paste_clipboard() {
+		let kb = crate::core::ui_config::new_keybindings_manager();
+		let paste_key = if cfg!(target_os = "windows") {
+			KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT)
+		} else {
+			KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)
+		};
+		assert_eq!(
+			resolve_global_action(&kb, &paste_key, true),
+			Some(GlobalAction::PasteClipboard)
+		);
+		assert_eq!(
+			resolve_global_action(&kb, &paste_key, false),
+			Some(GlobalAction::PasteClipboard)
+		);
+	}
+
+	#[test]
+	fn quote_if_needed_quotes_spaces_and_specials() {
+		assert_eq!(quote_if_needed("foo.png"), "foo.png");
+		assert_eq!(
+			quote_if_needed("/path/to/my file.png"),
+			"'/path/to/my file.png'"
+		);
+		assert_eq!(quote_if_needed("foo'bar"), "'foo'\\''bar'");
 	}
 
 	#[test]

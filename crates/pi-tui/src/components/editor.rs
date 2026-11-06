@@ -135,10 +135,21 @@ impl Editor {
 		self.cursor += 1;
 	}
 
-	fn insert_str(&mut self, text: &str) {
+	pub fn insert_str(&mut self, text: &str) {
 		let byte = char_to_byte_index(&self.buffer, self.cursor);
 		self.buffer.insert_str(byte, text);
 		self.cursor += text.chars().count();
+	}
+
+	pub fn char_before_cursor(&self) -> Option<char> {
+		if self.cursor == 0 {
+			return None;
+		}
+		self.buffer.chars().nth(self.cursor - 1)
+	}
+
+	pub fn char_after_cursor(&self) -> Option<char> {
+		self.buffer.chars().nth(self.cursor)
 	}
 
 	fn backspace(&mut self) {
@@ -547,5 +558,21 @@ mod tests {
 		assert_eq!((row, col), (1, 2));
 		let lines = editor.render_lines();
 		assert_eq!(lines.len(), 2);
+	}
+
+	#[test]
+	fn insert_str_and_cursor_context() {
+		let mut editor = Editor::new("❯ ");
+		editor.set_text("hello world");
+		assert_eq!(editor.char_before_cursor(), Some('d'));
+		assert_eq!(editor.char_after_cursor(), None);
+
+		editor.cursor = 5;
+		assert_eq!(editor.char_before_cursor(), Some('o'));
+		assert_eq!(editor.char_after_cursor(), Some(' '));
+
+		editor.insert_str(" beautiful");
+		assert_eq!(editor.text(), "hello beautiful world");
+		assert_eq!(editor.cursor, 15);
 	}
 }

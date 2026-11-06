@@ -30,9 +30,9 @@
 | CLI 会话与资源旗标 | `--session-id`（校验/查重，存在即打开否则按该 id 新建）、`--fork <id\|路径>`（路径→本地精确→前缀→全局解析后分支新会话）、`--session-dir <dir>`（CLI > `PI_RS_SESSION_DIR`/`PI_SESSION_DIR` > settings `sessionDir`，交互 `/resume` 与选择器同根）、`--models <模式,…>`（glob/模糊作用域，picker 与 RPC 同步收窄）、`--theme <文件>` 可重复 / `--use-theme <名>` / `--no-themes`、`--export <id\|路径> [输出]`（恒为 HTML）、`--offline`、`-a/--approve` 与 `-na/--no-approve`（项目 `.pi` 资源信任覆盖）；`--tui-mode`/`--verbose` 未实现（TUI 恒全屏） |
 | `--rpc` | **33/33 命令**（session 树族 new/switch/fork/clone/get_tree/get_entries/get_fork_messages/set_session_name、bash/abort_bash 透传、get_session_stats/export_html、set/abort_auto_retry）+ 事件帧含 `agent_settled{aborted}`、`bash_execution_update`、`auto_retry_start/end`、`session_info_changed`；get_state 12 字段全集；无扩展取消钩子故 `cancelled` 恒 false；跨项目切换会关闭旧 MCP 连接并按目标项目的信任状态重连 |
 | bash 工具 | 注入 `PI_RS_*` 会话环境变量、信号退出码 128+n、超限全量输出落盘、流式输出节播到 TUI 实时预览 |
-| TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符） |
+| TUI 主题与键位 | 已接入配置加载：`themes/<name>.json`（settings `theme` 选择）与 `keybindings.json`，坏文件回退内置并提示；footer 统一上下文用量（压缩后显示 `?`、`(auto)` 指示符）；Markdown 围栏代码块支持 syntect 语法高亮（Sublime 语法包全覆盖，映射 Theme 的 `syntax*` 色位） |
 | TUI 会话命令 | `/resume`（无参开选择器：范围/树形/搜索/删除/重命名；带 id/路径直接恢复）、`/export`（HTML 默认或 .jsonl 分支导出）、`/new`、`/name`、`/session`（上游 Session Info 面板）、`/hotkeys`（键位 markdown 表格）、`/fork`（用户消息选择器，选中后回填编辑器）与 `/fork <n>`（编号分叉）、`/clone`、`/tree`、`/import`、`/trust`（上游 TrustSelector：信任/信任父目录/不信任 + 重启提示）、`/copy`（平台剪贴板阶梯 + OSC 52）、`/settings`（settings 键选择器，全局层写盘，即时项热应用）、`/scoped-models`（模型多选作用域，会话级）、`/changelog`（内嵌 CHANGELOG 的 What's New）、`/reload`（重建键位/主题/模型目录与运行时）、`/thinking <level>`；ctrl+g 外部编辑器（TUI 挂起/恢复） |
-| `@file` 图片 | 已实现：魔数嗅探（png/jpeg/gif/webp/bmp + APNG 排除）、EXIF 方向、4.5MB base64 预算 Lanczos3 递缩；限额内原始字节透传 |
+| 剪贴板与 `@file` 图片 | 已实现：`ctrl+v` / `alt+v`（Windows）智能粘贴（macOS Finder 复制文件路径、系统截图/图片直接存入临时文件并将路径填入编辑器、普通文本回退）；魔数嗅探（png/jpeg/gif/webp/bmp/tiff + APNG 排除）、EXIF 方向、4.5MB base64 预算 Lanczos3 递缩；限额内原始字节透传 |
 
 本项目仍在开发中，运行模型生成的 shell 命令和文件修改时，请在可信环境中使用并检查结果。
 
@@ -126,9 +126,9 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 ## 路线图
 
-已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
+已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位/语法高亮/剪贴板智能粘贴（图片/文件/文本）、工具集选择与消息 wire 对齐（差分六场景与上游快照逐字节一致）。
 
-剩余：1. **providers** — wire 层与认证已全部完成（10 个 API + auth.json/OAuth 8 流 + `/login`/`/logout`；模型目录生成物 hydration、compat 门控路径推迟）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models` 已完成；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — 外部进程桥已接入（-e/-ne、目录发现+信任门、工具/命令/事件面）；剩余：TUI 对话框路由（ui.select/confirm/input）、jiti 兜底非可擦除 TS、包管理（install/remove/update/list/config）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
+剩余：1. **providers** — wire 层与认证已全部完成（10 个 API + auth.json/OAuth 8 流 + `/login`/`/logout`；模型目录生成物 hydration、compat 门控路径推迟）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 交互细节微调（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models`、语法高亮、图片/文件直接粘贴已完成）。5. **扩展系统** — 外部进程桥已接入（-e/-ne、目录发现+信任门、工具/命令/事件面）；剩余：TUI 对话框路由（ui.select/confirm/input）、jiti 兜底非可擦除 TS、包管理（install/remove/update/list/config）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 

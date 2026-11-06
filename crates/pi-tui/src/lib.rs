@@ -9,6 +9,7 @@
 
 pub mod components;
 pub mod fuzzy;
+pub mod highlight;
 pub mod keybindings;
 pub mod keys;
 pub mod terminal;

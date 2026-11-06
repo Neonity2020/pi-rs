@@ -1,10 +1,21 @@
 //! Clipboard access — port of `pi/packages/coding-agent/src/utils/clipboard.ts`
 //! (`copyToClipboard`): the platform command ladder (5s timeout per writer),
 //! OSC 52 for remote sessions and headless Linux (100k base64 cap), the WSL
-//! PowerShell interop, and the upstream error messages. The native FFI
-//! clipboard writer (`getNativeClipboard`) stays deferred — the command
-//! ladder runs on every platform, which covers macOS (`pbcopy`) and Windows
-//! (`clip`) directly. The read path (`readClipboardText`) is deferred with it.
+//! PowerShell interop, and the upstream error messages. The read path
+//! (`paste_from_clipboard`) ports `clipboard-image.ts` and `custom-editor.ts`:
+//! file paths (macOS Finder copy) -> image (saved to /tmp/pi-clipboard-*.png) ->
+//! text fallback.
+
+use std::path::PathBuf;
+
+/// Content retrieved from system clipboard on paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteContent {
+	FilePaths(Vec<String>),
+	ImageFile(PathBuf),
+	Text(String),
+	Empty,
+}
 
 /// OSC 52 base64 payload cap (upstream `MAX_OSC52_ENCODED_LENGTH`).
 const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
@@ -244,6 +255,307 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
 	Err("Clipboard unavailable".into())
 }
 
+fn run_clipboard_command_capture_bytes(
+	command: &str,
+	args: &[&str],
+	timeout_ms: u64,
+) -> Option<Vec<u8>> {
+	use std::time::{Duration, Instant};
+	let mut child = std::process::Command::new(command)
+		.args(args)
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::null())
+		.spawn()
+		.ok()?;
+	let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+	let status = loop {
+		match child.try_wait() {
+			Ok(Some(status)) => break status,
+			Ok(None) if Instant::now() >= deadline => {
+				let _ = child.kill();
+				let _ = child.wait();
+				return None;
+			}
+			Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+			Err(_) => return None,
+		}
+	};
+	if !status.success() {
+		return None;
+	}
+	let mut stdout = Vec::new();
+	if let Some(mut pipe) = child.stdout.take() {
+		use std::io::Read;
+		let _ = pipe.read_to_end(&mut stdout);
+	}
+	Some(stdout)
+}
+
+/// Read file paths from clipboard (macOS Finder copy).
+pub fn read_clipboard_file_paths() -> Option<Vec<String>> {
+	if cfg!(target_os = "macos") {
+		let script = "set theList to {}\ntry\nrepeat with anItem in (the clipboard as list)\ntry\nset end of theList to POSIX path of (anItem as «class furl»)\nend try\nend repeat\nend try\nset AppleScript's text item delimiters to linefeed\ntheList as text";
+		let bytes = run_clipboard_command_capture_bytes("osascript", &["-e", script], 2000)?;
+		let text = String::from_utf8_lossy(&bytes);
+		let paths: Vec<String> = text
+			.lines()
+			.map(|line| line.trim().to_string())
+			.filter(|line| !line.is_empty())
+			.collect();
+		if !paths.is_empty() {
+			// Upstream check: throw if path contains control characters (\p{Cc})
+			if paths.iter().any(|p| p.chars().any(|c| c.is_control())) {
+				return None;
+			}
+			return Some(paths);
+		}
+	}
+	None
+}
+
+/// Read image bytes from system clipboard and write to temporary PNG file.
+pub fn read_clipboard_image() -> Option<PathBuf> {
+	if env_set("TERMUX_VERSION") {
+		return None;
+	}
+
+	let tmp_dir = std::env::temp_dir();
+	let tmp_file = tmp_dir.join(format!("pi-clipboard-{}.png", uuid::Uuid::new_v4()));
+
+	if cfg!(target_os = "macos") {
+		let path_str = tmp_file.to_string_lossy().to_string();
+		let script = format!(
+			"set theFile to open for access POSIX file \"{path_str}\" with write permission\n\
+				 set eof theFile to 0\n\
+				 set ok to false\n\
+				 try\n\
+				     write (the clipboard as «class PNGf») to theFile\n\
+				     set ok to true\n\
+				 on error\n\
+				     try\n\
+				         write (the clipboard as «class TIFF») to theFile\n\
+				         set ok to true\n\
+				     end try\n\
+				 end try\n\
+				 close access theFile\n\
+				 if ok then\n\
+				     return \"ok\"\n\
+				 else\n\
+				     do shell script \"rm -f \" & quoted form of \"{path_str}\"\n\
+				     return \"empty\"\n\
+				 end if"
+		);
+		let out =
+			run_clipboard_command_capture_bytes("osascript", &["-e", &script], COMMAND_TIMEOUT_MS)?;
+		let out_str = String::from_utf8_lossy(&out).trim().to_string();
+		if out_str != "ok" || !tmp_file.exists() {
+			return None;
+		}
+
+		// Check if written file is TIFF and convert to PNG if so
+		if let Ok(bytes) = std::fs::read(&tmp_file)
+			&& bytes.len() >= 4
+			&& (bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"))
+			&& let Ok(img) = image::load_from_memory(&bytes)
+		{
+			let _ = img.save_with_format(&tmp_file, image::ImageFormat::Png);
+		}
+		if std::fs::metadata(&tmp_file).is_ok_and(|m| m.len() > 0) {
+			return Some(tmp_file);
+		}
+		let _ = std::fs::remove_file(&tmp_file);
+		return None;
+	}
+
+	if cfg!(target_os = "linux") {
+		if (env_set("WAYLAND_DISPLAY") || is_wsl())
+			&& let Some(list_bytes) =
+				run_clipboard_command_capture_bytes("wl-paste", &["--list-types"], 1000)
+		{
+			let list_str = String::from_utf8_lossy(&list_bytes);
+			let preferred = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+			let mut chosen_type = None;
+			for pref in preferred {
+				if list_str
+					.lines()
+					.any(|l| l.trim().eq_ignore_ascii_case(pref))
+				{
+					chosen_type = Some(pref);
+					break;
+				}
+			}
+			if chosen_type.is_none() {
+				chosen_type = list_str.lines().find(|l| l.trim().starts_with("image/"));
+			}
+			if let Some(mime) = chosen_type
+				&& let Some(data) = run_clipboard_command_capture_bytes(
+					"wl-paste",
+					&["--type", mime.trim(), "--no-newline"],
+					COMMAND_TIMEOUT_MS,
+				) && !data.is_empty()
+				&& std::fs::write(&tmp_file, &data).is_ok()
+			{
+				return Some(tmp_file);
+			}
+		}
+
+		if env_set("DISPLAY")
+			&& let Some(targets_bytes) = run_clipboard_command_capture_bytes(
+				"xclip",
+				&["-selection", "clipboard", "-t", "TARGETS", "-o"],
+				1000,
+			) {
+			let targets_str = String::from_utf8_lossy(&targets_bytes);
+			let preferred = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+			let mut chosen_type = None;
+			for pref in preferred {
+				if targets_str
+					.lines()
+					.any(|l| l.trim().eq_ignore_ascii_case(pref))
+				{
+					chosen_type = Some(pref);
+					break;
+				}
+			}
+			if chosen_type.is_none() {
+				chosen_type = targets_str.lines().find(|l| l.trim().starts_with("image/"));
+			}
+			if let Some(mime) = chosen_type
+				&& let Some(data) = run_clipboard_command_capture_bytes(
+					"xclip",
+					&["-selection", "clipboard", "-t", mime.trim(), "-o"],
+					COMMAND_TIMEOUT_MS,
+				) && !data.is_empty()
+				&& std::fs::write(&tmp_file, &data).is_ok()
+			{
+				return Some(tmp_file);
+			}
+		}
+
+		if is_wsl()
+			&& let Some(win_path) =
+				run_clipboard_command_capture("wslpath", ["-w", &tmp_file.to_string_lossy()])
+		{
+			let win_path = win_path.trim();
+			if !win_path.is_empty() {
+				let script = format!(
+					"Add-Type -AssemblyName System.Windows.Forms; \
+						 Add-Type -AssemblyName System.Drawing; \
+						 $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+						 if ($img) {{ $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); 'ok' }} else {{ 'empty' }}",
+					win_path.replace('\'', "''")
+				);
+				if let Some(res) = run_clipboard_command_capture_bytes(
+					"powershell.exe",
+					&["-NoProfile", "-Command", &script],
+					COMMAND_TIMEOUT_MS,
+				) && String::from_utf8_lossy(&res).trim() == "ok"
+					&& tmp_file.exists()
+					&& std::fs::metadata(&tmp_file).is_ok_and(|m| m.len() > 0)
+				{
+					return Some(tmp_file);
+				}
+			}
+		}
+	}
+
+	if cfg!(target_os = "windows") {
+		let path_str = tmp_file.to_string_lossy().to_string();
+		let script = format!(
+			"Add-Type -AssemblyName System.Windows.Forms; \
+				 Add-Type -AssemblyName System.Drawing; \
+				 $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+				 if ($img) {{ $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); 'ok' }} else {{ 'empty' }}",
+			path_str.replace('\'', "''")
+		);
+		if let Some(res) = run_clipboard_command_capture_bytes(
+			"powershell.exe",
+			&["-NoProfile", "-Command", &script],
+			COMMAND_TIMEOUT_MS,
+		) && String::from_utf8_lossy(&res).trim() == "ok"
+			&& tmp_file.exists()
+			&& std::fs::metadata(&tmp_file).is_ok_and(|m| m.len() > 0)
+		{
+			return Some(tmp_file);
+		}
+	}
+
+	None
+}
+
+/// Read text from system clipboard using platform commands.
+pub fn read_clipboard_text() -> Option<String> {
+	if cfg!(target_os = "macos") {
+		let bytes = run_clipboard_command_capture_bytes("pbpaste", &[], COMMAND_TIMEOUT_MS)?;
+		let text = String::from_utf8_lossy(&bytes).to_string();
+		return Some(text);
+	}
+	if cfg!(target_os = "windows") {
+		let bytes = run_clipboard_command_capture_bytes(
+			"powershell.exe",
+			&["-NoProfile", "-Command", "Get-Clipboard"],
+			COMMAND_TIMEOUT_MS,
+		)?;
+		let text = String::from_utf8_lossy(&bytes).to_string();
+		return Some(text);
+	}
+	if cfg!(target_os = "linux") {
+		if env_set("WAYLAND_DISPLAY")
+			&& let Some(bytes) = run_clipboard_command_capture_bytes(
+				"wl-paste",
+				&["--no-newline"],
+				COMMAND_TIMEOUT_MS,
+			) {
+			return Some(String::from_utf8_lossy(&bytes).to_string());
+		}
+		if env_set("DISPLAY") {
+			if let Some(bytes) = run_clipboard_command_capture_bytes(
+				"xclip",
+				&["-selection", "clipboard", "-o"],
+				COMMAND_TIMEOUT_MS,
+			) {
+				return Some(String::from_utf8_lossy(&bytes).to_string());
+			}
+			if let Some(bytes) = run_clipboard_command_capture_bytes(
+				"xsel",
+				&["--clipboard", "--output"],
+				COMMAND_TIMEOUT_MS,
+			) {
+				return Some(String::from_utf8_lossy(&bytes).to_string());
+			}
+		}
+		if is_wsl()
+			&& let Some(bytes) = run_clipboard_command_capture_bytes(
+				"powershell.exe",
+				&["-NoProfile", "-Command", "Get-Clipboard"],
+				COMMAND_TIMEOUT_MS,
+			) {
+			return Some(String::from_utf8_lossy(&bytes).to_string());
+		}
+	}
+	None
+}
+
+/// Read clipboard content matching upstream `handleClipboardPaste`:
+/// 1. File paths (macOS Finder copy)
+/// 2. Image (saved to temp file)
+/// 3. Text fallback
+pub fn paste_from_clipboard() -> Result<PasteContent, String> {
+	if let Some(paths) = read_clipboard_file_paths() {
+		return Ok(PasteContent::FilePaths(paths));
+	}
+	if let Some(img_path) = read_clipboard_image() {
+		return Ok(PasteContent::ImageFile(img_path));
+	}
+	if let Some(text) = read_clipboard_text()
+		&& !text.is_empty()
+	{
+		return Ok(PasteContent::Text(text));
+	}
+	Ok(PasteContent::Empty)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -299,5 +611,14 @@ mod tests {
 			run_clipboard_command_capture("wslpath", ["-w", "/tmp"]),
 			None
 		);
+	}
+
+	#[test]
+	fn paste_smoke_does_not_panic() {
+		// paste_from_clipboard handles empty/missing clipboard gracefully without panicking
+		let _ = paste_from_clipboard();
+		let _ = read_clipboard_file_paths();
+		let _ = read_clipboard_image();
+		let _ = read_clipboard_text();
 	}
 }

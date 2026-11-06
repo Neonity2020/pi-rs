@@ -419,3 +419,18 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
   - `cli_auth.rs`：CLI `auth check` / `auth print-api-key` / `auth print-bearer-token` 全面对接 OAuth 状态，支持 `--no-refresh` 与 `--min-expiry`。
 全工作区测试 933 项全绿（+65 测试），fmt/clippy 干净。
 
+## 第四十一轮：TUI 语法高亮与剪贴板智能粘贴（2026-11-06）
+
+- **语法高亮 (`crates/pi-tui/src/highlight.rs`)**：
+  - 引入纯 Rust `syntect`（`regex-fancy` + `default-syntaxes`，零 C/C++ 依赖，跨平台与 CI 零门槛）。
+  - `Theme` 新增 12 个字段：`syntax_comment`, `syntax_keyword`, `syntax_function`, `syntax_variable`, `syntax_string`, `syntax_number`, `syntax_type`, `syntax_operator`, `syntax_punctuation`, `tool_diff_added`, `tool_diff_removed`, `tool_diff_context`，并在 `from_value` 中完成 JSON 解析与 dark/light 基线绑定。
+  - `markdown.rs` 渲染 `TagEnd::CodeBlock` 时按 `lang` 执行高亮与多 Span `wrap_spans` 折行；未知/空语言回退 `md_code_block` 纯文本。
+- **剪贴板智能粘贴 (`crates/pi-coding-agent/src/core/clipboard.rs` + `interactive.rs`)**：
+  - `paste_from_clipboard()` 统一读取阶梯：
+    1. macOS Finder 复制的文件路径（`«class furl»` 提取，过滤控制字符）。
+    2. 系统截图/图片：macOS `«class PNGf»`/`«class TIFF»`（TIFF 借 `image` crate 转 PNG）、Linux Wayland `wl-paste`、Linux X11 `xclip`、WSL / Windows PowerShell WinForms，统一下落 `/tmp/pi-clipboard-<uuid>.png` 并将绝对路径插入输入框。
+    3. 文本回退：macOS `pbpaste`、Windows PowerShell `Get-Clipboard`、Linux `wl-paste`/`xclip`。
+  - `interactive.rs` 响应 `app.clipboard.pasteImage` 快捷键（Windows `alt+v`，其余 `ctrl+v`），按上下文边界字符智能补充空格，并在 bash 模式对文件路径进行单引号转义。
+- **验证**：全工作区 940+ 测试全绿（+8 个新单测），`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 零警告，difftest 六场景 6/6 IDENTICAL。
+
+

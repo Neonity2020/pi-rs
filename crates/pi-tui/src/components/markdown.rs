@@ -17,6 +17,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::Component;
+use crate::highlight::highlight_code;
 use crate::theme::Theme;
 
 /// Render a markdown source string to themed lines at the given width.
@@ -415,22 +416,42 @@ impl<'t> Renderer<'t> {
 			TagEnd::CodeBlock => {
 				if let Some((lang, code)) = self.code_block.take() {
 					let border = Style::new().fg(self.theme.md_code_block_border);
-					let body = Style::new().fg(self.theme.md_code_block);
 					let indent = "  ";
 					let head = format!("```{lang}");
 					self.push_raw(vec![Span::styled(head, border)]);
 					self.open_block();
 					let content_width = self.effective_width().saturating_sub(2).max(1);
-					for src in code {
-						for (i, chunk) in hard_wrap(&src, content_width).into_iter().enumerate() {
-							let mut line = self.quote_borders();
-							if i == 0 {
-								line.push(Span::raw(indent.to_string()));
-							} else {
-								line.push(Span::raw("    ".to_string()));
+
+					if let Some(highlighted) = highlight_code(&code, &lang, self.theme) {
+						for line_spans in highlighted {
+							for (i, wrapped_chunk) in wrap_spans(line_spans, content_width)
+								.into_iter()
+								.enumerate()
+							{
+								let mut line = self.quote_borders();
+								if i == 0 {
+									line.push(Span::raw(indent.to_string()));
+								} else {
+									line.push(Span::raw("    ".to_string()));
+								}
+								line.extend(wrapped_chunk);
+								self.lines.push(Line::from(line));
 							}
-							line.push(Span::styled(chunk, body));
-							self.lines.push(Line::from(line));
+						}
+					} else {
+						let body = Style::new().fg(self.theme.md_code_block);
+						for src in code {
+							for (i, chunk) in hard_wrap(&src, content_width).into_iter().enumerate()
+							{
+								let mut line = self.quote_borders();
+								if i == 0 {
+									line.push(Span::raw(indent.to_string()));
+								} else {
+									line.push(Span::raw("    ".to_string()));
+								}
+								line.push(Span::styled(chunk, body));
+								self.lines.push(Line::from(line));
+							}
 						}
 					}
 					self.lines.last_mut().map(strip_trailing_space);
@@ -846,6 +867,59 @@ fn hard_wrap(line: &str, width: usize) -> Vec<String> {
 	out
 }
 
+/// Hard-wrap styled spans at `width` (for highlighted code blocks).
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+	if spans.is_empty() {
+		return vec![vec![]];
+	}
+	let mut lines = Vec::new();
+	let mut current_line = Vec::new();
+	let mut current_width = 0;
+
+	for span in spans {
+		let span_width = span.content.width();
+		if current_width + span_width <= width {
+			current_line.push(span);
+			current_width += span_width;
+		} else {
+			let mut remaining = span.content.to_string();
+			let style = span.style;
+			while !remaining.is_empty() {
+				let available = width.saturating_sub(current_width);
+				if available == 0 {
+					if !current_line.is_empty() {
+						lines.push(std::mem::take(&mut current_line));
+					}
+					current_width = 0;
+					continue;
+				}
+				let mut chunk_len = 0;
+				let mut chunk_w = 0;
+				for c in remaining.chars() {
+					let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+					if chunk_w + cw > available && chunk_len > 0 {
+						break;
+					}
+					chunk_len += c.len_utf8();
+					chunk_w += cw;
+				}
+				let chunk: String = remaining.drain(..chunk_len).collect();
+				current_line.push(Span::styled(chunk, style));
+				current_width += chunk_w;
+
+				if current_width >= width {
+					lines.push(std::mem::take(&mut current_line));
+					current_width = 0;
+				}
+			}
+		}
+	}
+	if !current_line.is_empty() || lines.is_empty() {
+		lines.push(current_line);
+	}
+	lines
+}
+
 fn flatten_runs(runs: &[Run]) -> Vec<Span<'static>> {
 	let mut spans: Vec<Span<'static>> = Vec::new();
 	for run in runs {
@@ -948,6 +1022,24 @@ mod tests {
 		let theme = Theme::dark();
 		let out = plain(markdown_lines("```rust\nlet x = 1;\n```\n", 40, &theme));
 		assert_eq!(out, vec!["```rust", "  let x = 1;", "```"]);
+	}
+
+	#[test]
+	fn code_block_syntax_highlighted() {
+		let theme = Theme::dark();
+		let lines = markdown_lines("```rust\nfn main() {}\n```\n", 40, &theme);
+		assert_eq!(lines.len(), 3);
+		// line 0: ```rust
+		// line 1:   fn main() {}
+		// line 2: ```
+		let content_line = &lines[1];
+		assert_eq!(content_line.spans[0].content, "  ");
+		// Second span should be "fn" styled with syntax_keyword
+		assert_eq!(content_line.spans[1].content, "fn");
+		assert_eq!(
+			content_line.spans[1].style.fg,
+			Some(ratatui::style::Color::Rgb(36, 114, 200))
+		);
 	}
 
 	#[test]

@@ -84,6 +84,30 @@ pub struct Theme {
 	pub md_list_bullet: Color,
 	/// Background behind user messages (`userMessageBg`).
 	pub user_bg: Color,
+	/// Syntax highlighting: comments (`syntaxComment`).
+	pub syntax_comment: Color,
+	/// Syntax highlighting: keywords (`syntaxKeyword`).
+	pub syntax_keyword: Color,
+	/// Syntax highlighting: function names (`syntaxFunction`).
+	pub syntax_function: Color,
+	/// Syntax highlighting: variable names (`syntaxVariable`).
+	pub syntax_variable: Color,
+	/// Syntax highlighting: string literals (`syntaxString`).
+	pub syntax_string: Color,
+	/// Syntax highlighting: number literals (`syntaxNumber`).
+	pub syntax_number: Color,
+	/// Syntax highlighting: type names (`syntaxType`).
+	pub syntax_type: Color,
+	/// Syntax highlighting: operators (`syntaxOperator`).
+	pub syntax_operator: Color,
+	/// Syntax highlighting: punctuation (`syntaxPunctuation`).
+	pub syntax_punctuation: Color,
+	/// Tool diff: added lines (`toolDiffAdded`).
+	pub tool_diff_added: Color,
+	/// Tool diff: removed lines (`toolDiffRemoved`).
+	pub tool_diff_removed: Color,
+	/// Tool diff: context lines (`toolDiffContext`).
+	pub tool_diff_context: Color,
 }
 
 impl Default for Theme {
@@ -117,6 +141,18 @@ impl Theme {
 			md_hr: Color::DarkGray,
 			md_list_bullet: Color::Magenta,
 			user_bg: Color::Rgb(48, 48, 48),
+			syntax_comment: Color::DarkGray,
+			syntax_keyword: Color::Blue,
+			syntax_function: Color::Yellow,
+			syntax_variable: Color::Cyan,
+			syntax_string: Color::Rgb(255, 170, 0),
+			syntax_number: Color::Green,
+			syntax_type: Color::Magenta,
+			syntax_operator: Color::White,
+			syntax_punctuation: Color::Gray,
+			tool_diff_added: Color::Green,
+			tool_diff_removed: Color::Red,
+			tool_diff_context: Color::DarkGray,
 		}
 	}
 
@@ -143,7 +179,19 @@ impl Theme {
 			md_quote_border: Color::Rgb(105, 105, 105),
 			md_hr: Color::Rgb(105, 105, 105),
 			md_list_bullet: Color::Rgb(125, 30, 115),
-			user_bg: Color::Rgb(238, 238, 238),
+			user_bg: Color::Rgb(220, 230, 245),
+			syntax_comment: Color::Rgb(120, 120, 120),
+			syntax_keyword: Color::Rgb(0, 60, 145),
+			syntax_function: Color::Rgb(120, 65, 0),
+			syntax_variable: Color::Rgb(0, 90, 115),
+			syntax_string: Color::Rgb(165, 75, 0),
+			syntax_number: Color::Rgb(0, 100, 45),
+			syntax_type: Color::Rgb(125, 30, 115),
+			syntax_operator: Color::Rgb(55, 55, 55),
+			syntax_punctuation: Color::Rgb(90, 90, 90),
+			tool_diff_added: Color::Rgb(0, 100, 45),
+			tool_diff_removed: Color::Rgb(165, 20, 20),
+			tool_diff_context: Color::Rgb(90, 90, 90),
 		}
 	}
 
@@ -218,6 +266,18 @@ impl Theme {
 			md_hr: token("mdHr", dark.md_hr)?,
 			md_list_bullet: token("mdListBullet", dark.md_list_bullet)?,
 			user_bg: token("userMessageBg", dark.user_bg)?,
+			syntax_comment: token("syntaxComment", dark.syntax_comment)?,
+			syntax_keyword: token("syntaxKeyword", dark.syntax_keyword)?,
+			syntax_function: token("syntaxFunction", dark.syntax_function)?,
+			syntax_variable: token("syntaxVariable", dark.syntax_variable)?,
+			syntax_string: token("syntaxString", dark.syntax_string)?,
+			syntax_number: token("syntaxNumber", dark.syntax_number)?,
+			syntax_type: token("syntaxType", dark.syntax_type)?,
+			syntax_operator: token("syntaxOperator", dark.syntax_operator)?,
+			syntax_punctuation: token("syntaxPunctuation", dark.syntax_punctuation)?,
+			tool_diff_added: token("toolDiffAdded", dark.tool_diff_added)?,
+			tool_diff_removed: token("toolDiffRemoved", dark.tool_diff_removed)?,
+			tool_diff_context: token("toolDiffContext", dark.tool_diff_context)?,
 		})
 	}
 
