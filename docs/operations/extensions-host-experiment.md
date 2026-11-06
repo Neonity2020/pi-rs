@@ -84,3 +84,8 @@ host → Rust:  {"type":"return","id":7,"ok":true,"result":{...}}
 - **进程内调用与请求返回交错**：Rust 侧共享状态（Arc<Mutex>）使 call future 与 host 反向调用（对话框）可同时进行。
 
 生产桥差距（下一轮接线清单，按依赖排序）：接入 pi-coding-agent（`-e/--extension`/`-ne`、扩展目录发现、信任门：项目扩展仅信任决策后加载）→ 桥产物入会话（工具注册进 registry、命令进斜杠表、事件接 agent/session 生命周期）→ jiti 兜底非可擦除语法 → sessionManager 读面与 input/session_tree/before_* 事件补齐 → 对照上游 runner 的事件顺序审计。
+
+## 7. 生产桥增量（2026-11-06，第四十三轮）
+
+- **jiti 兜底已接线**（PoC 差距清单第 3 项闭环）：spawn 阶梯三环——原生剥离（无旗标）→ `--experimental-strip-types` → jiti（`createRequire(extensionPath).resolve("jiti")` 从扩展目录向上解析，未命中保持原始 strip 错误）；`PI_EXT_LOADER` 每次 spawn 显式设置（`""`/`"jiti"`）防环境继承翻转；帧协议零变化，仅失败 `stage` 区分（`import` vs `jiti`）。jiti `alias` 承载 `@earendil-works` shim 映射（jiti 有独立解析管线，不走全局 loader hooks）。上游对照：loader.ts:570-584 无条件经 jiti 加载，strip-first 阶梯是移植侧等价物。测试用最小假 jiti 包（CJS 入口、仅 enum 变换）——真实 jiti 未入库，其行为未经测试验证（声明）。
+- **事件顺序审计完成**：见 [extensions-event-order-audit.md](extensions-event-order-audit.md)——分发顺序与上游一致；3 个未声明 P1（tool_call 异常 fail-open、terminate 批次 any-vs-every、before_agent_start 每请求触发）已在同轮修复；P2 字段缺失族与修复顺序在文档末尾。

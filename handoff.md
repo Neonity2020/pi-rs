@@ -446,3 +446,14 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 **交接事项（下一轮候选）**：jiti 兜底（非可擦除 TS 语法）；对照上游 runner 的事件顺序审计；包管理子命令（install/remove/update/list/config）；ui.setEditorText（编辑器回填）；RPC 模式的对话框转发（upstream hasUI 对 RPC 也为 true）。改动未提交（本条 handoff 与代码一起提交），等用户指令。
 
 
+
+## 第四十三轮：并行切片——ui.* 面完整化 + jiti 兜底 + 事件顺序审计 + 审计 P1 修复（2026-11-06，主会话实现 A/E + 2 个后台子 agent B/C）
+
+基线 `9eaf2f7`（第四十二轮合并后）。切片 A（ui.* setEditorText/setStatus/setTitle）因并发限额由主会话直接实现；B（jiti 兜底）、C（事件顺序审计）为后台子 agent；D（MCP OAuth）另行提交。
+
+- **A（ui.* 面，主会话）**：`ui.setEditorText/setStatus/setTitle` 路由为 fire-and-forget TUI 事件（上游无 UI 上下文是 no-op，runner.ts:337-348；has_ui 门控 `emit_ui_event`）——`ExtensionEditorText`→`editor.set_text`（对照 interactive-mode.ts:2656 的纯 setText，无 paste 处理）、`ExtensionStatus`→单槽位（**host shim 丢 key**，host.mjs `setStatus:(text)=>…`；footer 增第三行 sanitize 规则逐字对照 footer.ts:14-20 + 289-299，footer 高度动态 2→3）+ `ExtensionTitle`→OSC-0 终端窗口标题（terminal.ts:592-594，非 header 行）。测试：bridge 两测（有 UI 事件齐/无 UI 零事件——fire-and-forget 尾帧走 drain 通路）+ pty 冒烟（`/decorate`→footer 状态行/编辑器回填/OSC 标题，harness 只剥 CSI 保留 OSC 断言）。
+- **B（jiti 兜底，子 agent）**：spawn 阶梯三环（原生剥离→strip 旗标→jiti）；jiti 经 `createRequire(extensionPath).resolve("jiti")` 从扩展目录向上解析（未命中保持原始 strip 错误）；`PI_EXT_LOADER` 显式设置防继承；帧协议零变化仅失败 `stage` 区分（`import`/`jiti`）；jiti `alias` 承载 shim 映射（独立解析管线）。上游对照 loader.ts:570-584（无条件 jiti——strip-first 阶梯是移植等价物）。9/9 测试（假 jiti 包 CJS 入口仅 enum 变换——真 jiti 未入库，声明）。坑：`createRequire().resolve("jiti")` 在 Node 22.6-22.11 上 require(esm) 未开放，假包必须 CJS。
+- **C（事件顺序审计，子 agent，只读）**：docs/operations/extensions-event-order-audit.md——分发顺序/prompt() 四段/聚合语义与上游一致；**3 个未声明 P1**（见 E）+ P2×12（payload 字段缺失族：input 缺 images/source/streamingBehavior、tool_result 缺 structuredContent/usage/parentToolCallId、turn_end 缺 7 字段等）+ P3×7；文末 8 步修复顺序。
+- **E（P1 修复，主会话）**：① tool_call handler 异常 fail-closed——`aggregate_tool_call_outcomes` 把 `{__error}` 视为 block（reason=原始消息；对照上游 emitToolCall 无 try/catch→prepareToolCall catch→createErrorToolResult(error.message)，agent-loop.ts:780-786；异常优先于早前的 block 结果——上游 throw 丢弃已收集结果）；② terminate 批次 any→**every**（agent_loop.rs sequential `|=`/parallel `.any()` 改全量判定，空批次 false；对照 shouldTerminateToolBatch agent-loop.ts:700-702；头部偏差清单同步）——修正了一个编码旧语义的测试（混批终止→续跑第二 turn）+ 新增 every 正例；③ before_agent_start 从 prepare_request 钩子（每 LLM 请求）上移到 session task 起 run 前（每 run 一次，对照 _prepareRun agent-session.ts:1926-1977；5 个 prompt 起跑点；payload 补 messageType/images，systemPrompt getter 仍缺为 F1）——**坑：run 完成臂里 let-chain 判定式的 std MutexGuard 临时被生成器 Send 分析判活跨过新 await，rustc 报 future not Send；把 1661 的守卫收进内层块 + let-chain 判定式改块表达式取值才过**。测试：异常 block 单测 + `before_agent_start_fires_once_per_run`（两 prompt 恰两派发）。
+
+**交接事项（下一轮候选）**：审计 P2 修复（payload 字段族/tool_result await/turn_end 边界结果通道）；MCP OAuth（D 切片，另行提交）；包管理子命令；RPC 对话框转发。改动 A/B/C/E 已分三个提交入库，D 未完成前不推送。
