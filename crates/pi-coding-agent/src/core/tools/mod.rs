@@ -210,7 +210,26 @@ fn tool_summary(tools: &[McpTool]) -> String {
 /// timeout) or a dropped client cleans the server up.
 async fn connect_one(entry: &McpServerEntry) -> anyhow::Result<(SharedMcpClient, Vec<McpTool>)> {
 	let transport: Box<dyn pi_mcp::Transport> = if let Some(url) = &entry.url {
-		Box::new(StreamableHttpTransport::new(url, entry.headers.clone()))
+		// HTTP servers get the stored-token auth provider (upstream
+		// `createMcpAuthProvider` wiring, extensions/mcp/oauth.ts): tokens
+		// persist in `<agent-dir>/mcp-auth.json`, a 401/403-insufficient_scope
+		// refreshes once and retries. Without stored tokens the server's
+		// challenge surfaces as `AuthorizationRequired` — the interactive
+		// sign-in flow is a declared deferral.
+		let agent_dir = crate::config::agent_dir();
+		let store = pi_mcp::oauth::FileStateStore::new(agent_dir.join("mcp-auth.json"))
+			.server(&entry.name, url);
+		let provider = pi_mcp::oauth::StoredTokenProvider::new(
+			entry.name.clone(),
+			url.clone(),
+			store,
+			pi_mcp::oauth::OAuthSettings::default(),
+		)
+		.with_lock_dir(agent_dir);
+		Box::new(
+			StreamableHttpTransport::new(url, entry.headers.clone())
+				.with_auth_provider(std::sync::Arc::new(provider)),
+		)
 	} else {
 		let mut transport =
 			StdioTransport::new(entry.command.clone(), entry.args.clone(), entry.env.clone());

@@ -1,12 +1,24 @@
 //! MCP Streamable HTTP transport for JSON and SSE POST responses and the
 //! optional server-to-client GET stream. GET reconnects with Last-Event-ID;
-//! Response streams can resume via GET with Last-Event-ID. OAuth and
-//! server-initiated requests are not yet implemented.
+//! Response streams can resume via GET with Last-Event-ID. Server-initiated
+//! requests are not yet implemented.
+//!
+//! With an [`AuthProvider`](crate::AuthProvider) attached, requests carry
+//! `Authorization: Bearer …`, and a 401 (or a 403 challenging
+//! `insufficient_scope`) is handed to the provider once before the request
+//! is retried with whatever credentials it left behind — upstream
+//! `authorizedFetch`. Declared difference: the detached GET stream resolves
+//! its token once when it opens and does not drive 401 recovery; the POST
+//! path owns refreshes, like the initialize/request mainline upstream.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use super::{Transport, TransportEvent, parse_frame};
+use crate::auth_provider::{AuthProvider, UnauthorizedContext};
+use crate::oauth::discovery::parse_www_authenticate;
 use crate::protocol::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
 pub struct StreamableHttpTransport {
@@ -15,6 +27,10 @@ pub struct StreamableHttpTransport {
 	client: reqwest::Client,
 	session_id: Option<String>,
 	protocol_version: Option<String>,
+	auth: Option<Arc<dyn AuthProvider>>,
+	/// Access token of the latest request, which `close()` reuses instead of
+	/// asking the auth provider (upstream `lastToken`).
+	last_token: Option<String>,
 	tx: mpsc::Sender<TransportEvent>,
 	fatal_tx: tokio::sync::watch::Sender<Option<String>>,
 	fatal_rx: tokio::sync::watch::Receiver<Option<String>>,
@@ -33,6 +49,8 @@ impl StreamableHttpTransport {
 			client: reqwest::Client::new(),
 			session_id: None,
 			protocol_version: None,
+			auth: None,
+			last_token: None,
 			tx,
 			fatal_tx,
 			fatal_rx,
@@ -40,6 +58,13 @@ impl StreamableHttpTransport {
 			tasks: Vec::new(),
 			closed: false,
 		}
+	}
+
+	/// Attach the auth provider whose tokens requests carry (upstream
+	/// `StreamableHttpTransportOptions.authProvider`).
+	pub fn with_auth_provider(mut self, auth: Arc<dyn AuthProvider>) -> Self {
+		self.auth = Some(auth);
+		self
 	}
 
 	fn request(&self, method: reqwest::Method) -> reqwest::RequestBuilder {
@@ -56,14 +81,101 @@ impl StreamableHttpTransport {
 		request
 	}
 
+	/// `request` plus the bearer token of the current credentials.
+	fn bearer_request(
+		&self,
+		method: reqwest::Method,
+		token: Option<&str>,
+	) -> reqwest::RequestBuilder {
+		let mut request = self.request(method);
+		if let Some(token) = token {
+			request = request.header("Authorization", format!("Bearer {token}"));
+		}
+		request
+	}
+
+	/// 401, or 403 with an `insufficient_scope` bearer challenge (step-up
+	/// authorization) — upstream `needsAuthorization`.
+	fn needs_authorization(response: &reqwest::Response) -> bool {
+		match response.status().as_u16() {
+			401 => true,
+			403 => {
+				let header = response
+					.headers()
+					.get("www-authenticate")
+					.and_then(|value| value.to_str().ok());
+				parse_www_authenticate(header).error.as_deref() == Some("insufficient_scope")
+			}
+			_ => false,
+		}
+	}
+
+	/// POST a JSON document with auth headers. A 401 (or a 403 asking for
+	/// more scope) is handed to the auth provider once, and the request is
+	/// retried with whatever credentials it left behind.
+	async fn authorized_post(
+		&mut self,
+		body: &impl serde::Serialize,
+	) -> crate::Result<reqwest::Response> {
+		let mut attempt = 0u32;
+		loop {
+			let token = match &self.auth {
+				Some(provider) => provider.token().await,
+				None => None,
+			};
+			self.last_token = token.clone();
+			let post = self
+				.bearer_request(reqwest::Method::POST, token.as_deref())
+				.header("Accept", "application/json, text/event-stream")
+				.json(body)
+				.send();
+			let response = tokio::select! { biased;
+				changed = self.fatal_rx.changed() => {
+					if changed.is_ok() && let Some(error) = self.fatal_rx.borrow().clone() {
+						return Err(crate::Error::Transport(error));
+					}
+					return Err(crate::Error::Closed);
+				}
+				result = post => result.map_err(|e| crate::Error::Transport(e.to_string()))?,
+			};
+			if attempt > 0 || !Self::needs_authorization(&response) {
+				return Ok(response);
+			}
+			let Some(provider) = self.auth.clone() else {
+				return Ok(response);
+			};
+			// Dropping the response releases the connection (upstream
+			// cancels the body before handing it to the provider).
+			let context = UnauthorizedContext {
+				status: response.status().as_u16(),
+				www_authenticate: response
+					.headers()
+					.get("www-authenticate")
+					.and_then(|value| value.to_str().ok())
+					.map(str::to_owned),
+				server_url: self.url.clone(),
+				token,
+			};
+			provider.on_unauthorized(context).await?;
+			attempt += 1;
+		}
+	}
+
 	fn start_get(&mut self) {
 		let request = self
 			.request(reqwest::Method::GET)
 			.header("Accept", "text/event-stream");
+		let auth = self.auth.clone();
 		self.tasks.retain(|task| !task.is_finished());
 		let tx = self.tx.clone();
 		let fatal_tx = self.fatal_tx.clone();
 		self.tasks.push(tokio::spawn(async move {
+			// The GET stream resolves its token once when it opens; the POST
+			// path owns 401 recovery (see the module docs).
+			let token = match &auth {
+				Some(provider) => provider.token().await,
+				None => None,
+			};
 			let mut cursor: Option<String> = None;
 			let mut retry: Option<std::time::Duration> = None;
 			let mut delay = std::time::Duration::from_secs(1);
@@ -72,6 +184,9 @@ impl StreamableHttpTransport {
 				let Some(mut next) = request.try_clone() else {
 					break;
 				};
+				if let Some(token) = &token {
+					next = next.header("Authorization", format!("Bearer {token}"));
+				}
 				if let Some(id) = &cursor {
 					next = next.header("Last-Event-ID", id);
 				}
@@ -265,27 +380,14 @@ impl Transport for StreamableHttpTransport {
 			return Err(crate::Error::Transport(error));
 		}
 		self.tasks.retain(|task| !task.is_finished());
-		let post = self
-			.request(reqwest::Method::POST)
-			.header("Accept", "application/json, text/event-stream")
-			.json(request)
-			.send();
-		let response = tokio::select! { biased;
-			changed = self.fatal_rx.changed() => {
-				if changed.is_ok() && let Some(error) = self.fatal_rx.borrow().clone() {
-					return Err(crate::Error::Transport(error));
-				}
-				return Err(crate::Error::Closed);
-			}
-			result = post => result.map_err(|e| crate::Error::Transport(e.to_string()))?,
-		};
+		let response = self.authorized_post(request).await?;
 		if !response.status().is_success() {
 			let status = response.status();
 			let body = response.text().await.unwrap_or_default();
-			let reason = if status.as_u16() == 404 && self.session_id.is_some() {
-				"MCP session expired"
-			} else {
-				"MCP POST failed"
+			let reason = match status.as_u16() {
+				401 => "MCP server requires authentication",
+				404 if self.session_id.is_some() => "MCP session expired",
+				_ => "MCP POST failed",
 			};
 			return Err(crate::Error::Transport(format!(
 				"{reason}: {status}: {body}"
@@ -423,18 +525,7 @@ impl Transport for StreamableHttpTransport {
 		if let Some(error) = self.fatal_rx.borrow().clone() {
 			return Err(crate::Error::Transport(error));
 		}
-		let post = self
-			.request(reqwest::Method::POST)
-			.header("Accept", "application/json, text/event-stream")
-			.json(response)
-			.send();
-		let response = tokio::select! { biased;
-			changed = self.fatal_rx.changed() => {
-				if changed.is_ok() && let Some(error) = self.fatal_rx.borrow().clone() { return Err(crate::Error::Transport(error)); }
-				return Err(crate::Error::Closed);
-			}
-			result = post => result.map_err(|e| crate::Error::Transport(e.to_string()))?,
-		};
+		let response = self.authorized_post(response).await?;
 		let status = response.status();
 		if !status.is_success() {
 			let body = response.text().await.unwrap_or_default();
@@ -481,11 +572,12 @@ impl Transport for StreamableHttpTransport {
 			task.abort();
 		}
 		if self.session_id.is_some() {
-			let _ = tokio::time::timeout(
-				std::time::Duration::from_secs(1),
-				self.request(reqwest::Method::DELETE).send(),
-			)
-			.await;
+			// Best effort: the session expires on the server anyway. The auth
+			// provider may refresh tokens over the network, so it is not asked
+			// here and closing never waits for a refresh — the last request's
+			// token is reused (upstream `lastToken`).
+			let delete = self.bearer_request(reqwest::Method::DELETE, self.last_token.as_deref());
+			let _ = tokio::time::timeout(std::time::Duration::from_secs(1), delete.send()).await;
 		}
 		Ok(())
 	}

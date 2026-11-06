@@ -4,11 +4,17 @@
 //! (stdio / streamable-HTTP / in-memory), OAuth flow, and the client the MCP
 //! extension uses to surface `mcp__<server>__<tool>` tools to the agent.
 
+pub mod auth_provider;
 pub mod client;
+pub mod oauth;
 pub mod protocol;
 pub mod tool;
 pub mod transports;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
+pub use auth_provider::{AuthProvider, UnauthorizedContext};
 pub use client::{DEFAULT_REQUEST_TIMEOUT_MS, McpClient, McpServerConfig, McpToolInfo};
 pub use protocol::jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use protocol::types::{
@@ -31,6 +37,10 @@ pub enum Error {
 	Timeout(u64),
 	#[error(transparent)]
 	Json(#[from] serde_json::Error),
+	/// OAuth failed inside the transport's auth provider (upstream lets the
+	/// error propagate out of `send`).
+	#[error(transparent)]
+	Oauth(#[from] oauth::OAuthError),
 	#[error("unsupported transport for this operation: {0}")]
 	Unsupported(String),
 }
