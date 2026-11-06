@@ -212,8 +212,24 @@ pub struct ExtensionHost {
 
 impl ExtensionHost {
 	/// Spawn the host and wait for the factory phase to complete (`ready`).
-	/// Retries once with `--experimental-strip-types` for Node versions that
-	/// ship type stripping behind the flag.
+	///
+	/// Loader ladder (protocol documented in host.mjs; each rung only runs
+	/// when the previous one failed with an `import`-stage error, i.e. the
+	/// extension module itself failed to load):
+	///
+	/// 1. native TS type stripping without a flag (Node >= 23.6 default),
+	/// 2. the same with `--experimental-strip-types` (Node 22.6+ flag-gated),
+	/// 3. jiti (`PI_EXT_LOADER=jiti`): the host resolves `jiti` from the
+	///    extension file's directory upward and loads through
+	///    `createJiti`/`jiti.import`, which transforms the full TS grammar
+	///    (upstream loads every extension through jiti for exactly this
+	///    reason). Without jiti installed next to the extension the host
+	///    falls back to the strip-only load, so the final error is the raw
+	///    strip-only failure plus a ladder-exhausted hint.
+	///
+	/// Non-erasable TS syntax (enums, namespaces, parameter properties)
+	/// survives rungs 1-2 and loads in rung 3. A jiti-run failure reports
+	/// `stage: "jiti"`; the strip rungs keep `stage: "import"`.
 	pub async fn spawn(config: HostConfig) -> Result<Self, SpawnError> {
 		let (major, minor) = runtime_probe(&config.runtime)?;
 		if (major, minor) < (MIN_NODE_MAJOR, MIN_NODE_MINOR) {
@@ -224,13 +240,33 @@ impl ExtensionHost {
 				),
 			});
 		}
-		match Self::spawn_once(&config, false).await {
-			Err(err) if err.stage == "import" => Self::spawn_once(&config, true).await,
-			other => other,
+		// (strip_types_flag, jiti_loader) per rung. Rung 3 keeps the strip
+		// flag: the loaded module's own ESM imports may be `.ts` files that
+		// still need flag-gated stripping on Node 22.x.
+		const LADDER: [(bool, bool); 3] = [(false, false), (true, false), (true, true)];
+		let mut last_import_error: Option<SpawnError> = None;
+		for (strip_types_flag, jiti_loader) in LADDER {
+			match Self::spawn_once(&config, strip_types_flag, jiti_loader).await {
+				Ok(host) => return Ok(host),
+				Err(err) if err.stage == "import" => last_import_error = Some(err),
+				Err(err) => return Err(err),
+			}
 		}
+		let err = last_import_error.expect("the ladder has at least one rung");
+		Err(SpawnError {
+			stage: err.stage,
+			message: format!(
+				"{} (TS loader ladder exhausted; installing jiti next to the extension enables the upstream full-TS loader)",
+				err.message
+			),
+		})
 	}
 
-	async fn spawn_once(config: &HostConfig, strip_types_flag: bool) -> Result<Self, SpawnError> {
+	async fn spawn_once(
+		config: &HostConfig,
+		strip_types_flag: bool,
+		jiti_loader: bool,
+	) -> Result<Self, SpawnError> {
 		let workdir = materialize_scripts()?;
 		let mut command = Command::new(&config.runtime);
 		if strip_types_flag {
@@ -242,6 +278,12 @@ impl ExtensionHost {
 			.arg(workdir.join("host.mjs"))
 			.arg(&config.extension)
 			.env("PI_EXT_FLAGS", config.flags.to_string())
+			// Loader selection is part of the spawn protocol (host.mjs
+			// header): "jiti" prefers the jiti loader resolved from the
+			// extension directory, "" keeps native strip-only loading. Set
+			// explicitly on every attempt so an inherited PI_EXT_LOADER
+			// cannot flip the selection.
+			.env("PI_EXT_LOADER", if jiti_loader { "jiti" } else { "" })
 			.env("PI_EXT_CWD", &config.cwd)
 			.env("PI_EXT_HAS_UI", if config.has_ui { "1" } else { "0" })
 			.current_dir(&config.cwd)

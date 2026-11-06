@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Non-erasable TS fixture (enum): only loads through the jiti rung of the
+/// spawn ladder.
+const NON_ERASABLE_TS: &str = include_str!("fixtures/non-erasable.ts");
+const FAKE_JITI_PACKAGE_JSON: &str = include_str!("fixtures/fake-jiti/package.json");
+const FAKE_JITI_INDEX: &str = include_str!("fixtures/fake-jiti/index.cjs");
+
 fn fixture(name: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 		.join("tests")
@@ -297,6 +303,114 @@ async fn flags_flow_through_register_and_getflag() {
 	assert_eq!(outcomes.len(), 1);
 	assert!(outcomes[0].is_null());
 	host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_erasable_ts_extension_loads_through_the_jiti_ladder() {
+	// Isolated copy so the fake node_modules never lands in the source tree
+	// (the no-jiti sibling test relies on nothing resolving "jiti" above the
+	// checked-in fixture).
+	let temp = std::env::temp_dir().join(format!(
+		"pi-ext-host-jiti-test-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos()
+	));
+	std::fs::create_dir_all(temp.join("node_modules").join("jiti")).expect("create fake jiti tree");
+	std::fs::write(temp.join("extension.ts"), NON_ERASABLE_TS).expect("write fixture copy");
+	std::fs::write(
+		temp.join("node_modules").join("jiti").join("package.json"),
+		FAKE_JITI_PACKAGE_JSON,
+	)
+	.expect("write fake jiti package.json");
+	std::fs::write(
+		temp.join("node_modules").join("jiti").join("index.cjs"),
+		FAKE_JITI_INDEX,
+	)
+	.expect("write fake jiti index.cjs");
+
+	let config = HostConfig {
+		extension: temp.join("extension.ts"),
+		cwd: temp.clone(),
+		..Default::default()
+	};
+	let host = match spawn_or_skip(config).await {
+		Ok(host) => host,
+		Err(()) => return,
+	};
+
+	// Spawn succeeding proves the ladder reached the jiti rung: the enum
+	// cannot load through native strip-only typing (rungs 1-2 fail with
+	// "TypeScript enum is not supported in strip-only mode").
+	let registrations = host.registrations().await;
+	assert!(
+		registrations
+			.iter()
+			.any(|r| r.capability == "tool" && r.name.as_deref() == Some("color")),
+		"enum-backed tool registered: {registrations:?}"
+	);
+	assert!(
+		registrations
+			.iter()
+			.any(|r| r.capability == "event" && r.event.as_deref() == Some("session_start")),
+		"event registration frames are unchanged in jiti mode: {registrations:?}"
+	);
+
+	// Same call/return protocol as the strip-loaded fixtures, with enum
+	// member values that only exist after a real TS transform.
+	let result = host
+		.call(
+			"tool.execute",
+			json!({"name": "color", "toolCallId": "t1", "args": {"which": "green"}}),
+			TIMEOUT,
+		)
+		.await
+		.expect("tool execute succeeds on the jiti-loaded module");
+	assert_eq!(result["content"][0]["text"], json!("color=green"));
+	assert_eq!(result["details"]["color"], json!("green"));
+
+	let outcomes = host
+		.dispatch_event("session_start", json!({}), TIMEOUT)
+		.await
+		.expect("event dispatch succeeds on the jiti-loaded module");
+	assert_eq!(outcomes.len(), 1);
+	assert!(outcomes[0].is_null());
+	let actions = host.actions().await;
+	assert!(
+		actions
+			.iter()
+			.any(|a| a.method == "session.appendEntry" && a.params["data"]["red"] == json!("red")),
+		"appendEntry action carries the enum value: {actions:?}"
+	);
+
+	host.shutdown().await;
+	let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_erasable_ts_extension_without_jiti_reports_a_readable_strip_error() {
+	match ExtensionHost::spawn(config("non-erasable.ts")).await {
+		Ok(_) => panic!("strip-only loading must refuse a TS enum"),
+		Err(SpawnError { stage, message }) if stage == "runtime" => {
+			eprintln!("skipping PoC test: {message}");
+		}
+		Err(SpawnError { stage, message }) => {
+			assert_eq!(
+				stage, "import",
+				"without jiti the raw strip failure keeps the import stage: {stage} {message}"
+			);
+			assert!(
+				message.to_lowercase().contains("enum"),
+				"error names the unsupported enum syntax: {message}"
+			);
+			assert!(
+				message.contains("jiti"),
+				"exhausted-ladder hint points at installing jiti: {message}"
+			);
+		}
+	}
 }
 
 #[tokio::test(flavor = "multi_thread")]

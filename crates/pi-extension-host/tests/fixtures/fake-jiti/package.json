@@ -1,0 +1,9 @@
+{
+	"name": "jiti",
+	"version": "0.0.0-fake",
+	"description": "Minimal fixture-scoped fake of jiti 2.x's createJiti/import surface for the pi-extension-host tests. Real jiti transforms the full TS grammar with Babel; this fake only rewrites `enum` declarations and delegates the rest to Node's native strip-types loader.",
+	"main": "./index.cjs",
+	"exports": {
+		".": "./index.cjs"
+	}
+}

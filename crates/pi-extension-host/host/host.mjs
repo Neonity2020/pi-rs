@@ -12,11 +12,28 @@
 //                {"type":"call","id":N,"method":...,"params":...} |
 //                {"type":"return","id":M,"ok":bool,"result"|"error"} |
 //                {"type":"shutdown"}
+//
+// Loader protocol (PI_EXT_LOADER, set explicitly by the Rust spawn ladder on
+// every attempt so an inherited value cannot flip the selection):
+//   "" / absent → native Node TS type stripping (strip-only mode: erasable
+//     syntax only, so TS enums / namespaces / parameter properties fail with
+//     e.g. "TypeScript enum is not supported in strip-only mode");
+//   "jiti"      → resolve `jiti` from the extension file's directory upward
+//     (createRequire walks node_modules) and load through it — full TS
+//     transform, mirroring upstream loader.ts loadExtensionModule
+//     (jiti-loader.ts: `export { createJiti } from "jiti"`; loader.ts:579-584:
+//     `createJiti(import.meta.url, {...})` + `jiti.import(path,
+//     { default: true })`). The shims are passed to jiti as aliases. When jiti
+//     does not resolve, fall back to the native strip load so the raw error
+//     surfaces unchanged. jiti only changes how the module is loaded: every
+//     frame below (register/ready/error/return/call/action/event/shutdown)
+//     is identical in both modes, and load failures report stage "jiti"
+//     instead of "import".
 import process from "node:process";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { register } from "node:module";
+import { register, createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import readline from "node:readline";
 import { execFile } from "node:child_process";
@@ -228,19 +245,72 @@ function makeCtx(extra) {
 }
 
 // --- load + factory ---------------------------------------------------------
-let loaded;
-try {
-	loaded = await import(pathToFileURL(extensionPath).href);
-} catch (error) {
-	frame({ type: "error", stage: "import", message: String(error?.message ?? error) });
+// Resolve "jiti" from the extension file's directory upward. Returns the
+// createJiti factory (CJS named export, ESM namespace via require(esm), or an
+// interop default) or null when the package is not installed next to the
+// extension.
+function resolveJiti() {
+	try {
+		const require = createRequire(pathToFileURL(extensionPath).href);
+		const jitiModule = require("jiti");
+		const createJiti = jitiModule?.createJiti ?? jitiModule?.default?.createJiti ?? jitiModule?.default;
+		return typeof createJiti === "function" ? createJiti : null;
+	} catch {
+		return null;
+	}
+}
+
+// Same bare-specifier → shim mapping the native loader resolves through
+// hooks.mjs; jiti runs its own resolution pipeline, so it needs the shims as
+// alias targets instead.
+function jitiAliases() {
+	const map = JSON.parse(process.env.PI_EXT_SHIM_MAP ?? "{}");
+	return Object.fromEntries(
+		Object.entries(map).map(([specifier, file]) => [specifier, `${process.env.PI_EXT_SHIM_DIR}/${file}`]),
+	);
+}
+
+async function loadExtensionModule() {
+	if (process.env.PI_EXT_LOADER === "jiti") {
+		const createJiti = resolveJiti();
+		if (createJiti) {
+			try {
+				// Upstream loader.ts:579-584 — createJiti(parent, { moduleCache:
+				// false, ... }) then jiti.import(path, { default: true }) which is
+				// `mod?.default ?? mod`. moduleCache stays false so reloads see
+				// fresh files, like upstream.
+				const jiti = createJiti(import.meta.url, { alias: jitiAliases(), moduleCache: false });
+				const factory = await jiti.import(extensionPath, { default: true });
+				return { factory };
+			} catch (error) {
+				return {
+					errorStage: "jiti",
+					errorMessage: `jiti loader failed: ${String(error?.message ?? error)}`,
+				};
+			}
+		}
+		// jiti requested but not resolvable from the extension directory: keep
+		// the native strip load below so the raw error surfaces unchanged.
+	}
+	try {
+		const loaded = await import(pathToFileURL(extensionPath).href);
+		return { factory: loaded?.default };
+	} catch (error) {
+		return { errorStage: "import", errorMessage: String(error?.message ?? error) };
+	}
+}
+
+const outcome = await loadExtensionModule();
+if (outcome.errorStage) {
+	frame({ type: "error", stage: outcome.errorStage, message: outcome.errorMessage });
 	process.exit(1);
 }
-if (typeof loaded.default !== "function") {
+if (typeof outcome.factory !== "function") {
 	frame({ type: "error", stage: "factory", message: "extension has no default factory function" });
 	process.exit(1);
 }
 try {
-	await loaded.default(pi);
+	await outcome.factory(pi);
 } catch (error) {
 	frame({ type: "error", stage: "factory", message: String(error?.message ?? error) });
 	process.exit(1);
