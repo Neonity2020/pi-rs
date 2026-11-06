@@ -53,7 +53,7 @@ cargo build --release
 
 启动时可用 `-n <名称>` 命名会话；`-r` 或无值 `--resume` 打开会话选择器（行式列表：mtime 降序，编号选择、文本过滤、空输入取消 exit 0；RPC 模式不可用）；带值 `--resume <ID或路径>` 或 `--session <ID或路径>` 直接恢复；`--session-id <id>` 指定会话 id；`--fork <id|路径>` 从既有会话分支。按 id/前缀解析到其他项目的会话时会提示 `Fork this session into current directory?`——确认则分支到当前项目，拒绝则退出；直接路径恢复保持会话原项目的设置与工作目录，原目录不存在时启动失败。
 
-`pi-rs auth check [--provider <p>] [--model <m>] [--json] [--credentials]` 校验 provider 凭证可解析（models.json 的 `$ENV`/`!cmd` 形态；无 OAuth，故恒为 api_key 型，`--no-refresh` 解析但无效），`auth print-api-key` 打印凭证，`auth print-bearer-token` 因无 OAuth 恒报错（文案对照上游）。
+`pi-rs auth check [--provider <p>] [--model <m>] [--json] [--credentials] [--no-refresh]` 校验 provider 凭证可解析——auth.json 存储凭证优先（OAuth 凭证默认在 5 分钟窗口内自动刷新，`--no-refresh` 禁网），其次 models.json 的 `$ENV`/`!cmd` 形态与适配器环境变量；`auth print-api-key` 打印 API key（OAuth provider 报上游文案错误），`auth print-bearer-token [--min-expiry <duration>]` 打印 OAuth access token（要求刷新后剩余有效期 ≥ min-expiry，默认 30m）。OAuth 登录：TUI `/login`（provider 选择器 → 浏览器/device-code/copy-code 流，凭据落 `~/.pi-rs/agent/auth.json`）、`/logout` 移除。
 
 浅色终端可使用 `cargo run -p pi-coding-agent -- --light`，或在 settings.json 中设置 `"theme": "light"`。如果终端设置了 `COLORFGBG`，程序也会按它声明的背景颜色选择默认主题；显式主题设置优先。
 
@@ -97,7 +97,7 @@ mock provider 行为：普通消息回显（演示流式渲染）；包含 "list
 | `pi-tui` | `packages/tui` | **核心可用** | ratatui + crossterm 上的组件体系：`Component` trait、多行 emacs 风格 `Editor`（词导航/kill/`\` 续行）、`ScrollView`、pulldown-cmark `Markdown`（对照 markdown.ts）、fuzzy 匹配 + `SelectList`、`Theme`（含 md 配色）、终端生命周期 |
 | `pi-codemode` | `packages/codemode` | 占位 | 沙箱脚本执行，仅能调用注入的工具 |
 | `pi-mcp` | `packages/mcp` | 骨架 | MCP 客户端：JSON-RPC 协议类型、transport trait（stdio、streamable-http 和 in-memory 实现）、client |
-| `pi-ai` | `packages/ai` | **部分（10 个 provider API 已实现，wire 层对齐）** | 归一化消息模型、`AssistantMessageEvent` 流协议、provider 适配器注册（anthropic-messages、openai-completions/responses、azure-openai-responses、google-generative-ai/vertex、mistral-conversations、bedrock-converse-stream、pi-messages、mock）；模型目录/OAuth 认证未实现 |
+| `pi-ai` | `packages/ai` | **部分（10 个 provider API 已实现，wire 层对齐）** | 归一化消息模型、`AssistantMessageEvent` 流协议、provider 适配器注册（anthropic-messages、openai-completions/responses、azure-openai-responses、google-generative-ai/vertex、mistral-conversations、bedrock-converse-stream、pi-messages、mock）；auth 模块（auth.json 存储锁写、PKCE/回调服务器/device-code 基础件、8 个 OAuth 流：anthropic/openai-chatgpt/openai-codex/github-copilot/openrouter/kimi-coding/xai/meta，radius 未移植）；模型目录生成物 hydration 未实现 |
 | `pi-durable` | `packages/durable` | 占位 | 持久会话 / 任务 / 文档运行时 |
 | `pi-env` | `packages/env` | **本地实现** | `EnvConnection` 抽象（exec/read/write/list/watch），本地实现完整，SSH 远程为桩 |
 | `pi-agent` | `packages/agent` | **核心可用** | `AgentTool` 契约、`AgentEvent`、steering/follow-up 队列、agent loop（`run_agent_loop`，对应 `agent-loop.ts`）、`Agent`；钩子全接线、并行工具执行、content 工具检测 |
@@ -128,7 +128,7 @@ JSON 兼容性：消息、模型、session 文件全部按 pi 的 camelCase wire
 
 已完成：anthropic-messages/openai-completions 增量流式、agent loop 完整化（并行工具、钩子、工具检测）、会话压缩全链路（阈值/split-turn/mid-run/溢出恢复）、MCP stdio+streamable HTTP 接入、TUI 主题/键位、工具集选择与消息 wire 对齐（差分四场景与上游快照逐字节一致）。
 
-剩余：1. **providers** — wire 层已全部完成（10 个 API；compat 门控路径推迟）；模型目录/认证（auth.json/OAuth——auth 子命令已落地 api_key 面）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models` 已完成；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — 外部进程桥已接入（-e/-ne、目录发现+信任门、工具/命令/事件面）；剩余：TUI 对话框路由（ui.select/confirm/input）、jiti 兜底非可擦除 TS、包管理（install/remove/update/list/config）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
+剩余：1. **providers** — wire 层与认证已全部完成（10 个 API + auth.json/OAuth 8 流 + `/login`/`/logout`；模型目录生成物 hydration、compat 门控路径推迟）。2. **RPC/SDK** — SDK 导出面。3. **MCP** — OAuth、`/mcp` UI。4. **TUI** — 语法高亮、剪贴板图片粘贴（会话选择器、外部编辑器 ctrl+g、设置选择器 `/settings` 与 `/scoped-models` 已完成；`@file` 图片附件已完成——魔数嗅探/EXIF 方向/限额重缩）。5. **扩展系统** — 外部进程桥已接入（-e/-ne、目录发现+信任门、工具/命令/事件面）；剩余：TUI 对话框路由（ui.select/confirm/input）、jiti 兜底非可擦除 TS、包管理（install/remove/update/list/config）、codemode 沙箱、tool-search。6. **SSH 远程环境**。
 7. **rpc 模式** — 命令分发接 `SessionCommand`（协议帧已就位）。
 8. **外围** — pi-durable（replay 策略）、pi-env SSH、pi-chord 多机。
 

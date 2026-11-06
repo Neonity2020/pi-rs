@@ -907,7 +907,7 @@ async fn main() -> anyhow::Result<()> {
 		// `requires = "model"`). dotenvy has run, so `!command` credentials
 		// see the loaded env.
 		if argv.get(1).map(String::as_str) == Some("auth") {
-			let code = cli_auth::run_auth_command(&argv[1..]);
+			let code = cli_auth::run_auth_command(&argv[1..]).await;
 			std::process::exit(code);
 		}
 		Cli::parse_from(rewrite_combined_short_args(argv))

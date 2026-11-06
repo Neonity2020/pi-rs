@@ -157,6 +157,9 @@ pub struct StreamOptions {
 	pub signal: CancellationToken,
 	/// Optional session identifier for cache-aware providers.
 	pub session_id: Option<String>,
+	/// Resolved request headers from auth (`ModelAuth.headers`) — merged into
+	/// the outgoing request after the adapter's own headers. Empty by default.
+	pub auth_headers: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for StreamOptions {
@@ -168,6 +171,7 @@ impl Default for StreamOptions {
 			reasoning: None,
 			signal: CancellationToken::new(),
 			session_id: None,
+			auth_headers: Default::default(),
 		}
 	}
 }

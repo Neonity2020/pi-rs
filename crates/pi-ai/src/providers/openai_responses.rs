@@ -366,6 +366,11 @@ async fn open_response(
 			.header("session_id", session_id)
 			.header("x-client-request-id", session_id);
 	}
+	// Resolved auth headers (`ModelAuth.headers`) merge after the adapter's
+	// own headers, like upstream `mergeHeaders(..., optionsHeaders)`.
+	for (name, value) in &options.auth_headers {
+		request = request.header(name.as_str(), value.as_str());
+	}
 	let response = request
 		.json(&request_body(&body_model, context, options))
 		.send()

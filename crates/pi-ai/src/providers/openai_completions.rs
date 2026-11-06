@@ -227,9 +227,15 @@ async fn open_response(
 	} else {
 		model.base_url.trim_end_matches('/')
 	};
-	let response = reqwest::Client::new()
+	let mut request = reqwest::Client::new()
 		.post(format!("{base}/chat/completions"))
-		.bearer_auth(key)
+		.bearer_auth(key);
+	// Resolved auth headers (`ModelAuth.headers`) merge after the adapter's
+	// own headers, like upstream `mergeHeaders(..., optionsHeaders)`.
+	for (name, value) in &options.auth_headers {
+		request = request.header(name.as_str(), value.as_str());
+	}
+	let response = request
 		.json(&request_body(model, context, options))
 		.send()
 		.await

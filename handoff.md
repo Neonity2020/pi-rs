@@ -391,3 +391,31 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **事件映射**（mapCodexEvents）：`error`→Err("Codex error: {message||code||event}"，message/code 取顶层或嵌套 error)；`response.failed`→Err(response.error.message||"Codex response failed")；`response.done/completed/incomplete`→重写 type 为 response.completed（end_turn 布尔写入 session、status 不在六值集则剔除）后交共享 ResponsesSession 处理；其余原样。尾部检查复用 finish()（终态事件必须到达、工具调用必须闭合）。
 - **声明推迟**：WebSocket 传输及会话/continuation 缓存（走上游的 SSE 回退路径）、zstd 请求压缩（后端也收明文 JSON）、重试循环（上游 DEFAULT_MAX_RETRIES=0）、maxRetries/timeoutMs、grammar 工具、service tier 定价、onPayload/onResponse、identity 头（仅 originator）。
 677 项测试全绿（+10：请求体固定面/系统映射/推理档位/缓存键钳制/URL 三分支/JWT 提取+两种坏 token/error 映射两种/response.failed/response.done 重写+end_turn/未知 status 剔除/mock HTTP 全链路——断言请求行、account/originator/beta 头、SSE 全程到 Done+usage+end_turn），fmt/clippy 严格干净。**坑：①normalize_context(None,..) 会丢弃传入 messages 里已有的 system 消息（只折叠 system_prompt 参数）——构造 TranscriptContext 直传即可；②reqwest/http crate 把请求头名规范成小写，mock 服务器断言要写 `openai-beta` 而非 `OpenAI-Beta`（HTTP 头名大小写不敏感，行为等价）。** 差分回归：六场景 6/6 IDENTICAL（f9daca34）。
+
+## 第三十八轮：OAuth 凭证系统与 8 个登录流（2026-11-06）
+
+基线 `dc06beb`。上游 `packages/ai/src/auth` 完整移植 + coding-agent `auth.json` 存储/CLI `auth` 对齐。
+- **核心模块 `crates/pi-ai/src/auth/`**：
+  - `types.rs`：`Credential`（`api_key`/`oauth`）、`OAuthCredential`、`ModelAuth`、`AuthInteraction`、`OAuthFlow` trait。
+  - `store.rs`：`AuthStorage`（`~/.pi-rs/agent/auth.json`），`0600` 权限，`mkdir` 锁原子写入防止多进程双重刷新。
+  - `pkce.rs`：纯 Rust 实现 S256 PKCE challenge 生成。
+  - `callback.rs`：OAuth 回调本地域名服务器（动态端口/固定端口 fallback、HTML 成功/失败页面生成、请求超时控制）。
+  - `device.rs`：RFC 8628 设备码轮询器，支持 `slow_down` 退避。
+  - `resolve.rs`：过期 OAuth 凭证自动在锁保护下并发安全刷新（5 分钟过期窗口）。
+- **8 个 OAuth 流移植 (`crates/pi-ai/src/auth/oauth/`)**：
+  - `anthropic.rs`：Claude Pro/Max（支持浏览器回调与 `copy_code` 无头模式）。
+  - `openai_chatgpt.rs`：OpenAI ChatGPT Plus/Pro 浏览器授权流。
+  - `openai_codex.rs`：OpenAI Codex 设备码与浏览器双流，自动解析 JWT `chatgpt_account_id`。
+  - `github_copilot.rs`：GitHub 设备流认证、Copilot Token 交换（企业/个人端点自动选择）。
+  - `openrouter.rs`：OpenRouter PKCE 授权码流。
+  - `kimi_coding.rs`：Kimi Coding 设备码认证流。
+  - `xai.rs`：xAI 授权码流。
+  - `meta.rs`：Meta 授权码流。
+- **coding-agent 接线**：
+  - `core/auth_storage.rs`：`AuthContext` 提供凭证读写与同步/异步解析。
+  - `core/model_registry.rs`：`authed_stream_fn` 接入凭证优先策略（auth.json 覆盖 models.json/env）。
+  - `stream.rs`：`StreamOptions` 支持 `auth_headers` 透传。
+  - 适配器接线：Anthropic 适配器支持 `sk-ant-oat*` OAuth token 转换为 Bearer 认证并注入 `claude-cli` user-agent。
+  - `cli_auth.rs`：CLI `auth check` / `auth print-api-key` / `auth print-bearer-token` 全面对接 OAuth 状态，支持 `--no-refresh` 与 `--min-expiry`。
+全工作区测试 933 项全绿（+65 测试），fmt/clippy 干净。
+

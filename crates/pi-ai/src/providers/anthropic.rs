@@ -256,11 +256,29 @@ async fn open_response(
 	} else {
 		model.base_url.trim_end_matches('/')
 	};
-	let response = reqwest::Client::new()
+	// Upstream `isOAuthToken` (anthropic-messages.ts:1005): Claude Pro/Max
+	// OAuth access tokens (`sk-ant-oat…`) ride the SDK's authToken slot —
+	// Bearer auth with the Claude Code identity headers instead of x-api-key.
+	let is_oauth = key.contains("sk-ant-oat");
+	let mut request = reqwest::Client::new()
 		.post(format!("{base}/v1/messages"))
-		.header("accept", "application/json")
-		.header("x-api-key", key)
-		.header("anthropic-version", ANTHROPIC_VERSION)
+		.header("accept", "application/json");
+	if is_oauth {
+		request = request
+			.header("Authorization", format!("Bearer {key}"))
+			.header("anthropic-dangerous-direct-browser-access", "true")
+			.header("user-agent", "claude-cli/2.1.280")
+			.header("x-app", "cli");
+	} else {
+		request = request.header("x-api-key", key);
+	}
+	request = request.header("anthropic-version", ANTHROPIC_VERSION);
+	// Resolved auth headers (`ModelAuth.headers`) merge after the adapter's
+	// own headers, like upstream `mergeHeaders(..., optionsHeaders)`.
+	for (name, value) in &options.auth_headers {
+		request = request.header(name.as_str(), value.as_str());
+	}
+	let response = request
 		.json(&request_body(model, context, options))
 		.send()
 		.await

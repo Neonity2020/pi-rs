@@ -29,7 +29,7 @@
 | `@file` 参数注入首条 prompt | args.ts:247-248；src/cli/file-processor.ts | `process_file_arguments`（文本分支；缺失 exit 1；RPC 模式拒绝） | 已验证(部分) | 图片附件走上游失败文本形态（第八轮） |
 | 管道 stdin 内容前置到 prompt | main.ts:80-97,897-907 | `buildInitialMessage` 移植（stdin→@file→prompt 单消息拼接） | 已验证(部分) | |
 | 模式解析规则（stdout 非 TTY 也进 print） | main.ts:112-123 | main.rs `resolve_app_mode` | 已验证 | |
-| 子命令 install/remove/update/list/config/auth/mcp | docs/cli.md:8-16,250-333 | `pi-rs auth check\|print-api-key\|print-bearer-token`（cli_auth.rs，clap 前拦截 argv；exit 码矩阵与 help/usage 文案逐字对照 auth-command.ts） | 已验证(部分) | 无 OAuth/auth.json：check 恒 api_key 型、`--no-refresh`/`--min-expiry` 解析但无效、print-bearer-token 恒失败（上游自身文案）；install/remove/update/list/config 依赖扩展/包系统（P3） |
+| 子命令 install/remove/update/list/config/auth/mcp | docs/cli.md:8-16,250-333 | `pi-rs auth check\|print-api-key\|print-bearer-token`（cli_auth.rs，clap 前拦截 argv；exit 码矩阵与 help/usage 文案逐字对照 auth-command.ts） | 已验证(部分) | ambient 解析链为 pi-rs 层（models.json apiKey + 适配器环境变量，上游为 provider 自带 env 链/ADC/IAM）；`--model` 扫描含 models.json 可解析 provider（上游仅扫描 auth.json 存储）；radius/llama.cpp 流未移植；install/remove/update/list/config 依赖扩展/包系统（P3） |
 
 **CLI 覆盖度**：上游 ~44 项 vs Rust 已验证/部分 19 项（≈43%，2026-10-31 第十轮后；完全一致项见各行状态）。
 
@@ -43,7 +43,7 @@
 | print 输出最后一条 assistant | print-mode.ts:139-159 | print.rs:28-41 输出**每条** | 部分 |
 | 信号 SIGTERM/SIGHUP → 143/129 | print-mode.ts:50-66；rpc-mode.ts:359-375 | 无信号处理（rpc.rs:49-50 自认） | 未实现 |
 | 诊断错误 → 1 | main.ts:624-631 | anyhow→1；clap 参数错→2 | 接受差异 |
-| auth check 0/1/2 | main.ts:202,206 | cli_auth.rs（ready=0/not_ready=1/AuthCommandError=2，--json/--credentials；真实子进程测试 auth_cli.rs 2026-11-03） | 已验证(部分) | 无 OAuth：authType 恒 api_key |
+| auth check 0/1/2 | main.ts:202,206 | cli_auth.rs（ready=0/not_ready=1/AuthCommandError=2，--json/--credentials；--no-refresh 禁网，过期 OAuth 报 invalid/invalid_state；真实子进程测试 auth_cli.rs 2026-11-03） | 已验证(部分) | OAuth 分支待补子进程测试 |
 | 会话选择取消 → 0 | main.ts:423-425 | "No session selected" exit 0（resume_selector_cli.rs 2026-11-03） | 已验证 | |
 | RPC stdin EOF → 0 | rpc-mode.ts:713-727 | rpc.rs:574-589（abort+settle+落盘） | 已验证 |
 

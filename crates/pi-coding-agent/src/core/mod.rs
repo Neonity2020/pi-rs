@@ -2,6 +2,7 @@
 //! port of `pi/packages/coding-agent/src/core/*`.
 
 pub mod agent_session;
+pub mod auth_storage;
 pub mod changelog;
 pub mod clipboard;
 pub mod compaction;

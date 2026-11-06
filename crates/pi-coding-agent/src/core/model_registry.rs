@@ -23,9 +23,12 @@
 //! read when `providers` is a JSON array, with the old defaults
 //! (`maxTokens` 8192, no key resolution). Detection is by JSON shape.
 //!
+//! Request auth resolves through [`authed_stream_fn`]: auth.json stored
+//! credentials first ([`core::auth_storage`], OAuth flows included), then
+//! models.json `apiKey`, then the adapter env fallback.
+//!
 //! Not ported (P2+): the generated catalog hydration from pi's official
-//! models.json, virtual models, OAuth providers, and the auth-status
-//! composer.
+//! models.json, virtual models, and the auth-status composer.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -34,7 +37,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::Value;
 
-use pi_ai::{Api, Model, ModelCost, StreamFn, ThinkingLevel};
+use futures::StreamExt;
+use pi_ai::{Api, Model, ModelCost, StreamFn, ThinkingLevel, TranscriptContext};
 
 use crate::config;
 
@@ -445,20 +449,100 @@ fn split_thinking_suffix(pattern: &str) -> (&str, Option<ThinkingLevel>) {
 	}
 }
 
-/// Stream fn that dispatches to the provider adapter with the models.json
-/// `apiKey` injected (`agent-loop.ts` leaves `StreamOptions.api_key` empty and
-/// lets the request build resolve provider auth). An explicit
-/// `options.api_key` wins; a provider without a resolvable key falls through
-/// to the adapter's env-var fallback.
+/// Stream fn that dispatches to the provider adapter with request auth
+/// resolved (`agent-loop.ts` leaves `StreamOptions.api_key` empty and lets
+/// the request build resolve provider auth). Resolution order — upstream
+/// resolve.ts "a stored credential owns the provider":
+/// 1. auth.json stored credential (api-key value resolved through
+///    `resolve_config_value`; OAuth tokens via the provider flow, refreshing
+///    under the store lock when <5 min remain — the only async branch),
+/// 2. models.json `apiKey` (literal/`$ENV`/`!cmd`),
+/// 3. the adapter's env-var fallback.
+///
+/// Resolved `headers`/`baseUrl` merge into the request/options; an explicit
+/// `options.api_key` still wins over every layer.
 pub fn authed_stream_fn(registry: Arc<Mutex<ModelRegistry>>) -> StreamFn {
 	Arc::new(move |model, context, mut options| {
-		if options.api_key.is_none()
-			&& let Some(key) = registry.lock().unwrap().resolve_api_key(&model.provider)
-		{
-			options.api_key = Some(key);
+		let auth = crate::core::auth_storage::AuthContext::shared();
+		match auth.try_resolve_sync(&model.provider) {
+			Ok(Some((resolved, _source))) => {
+				let mut owned = model.clone();
+				apply_model_auth(&mut options, &mut owned, resolved);
+				return pi_ai::providers::stream_fn_for(&owned)(&owned, context, options);
+			}
+			Ok(None) => {}
+			// Expiring OAuth: refresh under the store lock inside the stream.
+			Err(_refresh_required) => {
+				let provider = model.provider.clone();
+				let model = model.clone();
+				let context = context.clone();
+				let registry = Arc::clone(&registry);
+				let inner = futures::stream::once(async move {
+					match auth.resolve_auth(&provider, None).await {
+						Ok(Some((resolved, _source))) => {
+							let mut model = model;
+							apply_model_auth(&mut options, &mut model, resolved);
+							pi_ai::providers::stream_fn_for(&model)(&model, &context, options)
+						}
+						Ok(None) => models_json_fallback(&registry, &model, context, options),
+						Err(error) => auth_error_stream(&model, &error),
+					}
+				})
+				.flatten();
+				return Box::pin(inner);
+			}
 		}
-		pi_ai::providers::stream_fn_for(model)(model, context, options)
+		models_json_fallback(&registry, model, context.clone(), options)
 	})
+}
+
+/// The models.json `apiKey` layer + adapter env fallback (the pre-auth.json
+/// behavior, unchanged).
+fn models_json_fallback(
+	registry: &Arc<Mutex<ModelRegistry>>,
+	model: &Model,
+	context: TranscriptContext,
+	mut options: pi_ai::StreamOptions,
+) -> pi_ai::AssistantMessageEventStream {
+	if options.api_key.is_none()
+		&& let Some(key) = registry.lock().unwrap().resolve_api_key(&model.provider)
+	{
+		options.api_key = Some(key);
+	}
+	pi_ai::providers::stream_fn_for(model)(model, &context, options)
+}
+
+/// Merge resolved request auth into the options/model (upstream
+/// `ModelAuth`): api key, extra headers, per-credential baseUrl override.
+fn apply_model_auth(
+	options: &mut pi_ai::StreamOptions,
+	model: &mut Model,
+	auth: pi_ai::auth::ModelAuth,
+) {
+	if options.api_key.is_none() {
+		options.api_key = auth.api_key;
+	}
+	for (name, value) in auth.headers {
+		options.auth_headers.insert(name, value);
+	}
+	if let Some(base_url) = auth.base_url
+		&& !base_url.is_empty()
+	{
+		model.base_url = base_url;
+	}
+}
+
+/// Single-error event stream for auth failures (same shape as the adapter
+/// unsupported-provider path).
+fn auth_error_stream(model: &Model, error: &str) -> pi_ai::AssistantMessageEventStream {
+	let message =
+		pi_ai::types::AssistantMessage::error(model, pi_ai::StopReason::Error, error.to_string());
+	Box::pin(futures::stream::iter(vec![
+		pi_ai::AssistantMessageEvent::Error {
+			reason: pi_ai::StopReason::Error,
+			error: message,
+		},
+	]))
 }
 
 // -------------------------------------------------------------------------------------------

@@ -9,6 +9,7 @@
 //! The wire JSON is camelCase, matching the TS pi exactly so session files,
 //! model catalogs, and RPC payloads stay interchangeable.
 
+pub mod auth;
 pub mod model;
 pub mod providers;
 pub mod stream;

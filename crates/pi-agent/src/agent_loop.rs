@@ -375,6 +375,7 @@ pub async fn run_agent_loop(
 			reasoning,
 			signal: signal.clone(),
 			session_id: run.session_id.clone(),
+			auth_headers: Default::default(),
 		};
 
 		let context = TranscriptContext {

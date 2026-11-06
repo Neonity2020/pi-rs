@@ -965,3 +965,67 @@ async fn request_wire_format_reaches_v1_messages() {
 	assert!(body.get("tools").is_none());
 	assert!(body.get("thinking").is_none());
 }
+
+#[tokio::test]
+async fn oauth_tokens_ride_bearer_auth_with_claude_identity_headers() {
+	// Upstream `isOAuthToken` (anthropic-messages.ts:1005): `sk-ant-oat…`
+	// access tokens (Claude Pro/Max OAuth) switch the request from x-api-key
+	// to Authorization Bearer plus the Claude Code identity headers.
+	let (base, requests) = serve_capture(sse_response(
+		&[
+			message_start(),
+			event(
+				"message_delta",
+				r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+			),
+			message_stop(),
+		],
+		true,
+	))
+	.await;
+
+	let options = StreamOptions {
+		api_key: Some("sk-ant-oat01-test".to_string()),
+		..Default::default()
+	};
+	let events = collect((pi_ai::providers::anthropic::stream_fn())(
+		&model_at(&base),
+		&context(),
+		options,
+	))
+	.await;
+	assert!(
+		events
+			.iter()
+			.any(|event| matches!(event, AssistantMessageEvent::Done { .. }))
+	);
+
+	let request = String::from_utf8_lossy(&requests.lock().unwrap()[0]).to_lowercase();
+	assert!(
+		request.contains("authorization: bearer sk-ant-oat01-test"),
+		"{request}"
+	);
+	assert!(!request.contains("x-api-key:"), "{request}");
+	assert!(request.contains("user-agent: claude-cli/"));
+	assert!(request.contains("x-app: cli"));
+
+	// Plain API keys keep the x-api-key path (regression guard).
+	let (base, requests) =
+		serve_capture(sse_response(&[message_start(), message_stop()], true)).await;
+	let options = StreamOptions {
+		api_key: Some("sk-ant-api-regular".to_string()),
+		..Default::default()
+	};
+	let _ = collect((pi_ai::providers::anthropic::stream_fn())(
+		&model_at(&base),
+		&context(),
+		options,
+	))
+	.await;
+	let request = String::from_utf8_lossy(&requests.lock().unwrap()[0]).to_lowercase();
+	assert!(
+		request.contains("x-api-key: sk-ant-api-regular"),
+		"{request}"
+	);
+	assert!(!request.contains("authorization:"), "{request}");
+}
