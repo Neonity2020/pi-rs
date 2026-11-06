@@ -27,8 +27,10 @@
 //!   channel, so a dialog resolves while the agent loop is blocked inside a
 //!   hook). Without dialog-capable UI (`ctx.hasUI` false — print/json/rpc)
 //!   they resolve with the upstream no-UI defaults: select/input → null,
-//!   confirm → false. `ui.setStatus`/`ui.setTitle`/`ui.setEditorText` stay
-//!   unbridged (answered null).
+//!   confirm → false. `ui.setEditorText`/`ui.setStatus`/`ui.setTitle` are
+//!   fire-and-forget TUI events on the same bus (status: single slot — the
+//!   host shim drops the upstream `key`; title: OSC-0 terminal window
+//!   title).
 //! - `pi.sendUserMessage`/`pi.sendMessage` inject a prompt through
 //!   `SessionCommand::ExtensionPrompt` — upstream `prompt(text, {source:
 //!   "extension"})` with `expandPromptTemplates` defaulting false; the host
@@ -327,6 +329,25 @@ impl BridgeInner {
 			.and_then(|bus| bus.upgrade())
 		{
 			bus.emit(SessionEvent::Notice(text));
+		}
+	}
+
+	/// Fire-and-forget TUI-only `ui.*` calls (`setEditorText`/`setStatus`/
+	/// `setTitle`): emitted on the session bus only while dialog-capable UI
+	/// is attached — the upstream no-UI context makes them no-ops
+	/// (runner.ts:337-348).
+	fn emit_ui_event(&self, event: SessionEvent) {
+		if !self.has_ui {
+			return;
+		}
+		if let Some(bus) = self
+			.bus
+			.lock()
+			.unwrap()
+			.as_ref()
+			.and_then(|bus| bus.upgrade())
+		{
+			bus.emit(event);
 		}
 	}
 
@@ -732,9 +753,12 @@ impl ExtensionBridge {
 		}
 	}
 
-	/// Install the agent hooks that bridge `tool_call`/`tool_result`/
-	/// `before_agent_start` (re-run on session replacement — the replacement
-	/// builds a fresh agent).
+	/// Install the agent hooks that bridge `tool_call`/`tool_result` (re-run
+	/// on session replacement — the replacement builds a fresh agent).
+	/// `before_agent_start` is deliberately NOT an agent hook here: the
+	/// `prepare_request` hook fires per LLM request, while upstream emits
+	/// once per run (`_prepareRun`, agent-session.ts:1926-1977) — the session
+	/// task dispatches it at run start instead (audit P1-B3).
 	pub fn install_hooks(&self, agent: &pi_agent::Agent) {
 		let bridge = self.clone();
 		let before: pi_agent::BeforeToolCallFn = Arc::new(move |ctx| {
@@ -781,41 +805,27 @@ impl ExtensionBridge {
 			pi_agent::AfterToolCallResult::default()
 		});
 		agent.set_after_tool_call(after);
-
-		let bridge = self.clone();
-		let prepare: pi_agent::PrepareRequestFn = Arc::new(move |ctx| {
-			let bridge = bridge.clone();
-			Box::pin(async move {
-				let prompt = ctx
-					.messages
-					.iter()
-					.rev()
-					.find_map(|message| match message {
-						pi_ai::Message::User(user) => Some(user.content.as_text()),
-						_ => None,
-					})
-					.unwrap_or_default();
-				bridge
-					.dispatch_event_all(
-						"before_agent_start",
-						json!({"type": "before_agent_start", "prompt": prompt}),
-						EXT_EVENT_TIMEOUT,
-					)
-					.await;
-				// Results are ignored: upstream handlers may rewrite the
-				// system prompt or inject a message; the bridge cannot modify
-				// the request (declared limitation).
-				None
-			})
-		});
-		agent.set_prepare_request(prepare);
 	}
 }
 
-/// Aggregate `tool_call` outcomes: any handler blocking wins, with the first
+/// Aggregate `tool_call` outcomes. A handler exception (`{__error}`, host.mjs
+/// `runEvent`) blocks the call with the raw message as the reason — upstream
+/// fail-closed: `emitToolCall` has no try/catch, so the exception propagates
+/// through `prepareToolCall`'s catch into `createErrorToolResult(error.message)`
+/// (agent-loop.ts:780-786), discarding results of handlers that ran before
+/// it. A handler block still wins over later plain outcomes, with the first
 /// non-empty reason (an empty reason keeps pi-agent's upstream default text
 /// "Tool execution was blocked").
 fn aggregate_tool_call_outcomes(outcomes: &[Value]) -> pi_agent::BeforeToolCallResult {
+	for outcome in outcomes {
+		if let Some(error) = outcome.get("__error").and_then(Value::as_str) {
+			return pi_agent::BeforeToolCallResult {
+				block: true,
+				reason: Some(error.to_string()),
+				terminate: false,
+			};
+		}
+	}
 	for outcome in outcomes {
 		if outcome.get("block").and_then(Value::as_bool) == Some(true) {
 			let reason = outcome
@@ -973,8 +983,40 @@ async fn answer_host_call(
 			// message is dropped (production installs the router at spawn).
 			let _ = host.answer(call.id, Value::Null).await;
 		}
-		// ui.setStatus/ui.setTitle/ui.setEditorText and anything else: not
-		// bridged (declared limitation) — acknowledged with null.
+		"ui.setEditorText" => {
+			let text = call
+				.params
+				.get("text")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			inner.emit_ui_event(SessionEvent::ExtensionEditorText(text));
+			let _ = host.answer(call.id, Value::Null).await;
+		}
+		// The host shim drops the upstream `key` argument (host.mjs
+		// `setStatus: (text) => …`), so pi-rs keeps a single status slot;
+		// absent text clears it.
+		"ui.setStatus" => {
+			let text = call
+				.params
+				.get("text")
+				.and_then(Value::as_str)
+				.map(str::to_string);
+			inner.emit_ui_event(SessionEvent::ExtensionStatus(text));
+			let _ = host.answer(call.id, Value::Null).await;
+		}
+		"ui.setTitle" => {
+			let text = call
+				.params
+				.get("text")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			inner.emit_ui_event(SessionEvent::ExtensionTitle(text));
+			let _ = host.answer(call.id, Value::Null).await;
+		}
+		// Anything else: not bridged (declared limitation) — acknowledged
+		// with null.
 		_ => {
 			let _ = host.answer(call.id, Value::Null).await;
 		}
@@ -1617,6 +1659,22 @@ mod tests {
 		// Allows everywhere → no block.
 		let decision = aggregate_tool_call_outcomes(&[serde_json::json!(null)]);
 		assert!(!decision.block);
+
+		// A handler exception blocks the call fail-closed with the raw
+		// message (upstream: the throw becomes createErrorToolResult(message))
+		// and wins over earlier plain block results (the throw discards them).
+		let decision = aggregate_tool_call_outcomes(&[
+			serde_json::json!({"block": true, "reason": "earlier"}),
+			serde_json::json!({"__error": "boom"}),
+		]);
+		assert!(decision.block);
+		assert_eq!(decision.reason.as_deref(), Some("boom"));
+		assert!(!decision.terminate);
+
+		// A lone error outcome blocks too.
+		let decision = aggregate_tool_call_outcomes(&[serde_json::json!({"__error": "exploded"})]);
+		assert!(decision.block);
+		assert_eq!(decision.reason.as_deref(), Some("exploded"));
 	}
 
 	// -- dialog routing (round 42) --------------------------------------------
@@ -1626,6 +1684,94 @@ mod tests {
 	#[test]
 	fn answering_an_unknown_dialog_is_false() {
 		assert!(!ExtensionBridge::empty().answer_dialog(42, Value::Null));
+	}
+
+	// -- ui.* decorations (round 43) ------------------------------------------
+
+	fn decoration_entries() -> Vec<(String, PathBuf)> {
+		let entry = fixture("ui-decorations.ts");
+		vec![(entry.display().to_string(), entry)]
+	}
+
+	/// `ui.setEditorText`/`ui.setStatus`/`ui.setTitle` from a command handler
+	/// surface as fire-and-forget session events; the trailing frames are
+	/// drained after the request completes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn ui_decorations_surface_as_events() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let root = temp_root("ui-decorations");
+		let assembly = spawn_extensions(
+			decoration_entries(),
+			&SpawnOptions {
+				has_ui: true,
+				..spawn_opts(&root)
+			},
+		)
+		.await;
+		let bus = EventBus::new();
+		assembly.bridge.set_bus(bus.clone());
+		let mut events = bus.subscribe();
+
+		assembly
+			.bridge
+			.execute_command("decorate", "")
+			.await
+			.expect("command completes");
+		let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+		let mut editor_text = None;
+		let mut status = None;
+		let mut title = None;
+		while (editor_text.is_none() || status.is_none() || title.is_none())
+			&& tokio::time::Instant::now() < deadline
+		{
+			match tokio::time::timeout_at(deadline, events.recv()).await {
+				Ok(Ok(SessionEvent::ExtensionEditorText(text))) => editor_text = Some(text),
+				Ok(Ok(SessionEvent::ExtensionStatus(text))) => status = text,
+				Ok(Ok(SessionEvent::ExtensionTitle(text))) => title = Some(text),
+				Ok(Ok(_)) => continue,
+				Ok(Err(err)) => panic!("bus error: {err}"),
+				Err(_) => break,
+			}
+		}
+		assert_eq!(editor_text.as_deref(), Some("prefilled text"));
+		assert_eq!(status.as_deref(), Some("watching files"));
+		assert_eq!(title.as_deref(), Some("pi-ext-title"));
+		assembly.bridge.shutdown().await;
+		std::fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// Without dialog-capable UI the decoration calls are no-ops (upstream
+	/// runner.ts:337-348): the command succeeds but no events surface.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn ui_decorations_are_noops_without_ui() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let root = temp_root("ui-decorations-noui");
+		let assembly = spawn_extensions(decoration_entries(), &spawn_opts(&root)).await;
+		let bus = EventBus::new();
+		assembly.bridge.set_bus(bus.clone());
+		let mut events = bus.subscribe();
+
+		assembly
+			.bridge
+			.execute_command("decorate", "")
+			.await
+			.expect("command completes");
+		// Give the (absent) frames a moment; nothing may arrive.
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(200), events.recv())
+				.await
+				.is_err(),
+			"no ui.* events expected without UI"
+		);
+		assembly.bridge.shutdown().await;
+		std::fs::remove_dir_all(&root).unwrap();
 	}
 
 	fn dialog_entries() -> Vec<(String, PathBuf)> {

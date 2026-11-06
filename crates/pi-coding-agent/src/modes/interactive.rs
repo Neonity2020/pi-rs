@@ -567,6 +567,9 @@ pub struct InteractiveMode {
 	// modal over every other overlay; answers go through the bridge registry.
 	extension_dialog: Option<ExtensionDialogState>,
 	pending_extension_dialogs: VecDeque<crate::core::extensions::ExtensionDialogRequest>,
+	// ui.setStatus slot (round 43): the host shim drops the upstream `key`,
+	// so this holds the latest text; `None` hides the footer status line.
+	extension_status: Option<String>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -1073,6 +1076,7 @@ impl InteractiveMode {
 			scoped_overlay: None,
 			extension_dialog: None,
 			pending_extension_dialogs: VecDeque::new(),
+			extension_status: None,
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -3624,6 +3628,22 @@ impl InteractiveMode {
 			// Quiescence marker; the TUI derives busy/idle from agent events.
 			SessionEvent::Settled { .. } => {}
 			SessionEvent::ExtensionDialog(request) => self.open_extension_dialog(request),
+			// ui.setEditorText (upstream interactive-mode.ts:2656): plain
+			// editor buffer replace — no paste handling on this path.
+			SessionEvent::ExtensionEditorText(text) => self.editor.set_text(text),
+			// ui.setStatus (footer.ts:146-151 + 289-299): a single slot here
+			// because the host shim drops the upstream `key`; missing text
+			// clears, empty text keeps an (empty) third footer line — same
+			// as upstream's `size > 0` gate. Footer height grows in draw().
+			SessionEvent::ExtensionStatus(text) => self.extension_status = text,
+			// ui.setTitle (interactive-mode.ts:2653 → terminal.setTitle,
+			// terminal.ts:592-594): OSC-0 terminal window title.
+			SessionEvent::ExtensionTitle(title) => {
+				let _ = crossterm::execute!(
+					std::io::stdout(),
+					crossterm::terminal::SetTitle(title.as_str())
+				);
+			}
 		}
 	}
 
@@ -3956,11 +3976,14 @@ impl InteractiveMode {
 			.editor
 			.preferred_height(area.width.saturating_sub(2))
 			.clamp(1, EDITOR_MAX_ROWS as u16);
+		// Footer grows to three lines while an extension status item is set
+		// (footer.ts:289-299 appends the status line when non-empty).
+		let footer_rows = 2 + u16::from(self.extension_status.is_some());
 		let chunks = Layout::vertical([
 			Constraint::Length(1),
 			Constraint::Min(3),
 			Constraint::Length(editor_rows + 2),
-			Constraint::Length(2),
+			Constraint::Length(footer_rows),
 		])
 		.split(area);
 
@@ -4185,6 +4208,27 @@ impl InteractiveMode {
 			..area
 		};
 		frame.render_widget(Paragraph::new(stats_line), stats_area);
+
+		// Line 3: extension status items (footer.ts:289-299). The host shim
+		// drops the upstream `key`, so this is the single slot's text,
+		// sanitized the same way (newlines/tabs → spaces, collapsed).
+		if let Some(status) = self.extension_status.as_ref() {
+			let status = sanitize_status_text(status);
+			if !status.is_empty() {
+				let status_area = Rect {
+					y: area.y + 2,
+					height: 1,
+					..area
+				};
+				frame.render_widget(
+					Paragraph::new(Line::from(Span::styled(
+						truncate_to_width(&status, width),
+						Style::new().fg(self.theme.muted),
+					))),
+					status_area,
+				);
+			}
+		}
 	}
 
 	/// Model selector overlay (model-selector.ts): bordered panel with a search
@@ -5066,6 +5110,22 @@ fn thinking_label(level: pi_ai::ThinkingLevel) -> String {
 		pi_ai::ThinkingLevel::Xhigh => "xhigh".into(),
 		pi_ai::ThinkingLevel::Max => "max".into(),
 	}
+}
+
+/// footer.ts:14-20 `sanitizeStatusText`: newlines/tabs/carriage returns
+/// become spaces, runs of spaces collapse, edges trim.
+fn sanitize_status_text(text: &str) -> String {
+	let flattened: String = text
+		.chars()
+		.map(|c| {
+			if c == '\n' || c == '\r' || c == '\t' {
+				' '
+			} else {
+				c
+			}
+		})
+		.collect();
+	flattened.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn truncate_to_width(text: &str, max: usize) -> String {

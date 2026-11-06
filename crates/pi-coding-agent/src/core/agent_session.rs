@@ -333,6 +333,16 @@ pub enum SessionEvent {
 	/// channel, so a dialog resolves while the agent loop is blocked
 	/// inside a hook.
 	ExtensionDialog(super::extensions::ExtensionDialogRequest),
+	/// `ui.setEditorText(text)` (round 43): replace the core input editor
+	/// buffer. Fire-and-forget; only emitted with dialog-capable UI.
+	ExtensionEditorText(String),
+	/// `ui.setStatus(text)` (round 43): footer status item. The host shim
+	/// drops the upstream `key`, so this is a single slot; `None` clears
+	/// (upstream footer.ts appends statuses as a third footer line).
+	ExtensionStatus(Option<String>),
+	/// `ui.setTitle(text)` (round 43): OSC-0 terminal window title
+	/// (upstream `terminal.setTitle`).
+	ExtensionTitle(String),
 }
 
 /// Session log plus the persist cursor, shared between the session task and
@@ -1125,6 +1135,7 @@ async fn session_task(
 						} else {
 							overflow_attempted = false;
 							abort_requested = false;
+							dispatch_before_agent_start(&extensions, &text, &images).await;
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move {
 								agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
@@ -1165,6 +1176,7 @@ async fn session_task(
 						} else {
 							overflow_attempted = false;
 							abort_requested = false;
+							dispatch_before_agent_start(&extensions, &text, &images).await;
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move {
 								agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
@@ -1200,6 +1212,7 @@ async fn session_task(
 							&& let Some((text, images)) = pending.pop_front() {
 							overflow_attempted = false;
 							abort_requested = false;
+							dispatch_before_agent_start(&extensions, &text, &images).await;
 							let agent = agent.clone();
 							run = Some(tokio::spawn(async move {
 								agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
@@ -1645,11 +1658,16 @@ async fn session_task(
 					Err(e) => notice(&event_bus, format!("prompt task failed: {e}")),
 				}
 				// Persist the completed turn before selecting a durable cut.
-				let mut guard = log.lock().unwrap();
-				if persist_messages(&agent, &mut guard, &event_bus) {
-					flush_pending_bash(&agent, &mut guard, &event_bus);
+				// Inner scope: the guard binding must end here — the arm's
+				// later `dispatch_before_agent_start` await made rustc's
+				// generator Send analysis keep an arm-scoped MutexGuard live
+				// across it (P1-B3 round).
+				{
+					let mut guard = log.lock().unwrap();
+					if persist_messages(&agent, &mut guard, &event_bus) {
+						flush_pending_bash(&agent, &mut guard, &event_bus);
+					}
 				}
-				drop(guard);
 
 				// Mid-run compaction committed by the hook: the run was cut
 				// short so the transcript swap could happen (pi-agent refuses
@@ -1705,11 +1723,21 @@ async fn session_task(
 				} else if recover && overflow_attempted {
 					notice(&event_bus, "overflow recovery failed after one compact-and-retry attempt".into());
 				}
-				if !recover && auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
+				let threshold_cut = if !recover
+					&& auto_compaction.load(std::sync::atomic::Ordering::Relaxed)
 					&& let Some((tokens, window)) = super::context_usage::compute(&agent)
 					&& tokens > window.saturating_sub(settings.reserve_tokens.unwrap_or(16_384))
-					&& let Some(cut) = auto_compaction_cut(&agent, &mut log.lock().unwrap(), settings.keep_recent_tokens.unwrap_or(20_000))
 				{
+					// Scoped lock: the let-chain below used to hold the std
+					// MutexGuard as a scrutinee temporary, which the generator
+					// Send analysis kept live across the later
+					// `dispatch_before_agent_start` await in this arm.
+					let mut guard = log.lock().unwrap();
+					auto_compaction_cut(&agent, &mut guard, settings.keep_recent_tokens.unwrap_or(20_000))
+				} else {
+					None
+				};
+				if let Some(cut) = threshold_cut {
 					notice(&event_bus, "auto-compaction (threshold)…".into());
 					let agent = agent.clone();
 					compacting = Some(tokio::spawn(async move { compaction::compact_prefix(&agent, Some(cut), None).await }));
@@ -1804,6 +1832,7 @@ async fn session_task(
 				if compacting.is_none() && run.is_none() && !agent.is_streaming() && let Some((text, images)) = pending.pop_front() {
 					overflow_attempted = false;
 					abort_requested = false;
+					dispatch_before_agent_start(&extensions, &text, &images).await;
 					let agent = agent.clone();
 					run = Some(tokio::spawn(async move {
 						agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
@@ -1841,6 +1870,7 @@ async fn session_task(
 				{
 					overflow_attempted = false;
 					abort_requested = false;
+					dispatch_before_agent_start(&extensions, &text, &images).await;
 					let agent = agent.clone();
 					run = Some(tokio::spawn(async move {
 						agent.prompt(PromptInput::Messages(vec![user_message_with_images(&text, &images)])).await
@@ -2019,6 +2049,49 @@ async fn session_task(
 			flush_pending_bash(&agent, &mut guard, &event_bus);
 		}
 	}
+}
+
+/// `before_agent_start` dispatch at run start (upstream `_prepareRun` fires
+/// once per `_startRun` — agent-session.ts:1873-1899, 1926-1977 — not per LLM
+/// request; audit P1-B3). Payload: `{type, messageType, prompt, images?}`;
+/// the `systemPrompt`/`systemPromptOptions` getters are not modeled (declared
+/// gap). Results are ignored: upstream handlers may inject a message or
+/// rewrite the system prompt; the bridge cannot modify the request (declared
+/// limitation).
+async fn dispatch_before_agent_start(
+	extensions: &Option<Arc<super::extensions::ExtensionBridge>>,
+	text: &str,
+	images: &[pi_ai::ImageContent],
+) {
+	let Some(bridge) = extensions else {
+		return;
+	};
+	let mut payload = json!({
+		"type": "before_agent_start",
+		"messageType": "user",
+		"prompt": text,
+	});
+	if !images.is_empty() {
+		payload["images"] = json!(
+			images
+				.iter()
+				.map(|image| {
+					json!({
+						"type": "image",
+						"data": image.data,
+						"mimeType": image.mime_type,
+					})
+				})
+				.collect::<Vec<_>>()
+		);
+	}
+	bridge
+		.dispatch_event_all(
+			"before_agent_start",
+			payload,
+			super::extensions::EXT_EVENT_TIMEOUT,
+		)
+		.await;
 }
 
 /// Apply the one-way `action` frames the extension hosts recorded since the
@@ -3846,6 +3919,90 @@ mod tests {
 			seen.iter().any(|text| text.contains("start:new")),
 			"replacement reason missing: {seen:?}"
 		);
+		assembly.bridge.shutdown().await;
+		drop(handle);
+		std::fs::remove_dir_all(&cwd).unwrap();
+	}
+
+	/// `before_agent_start` fires once per run (upstream `_prepareRun`,
+	/// agent-session.ts:1926-1977 — audit P1-B3): two prompts produce exactly
+	/// two dispatches, each carrying `messageType: "user"` and the prompt.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn before_agent_start_fires_once_per_run() {
+		let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/extensions/before-start.ts");
+		if std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.is_err()
+		{
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let cwd = std::env::temp_dir().join(format!(
+			"pi-rs-ext-bas-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let _ = std::fs::remove_dir_all(&cwd);
+		std::fs::create_dir_all(&cwd).unwrap();
+		let assembly = crate::core::extensions::spawn_extensions(
+			vec![(fixture.display().to_string(), fixture)],
+			&crate::core::extensions::SpawnOptions {
+				cwd: cwd.clone(),
+				has_ui: false,
+				runtime: "node".to_string(),
+			},
+		)
+		.await;
+		assert!(assembly.notices.is_empty(), "{:?}", assembly.notices);
+
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let resources = SessionResources {
+			extensions: Some(assembly.bridge.clone()),
+			..Default::default()
+		};
+		let mut handle = spawn_agent_session_with_options(
+			mock_agent(),
+			SessionManager::in_memory(),
+			registry,
+			CompactionSettings::default(),
+			crate::core::system_prompt::SystemPromptOptions::default(),
+			crate::core::settings_manager::RetrySettings::default(),
+			resources,
+		);
+
+		for prompt in ["first", "second"] {
+			handle
+				.cmd_tx
+				.send(SessionCommand::Prompt {
+					text: prompt.into(),
+					images: Vec::new(),
+				})
+				.unwrap();
+		}
+		// Two runs → exactly two dispatches (the mock provider answers each
+		// run with a single request).
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		let mut seen: Vec<String> = Vec::new();
+		while tokio::time::Instant::now() < deadline
+			&& !seen.iter().any(|text| text.contains("bas:2:"))
+		{
+			match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+				Ok(Ok(SessionEvent::Notice(text))) if text.contains("bas:") => seen.push(text),
+				Ok(Ok(_)) => {}
+				Ok(Err(_)) | Err(_) => break,
+			}
+		}
+		assert!(
+			seen.iter().any(|text| text.contains("bas:1:user:first")),
+			"first dispatch missing: {seen:?}"
+		);
+		assert!(
+			seen.iter().any(|text| text.contains("bas:2:user:second")),
+			"second dispatch missing: {seen:?}"
+		);
+		assert_eq!(seen.len(), 2, "per-run dispatch violated: {seen:?}");
 		assembly.bridge.shutdown().await;
 		drop(handle);
 		std::fs::remove_dir_all(&cwd).unwrap();

@@ -106,9 +106,13 @@ pub fn to_json_event(event: &SessionEvent) -> Option<String> {
 		SessionEvent::Notice(_)
 		| SessionEvent::Persisted { .. }
 		| SessionEvent::SessionReplaced
-		// Dialogs never reach the JSON wire: print mode runs the bridge
-		// with `has_ui: false`, so requests resolve inside the bridge.
-		| SessionEvent::ExtensionDialog(_) => None,
+		// Dialogs and TUI-only ui.* events never reach the JSON wire: print
+		// mode runs the bridge with `has_ui: false`, so requests resolve
+		// inside the bridge.
+		| SessionEvent::ExtensionDialog(_)
+		| SessionEvent::ExtensionEditorText(_)
+		| SessionEvent::ExtensionStatus(_)
+		| SessionEvent::ExtensionTitle(_) => None,
 	}
 }
 

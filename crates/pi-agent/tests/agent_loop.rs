@@ -674,14 +674,23 @@ async fn before_tool_call_block_without_reason_uses_the_default_message() {
 #[tokio::test]
 async fn before_tool_call_terminate_stops_launching_remaining_parallel_calls() {
 	let log = execution_log();
+	// A second turn is scripted deliberately: the batch terminate decision is
+	// upstream `shouldTerminateToolBatch`'s `every` (agent-loop.ts:700-702) —
+	// one terminated call in a mixed batch does NOT end the run.
 	let (agent, _) = scripted_agent(
-		vec![(
-			StopReason::ToolUse,
-			vec![
-				ScriptBlock::ToolCall(tool_call("a1", "alpha")),
-				ScriptBlock::ToolCall(tool_call("b1", "beta")),
-			],
-		)],
+		vec![
+			(
+				StopReason::ToolUse,
+				vec![
+					ScriptBlock::ToolCall(tool_call("a1", "alpha")),
+					ScriptBlock::ToolCall(tool_call("b1", "beta")),
+				],
+			),
+			(
+				StopReason::Stop,
+				vec![ScriptBlock::Text("after batch".into())],
+			),
+		],
 		vec![
 			gated_tool("alpha", &log, None, None),
 			gated_tool("beta", &log, None, None),
@@ -703,7 +712,46 @@ async fn before_tool_call_terminate_stops_launching_remaining_parallel_calls() {
 		"later calls are skipped with an error result, got: {}",
 		texts[1]
 	);
-	// The terminate hint ends the run: no second assistant turn is scripted.
+	// The mixed batch does not terminate (every): the second turn ran.
+	assert_eq!(
+		roles_of(&agent.snapshot()),
+		[
+			"system",
+			"user",
+			"assistant",
+			"toolResult",
+			"toolResult",
+			"assistant"
+		]
+	);
+}
+
+#[tokio::test]
+async fn before_tool_call_terminate_every_result_ends_the_run() {
+	let log = execution_log();
+	// Only one turn is scripted: with every result carrying `terminate`, the
+	// batch terminates and the run ends (upstream `shouldTerminateToolBatch`).
+	let (agent, _) = scripted_agent(
+		vec![(
+			StopReason::ToolUse,
+			vec![
+				ScriptBlock::ToolCall(tool_call("a1", "alpha")),
+				ScriptBlock::ToolCall(tool_call("b1", "beta")),
+			],
+		)],
+		vec![
+			gated_tool("alpha", &log, None, None),
+			gated_tool("beta", &log, None, None),
+		],
+	);
+	agent.set_before_tool_call(Arc::new(|_| BeforeToolCallResult {
+		block: true,
+		reason: Some("halt".into()),
+		terminate: true,
+	}));
+	agent.prompt("run".into()).await.unwrap();
+
+	assert!(log.lock().unwrap().is_empty(), "neither tool may execute");
 	assert_eq!(
 		roles_of(&agent.snapshot()),
 		["system", "user", "assistant", "toolResult", "toolResult"]

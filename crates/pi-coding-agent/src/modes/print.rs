@@ -151,8 +151,12 @@ async fn run_print_to<W: Write>(
 				SessionEvent::Persisted { .. } | SessionEvent::SessionReplaced => {}
 				// Extension dialogs never fire here: print mode spawns the
 				// bridge with `has_ui: false`, so they resolve with the
-				// upstream no-UI defaults inside the bridge.
+				// upstream no-UI defaults inside the bridge. The same holds
+				// for the fire-and-forget TUI-only ui.* events.
 				SessionEvent::ExtensionDialog(_) => {}
+				SessionEvent::ExtensionEditorText(_)
+				| SessionEvent::ExtensionStatus(_)
+				| SessionEvent::ExtensionTitle(_) => {}
 			}
 		}
 	}

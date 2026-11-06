@@ -15,7 +15,8 @@
 //!   terminate batches break before the hook point.
 //! - In parallel mode a `before_tool_call` block carrying `terminate: true`
 //!   stops launching subsequent calls of the batch (they receive error
-//!   results); upstream only stops the preflight on the abort signal.
+//!   results); upstream only stops the preflight on the abort signal. The
+//!   batch terminate decision itself matches upstream (`every`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -816,7 +817,10 @@ async fn execute_tool_calls_sequential(
 	hook_messages: &[Message],
 ) -> ExecutedToolBatch {
 	let mut messages = Vec::new();
-	let mut terminate = false;
+	// Upstream `shouldTerminateToolBatch` (agent-loop.ts:700-702): the batch
+	// terminates only when **every** finalized result carries `terminate`;
+	// an empty batch never terminates.
+	let mut terminate = tool_calls.is_empty();
 	for tool_call in tool_calls {
 		emit_tool_execution_start(run, tool_call);
 
@@ -865,7 +869,7 @@ async fn execute_tool_calls_sequential(
 
 		emit_tool_execution_end(run, &entry);
 		messages.push(append_tool_result(run, &entry));
-		terminate |= entry.result.terminate;
+		terminate &= entry.result.terminate;
 	}
 	ExecutedToolBatch {
 		messages,
@@ -1010,10 +1014,10 @@ async fn execute_tool_calls_parallel(
 		.flatten()
 		.map(|entry| append_tool_result(run, entry))
 		.collect();
-	let terminate = finalized
-		.iter()
-		.flatten()
-		.any(|entry| entry.result.terminate);
+	// Upstream `shouldTerminateToolBatch` (agent-loop.ts:700-702): every
+	// finalized result must carry `terminate`; empty batches never do.
+	let finalized: Vec<_> = finalized.iter().flatten().collect();
+	let terminate = !finalized.is_empty() && finalized.iter().all(|entry| entry.result.terminate);
 	ExecutedToolBatch {
 		messages,
 		terminate,

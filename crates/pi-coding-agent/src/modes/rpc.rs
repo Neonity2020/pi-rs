@@ -424,8 +424,12 @@ impl RpcSession {
 					// Extension dialogs never fire here: RPC spawns the bridge
 					// with `has_ui: false` (upstream forwards dialog requests
 					// over the wire; declared difference), so they resolve
-					// with the no-UI defaults inside the bridge.
+					// with the no-UI defaults inside the bridge. The same
+					// holds for the fire-and-forget TUI-only ui.* events.
 					Ok(SessionEvent::ExtensionDialog(_)) => continue,
+					Ok(SessionEvent::ExtensionEditorText(_) | SessionEvent::ExtensionStatus(_) | SessionEvent::ExtensionTitle(_)) => {
+						continue;
+					}
 					Err(broadcast::error::RecvError::Lagged(count)) => {
 						// Dropped events can include an `agent_end`, whose
 						// queued willRetry decision is now unpairable — drop
