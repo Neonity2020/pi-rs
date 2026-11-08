@@ -520,3 +520,7 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **文档**：审计 §9 表（F1/D2/D7 行更新）+ 新增 §11 修复记录；compatibility 头部第二十轮增量（含两条新声明：D7 子项异常行为、D5 边界语义缺位）。
 
 **交接事项（下一轮候选）**：包管理子命令（上游 `pi install/remove/update/list/config`——npm 包形态的扩展/主题/技能安装；cli.ts 的 `-l` 别名注释指向它）；`/mcp` 管理浮层（showMcpManager：enable/disable/exposure/状态编辑）；D5 turn_end 边界语义轮（custom-entry/context-edit 桥接）；RPC setWidget/editor 转发。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+
+### 第四十六轮补记：poc session_name 竞态修复（2026-11-08）
+
+推送 8c966a3 后 CI 的 pi-extension-host poc `session_name_command_sets_and_reads_the_name` 失败（notified=None）——fixture 的 `ctx.ui.notify(...)` **未 await**（fire-and-forget 同步调用），命令结果帧与 host-call 帧同时就绪时 `tokio::select!` 随机选中命令完成分支即 break，排队中的 notify 未被消费。既有测试竞态（第四十四轮 CI 事故曾以「通道关闭」形态出现过一次），本轮新增的 node host 测试改变了并行时序使其显形。修复：break 后经 `try_next_host_call()` 补排水（wire 顺序保证 host-call 帧先于 return 帧——该函数 doc 注释早已声明此确定性）。本地 5 连跑全绿。

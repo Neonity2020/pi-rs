@@ -162,6 +162,17 @@ async fn session_name_command_sets_and_reads_the_name() {
 			}
 		}
 	}
+	// The fixture issues ui.notify without awaiting it; when select hands the
+	// completed command priority, the queued host-call frame is still pending
+	// (wire order puts the host call before the return frame — see
+	// `try_next_host_call`), so drain it before asserting.
+	if notified.is_none() {
+		if let Some(call) = host.try_next_host_call().await {
+			assert_eq!(call.method, "ui.notify");
+			notified = Some(call.params["message"].clone());
+			host.answer(call.id, Value::Null).await.unwrap();
+		}
+	}
 	assert_eq!(notified, Some(json!("Session: My Session")));
 	host.shutdown().await;
 }
