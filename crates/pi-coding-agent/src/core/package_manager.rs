@@ -1134,9 +1134,7 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
 				.is_some_and(|ext| ext == "ts" || ext == "js")
 		{
 			entries.push(child);
-		} else if is_dir
-			&& let Some(resolved) = resolve_extension_entries(&child)
-		{
+		} else if is_dir && let Some(resolved) = resolve_extension_entries(&child) {
 			entries.extend(resolved);
 		}
 	}
