@@ -382,7 +382,7 @@ async fn acquire_refresh_lock(lock_dir: &Path, key: &str) -> Result<RefreshLockG
 
 /// Configuration of a server's OAuth client — resolved values (upstream
 /// `McpOAuthSettings`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OAuthSettings {
 	/// Pre-registered client id; without one the flow registers a client.
 	pub client_id: Option<String>,
@@ -392,6 +392,9 @@ pub struct OAuthSettings {
 	/// port); else the registered redirect URI is reused, else
 	/// `http://127.0.0.1/callback`.
 	pub redirect_url: Option<String>,
+	/// Fixed callback port without a full redirect URI (a configured
+	/// `callbackPort`); the redirect becomes `http://127.0.0.1:<port>/callback`.
+	pub callback_port: Option<u16>,
 	/// Scopes to request for the deferred interactive sign-in; the refresh
 	/// path takes its scope from the server's challenge. Default: the
 	/// server's advertised scopes.

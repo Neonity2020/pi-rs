@@ -30,6 +30,7 @@ pub mod discovery;
 pub mod errors;
 pub mod flow;
 pub mod provider;
+pub mod sign_in;
 pub mod types;
 
 pub use errors::Error as OAuthError;
@@ -37,6 +38,7 @@ pub use flow::{FlowOptions, FlowResult, authorize};
 pub use provider::{
 	FileStateStore, McpOAuthProvider, MemoryStateStore, OAuthSettings, StoredTokenProvider,
 };
+pub use sign_in::{SignInError, SignInOptions, SignInPrompt, sign_in};
 pub use types::{
 	AuthorizationServerMetadata, Challenge, ClientInformation, ClientMetadataDocument,
 	DiscoveryState, InvalidateKind, OAuthState, OAuthTokens, ProtectedResourceMetadata,

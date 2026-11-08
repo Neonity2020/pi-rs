@@ -130,8 +130,14 @@ pub fn oauth_error_html(message: &str, details: Option<&str>) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallbackOutcome {
 	/// The provider redirected with a code. `complete_with` has already told
-	/// the browser how the exchange went.
-	Code(String),
+	/// the browser how the exchange went. `state`/`iss` are the raw query
+	/// values: provider flows pre-validate `state` in the server, while the
+	/// MCP flow re-checks it itself and consumes `iss` (RFC 9207).
+	Code {
+		code: String,
+		state: Option<String>,
+		iss: Option<String>,
+	},
 	/// The provider redirected with an `error` parameter.
 	ProviderError(String),
 	/// `cancel()` was called before a callback arrived.
@@ -205,18 +211,9 @@ impl OAuthCallbackServer {
 			listener.set_nonblocking(true).ok();
 			let mut settled = false;
 			loop {
-				if thread_state.shutdown.load(Ordering::SeqCst) {
-					return;
-				}
-				if !settled
-					&& let Some(deadline) = deadline
-					&& Instant::now() >= deadline
-				{
-					let _ = events_tx.send(CallbackOutcome::ProviderError(format!(
-						"{provider_name} sign-in timed out"
-					)));
-					settled = true;
-				}
+				// Drain commands before the shutdown check: a completion page
+				// queued right before `close()` must still reach the parked
+				// browser connection.
 				while let Ok(command) = control_rx.try_recv() {
 					match command {
 						ThreadCommand::Page { status, html } => {
@@ -235,6 +232,18 @@ impl OAuthCallbackServer {
 							return;
 						}
 					}
+				}
+				if thread_state.shutdown.load(Ordering::SeqCst) {
+					return;
+				}
+				if !settled
+					&& let Some(deadline) = deadline
+					&& Instant::now() >= deadline
+				{
+					let _ = events_tx.send(CallbackOutcome::ProviderError(format!(
+						"{provider_name} sign-in timed out"
+					)));
+					settled = true;
 				}
 				if let Ok((stream, _addr)) = listener.accept() {
 					match handle_connection(
@@ -420,7 +429,17 @@ fn handle_connection(
 	state.claimed.store(true, Ordering::SeqCst);
 	// Park the socket so the completion page lands on the same connection.
 	*state.parked.lock().unwrap() = Some(stream);
-	let _ = events.send(CallbackOutcome::Code(code.clone()));
+	let _ = events.send(CallbackOutcome::Code {
+		code: code.clone(),
+		state: params
+			.iter()
+			.find(|(k, _)| k == "state")
+			.map(|(_, v)| v.clone()),
+		iss: params
+			.iter()
+			.find(|(k, _)| k == "iss")
+			.map(|(_, v)| v.clone()),
+	});
 	ConnectionResult::Deferred
 }
 
@@ -563,7 +582,14 @@ mod tests {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 			let browser = tokio::spawn(reqwest::get(format!("{redirect}?code=the-code&state=st")));
 			let outcome = wait.await.unwrap();
-			assert_eq!(outcome.0, CallbackOutcome::Code("the-code".to_string()));
+			assert_eq!(
+				outcome.0,
+				CallbackOutcome::Code {
+					code: "the-code".to_string(),
+					state: Some("st".to_string()),
+					iss: None,
+				}
+			);
 			outcome
 				.1
 				.complete_with(true, oauth_success_html("Signed in to Anthropic."));

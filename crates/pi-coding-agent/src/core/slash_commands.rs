@@ -29,6 +29,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandInfo] = &[
 		SlashCommandSource::Builtin,
 	),
 	info("clear", "clear the chat view", SlashCommandSource::Builtin),
+	info(
+		"mcp",
+		"manage MCP servers: /mcp [login|logout|reconnect [server]]",
+		SlashCommandSource::Builtin,
+	),
 	info("new", "start a new session", SlashCommandSource::Builtin),
 	info(
 		"resume",

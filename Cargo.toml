@@ -28,6 +28,7 @@ tokio = { version = "1", features = [
 	"time",
 	"process",
 	"io-util",
+	"io-std",
 	"fs",
 ] }
 tokio-util = "0.7"

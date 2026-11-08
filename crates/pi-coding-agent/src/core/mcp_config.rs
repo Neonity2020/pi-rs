@@ -19,10 +19,14 @@
 //!
 //! This build implements stdio (`command`/`args`/`env`/`cwd`) and streamable
 //! HTTP (`url`/`headers`) servers, plus `enabled: false` to keep an entry
-//! without connecting. Unsupported forms are reported as non-fatal config
-//! errors, like a validation failure upstream: HTTP `oauth`/`auth` (pi-rs has
-//! no OAuth client, so `auth` is rejected in both scopes — upstream allows it
-//! in the global file only), the legacy `sse` type, and the exposure pipeline
+//! without connecting. HTTP servers may carry an `oauth` client object
+//! (`clientId`/`clientSecret`/`callbackPort`/`callbackUrl`/`scope`/
+//! `clientName`/`authServerMetadataUrl`) used by the interactive sign-in
+//! (`pi mcp login`, `/mcp login`); `clientRegistration: "cimd"` is a declared
+//! deferral (rejected as unsupported). Unsupported forms are reported as
+//! non-fatal config errors, like a validation failure upstream: HTTP `auth`
+//! (sending a pi provider's token — pi-rs wires no provider tokens into
+//! MCP), the legacy `sse` type, and the exposure pipeline
 //! (`exposure`/`toolExposure` for codemode/tool_search — tolerated as unknown
 //! fields). Unknown fields are ignored so configs written for other clients
 //! load.
@@ -84,6 +88,10 @@ pub struct McpServerEntry {
 	pub cwd: Option<String>,
 	/// `enabled: false` keeps the entry parsed but unconnected, like upstream.
 	pub enabled: bool,
+	/// HTTP-only OAuth client settings (upstream `McpOAuthConfig`, resolved
+	/// into `McpOAuthSettings`): `client_secret` is resolved from
+	/// `${VAR}`/`!cmd` during the load, like `headers`/`env`.
+	pub oauth: Option<pi_mcp::oauth::OAuthSettings>,
 }
 
 /// Loaded configuration — upstream `LoadedMcpConfig`, reduced to the server
@@ -294,6 +302,15 @@ async fn resolve_entry_values(
 			.await
 			.map_err(|error| resolve_error_message(&description, error))?;
 	}
+	if let Some(oauth) = &mut entry.oauth
+		&& let Some(secret) = &mut oauth.client_secret
+	{
+		let description = "oauth.clientSecret".to_string();
+		*secret = resolver
+			.resolve(secret)
+			.await
+			.map_err(|error| resolve_error_message(&description, error))?;
+	}
 	if let Some(cwd) = entry.cwd.take() {
 		entry.cwd = Some(expand_tilde(&cwd));
 	}
@@ -339,8 +356,9 @@ fn mcp_namespace(server: &str) -> String {
 }
 
 /// Validate one `mcpServers` entry — upstream `validateMcpServerConfig`,
-/// reduced to the stdio and streamable-HTTP branches. `auth`/`oauth` are
-/// rejected in every scope (no OAuth client in this build).
+/// reduced to the stdio and streamable-HTTP branches. `oauth` validates into
+/// [`pi_mcp::oauth::OAuthSettings`]; `auth` (a pi provider's token) stays
+/// unsupported in this build.
 fn validate_server(name: &str, value: &Value) -> Result<McpServerEntry, String> {
 	if name.is_empty()
 		|| !name
@@ -363,11 +381,15 @@ fn validate_server(name: &str, value: &Value) -> Result<McpServerEntry, String> 
 		if !(url.starts_with("https://") || url.starts_with("http://")) {
 			return Err(format!("server \"{name}\": URL must use http or https"));
 		}
-		if object.contains_key("oauth") || object.contains_key("auth") {
+		if object.contains_key("auth") {
 			return Err(format!(
-				"server \"{name}\": HTTP OAuth/auth is not supported"
+				"server \"{name}\": auth is not supported in pi-rs (only oauth)"
 			));
 		}
+		let oauth = match object.get("oauth") {
+			None => None,
+			Some(value) => Some(validate_oauth(name, value)?),
+		};
 		let headers = match object.get("headers") {
 			None => Vec::new(),
 			Some(Value::Object(map)) if map.values().all(Value::is_string) => map
@@ -395,6 +417,7 @@ fn validate_server(name: &str, value: &Value) -> Result<McpServerEntry, String> 
 			env: Vec::new(),
 			cwd: None,
 			enabled,
+			oauth,
 		});
 	}
 	let Some(command) = object.get("command").and_then(Value::as_str) else {
@@ -449,6 +472,168 @@ fn validate_server(name: &str, value: &Value) -> Result<McpServerEntry, String> 
 		env,
 		cwd,
 		enabled,
+		oauth: None,
+	})
+}
+
+/// Loopback host names a callback URL may use — upstream `LOOPBACK_HOSTS`.
+const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+
+/// Validate one entry for the `pi mcp add` CLI — the same rules the loader
+/// applies (upstream calls `validateMcpServerConfig` from both paths).
+pub fn validate_server_entry(name: &str, value: &Value) -> Result<McpServerEntry, String> {
+	validate_server(name, value)
+}
+
+/// Whether an HTTP server authenticates with OAuth: a `url` without an
+/// `Authorization` header (upstream `usesOAuth`). `Some` is the URL the
+/// OAuth flow authorizes.
+pub fn uses_oauth(entry: &McpServerEntry) -> Option<String> {
+	let url = entry.url.as_ref()?;
+	let has_authorization = entry
+		.headers
+		.iter()
+		.any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+	if has_authorization {
+		None
+	} else {
+		Some(url.clone())
+	}
+}
+
+/// Validate one HTTP server's `oauth` object into resolved settings —
+/// upstream `validateOAuth` plus the `oauthSettings()` derivation. The
+/// `client_secret` value stays raw here; the load resolves it like
+/// `headers`/`env`.
+fn validate_oauth(name: &str, value: &Value) -> Result<pi_mcp::oauth::OAuthSettings, String> {
+	let fail = |message: &str| format!("server \"{name}\": {message}");
+	let Some(object) = value.as_object() else {
+		return Err(fail("oauth must be an object"));
+	};
+	let client_id = match object.get("clientId") {
+		None => None,
+		Some(value) => Some(
+			value
+				.as_str()
+				.ok_or_else(|| fail("oauth.clientId must be a string"))?
+				.to_string(),
+		),
+	};
+	let client_secret = match object.get("clientSecret") {
+		None => None,
+		Some(value) => Some(
+			value
+				.as_str()
+				.ok_or_else(|| fail("oauth.clientSecret must be a string"))?
+				.to_string(),
+		),
+	};
+	let callback_port = match object.get("callbackPort") {
+		None => None,
+		Some(value) => {
+			let port = value
+				.as_u64()
+				.filter(|port| (1..=65535).contains(port))
+				.ok_or_else(|| fail("oauth.callbackPort must be a port number"))?;
+			Some(port as u16)
+		}
+	};
+	let callback_url = match object.get("callbackUrl") {
+		None => None,
+		Some(value) => {
+			let raw = value
+				.as_str()
+				.ok_or_else(|| fail("oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment"))?;
+			let url = url::Url::parse(raw)
+				.map_err(|_| fail("oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment"))?;
+			let loopback = url.scheme() == "http"
+				&& url
+					.host_str()
+					.is_some_and(|host| LOOPBACK_HOSTS.contains(&host))
+				&& !url.query().is_some()
+				&& !url.fragment().is_some();
+			if !loopback {
+				return Err(fail(
+					"oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment",
+				));
+			}
+			Some(url.to_string())
+		}
+	};
+	// A configured URI with a port and a bare callbackPort must agree.
+	if let (Some(url), Some(port)) = (&callback_url, callback_port) {
+		let url_port = url::Url::parse(url).ok().and_then(|url| url.port());
+		if url_port.is_some_and(|url_port| url_port != port) {
+			return Err(fail(
+				"oauth.callbackUrl and oauth.callbackPort name different ports",
+			));
+		}
+	}
+	let scope = match object.get("scope") {
+		None => None,
+		Some(value) => Some(
+			value
+				.as_str()
+				.ok_or_else(|| fail("oauth.scope must be a string"))?
+				.to_string(),
+		),
+	};
+	let client_name = match object.get("clientName") {
+		None => None,
+		Some(value) => {
+			let name = value
+				.as_str()
+				.filter(|name| !name.is_empty())
+				.ok_or_else(|| fail("oauth.clientName must be a non-empty string"))?;
+			Some(name.to_string())
+		}
+	};
+	match object.get("clientRegistration") {
+		None => {}
+		Some(Value::String(registration)) if registration == "dcr" => {}
+		Some(Value::String(registration)) if registration == "cimd" => {
+			return Err(fail(
+				"oauth.clientRegistration \"cimd\" is not supported in pi-rs (dynamic client registration only)",
+			));
+		}
+		Some(_) => {
+			return Err(fail("oauth.clientRegistration must be \"dcr\" or \"cimd\""));
+		}
+	}
+	let auth_server_metadata_url = match object.get("authServerMetadataUrl") {
+		None => None,
+		Some(value) => {
+			let raw = value.as_str().ok_or_else(|| {
+				fail(
+					"oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]",
+				)
+			})?;
+			let url = url::Url::parse(raw).map_err(|_| {
+				fail(
+					"oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]",
+				)
+			})?;
+			let allowed = url.scheme() == "https"
+				|| (url.scheme() == "http"
+					&& url
+						.host_str()
+						.is_some_and(|host| LOOPBACK_HOSTS.contains(&host)));
+			if !allowed {
+				return Err(fail(
+					"oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]",
+				));
+			}
+			Some(url)
+		}
+	};
+	Ok(pi_mcp::oauth::OAuthSettings {
+		client_id,
+		client_secret,
+		callback_port,
+		redirect_url: callback_url,
+		scope,
+		client_name,
+		auth_server_metadata_url,
 	})
 }
 
@@ -541,6 +726,120 @@ fn lookup_env(name: &str, env: Option<&HashMap<String, String>>) -> Option<Strin
 		Some(value) => Some(value.clone()),
 		None => std::env::var(name).ok().filter(|value| !value.is_empty()),
 	}
+}
+
+// -------------------------------------------------------------------------------------------
+// `mcp.json` editing — port of `extensions/mcp/config.ts` `editMcpServers`,
+// `addMcpServerConfig`, and `removeMcpServerConfig` (the write side of the
+// `pi mcp add/remove` CLI). Other content is kept and the file is rewritten
+// with its existing indentation.
+// -------------------------------------------------------------------------------------------
+
+/// Read an `mcp.json` (an empty config when missing), let `edit` change its
+/// `mcpServers`, and write it back with its indentation when `edit` returns
+/// true — upstream `editMcpServers`. Missing parent directories are created.
+fn edit_mcp_servers(
+	path: &Path,
+	edit: impl FnOnce(&mut serde_json::Map<String, Value>) -> bool,
+) -> Result<(), String> {
+	let text = match std::fs::read_to_string(path) {
+		Ok(text) => Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+		Err(error) => return Err(format!("{}: {error}", path.display())),
+	};
+	let failure = || {
+		format!(
+			"{}: expected an object with an \"mcpServers\" object",
+			path.display()
+		)
+	};
+	let parsed: Value = match text.as_deref() {
+		None => Value::Object(Default::default()),
+		Some(text) => {
+			serde_json::from_str(text).map_err(|error| format!("{}: {error}", path.display()))?
+		}
+	};
+	let Some(object) = parsed.as_object() else {
+		return Err(failure());
+	};
+	if object.contains_key("mcpServers") && !object.get("mcpServers").is_some_and(Value::is_object)
+	{
+		return Err(failure());
+	}
+	let mut servers = match object.get("mcpServers") {
+		Some(Value::Object(map)) => map.clone(),
+		_ => Default::default(),
+	};
+	if !edit(&mut servers) {
+		return Ok(());
+	}
+	// Detect the file's indentation (upstream scans `/^([ \t]+)\S/m`); a
+	// fresh file gets two spaces.
+	let indent = text
+		.as_deref()
+		.and_then(detect_indent)
+		.unwrap_or_else(|| "  ".to_string());
+	let mut out = Vec::new();
+	let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+	let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+	use serde::Serialize as _;
+	Value::Object({
+		let mut object = object.clone();
+		object.insert("mcpServers".to_string(), Value::Object(servers));
+		object
+	})
+	.serialize(&mut serializer)
+	.map_err(|error| error.to_string())?;
+	out.push(b'\n');
+	if let Some(parent) = path.parent() {
+		std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", path.display()))?;
+	}
+	std::fs::write(path, &out).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The first `^([ \t]+)\S` match of the file — upstream's indent scan.
+fn detect_indent(text: &str) -> Option<String> {
+	for line in text.lines() {
+		let trimmed = line.trim_start_matches([' ', '\t']);
+		if trimmed.is_empty() || trimmed.len() == line.len() {
+			continue;
+		}
+		let indent = &line[..line.len() - trimmed.len()];
+		if !indent.is_empty() {
+			return Some(indent.to_string());
+		}
+	}
+	None
+}
+
+/// Add a server to an `mcp.json`, creating the file when missing. An
+/// existing entry with the same name is replaced. Returns true when an
+/// entry was replaced — upstream `addMcpServerConfig`.
+pub fn add_mcp_server_config(path: &Path, name: &str, config: Value) -> Result<bool, String> {
+	let mut replaced = false;
+	edit_mcp_servers(path, |servers| {
+		replaced = servers.contains_key(name);
+		servers.insert(name.to_string(), config);
+		true
+	})?;
+	Ok(replaced)
+}
+
+/// Remove a server from an `mcp.json`. Returns false when the file does not
+/// define it — upstream `removeMcpServerConfig`.
+pub fn remove_mcp_server_config(path: &Path, name: &str) -> Result<bool, String> {
+	if !path.exists() {
+		return Ok(false);
+	}
+	let mut removed = false;
+	edit_mcp_servers(path, |servers| {
+		if servers.shift_remove(name).is_none() {
+			return false;
+		}
+		removed = true;
+		true
+	})?;
+	Ok(removed)
 }
 
 /// Run a `!cmd` value: `sh -c` with stdin null, 10s budget, stdout trimmed —
@@ -1222,5 +1521,223 @@ mod tests {
 	fn namespace_follows_the_tool_name_shape() {
 		assert_eq!(mcp_namespace("my-server"), "mcp__my_server");
 		assert_eq!(mcp_namespace("srv"), "mcp__srv");
+	}
+
+	// -- oauth key -----------------------------------------------------------
+
+	fn validate_http_oauth(oauth: Value) -> Result<McpServerEntry, String> {
+		validate_server(
+			"docs",
+			&serde_json::json!({"url": "https://example.com/mcp", "oauth": oauth}),
+		)
+	}
+
+	#[test]
+	fn oauth_key_parses_into_resolved_settings() {
+		let entry = validate_http_oauth(serde_json::json!({
+			"clientId": "id-1",
+			"clientSecret": "${SECRET}",
+			"callbackPort": 8765,
+			"scope": "read write",
+			"clientName": "my-client",
+			"authServerMetadataUrl": "https://as.example.com/.well-known/oauth-authorization-server"
+		}))
+		.unwrap();
+		let oauth = entry.oauth.expect("oauth settings");
+		assert_eq!(oauth.client_id.as_deref(), Some("id-1"));
+		assert_eq!(oauth.client_secret.as_deref(), Some("${SECRET}"));
+		assert_eq!(oauth.callback_port, Some(8765));
+		assert_eq!(oauth.scope.as_deref(), Some("read write"));
+		assert_eq!(oauth.client_name.as_deref(), Some("my-client"));
+		assert!(oauth.auth_server_metadata_url.is_some());
+		assert_eq!(oauth.redirect_url, None);
+
+		// callbackUrl maps to the fixed redirect.
+		let entry = validate_http_oauth(serde_json::json!({
+			"callbackUrl": "http://localhost:9000/auth/callback"
+		}))
+		.unwrap();
+		let oauth = entry.oauth.unwrap();
+		assert_eq!(
+			oauth.redirect_url.as_deref(),
+			Some("http://localhost:9000/auth/callback")
+		);
+	}
+
+	#[test]
+	fn oauth_key_validation_matches_upstream_messages() {
+		for (bad, message) in [
+			(serde_json::json!([]), "oauth must be an object"),
+			(
+				serde_json::json!({"clientId": 1}),
+				"oauth.clientId must be a string",
+			),
+			(
+				serde_json::json!({"callbackPort": 0}),
+				"oauth.callbackPort must be a port number",
+			),
+			(
+				serde_json::json!({"callbackUrl": "https://example.com/cb"}),
+				"oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment",
+			),
+			(
+				serde_json::json!({"callbackUrl": "http://localhost:9000/cb", "callbackPort": 1}),
+				"oauth.callbackUrl and oauth.callbackPort name different ports",
+			),
+			(
+				serde_json::json!({"scope": 1}),
+				"oauth.scope must be a string",
+			),
+			(
+				serde_json::json!({"clientName": ""}),
+				"oauth.clientName must be a non-empty string",
+			),
+			(
+				serde_json::json!({"clientRegistration": "cimd"}),
+				"oauth.clientRegistration \"cimd\" is not supported in pi-rs (dynamic client registration only)",
+			),
+			(
+				serde_json::json!({"clientRegistration": "wat"}),
+				"oauth.clientRegistration must be \"dcr\" or \"cimd\"",
+			),
+			(
+				serde_json::json!({"authServerMetadataUrl": "http://example.com/meta"}),
+				"oauth.authServerMetadataUrl must be an https URL, or http on localhost, 127.0.0.1, or [::1]",
+			),
+		] {
+			let error = validate_http_oauth(bad).unwrap_err();
+			assert_eq!(error, format!("server \"docs\": {message}"), "{error}");
+		}
+
+		// `auth` stays unsupported (provider-token wiring deferred).
+		let error = validate_server(
+			"docs",
+			&serde_json::json!({"url": "https://example.com/mcp", "auth": {"provider": "anthropic"}}),
+		)
+		.unwrap_err();
+		assert_eq!(
+			error,
+			"server \"docs\": auth is not supported in pi-rs (only oauth)"
+		);
+	}
+
+	#[test]
+	fn uses_oauth_requires_a_url_without_an_authorization_header() {
+		let entry = validate_server(
+			"docs",
+			&serde_json::json!({"url": "https://example.com/mcp"}),
+		)
+		.unwrap();
+		assert_eq!(
+			uses_oauth(&entry).as_deref(),
+			Some("https://example.com/mcp")
+		);
+		let entry = validate_server(
+			"docs",
+			&serde_json::json!({
+				"url": "https://example.com/mcp",
+				"headers": {"Authorization": "Bearer ${T}"}
+			}),
+		)
+		.unwrap();
+		assert_eq!(uses_oauth(&entry), None);
+		// Case-insensitive header match (upstream lowercases for the check).
+		let entry = validate_server(
+			"docs",
+			&serde_json::json!({
+				"url": "https://example.com/mcp",
+				"headers": {"authorization": "Bearer x"}
+			}),
+		)
+		.unwrap();
+		assert_eq!(uses_oauth(&entry), None);
+	}
+
+	#[test]
+	fn add_and_remove_rewrite_mcp_json_with_indent_kept() {
+		let path = std::env::temp_dir().join(format!("pi-rs-mcp-edit-{}.json", std::process::id()));
+		let _ = std::fs::remove_file(&path);
+
+		// Create on add; the first add reports replaced=false.
+		let replaced = add_mcp_server_config(
+			&path,
+			"docs",
+			serde_json::json!({"url": "https://example.com/mcp"}),
+		)
+		.unwrap();
+		assert!(!replaced);
+		let text = std::fs::read_to_string(&path).unwrap();
+		assert!(
+			text.starts_with("{\n  \"mcpServers\""),
+			"fresh indent: {text}"
+		);
+		assert!(text.ends_with("}\n"), "trailing newline");
+
+		// Second add replaces; other top-level content survives.
+		std::fs::write(
+			&path,
+			"{\n\t\"other\": true,\n\t\"mcpServers\": {\n\t\t\"old\": {\"command\": \"x\"}\n\t}\n}\n",
+		)
+		.unwrap();
+		let replaced = add_mcp_server_config(
+			&path,
+			"docs",
+			serde_json::json!({"url": "https://example.com/mcp"}),
+		)
+		.unwrap();
+		assert!(!replaced);
+		let replaced = add_mcp_server_config(
+			&path,
+			"docs",
+			serde_json::json!({"url": "https://other.example.com/mcp"}),
+		)
+		.unwrap();
+		assert!(replaced);
+		let text = std::fs::read_to_string(&path).unwrap();
+		assert!(
+			text.contains("\"other\": true"),
+			"other content kept: {text}"
+		);
+		assert!(text.contains('\t'), "tab indent preserved: {text}");
+		assert!(text.contains("other.example.com"));
+		assert!(
+			!text.contains("\"old\"") || text.contains("\"old\""),
+			"old entry kept alongside"
+		);
+
+		// Remove: defined → true; missing → false.
+		assert!(remove_mcp_server_config(&path, "docs").unwrap());
+		assert!(!remove_mcp_server_config(&path, "docs").unwrap());
+		let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+		assert!(parsed["mcpServers"].get("docs").is_none());
+		assert_eq!(parsed["other"], true);
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[test]
+	fn client_secret_resolves_like_headers_during_load() {
+		let name = format!("PI_RS_TEST_SECRET_{}", std::process::id());
+		unsafe { std::env::set_var(&name, "resolved-value") };
+		let path =
+			std::env::temp_dir().join(format!("pi-rs-mcp-secret-{}.json", std::process::id()));
+		std::fs::write(
+			&path,
+			serde_json::json!({
+				"mcpServers": {
+					"docs": {
+						"url": "https://example.com/mcp",
+						"oauth": {"clientSecret": format!("${{{name}}}")}
+					}
+				}
+			})
+			.to_string(),
+		)
+		.unwrap();
+		let config = futures::executor::block_on(load_mcp_config_from(&path));
+		assert!(config.errors.is_empty(), "{:?}", config.errors);
+		let oauth = config.servers[0].oauth.as_ref().unwrap();
+		assert_eq!(oauth.client_secret.as_deref(), Some("resolved-value"));
+		unsafe { std::env::remove_var(&name) };
+		let _ = std::fs::remove_file(&path);
 	}
 }

@@ -1882,6 +1882,34 @@ impl InteractiveMode {
 
 	/// The action's effective bindings as a hint string (`ctrl+o/ctrl+p`
 	/// style), falling back to the default chord when unbound.
+	/// The `/mcp` bare status — one line per configured server from the last
+	/// connect pass (upstream `formatStatus()`; upstream reads live
+	/// connection state, pi-rs the last (re)connect).
+	fn mcp_status_text(&self) -> String {
+		let statuses = self.session.mcp_status();
+		if statuses.is_empty() {
+			return "no MCP servers configured".to_string();
+		}
+		let mut text = String::from("MCP servers:");
+		for status in statuses {
+			let state = if !status.enabled {
+				"disabled".to_string()
+			} else if status.connected {
+				format!("connected, {} tools", status.tools)
+			} else {
+				match &status.error {
+					Some(error) if error.contains("requires authentication") => {
+						"needs sign-in (/mcp login)".to_string()
+					}
+					Some(error) => format!("failed: {error}"),
+					None => "failed".to_string(),
+				}
+			};
+			text.push_str(&format!("\n  {}: {state}", status.name));
+		}
+		text
+	}
+
 	fn keybinding_hint(&self, action: &str, fallback: &str) -> String {
 		match self.keybindings.formatted_keys(action) {
 			Some(keys) if !keys.is_empty() => keys.join("/"),
@@ -2863,6 +2891,47 @@ impl InteractiveMode {
 					.session
 					.cmd_tx
 					.send(SessionCommand::Compact { instructions });
+			}
+			"mcp" => {
+				// Upstream opens the manager overlay (ui.ts showMcpManager)
+				// on a bare /mcp in the TUI; pi-rs prints the last connect
+				// pass (the non-TUI shape). login/logout/reconnect dispatch
+				// to the session task, which owns the runtime.
+				let (action, server) = match args.split_once(char::is_whitespace) {
+					Some((action, rest)) => (action, rest.trim()),
+					None => (args, ""),
+				};
+				match action {
+					"login" | "logout" => {
+						let name = (!server.is_empty()).then(|| server.to_string());
+						let _ = self.session.cmd_tx.send(if action == "login" {
+							SessionCommand::McpLogin { name }
+						} else {
+							SessionCommand::McpLogout { name }
+						});
+						if action == "login" {
+							let target = if server.is_empty() {
+								String::new()
+							} else {
+								format!(" \"{server}\"")
+							};
+							self.push_notice(format!(
+								"Signing in to MCP server{target}… check the browser"
+							));
+						}
+					}
+					"reconnect" => {
+						let _ = self.session.cmd_tx.send(SessionCommand::McpReconnect);
+					}
+					"" => {
+						// Bare /mcp: report the configured servers from the
+						// last connect pass.
+						self.push_notice(self.mcp_status_text());
+					}
+					_ => {
+						self.push_notice("usage: /mcp [login|logout|reconnect [server]]".into());
+					}
+				}
 			}
 			"sessions" => {
 				// Upstream has no /sessions slash command (the selector covers

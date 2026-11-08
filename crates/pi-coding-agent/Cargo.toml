@@ -23,6 +23,8 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `oauth.callbackUrl`/`authServerMetadataUrl` validation in mcp_config.rs.
+url = "2"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 ratatui = { workspace = true }

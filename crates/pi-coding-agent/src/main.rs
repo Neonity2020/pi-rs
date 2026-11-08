@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod cli_auth;
+mod cli_mcp;
 mod config;
 mod core;
 mod modes;
@@ -908,6 +909,13 @@ async fn main() -> anyhow::Result<()> {
 		// see the loaded env.
 		if argv.get(1).map(String::as_str) == Some("auth") {
 			let code = cli_auth::run_auth_command(&argv[1..]).await;
+			std::process::exit(code);
+		}
+		// `pi-rs mcp …` also short-circuits before clap parsing (upstream
+		// `runMcpCommand`, main.ts:617); its `--url`/`--env`/`--header`
+		// options are not Cli flags.
+		if argv.get(1).map(String::as_str) == Some("mcp") {
+			let code = cli_mcp::run_mcp_command(&argv[2..]).await;
 			std::process::exit(code);
 		}
 		Cli::parse_from(rewrite_combined_short_args(argv))

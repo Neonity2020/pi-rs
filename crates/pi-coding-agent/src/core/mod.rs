@@ -16,6 +16,7 @@ pub mod image_process;
 pub mod json_event;
 pub mod mcp_config;
 pub mod model_registry;
+pub mod open_browser;
 pub mod prompt_templates;
 pub mod retry;
 pub mod session_export;

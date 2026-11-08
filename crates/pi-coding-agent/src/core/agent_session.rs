@@ -64,6 +64,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 
@@ -229,6 +230,21 @@ pub enum SessionCommand {
 	ExtensionPrompt {
 		text: String,
 	},
+	/// `/mcp login [server]` — sign in to an OAuth MCP server (upstream the
+	/// mcp extension's `loginCommand`). The browser opens; the paste
+	/// fallback is CLI-only (declared). On success the MCP runtime
+	/// reconnects and the tool table refreshes in place.
+	McpLogin {
+		name: Option<String>,
+	},
+	/// `/mcp logout [server]` — delete one server's stored credentials.
+	McpLogout {
+		name: Option<String>,
+	},
+	/// `/mcp reconnect` — reconnect the MCP runtime and refresh the tool
+	/// table (upstream reconnects per server; pi-rs reconnects all —
+	/// declared).
+	McpReconnect,
 	Exit,
 }
 
@@ -420,6 +436,12 @@ pub(crate) struct SessionShared {
 	pub(crate) current_session_file: Arc<std::sync::Mutex<Option<PathBuf>>>,
 	/// The live session display name (latest `session_info`).
 	pub(crate) session_name: Arc<std::sync::Mutex<Option<String>>>,
+	/// The session cwd (header `cwd`, updated on replacement) — the `/mcp`
+	/// commands reload the trust-gated config against it.
+	pub(crate) cwd: std::sync::Mutex<PathBuf>,
+	/// Per-server outcome of the last MCP connect pass (`/mcp` status; the
+	/// TUI reads it without awaiting the runtime lock).
+	pub(crate) mcp_status: std::sync::Mutex<Vec<super::tools::McpServerStatus>>,
 	/// Wire-level events (bash updates, retry lifecycle).
 	pub(crate) wire_events: tokio::sync::broadcast::Sender<WireEvent>,
 	/// The `willRetry` decision per forwarded `agent_end`, in order. The task
@@ -457,6 +479,9 @@ impl SessionShared {
 		*self.current_session_file.lock().unwrap() =
 			session.session_dir().map(|dir| dir.join("session.jsonl"));
 		*self.session_name.lock().unwrap() = session.session_name();
+		if let Some(header) = session.header() {
+			*self.cwd.lock().unwrap() = PathBuf::from(&header.cwd);
+		}
 	}
 
 	fn emit(&self, event: WireEvent) {
@@ -564,8 +589,10 @@ impl SessionHandle {
 		&self,
 		runtime: super::tools::McpRuntime,
 	) -> Arc<tokio::sync::Mutex<super::tools::McpRuntime>> {
+		let statuses = runtime.assembly.statuses.clone();
 		let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
 		*self.shared.mcp.lock().unwrap() = Some(runtime.clone());
+		*self.shared.mcp_status.lock().unwrap() = statuses;
 		runtime
 	}
 
@@ -574,6 +601,11 @@ impl SessionHandle {
 	/// current session's agent (`self.agent` stays the startup agent).
 	pub fn live_agent(&self) -> Agent {
 		self.shared.live_agent.lock().unwrap().clone()
+	}
+
+	/// Per-server outcome of the last MCP connect pass (`/mcp` status).
+	pub fn mcp_status(&self) -> Vec<super::tools::McpServerStatus> {
+		self.shared.mcp_status.lock().unwrap().clone()
 	}
 
 	/// File of the live session (`None` when persistence is disabled).
@@ -644,6 +676,10 @@ pub fn spawn_agent_session_with_options(
 	));
 	let compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+	let cwd = session
+		.header()
+		.map(|header| PathBuf::from(&header.cwd))
+		.unwrap_or_default();
 	let log: SharedLogRef = Arc::new(std::sync::Mutex::new(SharedLog {
 		persisted: agent.snapshot().messages.len(),
 		session,
@@ -664,6 +700,8 @@ pub fn spawn_agent_session_with_options(
 		session_name: Arc::new(std::sync::Mutex::new(
 			log.lock().unwrap().session.session_name(),
 		)),
+		cwd: std::sync::Mutex::new(cwd),
+		mcp_status: std::sync::Mutex::new(Vec::new()),
 		wire_events: wire_tx,
 		agent_end_will_retry: Arc::new(std::sync::Mutex::new(VecDeque::new())),
 		retry: Arc::new(std::sync::Mutex::new(RetryRuntime {
@@ -975,6 +1013,257 @@ impl MidRunHook {
 			self.agent.abort();
 		}
 	}
+}
+
+/// The enabled HTTP servers without an `Authorization` header — upstream
+/// `usesOAuth` over the trust-gated config of the session cwd. `None` when
+/// MCP is disabled (a notice has been emitted).
+async fn mcp_oauth_candidates(
+	shared: &Arc<SessionShared>,
+	notice: &(dyn Fn(String) + Send + Sync),
+) -> Option<Vec<super::mcp_config::McpServerEntry>> {
+	if shared.mcp.lock().unwrap().is_none() {
+		notice("mcp: disabled".to_string());
+		return None;
+	}
+	let cwd = shared.cwd.lock().unwrap().clone();
+	let trusted = super::trust::is_trusted(&cwd);
+	let config = super::mcp_config::load_mcp_config_with(&cwd, trusted).await;
+	Some(
+		config
+			.servers
+			.into_iter()
+			.filter(|entry| entry.enabled && super::mcp_config::uses_oauth(entry).is_some())
+			.collect(),
+	)
+}
+
+/// The session-side sign-in prompt (upstream the TUI `signInWithUi`):
+/// notice with the URL and open the browser. The pasted-redirect fallback is
+/// CLI-only — a declared deviation (upstream asks through `ui.input`).
+struct SessionSignInPrompt {
+	name: String,
+	event_bus: EventBus<SessionEvent>,
+}
+
+#[async_trait::async_trait]
+impl pi_mcp::oauth::SignInPrompt for SessionSignInPrompt {
+	fn show_authorization_url(&self, url: &url::Url) {
+		self.event_bus.emit(SessionEvent::Notice(format!(
+			"Sign in to MCP server \"{}\" in your browser:\n{url}",
+			self.name
+		)));
+		crate::core::open_browser::open_browser(url.as_str());
+	}
+
+	async fn prompt_for_redirect_url(
+		&self,
+		cancel: tokio_util::sync::CancellationToken,
+	) -> Option<String> {
+		// Only the browser callback can finish; wake on cancellation so the
+		// sign-in does not outlive the session task.
+		cancel.cancelled().await;
+		None
+	}
+}
+
+/// `/mcp login [server]` — sign in to one OAuth MCP server (upstream the mcp
+/// extension's `loginCommand`). On success the runtime reconnects and the
+/// tool table refreshes; running sessions pick up credentials on their next
+/// turn.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mcp_login(
+	shared: &Arc<SessionShared>,
+	agent: &Agent,
+	event_bus: &EventBus<SessionEvent>,
+	name: Option<String>,
+) {
+	let notice = |message: String| event_bus.emit(SessionEvent::Notice(message));
+	let Some(candidates) = mcp_oauth_candidates(shared, &notice).await else {
+		return;
+	};
+	let entry = match name.as_deref() {
+		Some(name) => match candidates.iter().find(|entry| entry.name == name) {
+			Some(entry) => Some(entry.clone()),
+			None => {
+				notice(format!(
+					"No MCP server named \"{name}\" uses OAuth. Only HTTP servers without an Authorization header do."
+				));
+				return;
+			}
+		},
+		None => match candidates.len() {
+			0 => {
+				notice("No enabled MCP server uses OAuth. Only HTTP servers without an Authorization header do.".to_string());
+				return;
+			}
+			1 => Some(candidates[0].clone()),
+			// Upstream opens a server picker; pi-rs asks for the name.
+			_ => {
+				let names = candidates
+					.iter()
+					.map(|entry| entry.name.as_str())
+					.collect::<Vec<_>>()
+					.join(", ");
+				notice(format!(
+					"Multiple MCP servers use OAuth — pick one: /mcp login <server>. Candidates: {names}."
+				));
+				return;
+			}
+		},
+	};
+	let Some(entry) = entry else { return };
+	// Connecting first answers whether a sign-in is needed and records the
+	// server's challenge (upstream `connection.getClient()`).
+	let (state, challenge) = super::tools::probe_mcp_entry(&entry).await;
+	match state {
+		super::tools::McpProbeState::Connected { tools } => {
+			notice(format!(
+				"Already signed in to MCP server \"{}\" ({} tools).",
+				entry.name,
+				tools.len()
+			));
+			return;
+		}
+		super::tools::McpProbeState::Failed(message) => {
+			notice(format!(
+				"MCP server \"{}\" failed to connect: {message}",
+				entry.name
+			));
+			return;
+		}
+		super::tools::McpProbeState::NeedsAuth => {}
+	}
+	let url = super::mcp_config::uses_oauth(&entry).expect("oauth candidate has a url");
+	// Upstream waits for session end; pi-rs bounds the sign-in like the CLI
+	// default.
+	let cancel = pi_mcp::oauth::sign_in::cancel_after(Duration::from_secs(300));
+	let options = pi_mcp::oauth::SignInOptions {
+		server_url: url,
+		store: pi_mcp::oauth::FileStateStore::new(crate::config::agent_dir().join("mcp-auth.json"))
+			.server(&entry.name, &entry.url.clone().expect("url")),
+		settings: entry.oauth.clone().unwrap_or_default(),
+		challenge,
+		cancel,
+	};
+	let prompt = SessionSignInPrompt {
+		name: entry.name.clone(),
+		event_bus: event_bus.clone(),
+	};
+	match pi_mcp::oauth::sign_in(options, &prompt).await {
+		Ok(()) => {}
+		Err(pi_mcp::oauth::SignInError::Cancelled) => {
+			notice(format!(
+				"Sign-in to MCP server \"{}\" was cancelled.",
+				entry.name
+			));
+			return;
+		}
+		Err(error) => {
+			notice(format!(
+				"Sign-in to MCP server \"{}\" failed: {error}",
+				entry.name
+			));
+			return;
+		}
+	}
+	notice(format!("Signed in to MCP server \"{}\".", entry.name));
+	handle_mcp_reconnect(shared, agent, event_bus).await;
+}
+
+/// `/mcp logout [server]` — delete one server's stored OAuth credentials
+/// (upstream `signOut`).
+async fn handle_mcp_logout(
+	shared: &Arc<SessionShared>,
+	event_bus: &EventBus<SessionEvent>,
+	name: Option<String>,
+) {
+	let notice = |message: String| event_bus.emit(SessionEvent::Notice(message));
+	let Some(candidates) = mcp_oauth_candidates(shared, &notice).await else {
+		return;
+	};
+	let entry = match name.as_deref() {
+		Some(name) => match candidates.iter().find(|entry| entry.name == name) {
+			Some(entry) => Some(entry.clone()),
+			None => {
+				notice(format!(
+					"No MCP server named \"{name}\" uses OAuth. Only HTTP servers without an Authorization header do."
+				));
+				return;
+			}
+		},
+		None => match candidates.len() {
+			0 => {
+				notice("No enabled MCP server uses OAuth. Only HTTP servers without an Authorization header do.".to_string());
+				return;
+			}
+			1 => Some(candidates[0].clone()),
+			_ => {
+				let names = candidates
+					.iter()
+					.map(|entry| entry.name.as_str())
+					.collect::<Vec<_>>()
+					.join(", ");
+				notice(format!(
+					"Multiple MCP servers use OAuth — pick one: /mcp logout <server>. Candidates: {names}."
+				));
+				return;
+			}
+		},
+	};
+	let Some(entry) = entry else { return };
+	let url = super::mcp_config::uses_oauth(&entry).expect("oauth candidate has a url");
+	match pi_mcp::oauth::FileStateStore::new(crate::config::agent_dir().join("mcp-auth.json"))
+		.remove(&entry.name, &url)
+		.await
+	{
+		Ok(true) => notice(format!("Signed out of MCP server \"{}\".", entry.name)),
+		Ok(false) => notice(format!(
+			"No stored credentials for MCP server \"{}\".",
+			entry.name
+		)),
+		Err(message) => notice(format!("mcp: {message}")),
+	}
+}
+
+/// `/mcp reconnect` — reconnect the MCP runtime and refresh the tool table
+/// in place. Upstream reconnects per server; pi-rs reconnects the whole
+/// runtime (declared). New tools reach the model through the `set_tools`
+/// declaration announcement.
+async fn handle_mcp_reconnect(
+	shared: &Arc<SessionShared>,
+	agent: &Agent,
+	event_bus: &EventBus<SessionEvent>,
+) {
+	let notice = |message: String| event_bus.emit(SessionEvent::Notice(message));
+	let runtime = shared.mcp.lock().unwrap().clone();
+	let Some(runtime) = runtime else {
+		notice("mcp: disabled".to_string());
+		return;
+	};
+	if agent.is_streaming() {
+		// set_tools only swaps the executable set mid-run; a reconnect's
+		// declaration must be seen, so require an idle agent (upstream
+		// rebuilds per-server without this constraint).
+		notice("run active — /mcp reconnect needs an idle agent".to_string());
+		return;
+	}
+	let cwd = shared.cwd.lock().unwrap().clone();
+	let mut runtime = runtime.lock().await;
+	for mcp_notice in runtime.reconnect(&cwd).await {
+		notice(format!("mcp: {mcp_notice}"));
+	}
+	let mut tools: Vec<Arc<dyn pi_agent::AgentTool>> = agent
+		.tools()
+		.into_iter()
+		.filter(|tool| !tool.name().starts_with("mcp__"))
+		.collect();
+	let mcp_tools = runtime.assembly.tools.len();
+	tools.extend(runtime.assembly.tools.iter().cloned());
+	let statuses = runtime.assembly.statuses.clone();
+	*shared.mcp_status.lock().unwrap() = statuses;
+	agent.set_tools(tools);
+	notice(format!("mcp: reconnect complete ({mcp_tools} MCP tools)"));
 }
 
 #[allow(clippy::too_many_arguments)] // the flag pair and settings are distinct inputs
@@ -1654,6 +1943,15 @@ async fn session_task(
 							None => Err("no extensions loaded".into()),
 						};
 						let _ = response.send(result);
+					}
+					SessionCommand::McpLogin { name } => {
+						handle_mcp_login(&shared, &agent, &event_bus, name).await;
+					}
+					SessionCommand::McpLogout { name } => {
+						handle_mcp_logout(&shared, &event_bus, name).await;
+					}
+					SessionCommand::McpReconnect => {
+						handle_mcp_reconnect(&shared, &agent, &event_bus).await;
 					}
 					SessionCommand::Exit => break,
 				}
@@ -4023,6 +4321,86 @@ mod tests {
 	/// on the command channel as `ExtensionPrompt` and starts a run against
 	/// the mock provider (upstream `prompt(text, {source: "extension"})`).
 	#[tokio::test(flavor = "multi_thread")]
+	/// The `/mcp` session commands against a dead OAuth server: login fails
+	/// cleanly at the probe, logout reports the missing credentials. One
+	/// sequential test — the agent-dir override is process-global.
+	async fn mcp_commands_report_through_notices() {
+		let agent_dir = std::env::temp_dir().join(format!(
+			"pi-rs-mcp-session-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		std::fs::create_dir_all(&agent_dir).unwrap();
+		std::fs::write(
+			agent_dir.join("mcp.json"),
+			serde_json::json!({
+				"mcpServers": {
+					"docs": {"url": "http://127.0.0.1:1/mcp"}
+				}
+			})
+			.to_string(),
+		)
+		.unwrap();
+		unsafe { std::env::set_var(crate::config::AGENT_DIR_ENV, &agent_dir) };
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let mut handle = spawn_agent_session_with_options(
+			mock_agent(),
+			SessionManager::in_memory(),
+			registry,
+			CompactionSettings::default(),
+			crate::core::system_prompt::SystemPromptOptions::default(),
+			crate::core::settings_manager::RetrySettings::default(),
+			SessionResources::default(),
+		);
+		handle.configure_mcp(crate::core::tools::McpRuntime {
+			assembly: Default::default(),
+			allow: None,
+			exclude: None,
+		});
+
+		// Login: the probe's connection refusal surfaces as a notice.
+		handle
+			.cmd_tx
+			.send(SessionCommand::McpLogin {
+				name: Some("docs".into()),
+			})
+			.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+		loop {
+			match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+				Ok(Ok(SessionEvent::Notice(text)))
+					if text.contains("MCP server \"docs\" failed to connect") =>
+				{
+					break;
+				}
+				Ok(Ok(_)) => {}
+				Ok(Err(_)) | Err(_) => panic!("session ended before the login notice"),
+			}
+		}
+
+		// Logout: no stored credentials.
+		handle
+			.cmd_tx
+			.send(SessionCommand::McpLogout {
+				name: Some("docs".into()),
+			})
+			.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+		loop {
+			match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+				Ok(Ok(SessionEvent::Notice(text)))
+					if text.contains("No stored credentials for MCP server \"docs\"") =>
+				{
+					break;
+				}
+				Ok(Ok(_)) => {}
+				Ok(Err(_)) | Err(_) => panic!("session ended before the logout notice"),
+			}
+		}
+		unsafe { std::env::remove_var(crate::config::AGENT_DIR_ENV) };
+		let _ = std::fs::remove_dir_all(&agent_dir);
+	}
+
 	async fn extension_send_user_message_runs_a_prompt() {
 		let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
 			.join("tests/fixtures/extensions/dialogs.ts");
@@ -5310,6 +5688,8 @@ mod tests {
 				mcp: std::sync::Mutex::new(None),
 				tool_options: std::sync::Mutex::new(None),
 				live_agent: Arc::new(std::sync::Mutex::new(agent.clone())),
+				cwd: std::sync::Mutex::new(PathBuf::new()),
+				mcp_status: std::sync::Mutex::new(Vec::new()),
 				current_session_file: Arc::new(std::sync::Mutex::new(Some(
 					dir.join("session.jsonl"),
 				))),

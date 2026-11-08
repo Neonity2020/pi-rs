@@ -319,7 +319,7 @@ async fn wait_for_callback_or_manual_input(
 	};
 	manual_signal.cancel();
 	match outcome {
-		CallbackOutcome::Code(value) => Ok(CallbackOrManual::Callback(value)),
+		CallbackOutcome::Code { code: value, .. } => Ok(CallbackOrManual::Callback(value)),
 		CallbackOutcome::ProviderError(message) => Err(AuthError::Login(message)),
 		CallbackOutcome::Cancelled => manual_prompt.await.map(CallbackOrManual::Manual),
 	}

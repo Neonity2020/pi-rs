@@ -70,6 +70,19 @@ pub struct McpAssembly {
 	pub clients: Vec<SharedMcpClient>,
 	/// One human-readable line per config error and per server outcome.
 	pub notices: Vec<String>,
+	/// Per-server outcome of the last connect pass (`/mcp` status; upstream
+	/// reads live connection state).
+	pub statuses: Vec<McpServerStatus>,
+}
+
+/// One server's last connect outcome — upstream `ServerReport` (reduced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerStatus {
+	pub name: String,
+	pub enabled: bool,
+	pub connected: bool,
+	pub tools: usize,
+	pub error: Option<String>,
 }
 
 impl McpAssembly {
@@ -143,6 +156,7 @@ pub async fn connect_mcp_servers_with(config: &McpConfig, timeout: Duration) -> 
 		tools: Vec::new(),
 		clients: Vec::new(),
 		notices: Vec::new(),
+		statuses: Vec::new(),
 	};
 	// Config problems first, like upstream `reportProblems`.
 	for error in &config.errors {
@@ -150,7 +164,15 @@ pub async fn connect_mcp_servers_with(config: &McpConfig, timeout: Duration) -> 
 	}
 	for entry in &config.servers {
 		if !entry.enabled {
-			continue; // Parsed but unconnected, like a disabled server upstream.
+			// Parsed but unconnected, like a disabled server upstream.
+			assembly.statuses.push(McpServerStatus {
+				name: entry.name.clone(),
+				enabled: false,
+				connected: false,
+				tools: 0,
+				error: None,
+			});
+			continue;
 		}
 		match tokio::time::timeout(timeout, connect_one(entry)).await {
 			Ok(Ok((client, tools))) => {
@@ -159,6 +181,13 @@ pub async fn connect_mcp_servers_with(config: &McpConfig, timeout: Duration) -> 
 					name = entry.name,
 					summary = tool_summary(&tools)
 				));
+				assembly.statuses.push(McpServerStatus {
+					name: entry.name.clone(),
+					enabled: true,
+					connected: true,
+					tools: tools.len(),
+					error: None,
+				});
 				assembly.tools.extend(
 					tools
 						.into_iter()
@@ -166,14 +195,32 @@ pub async fn connect_mcp_servers_with(config: &McpConfig, timeout: Duration) -> 
 				);
 				assembly.clients.push(client);
 			}
-			Ok(Err(error)) => assembly
-				.notices
-				.push(format!("{}: failed: {error}", entry.name)),
-			Err(_) => assembly.notices.push(format!(
-				"{}: failed: startup timed out after {}s",
-				entry.name,
-				timeout.as_secs()
-			)),
+			Ok(Err(error)) => {
+				assembly
+					.notices
+					.push(format!("{}: failed: {error}", entry.name));
+				assembly.statuses.push(McpServerStatus {
+					name: entry.name.clone(),
+					enabled: true,
+					connected: false,
+					tools: 0,
+					error: Some(error.to_string()),
+				});
+			}
+			Err(_) => {
+				assembly.notices.push(format!(
+					"{}: failed: startup timed out after {}s",
+					entry.name,
+					timeout.as_secs()
+				));
+				assembly.statuses.push(McpServerStatus {
+					name: entry.name.clone(),
+					enabled: true,
+					connected: false,
+					tools: 0,
+					error: Some(format!("startup timed out after {}s", timeout.as_secs())),
+				});
+			}
 		}
 	}
 	assembly
@@ -209,27 +256,8 @@ fn tool_summary(tools: &[McpTool]) -> String {
 /// transport owns the child's process group, so a dropped future (startup
 /// timeout) or a dropped client cleans the server up.
 async fn connect_one(entry: &McpServerEntry) -> anyhow::Result<(SharedMcpClient, Vec<McpTool>)> {
-	let transport: Box<dyn pi_mcp::Transport> = if let Some(url) = &entry.url {
-		// HTTP servers get the stored-token auth provider (upstream
-		// `createMcpAuthProvider` wiring, extensions/mcp/oauth.ts): tokens
-		// persist in `<agent-dir>/mcp-auth.json`, a 401/403-insufficient_scope
-		// refreshes once and retries. Without stored tokens the server's
-		// challenge surfaces as `AuthorizationRequired` — the interactive
-		// sign-in flow is a declared deferral.
-		let agent_dir = crate::config::agent_dir();
-		let store = pi_mcp::oauth::FileStateStore::new(agent_dir.join("mcp-auth.json"))
-			.server(&entry.name, url);
-		let provider = pi_mcp::oauth::StoredTokenProvider::new(
-			entry.name.clone(),
-			url.clone(),
-			store,
-			pi_mcp::oauth::OAuthSettings::default(),
-		)
-		.with_lock_dir(agent_dir);
-		Box::new(
-			StreamableHttpTransport::new(url, entry.headers.clone())
-				.with_auth_provider(std::sync::Arc::new(provider)),
-		)
+	let transport: Box<dyn pi_mcp::Transport> = if entry.url.is_some() {
+		build_http_transport(entry, crate::config::agent_dir().as_path(), None)
 	} else {
 		let mut transport =
 			StdioTransport::new(entry.command.clone(), entry.args.clone(), entry.env.clone());
@@ -243,6 +271,104 @@ async fn connect_one(entry: &McpServerEntry) -> anyhow::Result<(SharedMcpClient,
 	let client: SharedMcpClient = Arc::new(tokio::sync::Mutex::new(client));
 	let tools = McpTool::all_for(&client).await?;
 	Ok((client, tools))
+}
+
+/// Shared slot for the server's last `WWW-Authenticate` challenge (upstream
+/// `connection.challenge`, which feeds sign-in).
+#[derive(Default)]
+pub struct ChallengeSlot(std::sync::Mutex<Option<pi_mcp::oauth::Challenge>>);
+
+impl ChallengeSlot {
+	/// Record a challenge from the transport's auth provider.
+	pub fn observe(&self, challenge: pi_mcp::oauth::Challenge) {
+		*self.0.lock().unwrap() = Some(challenge);
+	}
+
+	/// The last observed challenge, if any.
+	pub fn get(&self) -> Option<pi_mcp::oauth::Challenge> {
+		self.0.lock().unwrap().clone()
+	}
+}
+
+/// The streamable-HTTP transport for one server, with the stored-token auth
+/// provider (upstream `createMcpAuthProvider` wiring, extensions/mcp/oauth.ts):
+/// tokens persist in `<agent-dir>/mcp-auth.json`, a 401/403-insufficient_scope
+/// refreshes once and retries. `entry.oauth` (from `mcp.json`) configures the
+/// client. `challenge_slot` observes every challenge for sign-in flows.
+pub fn build_http_transport(
+	entry: &McpServerEntry,
+	agent_dir: &Path,
+	challenge_slot: Option<Arc<ChallengeSlot>>,
+) -> Box<dyn pi_mcp::Transport> {
+	let url = entry
+		.url
+		.clone()
+		.expect("build_http_transport requires an HTTP entry");
+	let store = pi_mcp::oauth::FileStateStore::new(agent_dir.join("mcp-auth.json"))
+		.server(&entry.name, &url);
+	let settings = entry.oauth.clone().unwrap_or_default();
+	let mut provider =
+		pi_mcp::oauth::StoredTokenProvider::new(entry.name.clone(), url.clone(), store, settings)
+			.with_lock_dir(agent_dir.to_path_buf());
+	if let Some(slot) = challenge_slot {
+		provider =
+			provider.with_on_challenge(Arc::new(move |challenge| slot.observe(challenge.clone())));
+	}
+	Box::new(
+		StreamableHttpTransport::new(url, entry.headers.clone())
+			.with_auth_provider(Arc::new(provider)),
+	)
+}
+
+/// One probed server state — upstream `ServerReport.state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpProbeState {
+	Connected { tools: Vec<String> },
+	NeedsAuth,
+	Failed(String),
+}
+
+/// Connect one configured entry without registering tools (upstream
+/// `createConnection` + `getClient`): connected, needs-auth, or failed. The
+/// probe behind `pi mcp list/login` and `/mcp login`; HTTP servers get the
+/// stored-token provider plus a challenge slot for sign-in.
+pub(crate) async fn probe_mcp_entry(
+	entry: &McpServerEntry,
+) -> (McpProbeState, Option<pi_mcp::oauth::Challenge>) {
+	let needs_auth = |error: &pi_mcp::Error| match error {
+		pi_mcp::Error::Oauth(error) => {
+			matches!(error, pi_mcp::oauth::OAuthError::AuthorizationRequired)
+		}
+		pi_mcp::Error::Transport(message) => message.contains("MCP server requires authentication"),
+		_ => false,
+	};
+	let slot = Arc::new(ChallengeSlot::default());
+	let probe = async {
+		let transport: Box<dyn pi_mcp::Transport> = if entry.url.is_some() {
+			build_http_transport(
+				entry,
+				crate::config::agent_dir().as_path(),
+				Some(Arc::clone(&slot)),
+			)
+		} else {
+			let mut transport =
+				StdioTransport::new(entry.command.clone(), entry.args.clone(), entry.env.clone());
+			if let Some(cwd) = &entry.cwd {
+				transport = transport.with_cwd(cwd);
+			}
+			Box::new(transport)
+		};
+		let mut client = McpClient::new(entry.name.clone(), transport);
+		client.initialize(crate::config::VERSION).await?;
+		let client: SharedMcpClient = Arc::new(tokio::sync::Mutex::new(client));
+		let tools = McpTool::all_for(&client).await?;
+		Ok::<Vec<String>, pi_mcp::Error>(tools.iter().map(|tool| tool.name().to_string()).collect())
+	};
+	match probe.await {
+		Ok(tools) => (McpProbeState::Connected { tools }, slot.get()),
+		Err(error) if needs_auth(&error) => (McpProbeState::NeedsAuth, slot.get()),
+		Err(error) => (McpProbeState::Failed(error.to_string()), slot.get()),
+	}
 }
 
 /// Resolve a tool-provided path against the tool cwd, mirroring

@@ -120,7 +120,7 @@ pub(crate) async fn wait_for_callback_or_manual_input(
 	};
 	manual_signal.cancel();
 	match outcome {
-		CallbackOutcome::Code(value) => Ok(Ok(value)),
+		CallbackOutcome::Code { code: value, .. } => Ok(Ok(value)),
 		CallbackOutcome::ProviderError(message) => Err(AuthError::Login(message)),
 		CallbackOutcome::Cancelled => {
 			// Fall through to the manual prompt.
