@@ -6,8 +6,10 @@ on:
 
 # ubuntu-24.04 pinned (2026-11-06): the ubuntu-latest image drift (Python
 # 3.14 + Linux 7.0 pty behavior) broke the pty/node test harnesses on an
-# unchanged code base (9cf57fa failed identically). Revisit the harness
-# port before unpinning.
+# unchanged code base (9cf57fa failed identically). The pty harness port
+# landed 2026-11-08 (transient master-read OSErrors are non-terminal; 24.04's
+# own 7.0 kernel image reproduced and the fix went green), so the pin is now
+# precautionary — unpin freely if the latest image is otherwise preferred.
 jobs:
   test:
     runs-on: ubuntu-24.04

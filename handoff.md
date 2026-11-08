@@ -500,3 +500,7 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **声明差异（汇总）**：TUI 管理浮层（enable/disable/exposure 编辑）未做；TUI 登录无粘贴回退（CLI 有）；per-server 重连→全量重连；`mcp list` 无 resources/toolExposure 列；CIMD clientRegistration 拒绝；`auth`（provider token 直发 MCP）仍不支持；TUI/CLI 登录超时 300s（上游 TUI 等到会话结束）。
 
 **交接事项（下一轮候选）**：审计 P2 payload 字段族（session_start previousSessionFile、turn_start turnIndex/timestamp、tool_result structuredContent/usage 等——事件顺序审计文末 8 步修复顺序）；包管理子命令（上游 `pi install/remove/update/list/config`，cli.ts 的 -l 别名注释指向它）；`/mcp` 管理浮层（showMcpManager：enable/disable/exposure/状态编辑）；RPC 模式 setWidget/editor 转发。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+
+### 第四十五轮补记：pty harness 内核 7.0 移植落地（2026-11-08，主会话）
+
+推送 f66cb0f 后 CI 的 test job 失败（tui_interactive quit_cleanly "pi-rs did not exit after ctrl+c"）——但**与第四十四轮事故不是同一机理**：对照 11-06 绿色基线（ff31fc3）的诊断输出，ubuntu-24.04 镜像（20261101.360.1）当时就已带上 Linux 7.0.0-1017-azure 内核且跑绿，环境未变；真因在 harness 自身——`os.read(master)` 在子进程**仍在运行**时于 quit_cleanly 内抛 OSError（内核 7.0 的新行为），`except OSError: break` 立刻跳出 deadline 循环，`assert poll() is not None` 0.15 秒内即失败（此前 wait_for 已成功看到欢迎页与 /copy 输出，证明 OSErrors 是**瞬态**的）。修复（92baf4d，全部 7 个 pty 脚本）：master 读失败不再终止循环——sleep 50ms 后 continue，把退出判定完全交给 deadline + `process.poll()`（即 handoff 预告的「EOF/EIO+poll 组合判定」端口）；macOS 本地 EIO（子进程已退）路径行为不变（poll 很快为真）。三 job 全绿。ci.yml 的钉住注释已更新：移植已完成，钉住降级为预防措施（可随时解钉）。
