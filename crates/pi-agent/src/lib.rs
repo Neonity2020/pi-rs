@@ -16,7 +16,7 @@ pub use agent_loop::{
 	PrepareNextTurnFn, PrepareRequestContext, PrepareRequestFn, run_agent_loop,
 };
 pub use types::{
-	AfterToolCallFn, AfterToolCallResult, AgentEvent, AgentTool, AgentToolResult,
-	AgentTurnDecision, BeforeToolCallFn, BeforeToolCallResult, DEFAULT_TOOL_EXECUTION, PromptInput,
-	QueueMode, ToolExecutionMode, ToolUpdate,
+	AfterToolCallContext, AfterToolCallFn, AfterToolCallResult, AgentEvent, AgentTool,
+	AgentToolResult, AgentTurnDecision, BeforeToolCallFn, BeforeToolCallResult,
+	DEFAULT_TOOL_EXECUTION, PromptInput, QueueMode, ToolExecutionMode, ToolUpdate,
 };

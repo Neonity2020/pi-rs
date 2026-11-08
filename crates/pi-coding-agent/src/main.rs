@@ -1592,7 +1592,7 @@ async fn main() -> anyhow::Result<()> {
 		// Session shutdown: tear the extension hosts down (session_shutdown
 		// dispatch → graceful host ladder), then close the MCP server
 		// transports before returning.
-		extension_bridge.shutdown().await;
+		extension_bridge.shutdown("quit").await;
 		if let Some(runtime) = &mcp_runtime {
 			runtime.lock().await.assembly.shutdown().await;
 		}
@@ -1649,7 +1649,7 @@ async fn main() -> anyhow::Result<()> {
 		// the forced exit — std::process::exit skips destructors, so the
 		// graceful close ladders (and the orphan guard's SIGKILL) must run
 		// explicitly here.
-		extension_bridge.shutdown().await;
+		extension_bridge.shutdown("quit").await;
 		if let Some(runtime) = &mcp_runtime {
 			runtime.lock().await.assembly.shutdown().await;
 		}
@@ -1712,7 +1712,7 @@ async fn main() -> anyhow::Result<()> {
 	// dispatch → graceful host ladder), then close the MCP server transports
 	// (graceful ladder, process group reaped) before main drops the
 	// assemblies.
-	extension_bridge.shutdown().await;
+	extension_bridge.shutdown("quit").await;
 	if let Some(runtime) = &mcp_runtime {
 		runtime.lock().await.assembly.shutdown().await;
 	}

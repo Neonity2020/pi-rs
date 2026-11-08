@@ -103,6 +103,12 @@ pub enum RpcReplacement {
 	Switch {
 		path: String,
 	},
+	/// `/reload`: the same session path re-opened through the replacement
+	/// machinery. Upstream reports `session_start reason "reload"` — a bare
+	/// `Switch` maps to `"resume"`, so this variant carries its own reason.
+	Reload {
+		path: String,
+	},
 	Fork {
 		entry_id: String,
 	},
@@ -1282,6 +1288,9 @@ async fn session_task(
 	let mut agent_rx = agent.subscribe();
 	let mut pending: VecDeque<(String, Vec<pi_ai::ImageContent>)> = VecDeque::new();
 	let mut run: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+	// Extension-facing turn counter (upstream `turnIndex`): resets at
+	// `agent_start`, never at `agent_end` (agent-session.ts:1305,1320).
+	let mut extension_turn_index: u64 = 0;
 	// In-flight compaction summarization; the agent is idle while this runs.
 	let mut compacting: Option<tokio::task::JoinHandle<anyhow::Result<CompactionOutcome>>> = None;
 	// In-flight `/tree` navigation with a branch summary (`nav_task` runs the
@@ -1401,12 +1410,25 @@ async fn session_task(
 						// check, before skill/template expansion. Upstream
 						// handlers may transform or swallow the input — the
 						// bridge dispatches and ignores the outcomes (declared
-						// limitation).
+						// limitation). `streamingBehavior` maps pi-rs's
+						// settle-then-replay pending queue onto upstream's
+						// `followUp` (queue-semantics deviation D4 declared).
 						if let Some(bridge) = &extensions {
+							let mut input = json!({
+								"type": "input",
+								"text": text,
+								"source": "interactive",
+							});
+							if !images.is_empty() {
+								input["images"] = json!(images);
+							}
+							if run.is_some() || agent.is_streaming() {
+								input["streamingBehavior"] = json!("followUp");
+							}
 							bridge
 								.dispatch_event_all(
 									"input",
-									json!({"type": "input", "text": text}),
+									input,
 									super::extensions::EXT_EVENT_TIMEOUT,
 								)
 								.await;
@@ -1449,10 +1471,20 @@ async fn session_task(
 						// `input` event fires, the extension-command check
 						// and the skill/template expansion do not.
 						if let Some(bridge) = &extensions {
+							// Upstream `prompt(text, {source: "extension"})`;
+							// the pending queue maps to `followUp` (D4).
+							let mut input = json!({
+								"type": "input",
+								"text": text,
+								"source": "extension",
+							});
+							if run.is_some() || agent.is_streaming() {
+								input["streamingBehavior"] = json!("followUp");
+							}
 							bridge
 								.dispatch_event_all(
 									"input",
-									json!({"type": "input", "text": text}),
+									input,
 									super::extensions::EXT_EVENT_TIMEOUT,
 								)
 								.await;
@@ -1716,6 +1748,9 @@ async fn session_task(
 						let (planned, session_start_reason) = match operation {
 							RpcReplacement::New { parent_session } => (plan_new_session(&log, parent_session).map(|plan| (plan, None)), "new"),
 							RpcReplacement::Switch { path } => (plan_switch_session(&path).map(|plan| (plan, None)), "resume"),
+							// Upstream reload fires `session_start{reason:"reload"}`
+							// on the rebuilt runtime (agent-session.ts:3755).
+							RpcReplacement::Reload { path } => (plan_switch_session(&path).map(|plan| (plan, None)), "reload"),
 							RpcReplacement::Fork { entry_id } => (plan_fork(&log, &entry_id, ForkPosition::Before), "fork"),
 							RpcReplacement::Clone => {
 								let leaf = log.lock().unwrap().session.leaf_id().map(str::to_owned);
@@ -2305,9 +2340,16 @@ async fn session_task(
 						// bridge (upstream runner dispatches the same
 						// lifecycle events; payloads use the upstream field
 						// names reduced to what pi-agent emits).
+						if let AgentEvent::AgentStart = &agent_event {
+							extension_turn_index = 0;
+						}
 						if let Some(bridge) = &extensions
-							&& let Some((event, payload)) = extension_agent_event_payload(&agent_event)
+							&& let Some((event, payload)) =
+								extension_agent_event_payload(&agent_event, extension_turn_index)
 						{
+							if let AgentEvent::TurnStart = &agent_event {
+								extension_turn_index += 1;
+							}
 							bridge
 								.dispatch_event_all(event, payload, super::extensions::EXT_EVENT_TIMEOUT)
 								.await;
@@ -2432,20 +2474,31 @@ async fn apply_extension_actions(
 /// Map an agent event onto the extension event name + payload. `None` for
 /// events the bridge does not forward (message_* / tool_execution_* — the
 /// tool face crosses the hooks, and message deltas would be per-chunk noise).
-fn extension_agent_event_payload(event: &AgentEvent) -> Option<(&'static str, Value)> {
+fn extension_agent_event_payload(
+	event: &AgentEvent,
+	turn_index: u64,
+) -> Option<(&'static str, Value)> {
 	match event {
 		AgentEvent::AgentStart => Some(("agent_start", json!({"type": "agent_start"}))),
 		AgentEvent::AgentEnd { messages } => Some((
 			"agent_end",
 			json!({"type": "agent_end", "messages": messages}),
 		)),
-		AgentEvent::TurnStart => Some(("turn_start", json!({"type": "turn_start"}))),
+		AgentEvent::TurnStart => Some((
+			"turn_start",
+			json!({"type": "turn_start", "turnIndex": turn_index, "timestamp": pi_ai::types::now_ms()}),
+		)),
 		AgentEvent::TurnEnd {
 			message,
 			tool_results,
 		} => Some((
 			"turn_end",
-			json!({"type": "turn_end", "message": message, "toolResults": tool_results}),
+			json!({
+				"type": "turn_end",
+				"turnIndex": turn_index.saturating_sub(1),
+				"message": message,
+				"toolResults": tool_results,
+			}),
 		)),
 		_ => None,
 	}
@@ -3560,6 +3613,7 @@ async fn apply_replacement(
 	}
 
 	// -- swap the shared state ---------------------------------------------
+	let previous_session_file = ctx.shared.current_session_file.lock().unwrap().clone();
 	{
 		let mut guard = ctx.log.lock().unwrap();
 		*guard = SharedLog {
@@ -3582,10 +3636,16 @@ async fn apply_replacement(
 		ctx.session_start_reason,
 		ctx.shared.resources.extensions.as_ref(),
 	) {
+		// Upstream `previousSessionFile` rides on new/resume/fork (types.ts
+		// 755-761); pi-rs carries the outgoing file whatever the reason.
+		let mut payload = json!({"type": "session_start", "reason": reason});
+		if let Some(previous) = previous_session_file.as_ref() {
+			payload["previousSessionFile"] = json!(previous.display().to_string());
+		}
 		bridge
 			.dispatch_event_all(
 				"session_start",
-				json!({"type": "session_start", "reason": reason}),
+				payload,
 				super::extensions::EXT_EVENT_TIMEOUT,
 			)
 			.await;
@@ -4228,7 +4288,105 @@ mod tests {
 			seen.iter().any(|text| text.contains("start:new")),
 			"replacement reason missing: {seen:?}"
 		);
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
+		drop(handle);
+		std::fs::remove_dir_all(&cwd).unwrap();
+	}
+
+	/// Collect notices until one contains `needle` (shared by the payload
+	/// assertions below).
+	async fn wait_notice(
+		handle: &mut SessionHandle,
+		needle: &'static str,
+		deadline: tokio::time::Instant,
+	) {
+		loop {
+			match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+				Ok(Ok(SessionEvent::Notice(text))) if text.contains(needle) => return,
+				Ok(Ok(_)) => {}
+				Ok(Err(_)) | Err(_) => panic!("session ended before {needle:?} surfaced"),
+			}
+		}
+	}
+
+	/// F1 payload fields (audit step 4): the `input` event carries
+	/// source/streamingBehavior, `turn_start`/`turn_end` carry turnIndex
+	/// (+ timestamp), `session_start` carries previousSessionFile after a
+	/// replacement from a persisted session, and `session_shutdown` carries
+	/// the quit reason.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extension_payload_fields_reach_handlers() {
+		let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/extensions/payload-fields.ts");
+		if std::process::Command::new("node")
+			.arg("--version")
+			.output()
+			.is_err()
+		{
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let cwd = std::env::temp_dir().join(format!(
+			"pi-rs-ext-payload-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let _ = std::fs::remove_dir_all(&cwd);
+		std::fs::create_dir_all(&cwd).unwrap();
+		let assembly = crate::core::extensions::spawn_extensions(
+			vec![(fixture.display().to_string(), fixture)],
+			&crate::core::extensions::SpawnOptions {
+				cwd: cwd.clone(),
+				has_ui: false,
+				runtime: "node".to_string(),
+			},
+		)
+		.await;
+		assert!(assembly.notices.is_empty(), "{:?}", assembly.notices);
+
+		let registry = Arc::new(std::sync::Mutex::new(ModelRegistry::load(None)));
+		let resources = SessionResources {
+			extensions: Some(assembly.bridge.clone()),
+			..Default::default()
+		};
+		let sessions_root = cwd.join("sessions");
+		let session = SessionManager::create_in_with_options(&sessions_root, &cwd, None, None)
+			.expect("persisted session");
+		let mut handle = spawn_agent_session_with_options(
+			mock_agent(),
+			session,
+			registry,
+			CompactionSettings::default(),
+			crate::core::system_prompt::SystemPromptOptions::default(),
+			crate::core::settings_manager::RetrySettings::default(),
+			resources,
+		);
+
+		// Idle prompt: source "interactive", no streamingBehavior, turn 0.
+		handle
+			.cmd_tx
+			.send(SessionCommand::Prompt {
+				text: "hello".into(),
+				images: Vec::new(),
+			})
+			.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		wait_notice(&mut handle, "input:interactive:sb=none", deadline).await;
+		wait_notice(&mut handle, "turnstart:0:number", deadline).await;
+		wait_notice(&mut handle, "turnend:0", deadline).await;
+
+		// Replacement from a persisted session: previousSessionFile is the
+		// outgoing file.
+		handle
+			.cmd_tx
+			.send(SessionCommand::NewSession {
+				parent_session: None,
+			})
+			.unwrap();
+		wait_notice(&mut handle, "start:new:prev=", deadline).await;
+		// ...and the quit shutdown carries its reason.
+		assembly.bridge.shutdown("quit").await;
+		wait_notice(&mut handle, "shutdown:quit", deadline).await;
 		drop(handle);
 		std::fs::remove_dir_all(&cwd).unwrap();
 	}
@@ -4312,7 +4470,7 @@ mod tests {
 			"second dispatch missing: {seen:?}"
 		);
 		assert_eq!(seen.len(), 2, "per-run dispatch violated: {seen:?}");
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		drop(handle);
 		std::fs::remove_dir_all(&cwd).unwrap();
 	}
@@ -4487,7 +4645,7 @@ mod tests {
 			EntryKind::Message { message }
 				if matches!(message.as_ref(), pi_ai::Message::Assistant(_))
 		)));
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		drop(handle);
 		std::fs::remove_dir_all(&cwd).unwrap();
 	}

@@ -504,3 +504,19 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 ### 第四十五轮补记：pty harness 内核 7.0 移植落地（2026-11-08，主会话）
 
 推送 f66cb0f 后 CI 的 test job 失败（tui_interactive quit_cleanly "pi-rs did not exit after ctrl+c"）——但**与第四十四轮事故不是同一机理**：对照 11-06 绿色基线（ff31fc3）的诊断输出，ubuntu-24.04 镜像（20261101.360.1）当时就已带上 Linux 7.0.0-1017-azure 内核且跑绿，环境未变；真因在 harness 自身——`os.read(master)` 在子进程**仍在运行**时于 quit_cleanly 内抛 OSError（内核 7.0 的新行为），`except OSError: break` 立刻跳出 deadline 循环，`assert poll() is not None` 0.15 秒内即失败（此前 wait_for 已成功看到欢迎页与 /copy 输出，证明 OSErrors 是**瞬态**的）。修复（92baf4d，全部 7 个 pty 脚本）：master 读失败不再终止循环——sleep 50ms 后 continue，把退出判定完全交给 deadline + `process.poll()`（即 handoff 预告的「EOF/EIO+poll 组合判定」端口）；macOS 本地 EIO（子进程已退）路径行为不变（poll 很快为真）。三 job 全绿。ci.yml 的钉住注释已更新：移植已完成，钉住降级为预防措施（可随时解钉）。
+
+## 第四十六轮：审计 F1 payload 字段族 + D2 /reload reason（2026-11-08，主会话单线）
+
+基线 `728d2f4`（第四十五轮推送后）。上游对照：`core/extensions/types.ts`（SessionStartEvent 755-761 / TurnStartEvent 1058-1062 / InputEvent 1171-1181 / InputSource 1168 / SessionShutdownEvent 824-829 / ToolResultUsage）+ `agent-session.ts`（_runInputHandlers 2041-2059、emitInput 调用点 source 取值、turnIndex 语义 1305,1320）。按审计文末 §10 顺序执行 4/5/6/8，7（D5）按计划仅声明。
+
+- **input 事件**（agent_session.rs 两个派发点，Prompt/ExtensionPrompt 臂）：补 `images`（非空才带，serde 直出 ImageContent camelCase 形状）、`source`（Prompt→`"interactive"`、ExtensionPrompt→`"extension"`；上游 "rpc" 变体随 RPC 模式 prompt 走 SessionCommand::Prompt 未区分——声明在注释）、`streamingBehavior`（run/streaming 活跃时映射 `"followUp"`——pi-rs pending 队列即 settle 后新 run，D4 队列语义声明不变）。
+- **tool_result**：payload 组装抽为纯函数 `tool_result_payload(ctx, content)`（extensions.rs），补 `structuredContent`/`usage`（工具提供时在场、否则缺省不置 null；usage 借 Usage 的 camelCase serde 直出）；`parentToolCallId` 随 executeTool 能力缺位维持。
+- **turn_index**：session task 循环新增 `extension_turn_index` 计数（`agent_start` 重置、`agent_end` 不重置，对照 agent-session.ts:1305,1320）；`turn_start` 补 `turnIndex`+`timestamp`（now_ms）、`turn_end` 补本次 turn 的 `turnIndex`。
+- **session_start previousSessionFile**：apply_replacement 在 swap 前捕获 outgoing `current_session_file`（in-memory 为 None → 字段缺省），payload 带上（上游 new/resume/fork 携带、startup 无——pi-rs 无论 reason 有文件就带，声明）。
+- **session_shutdown reason**：`ExtensionBridge::shutdown(reason)` 带参（pi-rs 仅 quit 路径发 → `"quit"`；替换不发 shutdown 是 D1 声明），main.rs 3 处 + 测试 11 处调用点全改。
+- **D2**：`RpcReplacement::Reload{path}` 专变体（Switch 映射 "resume" 不动）→ `session_start reason="reload"`；interactive `/reload` 改发该变体（注释锚 agent-session.ts:3723-3755）。
+- **测试**：+2（全工作区 1016）：`payload-fields.ts` fixture + 会话级断言（`input:interactive:sb=none`、`turnstart:0:number`、`turnend:0`、持久化会话替换后 `start:new:prev=<路径>`、`shutdown:quit`；wait_notice helper 抽为 async fn——async closure 借用寿命编译不过）；`tool_result_payload` 单测（可选字段在场/缺省两态、usage camelCase、无 parentToolCallId）。fmt/clippy -D warnings 干净，difftest 六场景 **6/6 IDENTICAL**（f9daca34）。
+- **坑**：① python heredoc 写中文必须 `# -*- coding: utf-8 -*-`（兼容性头部增量再犯，第一次跑报 SyntaxError 静默失败）；② pi_agent 的 `AfterToolCallContext` 未再导出——lib.rs types:: 补一行；③ AssistantMessage/ToolCall 无 Default，测试字面量要逐字段（16 个字段）。
+- **文档**：审计 §9 表（F1/D2/D7 行更新）+ 新增 §11 修复记录；compatibility 头部第二十轮增量（含两条新声明：D7 子项异常行为、D5 边界语义缺位）。
+
+**交接事项（下一轮候选）**：包管理子命令（上游 `pi install/remove/update/list/config`——npm 包形态的扩展/主题/技能安装；cli.ts 的 `-l` 别名注释指向它）；`/mcp` 管理浮层（showMcpManager：enable/disable/exposure/状态编辑）；D5 turn_end 边界语义轮（custom-entry/context-edit 桥接）；RPC setWidget/editor 转发。改动未提交（本条 handoff 与代码一起提交），等用户指令。

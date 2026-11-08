@@ -120,15 +120,15 @@
 | # | 偏差 | 声明位置 |
 |---|---|---|
 | D1 | 会话替换不 fire session_shutdown、host 存活不重建 factory | `extensions.rs:21-23`、`agent_session.rs:3194-3198`、compatibility-v1.4.md 头部 |
-| D2 | `/reload` 重发 session_start reason="resume"（上游 "reload"） | 未声明（本轮新增） |
+| D2 | ~~`/reload` 重发 session_start reason="resume"（上游 "reload"）~~ **【第四十六轮已修】**：RpcReplacement::Reload 专变体映射 reason="reload"（§11） | 已修复 |
 | D3 | input/before_agent_start 结果被忽略（无法 transform/swallow、无法注入消息/改写 prompt） | `agent_session.rs:1090-1094`、`extensions.rs:805-807`、compatibility 头部"只通知" |
 | D4 | 流式中排队语义：pending 队列 settle 后新 run（上游 steer/followUp 当前 run 内消费） | 会话层既有差异；对扩展表现为 streamingBehavior 语义缺位 |
 | D5 | turn_end/agent_before_settle 边界语义缺失（entries/continue/context/entryId/outcome 7 字段 + 结果通道） | 未单独声明（本轮新增） |
 | D6 | 派发预算（事件 30s / tool_call 120s）vs 上游无界 | `extensions.rs:56-76` |
-| D7 | tool_result fire-and-forget（上游 await 且异常→结果转 error） | `extensions.rs:778-782`；异常子项未单独声明 |
+| D7 | tool_result fire-and-forget（上游 await 且异常→结果转 error） | `extensions.rs:778-782`；异常子项已声明（第四十六轮：pi-rs 对 `{__error}` 报 notice、结果照常——compatibility 头部） |
 | D8 | 事件面缺口（§8 各行：message_*/tool_execution_*/model_select/thinking_level_select/user_bash/resources_discover/session_before_*/session_compact*/context 族） | `agent_session.rs:2050-2052`（部分）+ compatibility 头部事件面圈定 |
 | D9 | project_trust 事件不派发（本地门控替代） | `extensions.rs:40-41` |
-| F1 | payload 字段缺失族：input（images/source/streamingBehavior）、tool_call（parentToolCallId）、tool_result（parentToolCallId/structuredContent/usage）、turn_start（turnIndex/timestamp）、turn_end（7 字段，并入 D5）、session_start（previousSessionFile）、session_shutdown（reason/targetSessionFile）、before_agent_start（messageType/images/systemPrompt/systemPromptOptions） | 本轮逐字段盘点（各节表格） |
+| F1 | payload 字段缺失族：input（images/source/streamingBehavior）、tool_call（parentToolCallId）、tool_result（parentToolCallId/structuredContent/usage）、turn_start（turnIndex/timestamp）、turn_end（7 字段，并入 D5）、session_start（previousSessionFile）、session_shutdown（reason/targetSessionFile）、before_agent_start（messageType/images/systemPrompt/systemPromptOptions）。**【第四十六轮已修大半】**input 三字段、tool_result structuredContent/usage、turn_start turnIndex/timestamp、turn_end turnIndex、session_start previousSessionFile、session_shutdown reason 已补（§11）；messageType/images 已随 P1-B3 修；仍缺：parentToolCallId（随 executeTool 能力）、before_agent_start systemPrompt/systemPromptOptions getter、turn_end 边界字段族（D5） | 本轮逐字段盘点（各节表格）+ §11 修复记录 |
 | D10 | has_ui 语义：print/json/rpc 恒 false（上游 RPC 为 true、有 RPC 对话框转发） | `extensions.rs:1188-1191` 声明 |
 | D11 | pi.sendUserMessage/sendMessage 只携带文本（custom-message 形状与 deliverAs 未建模） | `extensions.rs:32-36` 声明 |
 
@@ -146,6 +146,16 @@
 6. **D7 子项**：tool_result handler 异常的行为声明写进 compatibility 头部（上游转 error、pi-rs 照常），或低成本改为：`{__error}` 时在 dispatcher 里记 notice 并保持现状（先声明后修）。
 7. **D5（turn_end 边界）**：仅做声明补记（capability 缺口大，依赖 custom-entry/context-edit 桥接，单列一轮）。
 8. 文档收尾：本轮 P2-D2/D5 与 F1 清单并入 compatibility-v1.4.md 头部声明段。
+
+## 11. 修复记录（第四十六轮，2026-11-08）
+
+按 §10 顺序执行，4/5/6/8 已落地，7（D5 边界语义）按计划仅声明：
+
+- **F1 字段补齐**：`input` 补 `images`（有图才带）/`source`（Prompt→"interactive"、ExtensionPrompt→"extension"）/`streamingBehavior`（run/streaming 活跃时映射 `"followUp"`——pi-rs 的 pending 队列即 settle 后新 run，D4 声明不变）；`tool_result` 补 `structuredContent`/`usage`（工具提供时在场，否则缺省不置 null——`tool_result_payload` 抽为纯函数）；`turn_start` 补 `turnIndex`/`timestamp`（task 内计数，agent_start 重置、agent_end 不重置，对照 agent-session.ts:1305,1320）、`turn_end` 补 `turnIndex`（取本次 turn 的 index）；`session_start` 补 `previousSessionFile`（替换前捕获 outgoing 文件；in-memory 为缺省）；`session_shutdown` 补 `reason`（pi-rs 仅 quit 时发 → `"quit"`，D1 不变）。
+- **D2**：`RpcReplacement::Reload{path}` 专变体 → `session_start reason="reload"`；interactive `/reload` 改发该变体。
+- **D7 子项声明**：compatibility 头部声明「tool_result handler 异常：上游转 error 结果、pi-rs 报 notice 且结果照常」。
+- **D5 声明**：compatibility 头部声明 turn_end/agent_before_settle 边界语义（entries/continue/context/entryId/outcome + 结果通道）整体缺位，依赖 custom-entry/context-edit 桥接，单列一轮。
+- 测试：`payload-fields.ts` fixture + 会话级断言（input source/streamingBehavior 缺省、turnstart:0:number、turnend:0、start:new:prev=<路径>、shutdown:quit）+ `tool_result_payload` 单测（可选字段在场/缺省两态、usage camelCase、无 parentToolCallId）。
 
 ## 附：方法与限制
 

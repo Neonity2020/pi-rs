@@ -2532,7 +2532,11 @@ impl InteractiveMode {
 			Some(path) => {
 				let path = path.to_string_lossy().into_owned();
 				self.begin_replacement_labeled(
-					RpcReplacement::Switch { path },
+					// The dedicated variant maps to `session_start
+					// reason "reload"` (upstream handleReloadCommand fires
+					// session_start{reason:"reload"}, agent-session.ts:3723-3755);
+					// a bare Switch would report "resume".
+					RpcReplacement::Reload { path },
 					ReplacementKind::Reload,
 					"Reload failed",
 					None,

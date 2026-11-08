@@ -734,11 +734,13 @@ impl ExtensionBridge {
 	}
 
 	/// `session_shutdown` to every listening host, then the graceful host
-	/// shutdown ladder (ask → 3s grace → kill). Teardown path.
-	pub async fn shutdown(&self) {
+	/// shutdown ladder (ask → 3s grace → kill). Teardown path. `reason` is
+	/// upstream's shutdown reason — pi-rs only fires on quit (replacement
+	/// shuts the hosts down silently, D1 declared), so callers pass "quit".
+	pub async fn shutdown(&self, reason: &str) {
 		self.dispatch_event_all(
 			"session_shutdown",
-			json!({"type": "session_shutdown"}),
+			json!({"type": "session_shutdown", "reason": reason}),
 			EXT_EVENT_TIMEOUT,
 		)
 		.await;
@@ -792,15 +794,7 @@ impl ExtensionBridge {
 					}),
 				})
 				.collect();
-			let payload = json!({
-				"type": "tool_result",
-				"toolCallId": ctx.tool_call.id,
-				"toolName": ctx.tool_call.name,
-				"input": ctx.tool_call.arguments,
-				"content": content,
-				"isError": ctx.is_error,
-				"details": ctx.result.details.clone(),
-			});
+			let payload = tool_result_payload(&ctx, content);
 			// Fire-and-forget: a slow `tool_result` handler must not hold the
 			// run (upstream awaits it; declared bridge deviation).
 			bridge.hooks.fire("tool_result", payload, EXT_EVENT_TIMEOUT);
@@ -808,6 +802,30 @@ impl ExtensionBridge {
 		});
 		agent.set_after_tool_call(after);
 	}
+}
+
+/// The `tool_result` payload — upstream
+/// `{type, toolCallId, toolName, input, content, details, structuredContent?,
+/// isError, usage?}` (types.ts:1267-1283). `structuredContent`/`usage` are
+/// present only when the tool provided them; the nested `parentToolCallId`
+/// rides on the missing executeTool capability (audit F1).
+fn tool_result_payload(ctx: &pi_agent::AfterToolCallContext<'_>, content: Vec<Value>) -> Value {
+	let mut payload = json!({
+		"type": "tool_result",
+		"toolCallId": ctx.tool_call.id,
+		"toolName": ctx.tool_call.name,
+		"input": ctx.tool_call.arguments,
+		"content": content,
+		"isError": ctx.is_error,
+		"details": ctx.result.details.clone(),
+	});
+	if let Some(structured) = &ctx.result.structured_content {
+		payload["structuredContent"] = structured.clone();
+	}
+	if let Some(usage) = &ctx.result.usage {
+		payload["usage"] = json!(usage);
+	}
+	payload
 }
 
 /// Aggregate `tool_call` outcomes. A handler exception (`{__error}`, host.mjs
@@ -1658,9 +1676,87 @@ mod tests {
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
-	// -- tool_call outcome aggregation ---------------------------------------
+	// -- tool_result payload --------------------------------------------------
 
 	#[test]
+	fn tool_result_payload_carries_optional_fields_only_when_present() {
+		// The assistant message only anchors the context's lifetime fields;
+		// the payload reads nothing from it.
+		let assistant = pi_ai::AssistantMessage {
+			content: Vec::new(),
+			api: "mock".into(),
+			provider: "mock".into(),
+			model: "m".into(),
+			response_model: None,
+			response_id: None,
+			thinking_level: None,
+			usage: Default::default(),
+			stop_reason: Default::default(),
+			error_message: None,
+			raw_stop_reason: None,
+			end_turn: None,
+			timestamp: 0,
+			duration_ms: None,
+		};
+		let tool_call = pi_ai::ToolCall {
+			id: "call-1".into(),
+			name: "grep".into(),
+			arguments: serde_json::json!({"pattern": "x"}),
+			thought_signature: None,
+			namespace: None,
+			arguments_error: None,
+		};
+		let messages: Vec<pi_ai::Message> = Vec::new();
+		let content = vec![serde_json::json!({"type": "text", "text": "hit"})];
+
+		// Full result: both optional fields present, usage camelCase.
+		let result = pi_agent::AgentToolResult {
+			content: Vec::new(),
+			details: Some(serde_json::json!({"matches": 2})),
+			structured_content: Some(serde_json::json!({"k": "v"})),
+			usage: Some(pi_ai::Usage {
+				input: 3,
+				output: 5,
+				..Default::default()
+			}),
+			is_error: false,
+			terminate: false,
+		};
+		let payload = tool_result_payload(
+			&pi_agent::AfterToolCallContext {
+				assistant_message: &assistant,
+				tool_call: &tool_call,
+				result: &result,
+				is_error: false,
+				messages: &messages,
+			},
+			content.clone(),
+		);
+		assert_eq!(payload["toolCallId"], "call-1");
+		assert_eq!(payload["toolName"], "grep");
+		assert_eq!(payload["structuredContent"], serde_json::json!({"k": "v"}));
+		assert_eq!(payload["usage"]["input"], 3);
+		assert_eq!(payload["usage"]["cacheRead"], 0);
+		assert_eq!(payload["details"], serde_json::json!({"matches": 2}));
+		assert_eq!(payload["isError"], false);
+		assert!(payload.get("parentToolCallId").is_none());
+
+		// Bare result: the optional fields are absent, not null.
+		let bare = pi_agent::AgentToolResult::text("plain");
+		let payload = tool_result_payload(
+			&pi_agent::AfterToolCallContext {
+				assistant_message: &assistant,
+				tool_call: &tool_call,
+				result: &bare,
+				is_error: false,
+				messages: &messages,
+			},
+			content,
+		);
+		assert!(payload.get("structuredContent").is_none());
+		assert!(payload.get("usage").is_none());
+	}
+
 	fn blocking_outcomes_aggregate_with_the_first_reason() {
 		let outcomes = vec![
 			serde_json::json!(null),
@@ -1771,7 +1867,7 @@ mod tests {
 		);
 		assert_eq!(title.as_deref(), Some("pi-ext-title"));
 		assert_eq!(notify, Some(("decorated".to_string(), "info".to_string())));
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -1804,7 +1900,7 @@ mod tests {
 				.is_err(),
 			"no Extension event expected without UI"
 		);
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -1897,7 +1993,7 @@ mod tests {
 			.expect("command succeeds");
 		let notice = next_notice(&mut events, "picked:").await;
 		assert_eq!(notice, "picked: chocolate");
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -1959,7 +2055,7 @@ mod tests {
 			.collect::<Vec<_>>()
 			.join("");
 		assert_eq!(text, "allowed");
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -2021,7 +2117,7 @@ mod tests {
 				.is_err(),
 			"no Extension event expected without UI"
 		);
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -2105,7 +2201,7 @@ mod tests {
 		assert_eq!(text, "Hello, Pi!");
 		assert_eq!(result.details, Some(serde_json::json!({"greeted": "Pi"})));
 
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -2140,7 +2236,7 @@ mod tests {
 		let defs = assembly.bridge.tool_defs();
 		assert_eq!(defs.len(), 1);
 		assert_eq!(defs[0].name, "hello");
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -2217,7 +2313,7 @@ mod tests {
 			.await
 			.expect_err("unknown command errors");
 		assert!(error.contains("unknown extension command"), "{error}");
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 		std::fs::remove_dir_all(&root).unwrap();
 	}
 }

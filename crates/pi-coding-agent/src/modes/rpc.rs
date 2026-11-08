@@ -1392,7 +1392,7 @@ mod tests {
 		assert!(answered, "select dialog never surfaced");
 		assert!(notify_seen, "notify frame never surfaced");
 		assert!(settled_seen, "settle never surfaced");
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 	}
 
 	/// Fire-and-forget ui.* calls forward as `extension_ui_request` frames in
@@ -1454,7 +1454,7 @@ mod tests {
 		assert_eq!(title.as_deref(), Some("pi-ext-title"));
 		assert_eq!(editor.as_deref(), Some("prefilled text"));
 		assert_eq!(notify, Some(("decorated".to_string(), "info".to_string())));
-		assembly.bridge.shutdown().await;
+		assembly.bridge.shutdown("quit").await;
 	}
 
 	fn echo_assistant_for_stats() -> pi_ai::AssistantMessage {
