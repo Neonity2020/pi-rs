@@ -25,6 +25,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # `oauth.callbackUrl`/`authServerMetadataUrl` validation in mcp_config.rs.
 url = "2"
+# npm spec version ranges in the package manager (core/package_manager.rs).
+semver = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 ratatui = { workspace = true }

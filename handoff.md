@@ -524,3 +524,20 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 ### 第四十六轮补记：poc session_name 竞态修复（2026-11-08）
 
 推送 8c966a3 后 CI 的 pi-extension-host poc `session_name_command_sets_and_reads_the_name` 失败（notified=None）——fixture 的 `ctx.ui.notify(...)` **未 await**（fire-and-forget 同步调用），命令结果帧与 host-call 帧同时就绪时 `tokio::select!` 随机选中命令完成分支即 break，排队中的 notify 未被消费。既有测试竞态（第四十四轮 CI 事故曾以「通道关闭」形态出现过一次），本轮新增的 node host 测试改变了并行时序使其显形。修复：break 后经 `try_next_host_call()` 补排水（wire 顺序保证 host-call 帧先于 return 帧——该函数 doc 注释早已声明此确定性）。本地 5 连跑全绿。
+
+## 第四十七轮：包管理子命令 `pi-rs package`（2026-11-08，主会话单线）
+
+基线 `0243382`。上游对照：`core/package-manager.ts`（2791 行，截取包 CLI 面）+ `utils/git.ts`（parseGitUrl）+ `package-manager-cli.ts` 的 handlePackageCommand（自更新/托管安装机制不属 cargo 二进制，整体推迟）。
+
+- **core/package_manager.rs**（新模块，~1100 行）：
+  - **源解析**：`npm:<spec>`（name/version/semver range/pinned——`semver` crate 的新依赖即为此）→ `isLocalPath`（上游语义：只有 npm:/git:/github:/http(s):/ssh:/builtin: 前缀非本地，`file:` 亦本地）→ `parse_git_url`（`git:` 前缀放行 shorthand 且 host 须含点/localhost、repo 重写 https://；无前缀仅显式协议 URL；scp-like 需 git: 前缀——上游 isLocalPath 吞掉裸 git@ 形态；`@ref` 剥离三分支 scp/URL/shorthand；traversal 拒绝【decoded 检查】；URL 形态的 `..` 由 Url 归一化先行——与上游 new URL 一致）→ local 回退。
+  - **install/remove**：npm（`<agent-dir>/npm` 用户 / `.pi/npm` 项目【信任门】——ensureNpmProject 写 `{name:"pi-extensions",private:true}` + `.gitignore` `*`，`npm install <spec> --prefix --legacy-peer-deps`；uninstall 对称）；git（`<agent-dir>/git/<host>/<path>`，clone→checkout ref→package.json 时 `npm install --omit=dev --legacy-peer-deps`，失败清理；remove=rmdir+空父级修剪）；local（仅存在性检查，资源原位）。
+  - **update**：离线（PI_OFFLINE）直通；npm 非 pinned：`npm view <spec> version` semver gt→重装；git：fetch 配置 ref（或 clone 的 upstream 分支——`git rev-parse --abbrev-ref @{upstream}`）→HEAD 比对→`reset --hard`+依赖重装（上游 marker 干净重装阶梯声明简化）。`source` 过滤按 identity（npm:name / git:host/path / local:绝对路径），未命中报上游同文案。
+  - **settings 持久化**：原始 JSON 读改写 settings.json 的 `packages` 数组（保留其他键；对象条目取其 source 参与列举；identity 去重）；remove 返回是否命中。
+  - **资源发现**（`resolve_resources`）：每个已配置包——manifest `pi.<type>` 条目优先（存在文件；glob/否定模式声明简化）→ 否则约定目录 `<root>/<type>/`：extensions 走 resolveExtensionEntries（manifest/index.ts/js 优先于遍历）+ collectAutoExtensionEntries（*.ts/*.js + 子目录显式条目）、skills 走 SKILL.md 最近优先、prompts/themes 走 *.md/*.json（SKILL.md 不排除——上游遍历即如此，由模板解析器裁决）；hidden+node_modules 跳过；gitignore 按扫描目录读取（复用 skills.rs 的 IgnoreRules，改 pub(crate)）。未安装包→warning（启动不自动装——上游 onMissing 交互声明推迟）。
+- **启动接线（main.rs）**：resolve 后 warning 走 stderr；extensions 条目追加到 discovered.entries（--no-extensions 门控；包资源最后=上游 rank 4）；skills/prompts 文件链到 skill_paths/prompt_paths（--no-skills/--no-prompt-templates 门控）。**包主题文件推迟**（需 ui_config::load_from 线程化改动，声明）。
+- **cli_package.rs**：`pi-rs package install/remove/list/update`（main.rs clap 前短路，非 package 参数落回 clap；`-l/--local`、`--approve`【未信任项目改本地包配置】、help/usage 上游形状；list 输出 JSONL）。`pi config` 选择器推迟。
+- **测试**：+10（全工作区 **1026**）：parse×3（npm spec pin/range、git URL 三形态+traversal+prefix 语义、local 识别）、资源发现×2（约定目录+ignore+manifest 优先）、local 包 round trip、git 本地仓库 clone/update/remove round trip（install_parsed/remove_parsed pub(crate) 内部门——URL 语法只到网络 host，离线走已解析源）、CLI 参数×2。pty 冒烟 `tui_package.rs`：settings `packages` 条目的扩展注册 `/pkg-hello` 命令→notify 断言（resolve→启动全链路）。**坑**：①测试必须隔离 PI_RS_AGENT_DIR——首版把 fixture 写进了真实 `~/.pi-rs/agent/settings.json`（已清理）；②git 测试 `run(&["init"], None)` 在测试进程 cwd（workspace）里 init——add/commit 全跑错仓库；③本地目录 npm spec 装的是 symlink——registry 安装只能 CLI 冒烟，离线测试走 local/git 形态。
+- **文档**：README 能力表/剩余清单更新；compatibility 头部第二十一轮增量。
+
+**交接事项（下一轮候选）**：`pi config` 选择器（config-selector.ts 交互面）；包主题文件接入 ui_config；包 glob/否定模式与 per-resource settings 条目；上游 npm 托管安装/self-update（cargo 二进制不适用——永久声明或设计 cargo 版）；RPC setWidget/editor 转发；D5 turn_end 边界语义轮。改动未提交（本条 handoff 与代码一起提交），等用户指令。

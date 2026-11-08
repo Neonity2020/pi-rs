@@ -10,6 +10,7 @@
 
 mod cli_auth;
 mod cli_mcp;
+mod cli_package;
 mod config;
 mod core;
 mod modes;
@@ -918,6 +919,13 @@ async fn main() -> anyhow::Result<()> {
 			let code = cli_mcp::run_mcp_command(&argv[2..]).await;
 			std::process::exit(code);
 		}
+		// `pi-rs package …` likewise (upstream `handlePackageCommand` runs
+		// before mode dispatch); non-package arguments fall through to clap.
+		if argv.get(1).map(String::as_str) == Some("package")
+			&& let Some(code) = cli_package::run_package_command(&argv[2..]).await
+		{
+			std::process::exit(code);
+		}
 		Cli::parse_from(rewrite_combined_short_args(argv))
 	};
 	let startup_cwd = std::env::current_dir()?;
@@ -1331,6 +1339,22 @@ async fn main() -> anyhow::Result<()> {
 	// user `extensions/` directory, then the CLI paths; `-ne` skips the two
 	// default directories while explicit `-e` paths still load (upstream
 	// resource-loader `noExtensions` semantics).
+	// Package resources (settings `packages`): installed packages contribute
+	// extension entries plus skill/prompt files — upstream `resolve()`; the
+	// startup auto-install prompt and per-resource settings entries are
+	// declared reductions, missing packages surface as warnings.
+	let package_resources = {
+		let manager = crate::core::package_manager::PackageManager::new(
+			&cwd,
+			&crate::config::agent_dir(),
+			project_trusted,
+		);
+		let mut resources = manager.resolve_resources();
+		for warning in std::mem::take(&mut resources.warnings) {
+			eprintln!("warning: package: {warning}");
+		}
+		resources
+	};
 	let mut extensions = {
 		let cli_paths: Vec<PathBuf> = cli
 			.extension
@@ -1346,6 +1370,15 @@ async fn main() -> anyhow::Result<()> {
 				project_trusted,
 			},
 		);
+		if !cli.no_extensions {
+			// Package extensions load last (upstream precedence rank 4:
+			// below project/user file resources).
+			for path in &package_resources.extensions {
+				discovered
+					.entries
+					.push((path.display().to_string(), path.clone()));
+			}
+		}
 		let mut assembly = crate::core::extensions::spawn_extensions(
 			discovered.entries,
 			&crate::core::extensions::SpawnOptions {
@@ -1388,10 +1421,40 @@ async fn main() -> anyhow::Result<()> {
 	// startup warnings (upstream prints them to the console); a bad
 	// frontmatter in a skill warns instead of failing startup.
 	let resources = {
+		let mut package_skill_paths = Vec::new();
+		let mut package_prompt_paths = Vec::new();
+		if !cli.no_skills {
+			package_skill_paths.extend(
+				package_resources
+					.skills
+					.iter()
+					.map(|path| path.display().to_string()),
+			);
+		}
+		if !cli.no_prompt_templates {
+			package_prompt_paths.extend(
+				package_resources
+					.prompts
+					.iter()
+					.map(|path| path.display().to_string()),
+			);
+		}
+		let skill_paths = cli
+			.skill
+			.iter()
+			.cloned()
+			.chain(package_skill_paths)
+			.collect::<Vec<_>>();
+		let prompt_paths = cli
+			.prompt_template
+			.iter()
+			.cloned()
+			.chain(package_prompt_paths)
+			.collect::<Vec<_>>();
 		let skills = crate::core::skills::load_skills(crate::core::skills::LoadSkillsOptions {
 			cwd: cwd.clone(),
 			agent_dir: crate::config::agent_dir(),
-			skill_paths: cli.skill.clone(),
+			skill_paths,
 			include_defaults: !cli.no_skills,
 		});
 		for diagnostic in &skills.diagnostics {
@@ -1404,7 +1467,7 @@ async fn main() -> anyhow::Result<()> {
 			crate::core::prompt_templates::LoadPromptTemplatesOptions {
 				cwd: cwd.clone(),
 				agent_dir: crate::config::agent_dir(),
-				prompt_paths: cli.prompt_template.clone(),
+				prompt_paths,
 				include_defaults: !cli.no_prompt_templates,
 			},
 		);

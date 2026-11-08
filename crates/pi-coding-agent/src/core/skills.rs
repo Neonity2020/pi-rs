@@ -21,7 +21,7 @@ const MAX_NAME_LENGTH: usize = 64;
 /// Max description length per spec.
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
-const IGNORE_FILE_NAMES: [&str; 3] = [".gitignore", ".ignore", ".fdignore"];
+pub(crate) const IGNORE_FILE_NAMES: [&str; 3] = [".gitignore", ".ignore", ".fdignore"];
 
 /// Where a skill came from (`sourceInfo` upstream, reduced to the scope tag
 /// the interactive autocomplete prefixes descriptions with).
@@ -81,13 +81,13 @@ pub struct LoadSkillsResult {
 
 /// Accumulated gitignore-style rules (one matcher per upstream, rules
 /// re-prefixed relative to the scan root as directories are visited).
-struct IgnoreRules {
+pub(crate) struct IgnoreRules {
 	lines: Vec<String>,
 	matcher: ignore::gitignore::Gitignore,
 }
 
 impl IgnoreRules {
-	fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self {
 			lines: Vec::new(),
 			matcher: ignore::gitignore::Gitignore::empty(),
@@ -97,7 +97,7 @@ impl IgnoreRules {
 	/// Read this directory's ignore files, re-prefix their rules relative to
 	/// the scan root, and rebuild the matcher (upstream `addIgnoreRules` on a
 	/// single shared `ignore()` instance).
-	fn add_dir_rules(&mut self, dir: &Path, root: &Path) {
+	pub(crate) fn add_dir_rules(&mut self, dir: &Path, root: &Path) {
 		let relative_dir = relative_posix(root, dir);
 		let prefix = if relative_dir.is_empty() {
 			String::new()
@@ -127,7 +127,7 @@ impl IgnoreRules {
 		}
 	}
 
-	fn ignores(&self, rel_path: &str, is_dir: bool) -> bool {
+	pub(crate) fn ignores(&self, rel_path: &str, is_dir: bool) -> bool {
 		matches!(
 			self.matcher.matched(Path::new(rel_path), is_dir),
 			ignore::Match::Ignore(_)
@@ -139,7 +139,7 @@ impl IgnoreRules {
 /// negation and `\!`/`/` escapes normalize, and the rule gains the
 /// directory's relative prefix so one root-anchored matcher serves every
 /// nested ignore file.
-fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
+pub(crate) fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
 	let trimmed = line.trim();
 	if trimmed.is_empty() {
 		return None;
@@ -172,7 +172,7 @@ fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
 
 /// Node `path.relative(root, path)` for the only shape the walker produces:
 /// `path` at or below `root`. Posix separators.
-fn relative_posix(root: &Path, path: &Path) -> String {
+pub(crate) fn relative_posix(root: &Path, path: &Path) -> String {
 	let Ok(rel) = path.strip_prefix(root) else {
 		return path.to_string_lossy().into_owned();
 	};
