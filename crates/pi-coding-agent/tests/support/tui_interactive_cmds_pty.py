@@ -60,7 +60,16 @@ def wait_for(captured, process, master, needle):
             try:
                 captured.extend(os.read(master, 65536))
             except OSError:
-                break
+                # Kernel 7.0 raises transient OSErrors on master reads while
+
+                # the child still runs; keep polling — the deadline and the
+
+                # process poll own the exit decision (pty harness port).
+
+                time.sleep(0.05)
+
+                continue
+
     dump = os.environ.get("TUI_PTY_DEBUG_DUMP")
     if dump:
         with open(dump, "wb") as handle:
@@ -86,7 +95,16 @@ def quit_cleanly(master, captured, process):
             try:
                 captured.extend(os.read(master, 65536))
             except OSError:
-                break
+                # Kernel 7.0 raises transient OSErrors on master reads while
+
+                # the child still runs; keep polling — the deadline and the
+
+                # process poll own the exit decision (pty harness port).
+
+                time.sleep(0.05)
+
+                continue
+
     assert process.poll() is not None, "pi-rs did not exit after ctrl+c"
     assert process.returncode == 0
 

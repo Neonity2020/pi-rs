@@ -74,7 +74,16 @@ for choice in ("y", "n", "escape", "disabled", "missing"):
                 try:
                     captured.extend(os.read(master, 65536))
                 except OSError:
-                    break
+                    # Kernel 7.0 raises transient OSErrors on master reads while
+
+                    # the child still runs; keep polling — the deadline and the
+
+                    # process poll own the exit decision (pty harness port).
+
+                    time.sleep(0.05)
+
+                    continue
+
         raise AssertionError(f"{choice}: did not see {needle!r}; output: {bytes(captured[-5000:])!r}")
 
     def wait_for_switch():

@@ -59,7 +59,16 @@ def wait_for(captured, needle, deadline_seconds=30):
             try:
                 captured.extend(os.read(master, 65536))
             except OSError:
-                break
+                # Kernel 7.0 raises transient OSErrors on master reads while
+
+                # the child still runs; keep polling — the deadline and the
+
+                # process poll own the exit decision (pty harness port).
+
+                time.sleep(0.05)
+
+                continue
+
     raise AssertionError(f"did not see {needle!r}; tail: {bytes(captured[-4000:])!r}")
 
 captured = bytearray()
