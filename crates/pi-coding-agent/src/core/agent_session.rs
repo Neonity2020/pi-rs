@@ -376,6 +376,13 @@ pub enum SessionEvent {
 	/// `ui.setTitle(text)` (round 43): OSC-0 terminal window title
 	/// (upstream `terminal.setTitle`).
 	ExtensionTitle(String),
+	/// `ui.setWidget(key, content, options)` (round 48): widgets above or below
+	/// the editor. `lines: None` clears the widget for `key`.
+	ExtensionWidget {
+		key: String,
+		lines: Option<Vec<String>>,
+		placement: Option<String>,
+	},
 }
 
 /// Session log plus the persist cursor, shared between the session task and

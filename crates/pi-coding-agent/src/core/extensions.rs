@@ -272,6 +272,11 @@ pub enum ExtensionDialogKind {
 		title: String,
 		placeholder: Option<String>,
 	},
+	/// `ui.editor(title, prefill)` — answer `Some(text)` or `None`.
+	Editor {
+		title: String,
+		prefill: Option<String>,
+	},
 }
 
 /// Session-side services for host-initiated calls the bridge cannot serve
@@ -999,6 +1004,26 @@ async fn answer_host_call(
 			.await;
 			let _ = host.answer(call.id, answer).await;
 		}
+		"ui.editor" => {
+			let title = call
+				.params
+				.get("title")
+				.and_then(Value::as_str)
+				.unwrap_or("Editor")
+				.to_string();
+			let prefill = call
+				.params
+				.get("prefill")
+				.and_then(Value::as_str)
+				.map(str::to_string);
+			let answer = extension_dialog(
+				inner,
+				ExtensionDialogKind::Editor { title, prefill },
+				Value::Null,
+			)
+			.await;
+			let _ = host.answer(call.id, answer).await;
+		}
 		"session.sendUserMessage" | "session.sendMessage" => {
 			let text = call
 				.params
@@ -1053,6 +1078,36 @@ async fn answer_host_call(
 				.unwrap_or_default()
 				.to_string();
 			inner.emit_ui_event(SessionEvent::ExtensionTitle(text));
+			let _ = host.answer(call.id, Value::Null).await;
+		}
+		"ui.setWidget" => {
+			let key = call
+				.params
+				.get("key")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let lines = call
+				.params
+				.get("lines")
+				.and_then(Value::as_array)
+				.map(|items| {
+					items
+						.iter()
+						.filter_map(Value::as_str)
+						.map(str::to_string)
+						.collect()
+				});
+			let placement = call
+				.params
+				.get("placement")
+				.and_then(Value::as_str)
+				.map(str::to_string);
+			inner.emit_ui_event(SessionEvent::ExtensionWidget {
+				key,
+				lines,
+				placement,
+			});
 			let _ = host.answer(call.id, Value::Null).await;
 		}
 		// Anything else: not bridged (declared limitation) — acknowledged

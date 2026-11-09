@@ -334,10 +334,16 @@ struct ExtensionDialogState {
 
 impl ExtensionDialogState {
 	fn new(request: crate::core::extensions::ExtensionDialogRequest) -> Self {
+		let value = match &request.kind {
+			crate::core::extensions::ExtensionDialogKind::Editor { prefill, .. } => {
+				prefill.clone().unwrap_or_default()
+			}
+			_ => String::new(),
+		};
 		Self {
 			request,
 			cursor: 0,
-			value: String::new(),
+			value,
 		}
 	}
 }
@@ -570,6 +576,9 @@ pub struct InteractiveMode {
 	// ui.setStatus items (upstream `setStatus(key, text | undefined)`,
 	// footer.ts): the values render sorted by key as a third footer line.
 	extension_status: BTreeMap<String, String>,
+	/// ui.setWidget items (upstream `setWidget(key, content, options)`).
+	extension_widgets_above: BTreeMap<String, Vec<String>>,
+	extension_widgets_below: BTreeMap<String, Vec<String>>,
 	session_list_tx: mpsc::UnboundedSender<SessionListMsg>,
 	session_list_rx: mpsc::UnboundedReceiver<SessionListMsg>,
 	/// `@file` image attachments riding on the next prompt (`@file` text
@@ -1077,6 +1086,8 @@ impl InteractiveMode {
 			extension_dialog: None,
 			pending_extension_dialogs: VecDeque::new(),
 			extension_status: BTreeMap::new(),
+			extension_widgets_above: BTreeMap::new(),
+			extension_widgets_below: BTreeMap::new(),
 			session_list_tx,
 			session_list_rx,
 			pending_images: ui.initial_images,
@@ -1253,9 +1264,18 @@ impl InteractiveMode {
 						self.suspended = false;
 						term_pause = spawn_term_reader(term_tx.clone());
 					}
-					if let ExternalEditorOutcome::Complete(content) = outcome {
-						self.editor.set_text(content);
-					}
+						if let ExternalEditorOutcome::Complete(content) = outcome {
+							if let Some(state) = self.extension_dialog.as_mut()
+								&& matches!(
+									state.request.kind,
+									crate::core::extensions::ExtensionDialogKind::Editor { .. }
+								)
+							{
+								state.value = content;
+							} else {
+								self.editor.set_text(content);
+							}
+						}
 				}
 				_ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
 					self.tick = self.tick.wrapping_add(1);
@@ -1728,7 +1748,15 @@ impl InteractiveMode {
 
 	fn spawn_external_editor(&mut self) {
 		let command = self.external_editor_cmd.clone();
-		let content = self.editor.text().to_string();
+		let content = if let Some(state) = self.extension_dialog.as_ref()
+			&& matches!(
+				state.request.kind,
+				crate::core::extensions::ExtensionDialogKind::Editor { .. }
+			) {
+			state.value.clone()
+		} else {
+			self.editor.text().to_string()
+		};
 		let tx = self.editor_tx.clone();
 		tokio::spawn(async move {
 			let outcome = run_external_editor(&command, &content).await;
@@ -3727,6 +3755,26 @@ impl InteractiveMode {
 					crossterm::terminal::SetTitle(title.as_str())
 				);
 			}
+			SessionEvent::ExtensionWidget {
+				key,
+				lines,
+				placement,
+			} => {
+				self.extension_widgets_above.remove(&key);
+				self.extension_widgets_below.remove(&key);
+				if let Some(mut lines) = lines {
+					const MAX_WIDGET_LINES: usize = 8;
+					if lines.len() > MAX_WIDGET_LINES {
+						lines.truncate(MAX_WIDGET_LINES);
+						lines.push("... (widget truncated)".to_string());
+					}
+					if placement.as_deref() == Some("belowEditor") {
+						self.extension_widgets_below.insert(key, lines);
+					} else {
+						self.extension_widgets_above.insert(key, lines);
+					}
+				}
+			}
 		}
 	}
 
@@ -3807,6 +3855,37 @@ impl InteractiveMode {
 				}
 				_ => {}
 			},
+			crate::core::extensions::ExtensionDialogKind::Editor { .. } => {
+				if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+					self.pending_external_editor = true;
+					return;
+				}
+				match key.code {
+					KeyCode::Esc => self.answer_extension_dialog(serde_json::Value::Null),
+					KeyCode::Enter
+						if key
+							.modifiers
+							.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+					{
+						state.value.push('\n');
+					}
+					KeyCode::Enter => {
+						let value = std::mem::take(&mut state.value);
+						self.answer_extension_dialog(serde_json::Value::String(value));
+					}
+					KeyCode::Backspace => {
+						state.value.pop();
+					}
+					KeyCode::Char(c)
+						if !key
+							.modifiers
+							.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+					{
+						state.value.push(c);
+					}
+					_ => {}
+				}
+			}
 		}
 	}
 
@@ -4062,10 +4141,22 @@ impl InteractiveMode {
 		// Footer grows to three lines while an extension status item is set
 		// (footer.ts:289-299 appends the status line when non-empty).
 		let footer_rows = 2 + u16::from(!self.extension_status.is_empty());
+		let above_rows = self
+			.extension_widgets_above
+			.values()
+			.map(|l| l.len())
+			.sum::<usize>() as u16;
+		let below_rows = self
+			.extension_widgets_below
+			.values()
+			.map(|l| l.len())
+			.sum::<usize>() as u16;
 		let chunks = Layout::vertical([
 			Constraint::Length(1),
 			Constraint::Min(3),
+			Constraint::Length(above_rows),
 			Constraint::Length(editor_rows + 2),
+			Constraint::Length(below_rows),
 			Constraint::Length(footer_rows),
 		])
 		.split(area);
@@ -4075,9 +4166,11 @@ impl InteractiveMode {
 		let lines = self.render_blocks(chat_width);
 		self.chat.set_lines(lines);
 		self.chat.render(chunks[1], frame.buffer_mut());
-		self.draw_editor(frame, chunks[2]);
-		self.draw_footer(frame, chunks[3]);
-		self.draw_slash_menu(frame, chunks[1], chunks[2]);
+		self.draw_widgets(frame, &self.extension_widgets_above, chunks[2]);
+		self.draw_editor(frame, chunks[3]);
+		self.draw_widgets(frame, &self.extension_widgets_below, chunks[4]);
+		self.draw_footer(frame, chunks[5]);
+		self.draw_slash_menu(frame, chunks[1], chunks[3]);
 		self.draw_overlay(frame, chunks[1]);
 		self.draw_settings_overlay(frame, chunks[1]);
 		self.draw_scoped_overlay(frame, chunks[1]);
@@ -4165,6 +4258,22 @@ impl InteractiveMode {
 			Span::styled(format!("  {cwd_short}"), Style::new().fg(self.theme.muted)),
 		]);
 		frame.render_widget(Paragraph::new(line), area);
+	}
+
+	fn draw_widgets(&self, frame: &mut Frame, widgets: &BTreeMap<String, Vec<String>>, area: Rect) {
+		if area.height == 0 || widgets.is_empty() {
+			return;
+		}
+		let mut lines = Vec::new();
+		for widget_lines in widgets.values() {
+			for line in widget_lines {
+				lines.push(Line::from(Span::styled(
+					line.clone(),
+					Style::new().fg(self.theme.muted),
+				)));
+			}
+		}
+		frame.render_widget(Paragraph::new(lines), area);
 	}
 
 	fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
@@ -4568,6 +4677,20 @@ impl InteractiveMode {
 						"{value}{cursor}\n\n{} submit · {} cancel",
 						self.keybinding_hint("tui.input.submit", "enter"),
 						self.keybinding_hint("tui.select.cancel", "esc"),
+					),
+				)
+			}
+			crate::core::extensions::ExtensionDialogKind::Editor { title, .. } => {
+				let cursor = "▌";
+				(
+					format!(" {title} "),
+					format!(
+						"{}{cursor}\n\n{} submit · {} newline · {} cancel · {} external editor",
+						state.value,
+						self.keybinding_hint("tui.select.confirm", "enter"),
+						self.keybinding_hint("tui.input.newLine", "shift+enter"),
+						self.keybinding_hint("tui.select.cancel", "esc"),
+						self.keybinding_hint("app.editor.external", "ctrl+g"),
 					),
 				)
 			}
@@ -7393,6 +7516,34 @@ mod session_selector_tests {
 			resolve_global_action(&kb, &key, true),
 			Some(GlobalAction::SessionResume)
 		);
+	}
+
+	#[test]
+	fn extension_dialog_editor_prefill_and_state() {
+		let req = crate::core::extensions::ExtensionDialogRequest {
+			id: 1,
+			kind: crate::core::extensions::ExtensionDialogKind::Editor {
+				title: "Edit".to_string(),
+				prefill: Some("hello".to_string()),
+			},
+		};
+		let state = ExtensionDialogState::new(req);
+		assert_eq!(state.value, "hello");
+	}
+
+	#[test]
+	fn extension_widget_truncation_caps_at_max_lines() {
+		let mut widgets = BTreeMap::new();
+		let mut lines: Vec<String> = (1..=12).map(|i| format!("line {i}")).collect();
+		const MAX_WIDGET_LINES: usize = 8;
+		if lines.len() > MAX_WIDGET_LINES {
+			lines.truncate(MAX_WIDGET_LINES);
+			lines.push("... (widget truncated)".to_string());
+		}
+		widgets.insert("test".to_string(), lines);
+		let test_lines = widgets.get("test").unwrap();
+		assert_eq!(test_lines.len(), 9);
+		assert_eq!(test_lines[8], "... (widget truncated)");
 	}
 }
 

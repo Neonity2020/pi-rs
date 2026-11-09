@@ -1750,6 +1750,7 @@ async fn main() -> anyhow::Result<()> {
 		theme_setting.as_deref(),
 		cli.light,
 		&theme_files,
+		&package_resources.themes,
 		!cli.no_themes,
 	);
 	ui.external_editor = ui_config::resolve_external_editor(settings.external_editor.as_deref());

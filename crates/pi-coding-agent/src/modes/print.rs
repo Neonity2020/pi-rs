@@ -157,7 +157,8 @@ async fn run_print_to<W: Write>(
 				SessionEvent::ExtensionEditorText(_)
 				| SessionEvent::ExtensionStatus { .. }
 				| SessionEvent::ExtensionNotify { .. }
-				| SessionEvent::ExtensionTitle(_) => {}
+				| SessionEvent::ExtensionTitle(_)
+				| SessionEvent::ExtensionWidget { .. } => {}
 			}
 		}
 	}

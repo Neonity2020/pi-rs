@@ -16,6 +16,14 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("edit-text", {
+		description: "Ask via ui.editor",
+		handler: async (_args, ctx) => {
+			const text = await ctx.ui.editor("Edit file", "initial content");
+			ctx.ui.notify(`edited: ${text ?? "cancelled"}`, "info");
+		},
+	});
+
 	pi.registerCommand("prompt-me", {
 		description: "Inject a user prompt",
 		handler: async () => {

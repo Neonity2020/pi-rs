@@ -9,11 +9,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("decorate", {
 		description: "Exercise ui.setStatus/setTitle/setEditorText",
-		handler: async (_args, ctx) => {
-			ctx.ui.setStatus("files", "watching files");
-			ctx.ui.setTitle("pi-ext-title");
-			ctx.ui.setEditorText("prefilled text");
-			ctx.ui.notify("decorated", "info");
-		},
+			handler: async (_args, ctx) => {
+				ctx.ui.setStatus("files", "watching files");
+				ctx.ui.setTitle("pi-ext-title");
+				ctx.ui.setEditorText("prefilled text");
+				ctx.ui.setWidget("git-status", ["branch: main", "clean"], { placement: "belowEditor" });
+				ctx.ui.notify("decorated", "info");
+			},
 	});
 }

@@ -540,4 +540,36 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **测试**：+10（全工作区 **1026**）：parse×3（npm spec pin/range、git URL 三形态+traversal+prefix 语义、local 识别）、资源发现×2（约定目录+ignore+manifest 优先）、local 包 round trip、git 本地仓库 clone/update/remove round trip（install_parsed/remove_parsed pub(crate) 内部门——URL 语法只到网络 host，离线走已解析源）、CLI 参数×2。pty 冒烟 `tui_package.rs`：settings `packages` 条目的扩展注册 `/pkg-hello` 命令→notify 断言（resolve→启动全链路）。**坑**：①测试必须隔离 PI_RS_AGENT_DIR——首版把 fixture 写进了真实 `~/.pi-rs/agent/settings.json`（已清理）；②git 测试 `run(&["init"], None)` 在测试进程 cwd（workspace）里 init——add/commit 全跑错仓库；③本地目录 npm spec 装的是 symlink——registry 安装只能 CLI 冒烟，离线测试走 local/git 形态。
 - **文档**：README 能力表/剩余清单更新；compatibility 头部第二十一轮增量。
 
-**交接事项（下一轮候选）**：`pi config` 选择器（config-selector.ts 交互面）；包主题文件接入 ui_config；包 glob/否定模式与 per-resource settings 条目；上游 npm 托管安装/self-update（cargo 二进制不适用——永久声明或设计 cargo 版）；RPC setWidget/editor 转发；D5 turn_end 边界语义轮。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+**交接事项（下一轮候选）**：`pi config` 选择器（config-selector.ts 交互面）；包主题文件接入 ui_config；包 glob/否定模式与 per-resource settings 条目；上游 npm 托管安装/self-update（cargo 二进制不适用——永久声明或设计 cargo 版）；RPC setWidget/editor 转发；D5 turn_end 边界语义轮。
+
+## 第四十八轮：扩展 UI 完整化（setWidget + editor 跨 TUI/RPC 双模）+ 包主题文件接入 ui_config（2026-11-08，主会话单线）
+
+基线 `7a89fc2`。承接第四十七轮未决的两个高价值候选：包主题发现接入与扩展 UI 面补齐（setWidget 与 editor 跨双模）。
+
+- **包主题文件接入 ui_config** (`crates/pi-coding-agent/src/core/ui_config.rs` + `main.rs`)：
+  - `load_with_cli_themes` 接收 `package_theme_files: &[PathBuf]`，解析优先级对齐上游：内建 `dark`/`light` → CLI `--theme` 覆盖 → 用户目录 `<agent_dir>/themes/` → 安装包主题 `package_themes`（upstream rank 4）→ 回退内建并发出 notice。
+  - `main.rs` 将 `package_resources.themes` 正式喂入 `ui_config`。单测 `theme_loads_from_package_themes` 验证包主题发现。
+- **扩展 host.mjs 补齐** (`crates/pi-extension-host/host/host.mjs`)：
+  - `ui.setWidget(key, content, options)`：字符串数组提取 lines，调用 host `"ui.setWidget"`。
+  - `ui.editor(title, prefill)`：调用 host `"ui.editor"`。
+  - `ui.pasteToEditor(text)`：回退转发 `"ui.setEditorText"`（对齐上游 RPC 与无 paste 模式降级行为）。
+  - `ui.getEditorText()`：空串桩（对齐上游 RPC/非阻塞语义）。
+- **扩展桥与会话事件** (`crates/pi-coding-agent/src/core/{extensions.rs, agent_session.rs}`)：
+  - `ExtensionDialogKind::Editor { title, prefill }`：作为对话框原语，支持异步文本编辑，默认返回 `Value::Null`。
+  - `SessionEvent::ExtensionWidget { key, lines, placement }`：派发给 UI 模式消费。
+  - `answer_host_call` 接入 `"ui.editor"` 与 `"ui.setWidget"`。
+- **RPC 模式转发** (`crates/pi-coding-agent/src/modes/rpc.rs`)：
+  - `SessionEvent::ExtensionWidget` 转发 `extension_ui_request { method: "setWidget", widgetKey, widgetLines, widgetPlacement }`。
+  - `ExtensionDialogKind::Editor` 组装 `extension_ui_request { method: "editor", title, prefill }`。
+  - `handle_extension_ui_response` 原生透传 `value` / `cancelled`，解冻等待中的 `editor` Promise。
+  - 新增 RPC 单元测试：`extension_editor_dialog_round_trips_through_the_rpc_wire` 与 `extension_decorations_forward_as_extension_ui_requests` 中的 `setWidget` 断言。
+- **Interactive TUI 模式** (`crates/pi-coding-agent/src/modes/interactive.rs`)：
+  - 存储 `extension_widgets_above` 与 `extension_widgets_below`（BTreeMap），单 widget 限高 8 行，溢出追加 `... (widget truncated)`，None 清除对应 key。
+  - `draw()` 动态扩展垂直布局，在输入框上方和下方渲染部件。
+  - `ExtensionDialogState::new` 注入 prefill 初始值，`handle_extension_dialog_key` 响应 Shift/Alt+Enter 换行、Enter 提交、Esc 取消、Backspace、字符输入及 Ctrl+G 唤起外部编辑器。
+  - `spawn_external_editor` 与 `editor_rx.recv()` 感知活跃的 `Editor` 弹窗，外部编辑完成后写回 `state.value`。
+  - `draw_extension_dialog` 支持渲染带多行光标与热键提示的弹窗。
+- **验证**：全工作区测试全绿（+4 个新单测），`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings` 零警告，difftest 六场景 6/6 IDENTICAL。
+
+**交接事项（下一轮候选）**：`pi config` 选择器（config-selector.ts 交互面）；包 glob/否定模式与 per-resource settings 条目；上游 npm 托管安装/self-update（cargo 二进制不适用——永久声明或设计 cargo 版）；D5 turn_end 边界语义轮。改动未提交，等用户指令。
+

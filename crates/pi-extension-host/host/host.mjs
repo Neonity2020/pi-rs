@@ -228,15 +228,22 @@ function makeCtx(extra) {
 		mode: "bridge",
 		hasUI: process.env.PI_EXT_HAS_UI !== "0",
 		cwd: process.env.PI_EXT_CWD ?? process.cwd(),
-		ui: {
-			notify: (message, level) => callHost("ui.notify", { message, level: level ?? "info" }),
-			select: (title, options) => callHost("ui.select", { title, options }),
-			confirm: (title) => callHost("ui.confirm", { title }),
-			input: (title, placeholder) => callHost("ui.input", { title, placeholder }),
-			setEditorText: (text) => callHost("ui.setEditorText", { text }),
-			setStatus: (key, text) => callHost("ui.setStatus", { key, text }),
-			setTitle: (text) => callHost("ui.setTitle", { text }),
-		},
+			ui: {
+				notify: (message, level) => callHost("ui.notify", { message, level: level ?? "info" }),
+				select: (title, options) => callHost("ui.select", { title, options }),
+				confirm: (title) => callHost("ui.confirm", { title }),
+				input: (title, placeholder) => callHost("ui.input", { title, placeholder }),
+				editor: (title, prefill) => callHost("ui.editor", { title, prefill }),
+				setEditorText: (text) => callHost("ui.setEditorText", { text }),
+				pasteToEditor: (text) => callHost("ui.setEditorText", { text }),
+				getEditorText: () => "",
+				setStatus: (key, text) => callHost("ui.setStatus", { key, text }),
+				setTitle: (text) => callHost("ui.setTitle", { text }),
+				setWidget: (key, content, options) => {
+					const lines = Array.isArray(content) ? content : undefined;
+					return callHost("ui.setWidget", { key, lines, placement: options?.placement });
+				},
+			},
 		sessionManager: {
 			getCwd: () => process.env.PI_EXT_CWD ?? process.cwd(),
 		},

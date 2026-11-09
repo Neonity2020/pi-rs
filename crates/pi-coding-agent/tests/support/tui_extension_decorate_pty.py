@@ -71,6 +71,20 @@ def wait_for(captured, needle, deadline_seconds=30):
 
     raise AssertionError(f"did not see {needle!r}; tail: {bytes(captured[-4000:])!r}")
 
+def quit_cleanly(master, captured, process):
+    os.write(master, b"\x03")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return
+        if select.select([master], [], [], 0.1)[0]:
+            try:
+                captured.extend(os.read(master, 65536))
+            except OSError:
+                time.sleep(0.05)
+                continue
+    raise AssertionError(f"process did not exit on ctrl+c; poll={process.poll()}")
+
 captured = bytearray()
 try:
     wait_for(captured, "type /help")
@@ -82,8 +96,9 @@ try:
     wait_for(captured, "prefilled text")
     # The OSC-0 window title survived the CSI-only strip.
     assert b"pi-ext-title" in decoded(captured), "window title never set"
-    os.write(master, b"\x03")
-    process.wait(timeout=10)
+    # The widget lines joined below the editor.
+    wait_for(captured, "branch: main")
+    quit_cleanly(master, captured, process)
 finally:
     if process.poll() is None:
         process.kill()

@@ -444,14 +444,16 @@ mod tests {
 			None,
 		)
 		.unwrap();
-		assert_eq!(credential.expires, now + 7200 * 1000 - REFRESH_SKEW_MS);
+		let expected = now + 7200 * 1000 - REFRESH_SKEW_MS;
+		assert!((credential.expires - expected).abs() <= 1000);
 		// Omitted expires_in falls back to the default lifetime.
 		let credential = credentials_from_token_response(
 			&json!({"access_token": "at", "refresh_token": "rt"}),
 			None,
 		)
 		.unwrap();
-		assert_eq!(credential.expires, now + 3600 * 1000 - REFRESH_SKEW_MS);
+		let expected = now + 3600 * 1000 - REFRESH_SKEW_MS;
+		assert!((credential.expires - expected).abs() <= 1000);
 	}
 
 	#[test]

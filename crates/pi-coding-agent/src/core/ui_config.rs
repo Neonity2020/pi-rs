@@ -363,6 +363,7 @@ pub fn load_with_cli_themes(
 	theme_setting: Option<&str>,
 	light: bool,
 	theme_files: &[std::path::PathBuf],
+	package_theme_files: &[std::path::PathBuf],
 	discover: bool,
 ) -> UiConfig {
 	let agent_dir = config::agent_dir();
@@ -383,7 +384,7 @@ pub fn load_with_cli_themes(
 			theme = Some(Theme::light());
 		} else if !name.is_empty() && !name.contains('/') {
 			// Additional `--theme` files first, then the user themes
-			// directory when discovery is on.
+			// directory when discovery is on, then installed package themes.
 			for file in theme_files {
 				match std::fs::read_to_string(file)
 					.map_err(|error| error.to_string())
@@ -400,12 +401,34 @@ pub fn load_with_cli_themes(
 				}
 			}
 			if theme.is_none() && discover {
-				theme = Some(load_theme(
-					&config::themes_dir(),
-					theme_setting,
-					light,
-					&mut notices,
-				));
+				let user_path = config::themes_dir().join(format!("{name}.json"));
+				if user_path.exists() {
+					theme = Some(load_theme(
+						&config::themes_dir(),
+						theme_setting,
+						light,
+						&mut notices,
+					));
+				}
+			}
+			if theme.is_none() && discover {
+				for file in package_theme_files {
+					match std::fs::read_to_string(file)
+						.map_err(|error| error.to_string())
+						.and_then(|content| {
+							Theme::from_json_str(&content).map_err(|error| error.to_string())
+						}) {
+						Ok(loaded) => {
+							if loaded.name == name {
+								theme = Some(loaded);
+								break;
+							}
+						}
+						Err(error) => {
+							notices.push(format!("package theme file {}: {error}", file.display()))
+						}
+					}
+				}
 			}
 			if theme.is_none() {
 				notices.push(format!(
@@ -832,5 +855,20 @@ mod tests {
 		assert_eq!(ui.theme.name, Theme::dark().name);
 		assert_eq!(ui.notices.len(), 1);
 		assert!(ui.notices[0].contains("light/dark"));
+	}
+
+	#[test]
+	fn theme_loads_from_package_themes() {
+		let dir = temp_agent_dir("theme-package");
+		let pkg_theme = dir.join("pkg-theme.json");
+		std::fs::write(
+			&pkg_theme,
+			r##"{ "name": "pkg-theme", "colors": { "text": "#00ff00" } }"##,
+		)
+		.unwrap();
+		let ui = load_with_cli_themes(Some("pkg-theme"), false, &[], &[pkg_theme], true);
+		assert!(ui.notices.is_empty(), "{:?}", ui.notices);
+		assert_eq!(ui.theme.name, "pkg-theme");
+		assert_eq!(ui.theme.assistant, Color::Rgb(0, 255, 0));
 	}
 }

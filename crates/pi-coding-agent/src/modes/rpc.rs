@@ -469,17 +469,36 @@ impl RpcSession {
 							.to_string(),
 						);
 					}
-					Ok(SessionEvent::ExtensionEditorText(text)) => {
-						return Some(
-							json!({
+						Ok(SessionEvent::ExtensionEditorText(text)) => {
+							return Some(
+								json!({
+									"type": "extension_ui_request",
+									"id": uuid::Uuid::new_v4().to_string(),
+									"method": "set_editor_text",
+									"text": text,
+								})
+								.to_string(),
+							);
+						}
+						Ok(SessionEvent::ExtensionWidget {
+							key,
+							lines,
+							placement,
+						}) => {
+							let mut frame = json!({
 								"type": "extension_ui_request",
 								"id": uuid::Uuid::new_v4().to_string(),
-								"method": "set_editor_text",
-								"text": text,
-							})
-							.to_string(),
-						);
-					}
+								"method": "setWidget",
+								"widgetKey": key,
+							});
+							if let Some(lines) = lines {
+								frame["widgetLines"] = json!(lines);
+							}
+							if let Some(placement) = placement {
+								frame["widgetPlacement"] = json!(placement);
+							}
+							return Some(frame.to_string());
+						}
 					Err(broadcast::error::RecvError::Lagged(count)) => {
 						// Dropped events can include an `agent_end`, whose
 						// queued willRetry decision is now unpairable — drop
@@ -1016,6 +1035,18 @@ fn extension_ui_request_frame(request: &crate::core::extensions::ExtensionDialog
 			}
 			frame
 		}
+		crate::core::extensions::ExtensionDialogKind::Editor { title, prefill } => {
+			let mut frame = json!({
+				"type": "extension_ui_request",
+				"id": id,
+				"method": "editor",
+				"title": title,
+			});
+			if let Some(prefill) = prefill {
+				frame["prefill"] = json!(prefill);
+			}
+			frame
+		}
 	}
 }
 
@@ -1411,9 +1442,14 @@ mod tests {
 		let mut status = None;
 		let mut title = None;
 		let mut editor = None;
+		let mut widget = None;
 		let mut notify = None;
 		while tokio::time::Instant::now() < deadline
-			&& (status.is_none() || title.is_none() || editor.is_none() || notify.is_none())
+			&& (status.is_none()
+				|| title.is_none()
+				|| editor.is_none()
+				|| widget.is_none()
+				|| notify.is_none())
 		{
 			let frame = match tokio::time::timeout_at(deadline, session.next_event_frame()).await {
 				Ok(Some(frame)) => frame,
@@ -1437,6 +1473,19 @@ mod tests {
 				Some("set_editor_text") => {
 					editor = Some(value["text"].as_str().unwrap_or_default().to_string())
 				}
+				Some("setWidget") => {
+					widget = Some((
+						value["widgetKey"].as_str().unwrap_or_default().to_string(),
+						value["widgetLines"].as_array().map(|lines| {
+							lines
+								.iter()
+								.filter_map(Value::as_str)
+								.map(str::to_string)
+								.collect::<Vec<_>>()
+						}),
+						value["widgetPlacement"].as_str().map(str::to_string),
+					));
+				}
 				Some("notify") => {
 					notify = Some((
 						value["message"].as_str().unwrap_or_default().to_string(),
@@ -1453,7 +1502,65 @@ mod tests {
 		);
 		assert_eq!(title.as_deref(), Some("pi-ext-title"));
 		assert_eq!(editor.as_deref(), Some("prefilled text"));
+		assert_eq!(
+			widget,
+			Some((
+				"git-status".to_string(),
+				Some(vec!["branch: main".to_string(), "clean".to_string()]),
+				Some("belowEditor".to_string()),
+			))
+		);
 		assert_eq!(notify, Some(("decorated".to_string(), "info".to_string())));
+		assembly.bridge.shutdown("quit").await;
+	}
+
+	/// A `ui.editor` dialog surfaces as an `extension_ui_request` frame and
+	/// the client's `extension_ui_response` resolves the text through the bridge.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn extension_editor_dialog_round_trips_through_the_rpc_wire() {
+		if !node_available() {
+			eprintln!("skipping: node not available");
+			return;
+		}
+		let (mut session, assembly) = extension_session("dialogs.ts").await;
+		session.handle_line(r#"{"type":"prompt","message":"/edit-text","id":"p1"}"#);
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+		let mut answered = false;
+		let mut notify_seen = false;
+		let mut settled_seen = false;
+		while tokio::time::Instant::now() < deadline && !(notify_seen && settled_seen) {
+			let frame = match tokio::time::timeout_at(deadline, session.next_event_frame()).await {
+				Ok(Some(frame)) => frame,
+				Ok(None) => break,
+				Err(_) => break,
+			};
+			let value: Value = serde_json::from_str(&frame).unwrap();
+			if value["type"] == "extension_ui_request" && value["method"] == "editor" {
+				assert_eq!(value["title"], "Edit file");
+				assert_eq!(value["prefill"], "initial content");
+				assert!(!answered, "the editor dialog must not repeat: {value}");
+				answered = true;
+				let response = json!({
+					"type": "extension_ui_response",
+					"id": value["id"].clone(),
+					"value": "modified content",
+				});
+				assert!(
+					session.handle_line(&response.to_string()).is_empty(),
+					"the response is consumed without output frames"
+				);
+			} else if value["type"] == "extension_ui_request" && value["method"] == "notify" {
+				assert_eq!(value["message"], "edited: modified content", "{value}");
+				assert_eq!(value["notifyType"], "info");
+				notify_seen = true;
+			} else if value["type"] == "agent_settled" {
+				settled_seen = true;
+			}
+		}
+		assert!(answered, "editor dialog never surfaced");
+		assert!(notify_seen, "notify frame never surfaced");
+		assert!(settled_seen, "settle never surfaced");
 		assembly.bridge.shutdown("quit").await;
 	}
 
