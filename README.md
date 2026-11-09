@@ -141,3 +141,17 @@ cargo build          # 全工作区
 cargo test           # 单元测试（session 时间戳等）
 cargo run -p pi-coding-agent    # 调试运行
 ```
+
+## 官网
+
+`website/` 是 pi-rs 的营销落地页（Astro 静态站点，输出纯 HTML/CSS/少量 JS）：
+
+```bash
+cd website
+npm install
+npm run dev        # 本地开发，默认 base 路径 /pi-os
+npm run check      # astro check
+npm run build      # 产出 dist/
+```
+
+发布到 GitHub Pages（项目页 `https://neonity2020.github.io/pi-os/`）由 `.github/workflows/website.yml` 完成，构建参数 `SITE_URL` / `BASE_PATH` 说明见 `website/README.md`。

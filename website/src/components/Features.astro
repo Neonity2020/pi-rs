@@ -1,0 +1,147 @@
+---
+const features = [
+	{
+		title: 'Instant start, tiny footprint',
+		body: 'A single Rust binary with no Node runtime and no warm-up. It is ready before your prompt is.',
+		tone: 'accent',
+		icon: 'bolt',
+	},
+	{
+		title: 'Every provider, one config',
+		body: 'OpenAI-compatible chat and Responses, Anthropic Messages, Gemini, Vertex, Azure, Mistral, Bedrock Converse, ChatGPT Codex and the pi gateway.',
+		tone: 'blue',
+		icon: 'plug',
+	},
+	{
+		title: 'A terminal UI that stays out of the way',
+		body: 'Session tree with fork and clone, fuzzy slash commands, a model picker, syntax-highlighted output and themable keybindings.',
+		tone: 'violet',
+		icon: 'terminal',
+	},
+	{
+		title: 'MCP without the plumbing',
+		body: 'stdio and streamable HTTP servers, protocol negotiation, OAuth login and per-server reconnect — from a global or project-scoped mcp.json.',
+		tone: 'amber',
+		icon: 'network',
+	},
+	{
+		title: 'Extensible by design',
+		body: 'Skills, prompt templates, external extension processes and installable packages — each one adds tools, commands and events.',
+		tone: 'blue',
+		icon: 'puzzle',
+	},
+	{
+		title: 'Context that survives',
+		body: 'Automatic compaction, split-turn summarization, overflow recovery with one retry, and JSONL sessions you can resume, fork or export.',
+		tone: 'accent',
+		icon: 'shield',
+	},
+];
+---
+
+<section class="section" id="features">
+	<div class="container">
+		<div class="section-head section-head--center reveal">
+			<span class="eyebrow">Capabilities</span>
+			<h2>Everything a terminal agent should be</h2>
+			<p>
+				Not a reimplementation with different semantics — a port that keeps upstream pi's wire format, session
+				files and behaviour, so the things you already scripted keep working.
+			</p>
+		</div>
+
+		<div class="features__grid">
+			{
+				features.map((feature, index) => (
+					<article class={`card feature feature--${feature.tone} reveal`} style={`transition-delay:${index * 55}ms`}>
+						<span class="card__icon">
+							{feature.icon === 'bolt' && (
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+									<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" />
+								</svg>
+							)}
+							{feature.icon === 'plug' && (
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+									<path d="M9 2v6M15 2v6" />
+									<path d="M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6V8Z" />
+									<path d="M12 17v5" />
+								</svg>
+							)}
+							{feature.icon === 'terminal' && (
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+									<rect x="2" y="4" width="20" height="16" rx="2" />
+									<path d="m6 9 3 3-3 3M13 15h5" />
+								</svg>
+							)}
+							{feature.icon === 'network' && (
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+									<circle cx="12" cy="4" r="2" />
+									<circle cx="5" cy="18" r="2" />
+									<circle cx="19" cy="18" r="2" />
+									<path d="M12 6v5m0 0-5 5m5-5 5 5" />
+								</svg>
+							)}
+							{feature.icon === 'puzzle' && (
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+									<path d="M10 3h4v2.5a2 2 0 1 0 4 0V8h3v4h-2.5a2 2 0 1 0 0 4H21v5h-5v-2.5a2 2 0 1 0-4 0V21H7v-5H4.5a2 2 0 1 1 0-4H3V8h4V3Z" />
+								</svg>
+							)}
+							{feature.icon === 'shield' && (
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+									<path d="M12 3 5 6v6c0 4.5 3 8 7 9 4-1 7-4.5 7-9V6l-7-3Z" />
+									<path d="m9 12 2 2 4-4" />
+								</svg>
+							)}
+						</span>
+						<h3>{feature.title}</h3>
+						<p>{feature.body}</p>
+					</article>
+				))
+			}
+		</div>
+	</div>
+</section>
+
+<style>
+	.features__grid {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 1rem;
+	}
+
+	.feature {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.feature--blue .card__icon {
+		background: var(--blue-soft);
+		color: var(--blue);
+	}
+
+	.feature--violet .card__icon {
+		background: var(--violet-soft);
+		color: var(--violet);
+	}
+
+	.feature--amber .card__icon {
+		background: var(--amber-soft);
+		color: var(--amber);
+	}
+
+	.feature p {
+		flex: 1;
+	}
+
+	@media (max-width: 960px) {
+		.features__grid {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+
+	@media (max-width: 620px) {
+		.features__grid {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>

@@ -1,0 +1,71 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+
+const repo = 'https://github.com/Neonity2020/pi-os';
+---
+
+<BaseLayout
+	title="404 — pi-rs"
+	description="That page does not exist. Head back to the pi-rs landing page."
+	noindex
+>
+	<Nav />
+	<main id="main" class="nf">
+		<div class="container nf__inner">
+			<span class="nf__code">404</span>
+			<h1 class="nf__title">No such file or directory.</h1>
+			<p class="nf__text">
+				The page you asked for is not here. It may have been renamed, or the link that brought
+				you here was wrong.
+			</p>
+			<div class="nf__actions">
+				<a class="btn btn--primary" href="#top">Back to the homepage</a>
+				<a class="btn btn--ghost" href={repo} target="_blank" rel="noreferrer">Open the repository</a>
+			</div>
+		</div>
+	</main>
+	<Footer />
+</BaseLayout>
+
+<style>
+	.nf {
+		display: grid;
+		place-items: center;
+		min-height: 70vh;
+		padding-block: clamp(3rem, 10vh, 6rem);
+		text-align: center;
+	}
+
+	.nf__inner {
+		max-width: 34rem;
+	}
+
+	.nf__code {
+		display: inline-block;
+		font-family: var(--font-mono);
+		font-size: 0.9rem;
+		letter-spacing: 0.2em;
+		color: var(--accent);
+	}
+
+	.nf__title {
+		margin-top: 1rem;
+		font-size: clamp(1.9rem, 5vw, 2.6rem);
+		letter-spacing: -0.03em;
+	}
+
+	.nf__text {
+		margin-top: 0.9rem;
+		color: var(--text-muted);
+	}
+
+	.nf__actions {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.75rem;
+		margin-top: 2rem;
+	}
+</style>

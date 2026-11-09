@@ -1,0 +1,255 @@
+---
+const modes = [
+	{
+		id: 'tui',
+		tab: 'Interactive TUI',
+		title: 'A full-screen terminal workspace',
+		body: 'Markdown rendering, syntax highlighting, a model picker, fuzzy slash commands and a browsable session tree — with fork, clone, import and HTML export built in.',
+		bullets: ['RatATui interface', 'Image and file paste', 'Themes and keybindings'],
+		code: `$ pi-rs
+
+  pi-rs   mimo/mimo-v2.6-pro   thinking high
+  ─────────────────────────────────────────────
+  ›  refactor the tokenizer to stream in chunks
+
+  ⏵  read   crates/pi-ai/src/tokenizer.rs
+  ⏵  edit   crates/pi-ai/src/tokenizer.rs
+  ✓  2 tool calls · 8.1k tokens · 9.2s
+
+  ❯ `,
+	},
+	{
+		id: 'print',
+		tab: 'Print & JSON',
+		title: 'Scriptable by default',
+		body: 'Pipe a prompt in, capture the answer out. The JSON mode emits an aligned event stream — one frame per model, tool and lifecycle event — so diffing against upstream stays trivial.',
+		bullets: ['stdin piping and @file injection', 'Aligned JSON events', 'Upstream exit codes'],
+		code: `$ echo "list the TODOs in src" | pi-rs -p - --mode json
+
+  {"type":"session","id":"s1"}
+  {"type":"agent_start"}
+  {"type":"turn_start"}
+  {"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Scanning src/…"}}
+  {"type":"tool_execution_start","toolCallId":"call_1","toolName":"grep","args":{"pattern":"TODO"}}
+  {"type":"tool_execution_end","toolCallId":"call_1","toolName":"grep","result":"…","isError":false,"durationMs":9}
+  {"type":"turn_end","message":{…},"toolResults":[…]}
+  {"type":"agent_settled","aborted":false}`,
+	},
+	{
+		id: 'rpc',
+		tab: 'RPC',
+		title: 'Wire it into your own stack',
+		body: 'A JSON-RPC channel over stdio exposes every session and agent operation — 33 commands covering the session tree, bash execution, auto-retry control and extension UI events.',
+		bullets: ['33/33 commands', 'Session tree control', 'Extension UI forwarding'],
+		code: `$ pi-rs --rpc
+
+  > {"type":"get_state","id":"1"}
+  < {"type":"response","command":"get_state","success":true,"data":{"sessionId":"a1b2","model":"mimo/mimo-v2.6-pro","thinkingLevel":"high"}}
+
+  > {"type":"fork","entryId":"a1b2","id":"2"}
+  < {"type":"response","command":"fork","success":true,"data":{"cancelled":false}}`,
+	},
+];
+---
+
+<section class="section modes" id="modes">
+	<div class="container">
+		<div class="section-head reveal">
+			<span class="eyebrow">Run modes</span>
+			<h2>One agent, three ways to drive it</h2>
+			<p>
+				The same session store and the same tools — whether a human is at the keyboard, a CI job is running a
+				prompt, or another program is talking to pi-rs over stdio.
+			</p>
+		</div>
+
+		<div class="modes__panel reveal">
+			<div class="modes__tabs" role="tablist" aria-label="Run modes">
+				{
+					modes.map((mode, index) => (
+						<button
+							class="modes__tab"
+							type="button"
+							role="tab"
+							id={`tab-${mode.id}`}
+							aria-controls={`panel-${mode.id}`}
+							aria-selected={index === 0 ? 'true' : 'false'}
+							tabindex={index === 0 ? '0' : '-1'}
+							data-mode={mode.id}
+						>
+							{mode.tab}
+						</button>
+					))
+				}
+			</div>
+
+			{
+				modes.map((mode, index) => (
+					<div
+						class="modes__body"
+						role="tabpanel"
+						id={`panel-${mode.id}`}
+						aria-labelledby={`tab-${mode.id}`}
+						data-panel={mode.id}
+						hidden={index !== 0}
+					>
+						<div class="modes__copy">
+							<h3>{mode.title}</h3>
+							<p>{mode.body}</p>
+							<ul class="modes__bullets">
+								{mode.bullets.map((bullet) => (
+									<li>
+										<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+											<path d="M3 8.5l3.2 3.2L13 5" />
+										</svg>
+										{bullet}
+									</li>
+								))}
+							</ul>
+						</div>
+						<pre class="modes__code"><code>{mode.code}</code></pre>
+					</div>
+				))
+			}
+		</div>
+	</div>
+</section>
+
+<script>
+	const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.modes__tab'));
+	const panels = Array.from(document.querySelectorAll<HTMLElement>('.modes__body'));
+
+	const select = (id: string) => {
+		for (const tab of tabs) {
+			const active = tab.dataset.mode === id;
+			tab.setAttribute('aria-selected', String(active));
+			tab.tabIndex = active ? 0 : -1;
+		}
+		for (const panel of panels) {
+			panel.hidden = panel.dataset.panel !== id;
+		}
+	};
+
+	for (const tab of tabs) {
+		tab.addEventListener('click', () => select(tab.dataset.mode as string));
+		tab.addEventListener('keydown', (event) => {
+			const index = tabs.indexOf(tab);
+			let next = index;
+			if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+			else if (event.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+			else if (event.key === 'Home') next = 0;
+			else if (event.key === 'End') next = tabs.length - 1;
+			else return;
+			event.preventDefault();
+			tabs[next].focus();
+			select(tabs[next].dataset.mode as string);
+		});
+	}
+</script>
+
+<style>
+	.modes {
+		border-top: 1px solid var(--border);
+		background: color-mix(in srgb, var(--bg-elev) 40%, transparent);
+	}
+
+	.modes__panel {
+		border: 1px solid var(--border);
+		border-radius: var(--radius-lg);
+		background: var(--surface);
+		overflow: hidden;
+	}
+
+	.modes__tabs {
+		display: flex;
+		gap: 0.25rem;
+		padding: 0.5rem;
+		border-bottom: 1px solid var(--border);
+		background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+		overflow-x: auto;
+	}
+
+	.modes__tab {
+		padding: 0.5rem 0.95rem;
+		border: 0;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--text-muted);
+		font-size: 0.9rem;
+		font-weight: 500;
+		cursor: pointer;
+		white-space: nowrap;
+		transition:
+			background-color 0.2s var(--ease),
+			color 0.2s var(--ease);
+	}
+
+	.modes__tab:hover {
+		color: var(--text);
+	}
+
+	.modes__tab[aria-selected='true'] {
+		background: var(--accent-soft);
+		color: var(--accent);
+	}
+
+	.modes__body {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+		gap: 2rem;
+		padding: 2rem;
+	}
+
+	.modes__body[hidden] {
+		display: none;
+	}
+
+	.modes__copy h3 {
+		font-size: 1.3rem;
+		margin-bottom: 0.6rem;
+	}
+
+	.modes__copy p {
+		color: var(--text-muted);
+		font-size: 0.95rem;
+	}
+
+	.modes__bullets {
+		display: grid;
+		gap: 0.5rem;
+		margin-top: 1.25rem;
+	}
+
+	.modes__bullets li {
+		display: flex;
+		align-items: center;
+		gap: 0.55rem;
+		font-size: 0.9rem;
+		color: var(--text-muted);
+	}
+
+	.modes__bullets svg {
+		color: var(--accent);
+		flex-shrink: 0;
+	}
+
+	.modes__code {
+		margin: 0;
+		padding: 1.15rem 1.25rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: color-mix(in srgb, var(--bg) 70%, transparent);
+		font-family: var(--font-mono);
+		font-size: 0.78rem;
+		line-height: 1.75;
+		color: var(--text-muted);
+		overflow-x: auto;
+	}
+
+	@media (max-width: 900px) {
+		.modes__body {
+			grid-template-columns: minmax(0, 1fr);
+			padding: 1.5rem;
+		}
+	}
+</style>

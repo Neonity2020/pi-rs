@@ -1,0 +1,140 @@
+---
+const faqs = [
+	{
+		q: 'How does pi-rs relate to upstream pi?',
+		a: 'pi-rs is a Rust port of the pi coding agent. It keeps upstream’s model, tool and session semantics — including the wire format — so behaviour you depend on does not change when you swap binaries.',
+	},
+	{
+		q: 'Which providers can I use?',
+		a: 'Ten wire APIs ship in the box: OpenAI chat completions and responses, ChatGPT Codex, Anthropic messages, Gemini, Vertex, Azure OpenAI, Amazon Bedrock Converse, Mistral conversations and the pi-messages gateway. Eight OAuth sign-in flows are supported, and any OpenAI-compatible endpoint can be added through models.json.',
+	},
+	{
+		q: 'Will my existing sessions and MCP servers keep working?',
+		a: 'Yes. Sessions are stored as JSONL in upstream’s tree format and stay readable in both directions. Project-level .pi resources — skills, prompt templates, extensions and mcp.json — are discovered by both binaries; only the user-level config directory differs (~/.pi-rs/agent).',
+	},
+	{
+		q: 'Do I need Node installed?',
+		a: 'No. pi-rs is a single Rust binary with no runtime dependencies. Node is only required if you write an extension, because extensions run as external processes.',
+	},
+	{
+		q: 'What can I extend?',
+		a: 'Skills, prompt templates, external extension processes and installable packages. Extensions can register tools, add slash commands, subscribe to session and turn events, intercept tool calls and drive the TUI through a UI bridge.',
+	},
+	{
+		q: 'What happens when the context fills up?',
+		a: 'pi-rs compacts automatically once the context crosses your threshold, splits over-long turns with a double summary, and recovers from an overflow by dropping the failed turn, choosing a cut point, compacting and retrying once.',
+	},
+	{
+		q: 'Is it ready to use?',
+		a: 'It is v0.1 and moving fast — the framework, providers, tools, MCP, sessions and RPC surface are all in place, while SSH environments and a few deferred provider flags are still on the roadmap. Everything is MIT licensed.',
+	},
+];
+---
+
+<section class="section faq" id="faq">
+	<div class="container faq__inner">
+		<div class="faq__head reveal">
+			<span class="eyebrow">FAQ</span>
+			<h2>Questions, answered</h2>
+			<p>Something missing? The README and the docs folder in the repository go deeper on every topic below.</p>
+		</div>
+
+		<div class="faq__list reveal">
+			{
+				faqs.map((faq) => (
+					<details class="faq__item">
+						<summary>
+							{faq.q}
+							<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+								<path d="M3 6l5 5 5-5" />
+							</svg>
+						</summary>
+						<p>{faq.a}</p>
+					</details>
+				))
+			}
+		</div>
+	</div>
+</section>
+
+<style>
+	.faq {
+		border-top: 1px solid var(--border);
+	}
+
+	.faq__inner {
+		display: grid;
+		grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+		gap: clamp(1.5rem, 5vw, 4rem);
+		align-items: start;
+	}
+
+	.faq__head h2 {
+		font-size: clamp(1.9rem, 4.2vw, 2.5rem);
+		margin-block: 0.85rem 0.9rem;
+	}
+
+	.faq__head p {
+		color: var(--text-muted);
+		font-size: 0.95rem;
+	}
+
+	.faq__list {
+		display: grid;
+		gap: 0.6rem;
+	}
+
+	.faq__item {
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--surface);
+		overflow: hidden;
+		transition:
+			border-color 0.25s var(--ease),
+			background-color 0.25s var(--ease);
+	}
+
+	.faq__item[open] {
+		border-color: var(--border-strong);
+		background: var(--surface-strong);
+	}
+
+	.faq__item summary {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 1.05rem 1.25rem;
+		cursor: pointer;
+		font-weight: 550;
+		font-size: 0.98rem;
+		list-style: none;
+	}
+
+	.faq__item summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.faq__item summary svg {
+		flex-shrink: 0;
+		color: var(--text-dim);
+		transition: transform 0.25s var(--ease);
+	}
+
+	.faq__item[open] summary svg {
+		transform: rotate(180deg);
+		color: var(--accent);
+	}
+
+	.faq__item p {
+		padding: 0 1.25rem 1.25rem;
+		color: var(--text-muted);
+		font-size: 0.93rem;
+	}
+
+	@media (max-width: 900px) {
+		.faq__inner {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>

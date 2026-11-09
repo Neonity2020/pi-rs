@@ -1,0 +1,207 @@
+---
+const steps = [
+	{
+		title: 'Build the binary',
+		body: 'A Rust toolchain and nothing else. The workspace builds every crate in the dependency order upstream pi uses.',
+		code: `git clone https://github.com/Neonity2020/pi-os.git
+cd pi-os
+cargo build --release
+
+./target/release/pi-rs`,
+		alt: `# or install the binary onto your PATH
+cargo install --path crates/pi-coding-agent
+pi-rs --help`,
+	},
+	{
+		title: 'Point it at a model',
+		body: 'Use /login inside the TUI, export a key, or drop a .env next to your project. Keys land in models.json with 0600 permissions.',
+		code: `# one of these — pick your provider
+export MIMO_API_KEY=your-token-plan-key
+export OPENAI_API_KEY=sk-...
+
+# or in the project root
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env`,
+	},
+	{
+		title: 'Start working',
+		body: 'Interactive for humans, a single prompt for scripts, a JSON-RPC socket for programs.',
+		code: `# interactive terminal UI
+pi-rs
+
+# one-shot prompt, piped or inline
+pi-rs -p "summarise this diff"
+echo "what changed?" | pi-rs -p -`,
+	},
+];
+---
+
+<section class="section quickstart" id="quickstart">
+	<div class="container">
+		<div class="section-head reveal">
+			<span class="eyebrow">Install</span>
+			<h2>Running in about a minute</h2>
+			<p>
+				No account, no cloud, no telemetry. Configuration lives in <code class="mono">~/.pi-rs/agent/</code> and
+				sessions in <code class="mono">sessions/</code>, side by side with — not instead of — upstream pi.
+			</p>
+		</div>
+
+		<ol class="steps">
+			{
+				steps.map((step, index) => (
+					<li class="step reveal">
+						<div class="step__head">
+							<span class="step__index">{String(index + 1).padStart(2, '0')}</span>
+							<div>
+								<h3>{step.title}</h3>
+								<p>{step.body}</p>
+							</div>
+						</div>
+						<div class="step__blocks">
+							<div class="code" data-code>
+								<button class="code__copy" type="button" data-copy aria-label="Copy code">
+									<span data-copy-label>Copy</span>
+								</button>
+								<pre><code>{step.code}</code></pre>
+							</div>
+							{step.alt && (
+								<div class="code code--muted" data-code>
+									<button class="code__copy" type="button" data-copy aria-label="Copy code">
+										<span data-copy-label>Copy</span>
+									</button>
+									<pre><code>{step.alt}</code></pre>
+								</div>
+							)}
+						</div>
+					</li>
+				))
+			}
+		</ol>
+	</div>
+</section>
+
+<script>
+	for (const button of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
+		button.addEventListener('click', async () => {
+			const code = button.closest('[data-code]')?.querySelector('code')?.textContent ?? '';
+			const label = button.querySelector('[data-copy-label]');
+			try {
+				await navigator.clipboard.writeText(code.trim());
+				if (label) label.textContent = 'Copied';
+			} catch {
+				if (label) label.textContent = 'Press ⌘C';
+			}
+			setTimeout(() => {
+				if (label) label.textContent = 'Copy';
+			}, 1800);
+		});
+	}
+</script>
+
+<style>
+	.quickstart {
+		border-top: 1px solid var(--border);
+	}
+
+	.steps {
+		display: grid;
+		gap: 1rem;
+		counter-reset: step;
+	}
+
+	.step {
+		display: grid;
+		grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+		gap: 1.75rem;
+		padding: 1.75rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-lg);
+		background: var(--surface);
+	}
+
+	.step__head {
+		display: flex;
+		gap: 1rem;
+	}
+
+	.step__index {
+		font-family: var(--font-mono);
+		font-size: 0.85rem;
+		color: var(--accent);
+		padding-top: 0.25rem;
+	}
+
+	.step h3 {
+		font-size: 1.15rem;
+		margin-bottom: 0.4rem;
+	}
+
+	.step p {
+		color: var(--text-muted);
+		font-size: 0.93rem;
+	}
+
+	.step__blocks {
+		display: grid;
+		gap: 0.75rem;
+		align-content: start;
+	}
+
+	.code {
+		position: relative;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: color-mix(in srgb, var(--bg) 72%, transparent);
+		overflow: hidden;
+	}
+
+	.code--muted {
+		opacity: 0.85;
+	}
+
+	.code pre {
+		margin: 0;
+		padding: 1rem 1.1rem;
+		overflow-x: auto;
+		font-family: var(--font-mono);
+		font-size: 0.79rem;
+		line-height: 1.75;
+		color: var(--text-muted);
+	}
+
+	.code__copy {
+		position: absolute;
+		top: 0.55rem;
+		right: 0.55rem;
+		padding: 0.25rem 0.6rem;
+		border-radius: 6px;
+		border: 1px solid var(--border);
+		background: color-mix(in srgb, var(--bg-elev) 88%, transparent);
+		color: var(--text-dim);
+		font-size: 0.72rem;
+		cursor: pointer;
+		opacity: 0;
+		transition:
+			opacity 0.2s var(--ease),
+			color 0.2s var(--ease),
+			border-color 0.2s var(--ease);
+	}
+
+	.code:hover .code__copy,
+	.code__copy:focus-visible {
+		opacity: 1;
+	}
+
+	.code__copy:hover {
+		color: var(--accent);
+		border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+	}
+
+	@media (max-width: 900px) {
+		.step {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 1.25rem;
+			padding: 1.4rem;
+		}
+	}
+</style>

@@ -1,0 +1,119 @@
+---
+const repo = 'https://github.com/Neonity2020/pi-os';
+---
+
+<section class="section cta">
+	<div class="container">
+		<div class="cta__card reveal">
+			<div class="cta__glow" aria-hidden="true"></div>
+			<div class="cta__content">
+				<span class="badge badge--accent">MIT licensed · v0.1 · Rust 2024</span>
+				<h2>Put the Rust agent on your machine</h2>
+				<p>
+					Clone the workspace, build once, and keep every session, key and MCP server on your own disk.
+					Nothing to sign up for.
+				</p>
+				<div class="cta__actions">
+					<a class="btn btn--primary btn--lg" href="#quickstart">
+						Install pi-rs
+						<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							<path d="M6 3l5 5-5 5" />
+						</svg>
+					</a>
+					<a class="btn btn--ghost btn--lg" href={repo} target="_blank" rel="noreferrer">Read the README</a>
+				</div>
+			</div>
+			<div class="cta__snippet" aria-hidden="true">
+				<pre><code><span class="cta__prompt">❯</span> pi-rs -p "rename every legacy_* config key"
+
+  ⏵  grep(pattern="legacy_", path="src")
+  ⏵  edit  crates/pi-env/src/config.rs
+  ✓  6 files updated · 2.1k tokens · 7.8s</code></pre>
+			</div>
+		</div>
+	</div>
+</section>
+
+<style>
+	.cta {
+		border-top: 1px solid var(--border);
+	}
+
+	.cta__card {
+		position: relative;
+		display: grid;
+		grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+		gap: 2rem;
+		align-items: center;
+		padding: clamp(2rem, 4vw, 3rem);
+		border: 1px solid var(--border-strong);
+		border-radius: calc(var(--radius-lg) + 6px);
+		background: linear-gradient(150deg, var(--accent-soft), transparent 60%), var(--surface);
+		overflow: hidden;
+	}
+
+	.cta__glow {
+		position: absolute;
+		top: -12rem;
+		right: -8rem;
+		width: 34rem;
+		height: 34rem;
+		border-radius: 50%;
+		background: radial-gradient(closest-side, rgb(126 231 135 / 22%), transparent 70%);
+		filter: blur(28px);
+		pointer-events: none;
+	}
+
+	.cta__content {
+		position: relative;
+	}
+
+	.cta h2 {
+		font-size: clamp(1.8rem, 3.6vw, 2.5rem);
+		margin-block: 1rem 0.75rem;
+	}
+
+	.cta p {
+		color: var(--text-muted);
+		max-width: 30rem;
+	}
+
+	.cta__actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 1.75rem;
+	}
+
+	.cta__snippet {
+		position: relative;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: color-mix(in srgb, var(--bg) 75%, transparent);
+		overflow: hidden;
+	}
+
+	.cta__snippet pre {
+		margin: 0;
+		padding: 1.15rem 1.25rem;
+		font-family: var(--font-mono);
+		font-size: 0.76rem;
+		line-height: 1.8;
+		color: var(--text-muted);
+		overflow-x: auto;
+	}
+
+	.cta__prompt {
+		color: var(--accent);
+	}
+
+	@media (max-width: 860px) {
+		.cta__card {
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+		.cta__snippet {
+			display: none;
+		}
+	}
+</style>

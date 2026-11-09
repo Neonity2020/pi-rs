@@ -1,0 +1,115 @@
+---
+const cases = [
+	{
+		title: 'Day-to-day shipping',
+		body: 'Keep the agent in the terminal next to your editor. It reads the repo, edits files, runs the tests and shows you the diff before anything lands.',
+		points: ['Context files loaded automatically', 'Diff-tested tool calls', 'Session tree you can branch'],
+	},
+	{
+		title: 'Automation & CI',
+		body: 'Batch the work that does not need a human: triage issues, bump dependencies, regenerate docs — then let the job parse the JSON event stream.',
+		points: ['Print mode with exit codes', 'Aligned JSON events', 'Tools selectable per run'],
+	},
+	{
+		title: 'Your own agent stack',
+		body: 'Drive pi-rs from a desktop client, a CI orchestrator or a multi-agent workflow over RPC — with session control and extension hooks exposed.',
+		points: ['33 RPC commands', 'Extension UI events', 'MCP servers in the loop'],
+	},
+];
+---
+
+<section class="section cases">
+	<div class="container">
+		<div class="section-head section-head--center reveal">
+			<span class="eyebrow">Use cases</span>
+			<h2>Built for people who live in the terminal</h2>
+			<p>Whether a single prompt closes a ticket or a fleet of agents closes a quarter, the surface stays the same.</p>
+		</div>
+
+		<div class="cases__grid">
+			{
+				cases.map((item, index) => (
+					<article class="case reveal" style={`transition-delay:${index * 70}ms`}>
+						<h3>{item.title}</h3>
+						<p>{item.body}</p>
+						<ul>
+							{item.points.map((point) => (
+								<li>
+									<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+										<path d="M3 8.5l3.2 3.2L13 5" />
+									</svg>
+									{point}
+								</li>
+							))}
+						</ul>
+					</article>
+				))
+			}
+		</div>
+	</div>
+</section>
+
+<style>
+	.cases {
+		border-top: 1px solid var(--border);
+		background: color-mix(in srgb, var(--bg-elev) 40%, transparent);
+	}
+
+	.cases__grid {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 1rem;
+	}
+
+	.case {
+		padding: 1.75rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-lg);
+		background: var(--surface);
+		transition:
+			border-color 0.25s var(--ease),
+			transform 0.25s var(--ease);
+	}
+
+	.case:hover {
+		border-color: var(--border-strong);
+		transform: translateY(-3px);
+	}
+
+	.case h3 {
+		font-size: 1.15rem;
+		margin-bottom: 0.5rem;
+	}
+
+	.case > p {
+		color: var(--text-muted);
+		font-size: 0.93rem;
+	}
+
+	.case ul {
+		display: grid;
+		gap: 0.45rem;
+		margin-top: 1.25rem;
+		padding-top: 1.1rem;
+		border-top: 1px solid var(--border);
+	}
+
+	.case li {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.87rem;
+		color: var(--text-dim);
+	}
+
+	.case li svg {
+		color: var(--accent);
+		flex-shrink: 0;
+	}
+
+	@media (max-width: 900px) {
+		.cases__grid {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>

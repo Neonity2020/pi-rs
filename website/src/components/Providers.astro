@@ -1,0 +1,174 @@
+---
+const providers = [
+	{ name: 'OpenAI', api: 'chat-completions', auth: 'API key / OAuth', tone: 'accent' },
+	{ name: 'OpenAI', api: 'responses', auth: 'API key', tone: 'accent' },
+	{ name: 'ChatGPT Codex', api: 'codex responses', auth: 'OAuth', tone: 'accent' },
+	{ name: 'Anthropic', api: 'messages', auth: 'API key / OAuth', tone: 'amber' },
+	{ name: 'Google Gemini', api: 'generateContent', auth: 'API key', tone: 'blue' },
+	{ name: 'Google Vertex', api: 'express / ADC', auth: 'ADC', tone: 'blue' },
+	{ name: 'Azure OpenAI', api: 'responses', auth: 'api-key header', tone: 'blue' },
+	{ name: 'Amazon Bedrock', api: 'converse stream', auth: 'SigV4 / bearer', tone: 'violet' },
+	{ name: 'Mistral', api: 'conversations', auth: 'API key', tone: 'violet' },
+	{ name: 'pi gateway', api: 'pi-messages', auth: 'Bearer', tone: 'accent' },
+];
+
+const oauth = [
+	'Anthropic',
+	'OpenAI ChatGPT',
+	'OpenAI Codex',
+	'GitHub Copilot',
+	'OpenRouter',
+	'Kimi Coding',
+	'xAI',
+	'Meta',
+];
+---
+
+<section class="section providers" id="providers">
+	<div class="container">
+		<div class="section-head reveal">
+			<span class="eyebrow">Providers</span>
+			<h2>Ten wire APIs. One configuration format.</h2>
+			<p>
+				Streaming, tool calls, reasoning blocks and usage accounting are implemented per provider — not
+				approximated through one generic shape. Point <code class="mono">models.json</code> at any of them and
+				keep the same agent experience.
+			</p>
+		</div>
+
+		<ul class="providers__grid reveal">
+			{
+				providers.map((provider) => (
+					<li class={`provider provider--${provider.tone}`}>
+						<span class="provider__name">{provider.name}</span>
+						<span class="provider__api mono">{provider.api}</span>
+						<span class="provider__auth">{provider.auth}</span>
+					</li>
+				))
+			}
+		</ul>
+
+		<div class="providers__oauth reveal">
+			<div class="providers__oauth-text">
+				<h3>Credentials that behave</h3>
+				<p>
+					<code class="mono">auth.json</code> is locked, refreshed and checked automatically, and eight OAuth
+					sign-in flows land your tokens in the right place.
+				</p>
+			</div>
+			<ul class="providers__oauth-list">
+				{
+					oauth.map((name) => (
+						<li class="badge">{name}</li>
+					))
+				}
+			</ul>
+		</div>
+	</div>
+</section>
+
+<style>
+	.providers {
+		border-top: 1px solid var(--border);
+	}
+
+	.providers__grid {
+		display: grid;
+		grid-template-columns: repeat(5, minmax(0, 1fr));
+		gap: 0.75rem;
+	}
+
+	.provider {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		padding: 1.1rem 1.15rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--surface);
+		transition:
+			border-color 0.25s var(--ease),
+			transform 0.25s var(--ease);
+	}
+
+	.provider:hover {
+		border-color: var(--border-strong);
+		transform: translateY(-3px);
+	}
+
+	.provider__name {
+		font-weight: 600;
+		letter-spacing: -0.01em;
+	}
+
+	.provider__api {
+		color: var(--accent);
+		font-size: 0.76rem;
+	}
+
+	.provider--blue .provider__api {
+		color: var(--blue);
+	}
+
+	.provider--violet .provider__api {
+		color: var(--violet);
+	}
+
+	.provider--amber .provider__api {
+		color: var(--amber);
+	}
+
+	.provider__auth {
+		margin-top: 0.35rem;
+		font-size: 0.74rem;
+		color: var(--text-dim);
+	}
+
+	.providers__oauth {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+		gap: 1.5rem 2.5rem;
+		align-items: center;
+		margin-top: 1.5rem;
+		padding: 1.75rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-lg);
+		background: linear-gradient(140deg, var(--accent-soft), transparent 55%), var(--surface);
+	}
+
+	.providers__oauth-text h3 {
+		font-size: 1.15rem;
+		margin-bottom: 0.4rem;
+	}
+
+	.providers__oauth-text p {
+		color: var(--text-muted);
+		font-size: 0.92rem;
+	}
+
+	.providers__oauth-text code {
+		color: var(--text);
+	}
+
+	.providers__oauth-list {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+	}
+
+	@media (max-width: 1040px) {
+		.providers__grid {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+		}
+	}
+
+	@media (max-width: 720px) {
+		.providers__grid {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+
+		.providers__oauth {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+</style>
