@@ -25,5 +25,12 @@
   2. 读取历史记录时（`count_entries` / `read_session_messages`），自动跳过损坏、不完整或无法解析的行，防止破损内容导致会话解析全面失败。
   3. 后续追加操作将无缝另起新行写入，避免粘连成非法 JSON 串。
 
-### 3. 非事务性明确声明
+### 3. 中断回合自愈 (Interrupted Turn Self-healing)
+- 进程在「模型已发出 tool call、工具结果尚未落盘」之间被杀死时，会话文件里会留下一个没有对应结果的 tool call。
+- Anthropic 系 provider 会直接拒绝这种历史（`tool call result does not follow tool call`），不带修复的续接必然失败。
+- 重建模型上下文时（`project_entries`）校验 tool call 与 tool result 的配对：结果缺失、结果错位、结果没有对应调用，这些不完整的分组一律从上下文里剔除（`drop_incomplete_tool_groups`）。
+- 会话文件本身不改写：该条目仍留在日志里（导出 HTML 时渲染为 pending），只是不会进入送给模型的 transcript。
+- 配对完整的分组是正常路径，原样保留。
+
+### 4. 非事务性明确声明
 - 当前底层直接基于 append-only JSONL 文件，并非多版本并发事务系统（ACID DB）。多进程同时并发写入同一 session 文件不安全。

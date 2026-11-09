@@ -541,3 +541,16 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 - **文档**：README 能力表/剩余清单更新；compatibility 头部第二十一轮增量。
 
 **交接事项（下一轮候选）**：`pi config` 选择器（config-selector.ts 交互面）；包主题文件接入 ui_config；包 glob/否定模式与 per-resource settings 条目；上游 npm 托管安装/self-update（cargo 二进制不适用——永久声明或设计 cargo 版）；RPC setWidget/editor 转发；D5 turn_end 边界语义轮。改动未提交（本条 handoff 与代码一起提交），等用户指令。
+
+## 第四十八轮：中断回合的上下文自愈（2026-11-09，主会话单线）
+
+基线 `7a89fc2`（origin/main 被强制重写为完整上游历史，与旧本地历史无共同祖先——本次改动基于重写后的 origin/main）。
+
+- **问题**：进程在「模型已发出 tool call、工具结果尚未落盘」之间被杀死，会话文件尾部留下没有结果的 tool call。Anthropic 系 provider 直接拒绝这种历史，续接直接失败：
+  `provider returned 400 Bad Request: invalid params, tool call result does not follow tool call (2013)`。
+  实测复现（真实 minimax-cn provider）：注入悬空 toolCall 后 `--continue` 必现该 400。
+- **修复**（`crates/pi-coding-agent/src/core/session_manager.rs`）：`project_entries_with_leaf` 在投影完成后调用新增的 `drop_incomplete_tool_groups`，剔除模型不接受的 tool 分组——结果缺失（回合中途被杀）、部分有结果（两个调用只回一个）、结果没有对应调用（错位）。剔除范围含该 assistant 消息与其后不匹配的 tool 结果。
+- **取舍**：会话文件不改写。未完成的调用仍留在日志里（导出 HTML 早已把「无结果的调用」渲染为 pending，见 `export_html.rs`），只是不进入送给模型的 transcript；`usage_valid_from` 索引随剔除数量前移，仍指向同一条消息。选上下文侧过滤而非截断文件：截断会丢掉 assistant 已输出的正文，且与导出/统计看到的内容不一致。
+- **测试**：+4（`session_manager.rs`）：悬空调用、部分回答、无对应调用的结果、以及完整分组保持不变四条断言。
+- **验证**：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked` 全过。真实 provider 复验：修复前同一场景 400，修复后正常续接并作答。
+- **坑**：`core::tools::bash::tests::missing_session_context_fields_are_not_injected` 在带有 `PI_RS_SESSION_ID`/`PI_RS_MODEL` 等环境变量的 shell 里必然失败（它断言这些变量不存在）；干净环境下通过，与本次改动无关。
