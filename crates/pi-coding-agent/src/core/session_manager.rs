@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use pi_ai::{Message, Usage};
+use pi_ai::{AssistantContent, Message, Usage};
 
 use crate::config;
 
@@ -1143,9 +1143,83 @@ pub fn project_entries_with_leaf(
 			projection.usage_valid_from = projection.messages.len();
 		}
 	}
+	// A run that died mid-turn leaves a tool call without its result; the
+	// provider would reject that history, so the group never reaches the model.
+	drop_incomplete_tool_groups(&mut projection);
+
 	// An omission shrinks the transcript; a floor past the end is meaningless.
 	projection.usage_valid_from = projection.usage_valid_from.min(projection.messages.len());
 	projection
+}
+
+/// Drop the tool groups a provider would reject.
+///
+/// A tool call must be answered by a tool result: Anthropic-style APIs reject
+/// a request whose assistant turn carries tool calls that no tool result
+/// answers (`tool call result does not follow tool call`). A run that died
+/// mid-turn leaves exactly that behind, so the incomplete group never reaches
+/// the model. The session file keeps the entry — the export renders a call
+/// without a result as pending — but the transcript the model sees stays
+/// well formed.
+fn drop_incomplete_tool_groups(projection: &mut SessionProjection) {
+	let mut keep: Vec<bool> = vec![true; projection.messages.len()];
+	let mut index = 0;
+	while index < projection.messages.len() {
+		match &projection.messages[index].1 {
+			Message::Assistant(assistant) => {
+				let calls: Vec<&str> = assistant
+					.content
+					.iter()
+					.filter_map(|block| match block {
+						AssistantContent::ToolCall(call) => Some(call.id.as_str()),
+						_ => None,
+					})
+					.collect();
+				if calls.is_empty() {
+					index += 1;
+					continue;
+				}
+				// The results of a call follow it, in order.
+				let mut results = Vec::new();
+				let mut next = index + 1;
+				while next < projection.messages.len()
+					&& matches!(projection.messages[next].1, Message::ToolResult(_))
+				{
+					results.push(next);
+					next += 1;
+				}
+				let answered = results.len() == calls.len()
+					&& results.iter().zip(calls.iter()).all(|(slot, id)| {
+						matches!(&projection.messages[*slot].1, Message::ToolResult(result) if result.tool_call_id == *id)
+					});
+				if !answered {
+					keep[index] = false;
+					for slot in &results {
+						keep[*slot] = false;
+					}
+				}
+				index = next;
+			}
+			// A result without the call it answers.
+			Message::ToolResult(_) => {
+				keep[index] = false;
+				index += 1;
+			}
+			_ => index += 1,
+		}
+	}
+	// The usage boundary indexes the transcript: keep it on the same message.
+	let mut dropped_before = 0usize;
+	let mut kept: Vec<(Option<String>, Message)> = Vec::with_capacity(projection.messages.len());
+	for (index, message) in projection.messages.drain(..).enumerate() {
+		if keep[index] {
+			kept.push(message);
+		} else if index < projection.usage_valid_from {
+			dropped_before += 1;
+		}
+	}
+	projection.messages = kept;
+	projection.usage_valid_from = projection.usage_valid_from.saturating_sub(dropped_before);
 }
 
 /// Project one selected entry into model-visible messages
@@ -3924,6 +3998,166 @@ mod tests {
 		// post-compaction message is trusted again.
 		assert_eq!(projection.usage_valid_from, 3);
 		drop((m1, m2, m3, m4));
+	}
+
+	// -- incomplete tool groups -----------------------------------------------
+
+	fn assistant_calling(ids: &[&str]) -> Message {
+		Message::Assistant(AssistantMessage {
+			content: ids
+				.iter()
+				.map(|id| {
+					AssistantContent::ToolCall(pi_ai::ToolCall {
+						id: (*id).to_string(),
+						name: "bash".into(),
+						arguments: json!({}),
+						thought_signature: None,
+						namespace: None,
+						arguments_error: None,
+					})
+				})
+				.collect(),
+			api: "anthropic-messages".into(),
+			provider: "minimax-cn".into(),
+			model: "mock".into(),
+			response_model: None,
+			response_id: None,
+			thinking_level: None,
+			usage: Usage::default(),
+			stop_reason: pi_ai::StopReason::ToolUse,
+			error_message: None,
+			raw_stop_reason: None,
+			end_turn: None,
+			timestamp: 0,
+			duration_ms: None,
+		})
+	}
+
+	fn tool_result(id: &str) -> Message {
+		Message::ToolResult(pi_ai::ToolResultMessage::text_result(
+			id, "bash", "done", false,
+		))
+	}
+
+	/// A run that died mid-turn leaves a tool call without its result. The
+	/// provider rejects that history, so the group never reaches the model.
+	#[test]
+	fn a_tool_call_without_its_result_is_dropped_from_the_context() {
+		let mut manager = SessionManager::in_memory();
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("one")),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(assistant_calling(&["call_1"])),
+			},
+		);
+
+		let projection = project_entries(manager.entries());
+		let texts: Vec<String> = projection
+			.messages
+			.iter()
+			.map(|(_, message)| message_text(message))
+			.collect();
+		assert_eq!(texts, ["one"]);
+	}
+
+	/// One result of two is not an answer the provider accepts.
+	#[test]
+	fn a_partially_answered_tool_group_is_dropped_from_the_context() {
+		let mut manager = SessionManager::in_memory();
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("one")),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(assistant_calling(&["call_1", "call_2"])),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(tool_result("call_1")),
+			},
+		);
+
+		let projection = project_entries(manager.entries());
+		let texts: Vec<String> = projection
+			.messages
+			.iter()
+			.map(|(_, message)| message_text(message))
+			.collect();
+		assert_eq!(texts, ["one"]);
+	}
+
+	/// A result that answers a call nobody made breaks the pairing too.
+	#[test]
+	fn a_result_without_its_call_is_dropped_from_the_context() {
+		let mut manager = SessionManager::in_memory();
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("one")),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(tool_result("call_other")),
+			},
+		);
+
+		let projection = project_entries(manager.entries());
+		let texts: Vec<String> = projection
+			.messages
+			.iter()
+			.map(|(_, message)| message_text(message))
+			.collect();
+		assert_eq!(texts, ["one"]);
+	}
+
+	/// A complete group is the normal case and stays untouched.
+	#[test]
+	fn a_complete_tool_group_stays_in_the_context() {
+		let mut manager = SessionManager::in_memory();
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(user_message("one")),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(assistant_calling(&["call_1", "call_2"])),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(tool_result("call_1")),
+			},
+		);
+		linked(
+			&mut manager,
+			EntryKind::Message {
+				message: Box::new(tool_result("call_2")),
+			},
+		);
+
+		let projection = project_entries(manager.entries());
+		assert_eq!(projection.messages.len(), 4);
+		assert!(matches!(projection.messages[1].1, Message::Assistant(_)));
+		assert!(matches!(projection.messages[2].1, Message::ToolResult(_)));
+		assert!(matches!(projection.messages[3].1, Message::ToolResult(_)));
 	}
 
 	#[test]
