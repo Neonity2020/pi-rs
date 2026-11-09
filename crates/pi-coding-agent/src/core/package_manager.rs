@@ -336,13 +336,16 @@ fn resolve_path(base: &Path, path: &str) -> PathBuf {
 }
 
 /// One configured package entry — upstream `ConfiguredPackage`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConfiguredPackage {
 	pub source: String,
 	/// `"user"` (global settings) or `"project"`.
 	pub scope: &'static str,
 	/// Install path of the resolved package, when installed.
 	pub installed_path: Option<PathBuf>,
+	/// The raw settings entry (string or object) — object entries carry
+	/// per-resource pattern arrays and the `autoload` flag.
+	pub entry: Value,
 }
 
 /// Resource paths discovered inside installed packages — upstream
@@ -427,27 +430,17 @@ async fn run_command_capture(
 /// The `packages` entries of one settings file, as source strings (object
 /// entries contribute their `source`).
 fn read_sources(path: &Path) -> Vec<String> {
-	let Ok(text) = std::fs::read_to_string(path) else {
-		return Vec::new();
-	};
-	let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
-	else {
-		return Vec::new();
-	};
-	match map.get("packages") {
-		Some(Value::Array(items)) => items
-			.iter()
-			.filter_map(|item| match item {
-				Value::String(source) => Some(source.clone()),
-				Value::Object(object) => object
+	read_entries(path)
+		.iter()
+		.filter_map(|entry| {
+			entry.as_str().map(str::to_string).or_else(|| {
+				entry
 					.get("source")
 					.and_then(Value::as_str)
-					.map(str::to_string),
-				_ => None,
+					.map(str::to_string)
 			})
-			.collect(),
-		_ => Vec::new(),
-	}
+		})
+		.collect()
 }
 
 /// Read-modify-write one settings file's `packages` array, preserving every
@@ -479,6 +472,254 @@ fn edit_packages(
 	let body =
 		serde_json::to_string_pretty(&Value::Object(map)).map_err(|error| error.to_string())?;
 	std::fs::write(path, body + "\n").map_err(|error| error.to_string())
+}
+
+// -- per-resource pattern filters (upstream package-manager.ts:677-845) ------
+
+/// The four resource types a settings package entry can filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceType {
+	Extensions,
+	Skills,
+	Prompts,
+	Themes,
+}
+
+impl ResourceType {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			ResourceType::Extensions => "extensions",
+			ResourceType::Skills => "skills",
+			ResourceType::Prompts => "prompts",
+			ResourceType::Themes => "themes",
+		}
+	}
+
+	pub const ALL: [ResourceType; 4] = [
+		ResourceType::Extensions,
+		ResourceType::Skills,
+		ResourceType::Prompts,
+		ResourceType::Themes,
+	];
+}
+
+/// Glob match like upstream `matchesAnyPattern` (minimatch against the
+/// base-relative path, the file name, and the full path; SKILL.md files also
+/// match their parent directory's rel/name/full forms).
+fn matches_any_pattern(file: &Path, patterns: &[String], base_dir: &Path) -> bool {
+	let rel = relative_posix(base_dir, file);
+	let name = file
+		.file_name()
+		.map(|name| name.to_string_lossy().to_string())
+		.unwrap_or_default();
+	let full = file.to_string_lossy().replace('\\', "/");
+	let skill_parent = (name == "SKILL.md").then(|| file.parent().map(Path::to_path_buf));
+	patterns.iter().any(|pattern| {
+		let normalized = pattern.replace('\\', "/");
+		let glob = globset::Glob::new(&normalized)
+			.ok()
+			.map(|glob| glob.compile_matcher());
+		let matches = move |candidate: &str| match &glob {
+			Some(matcher) => matcher.is_match(candidate),
+			// Uncompilable globs degrade to literal equality (minimatch with
+			// a literal pattern is an exact match).
+			None => candidate == normalized,
+		};
+		matches(&rel) || matches(&name) || matches(&full) || {
+			let Some(Some(parent)) = &skill_parent else {
+				return false;
+			};
+			let parent_rel = relative_posix(base_dir, parent);
+			let parent_name = parent
+				.file_name()
+				.map(|name| name.to_string_lossy().to_string())
+				.unwrap_or_default();
+			let parent_full = parent.to_string_lossy().replace('\\', "/");
+			matches(&parent_rel) || matches(&parent_name) || matches(&parent_full)
+		}
+	})
+}
+
+/// Exact match like upstream `matchesAnyExactPattern` (`./` stripped, the
+/// pattern compared against the base-relative and full path; SKILL.md files
+/// also match their parent directory's forms).
+fn matches_any_exact(file: &Path, patterns: &[String], base_dir: &Path) -> bool {
+	if patterns.is_empty() {
+		return false;
+	}
+	let rel = relative_posix(base_dir, file);
+	let full = file.to_string_lossy().replace('\\', "/");
+	let skill_parent = (rel == "SKILL.md"
+		|| file.file_name().is_some_and(|name| name == "SKILL.md"))
+	.then(|| file.parent().map(Path::to_path_buf));
+	patterns.iter().any(|pattern| {
+		let normalized = pattern
+			.strip_prefix("./")
+			.or_else(|| pattern.strip_prefix(".\\"))
+			.unwrap_or(pattern)
+			.replace('\\', "/");
+		normalized == rel || normalized == full || {
+			let Some(Some(parent)) = &skill_parent else {
+				return false;
+			};
+			let parent_rel = relative_posix(base_dir, parent);
+			let parent_name = parent
+				.file_name()
+				.map(|name| name.to_string_lossy().to_string())
+				.unwrap_or_default();
+			let parent_full = parent.to_string_lossy().replace('\\', "/");
+			normalized == parent_rel || normalized == parent_name || normalized == parent_full
+		}
+	})
+}
+
+/// Apply a settings entry's pattern list and return the enabled file set —
+/// upstream `applyPatterns`: plain patterns include (glob), `!` excludes
+/// (glob), `+` force-includes (exact, beats `!`), `-` force-excludes (exact,
+/// beats everything).
+pub fn apply_patterns(
+	files: &[PathBuf],
+	patterns: &[String],
+	base_dir: &Path,
+) -> std::collections::HashSet<PathBuf> {
+	let mut includes = Vec::new();
+	let mut excludes = Vec::new();
+	let mut force_includes = Vec::new();
+	let mut force_excludes = Vec::new();
+	for pattern in patterns {
+		if let Some(rest) = pattern.strip_prefix('+') {
+			force_includes.push(rest.to_string());
+		} else if let Some(rest) = pattern.strip_prefix('-') {
+			force_excludes.push(rest.to_string());
+		} else if let Some(rest) = pattern.strip_prefix('!') {
+			excludes.push(rest.to_string());
+		} else {
+			includes.push(pattern.clone());
+		}
+	}
+
+	let mut enabled: Vec<&PathBuf> = if includes.is_empty() {
+		files.iter().collect()
+	} else {
+		files
+			.iter()
+			.filter(|file| matches_any_pattern(file, &includes, base_dir))
+			.collect()
+	};
+	if !excludes.is_empty() {
+		enabled.retain(|file| !matches_any_pattern(file, &excludes, base_dir));
+	}
+	if !force_includes.is_empty() {
+		for file in files {
+			if !enabled.iter().any(|kept| kept.as_path() == file)
+				&& matches_any_exact(file, &force_includes, base_dir)
+			{
+				enabled.push(file);
+			}
+		}
+	}
+	if !force_excludes.is_empty() {
+		enabled.retain(|file| !matches_any_exact(file, &force_excludes, base_dir));
+	}
+	enabled.into_iter().cloned().collect()
+}
+
+/// The `packages` entries of one settings file as raw values (string or
+/// object), preserving filter arrays and the `autoload` flag.
+fn read_entries(path: &Path) -> Vec<Value> {
+	let Ok(text) = std::fs::read_to_string(path) else {
+		return Vec::new();
+	};
+	let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+	else {
+		return Vec::new();
+	};
+	match map.get("packages") {
+		Some(Value::Array(items)) => items.clone(),
+		_ => Vec::new(),
+	}
+}
+
+/// The pattern list one settings entry carries for a resource type.
+fn entry_patterns(entry: &Value, resource_type: ResourceType) -> Vec<String> {
+	entry
+		.get(resource_type.as_str())
+		.and_then(Value::as_array)
+		.map(|items| {
+			items
+				.iter()
+				.filter_map(Value::as_str)
+				.map(str::to_string)
+				.collect()
+		})
+		.unwrap_or_default()
+}
+
+/// One item of the package resource selector: a discovered file, its package,
+/// and the enabled/override state the settings produce.
+#[derive(Debug, Clone)]
+pub struct ResourceItem {
+	pub path: PathBuf,
+	/// Package-root-relative posix path — the pattern the selector writes.
+	pub rel: String,
+	pub resource_type: ResourceType,
+	/// Enabled per the defining settings entry's pattern list.
+	pub enabled: bool,
+	/// Override from the other scope's same-identity entry — `None` inherits.
+	pub project_override: Option<bool>,
+	/// The settings entry that lists the package (`"user"` or `"project"`).
+	pub package_scope: &'static str,
+	pub package_source: String,
+}
+
+impl ResourceItem {
+	/// The state a project-mode view renders: override when set, else the
+	/// defining entry's enabled.
+	pub fn effective(&self) -> bool {
+		self.project_override.unwrap_or(self.enabled)
+	}
+}
+
+/// Project-override state for one resource from the other scope's entry —
+/// upstream `getOverrideStateFromEntries`: an empty array means unload-all
+/// (unless the entry is an `autoload: false` override shell), `+pattern`
+/// loads, `-`/`!` unloads, matched by exact string equality against the
+/// file's package-relative path.
+pub fn project_override_state(
+	entry: &Value,
+	resource_type: ResourceType,
+	rel_pattern: &str,
+) -> Option<bool> {
+	// A missing array inherits; an explicit empty array unloads everything
+	// (unless the entry is an `autoload: false` override shell).
+	let patterns = entry.get(resource_type.as_str())?.as_array()?;
+	if patterns.is_empty() {
+		return (entry.get("autoload").and_then(Value::as_bool) != Some(false)).then_some(false);
+	}
+	let normalize = |pattern: &str| {
+		pattern
+			.strip_prefix("./")
+			.or_else(|| pattern.strip_prefix(".\\"))
+			.unwrap_or(pattern)
+			.replace('\\', "/")
+	};
+	let target = normalize(rel_pattern);
+	let mut state = None;
+	for pattern in patterns {
+		let Some(pattern) = pattern.as_str() else {
+			continue;
+		};
+		let stripped = pattern
+			.strip_prefix('+')
+			.or_else(|| pattern.strip_prefix('-'))
+			.or_else(|| pattern.strip_prefix('!'))
+			.unwrap_or(pattern);
+		if normalize(stripped) != target {
+			continue;
+		}
+		state = Some(!pattern.starts_with('-') && !pattern.starts_with('!'));
+	}
+	state
 }
 
 /// The package manager: install/remove/update/list plus resource discovery —
@@ -954,11 +1195,18 @@ impl PackageManager {
 		let (global_path, project_path) = self.settings_paths();
 		let mut seen = Vec::new();
 		let mut packages = Vec::new();
-		let push = |source: String,
-		            scope: &'static str,
+		let push = |entry: Value,
 		            local: bool,
 		            packages: &mut Vec<ConfiguredPackage>,
 		            seen: &mut Vec<String>| {
+			let Some(source) = entry.as_str().map(str::to_string).or_else(|| {
+				entry
+					.get("source")
+					.and_then(Value::as_str)
+					.map(str::to_string)
+			}) else {
+				return;
+			};
 			let identity = parse_source(&source).identity(Some(&self.cwd));
 			if seen.contains(&identity) {
 				return;
@@ -967,38 +1215,262 @@ impl PackageManager {
 			let installed_path = self.installed_path(&source, local);
 			packages.push(ConfiguredPackage {
 				source,
-				scope,
+				scope: if local { "project" } else { "user" },
 				installed_path,
+				entry,
 			});
 		};
 		if let Some(project) = &project_path {
-			for entry in read_sources(project) {
-				push(entry, "project", true, &mut packages, &mut seen);
+			for entry in read_entries(project) {
+				push(entry, true, &mut packages, &mut seen);
 			}
 		}
-		for entry in read_sources(&global_path) {
-			push(entry, "user", false, &mut packages, &mut seen);
+		for entry in read_entries(&global_path) {
+			push(entry, false, &mut packages, &mut seen);
 		}
 		packages
 	}
 
 	/// Discover resources from every installed package — upstream
 	/// `resolve()`'s package branch (missing installs become warnings; the
-	/// interactive auto-install prompt and per-resource settings entries are
-	/// declared reductions).
+	/// interactive auto-install prompt is a declared reduction). Per-resource
+	/// pattern filters in the settings entries decide which discovered files
+	/// stay enabled: the defining entry's patterns are the base, and a
+	/// project-scope entry for the same package overrides item by item
+	/// (upstream `getOverrideStateFromEntries`).
 	pub fn resolve_resources(&self) -> PackageResources {
-		let mut resources = PackageResources::default();
-		for package in self.list_configured() {
-			let Some(installed) = package.installed_path else {
-				resources.warnings.push(format!(
-					"package \"{}\" is configured but not installed; run: pi-rs package install {}",
-					package.source, package.source
-				));
+		let (items, warnings) = self.resolve_items();
+		let mut resources = PackageResources {
+			warnings,
+			..Default::default()
+		};
+		for item in items {
+			if !item.effective() {
 				continue;
-			};
-			collect_package_resources(&installed, &mut resources);
+			}
+			match item.resource_type {
+				ResourceType::Extensions => resources.extensions.push(item.path),
+				ResourceType::Skills => resources.skills.push(item.path),
+				ResourceType::Prompts => resources.prompts.push(item.path),
+				ResourceType::Themes => resources.themes.push(item.path),
+			}
 		}
 		resources
+	}
+
+	/// The selector-facing resolve: every discovered file with its per-scope
+	/// settings state (see [`ResourceItem`]). Both settings files are walked
+	/// independently — the global entry defines loading (a project-only
+	/// package defines its own), and a same-identity project entry overrides
+	/// item by item.
+	pub fn resolve_items(&self) -> (Vec<ResourceItem>, Vec<String>) {
+		let (global_path, project_path) = self.settings_paths();
+		let project_entries = project_path
+			.as_ref()
+			.map(|path| read_entries(path))
+			.unwrap_or_default();
+		let mut items = Vec::new();
+		let mut warnings = Vec::new();
+		let mut seen: Vec<String> = Vec::new();
+
+		let mut resolve_one =
+			|source: &str, user_entry: Option<&Value>, project_entry: Option<&Value>| {
+				let identity = parse_source(source).identity(Some(&self.cwd));
+				if seen.contains(&identity) {
+					return;
+				}
+				seen.push(identity);
+				let installed = self
+					.installed_path(source, project_entry.is_some())
+					.or_else(|| self.installed_path(source, false));
+				let Some(installed) = installed else {
+					warnings.push(format!(
+						"package \"{source}\" is configured but not installed; run: pi-rs package install {source}"
+					));
+					return;
+				};
+				let files = collect_package_files(&installed);
+				let defining = user_entry.or(project_entry).expect("one entry exists");
+				let package_scope = if user_entry.is_some() {
+					"user"
+				} else {
+					"project"
+				};
+				for resource_type in ResourceType::ALL {
+					let type_files = files.for_type(resource_type);
+					let base_enabled = apply_patterns(
+						type_files,
+						&entry_patterns(defining, resource_type),
+						&installed,
+					);
+					for path in type_files {
+						let enabled = base_enabled.contains(path.as_path());
+						let rel = relative_posix(&installed, path);
+						let project_override = project_entry
+							.and_then(|entry| project_override_state(entry, resource_type, &rel));
+						items.push(ResourceItem {
+							path: path.clone(),
+							rel,
+							resource_type,
+							enabled,
+							project_override,
+							package_scope,
+							package_source: source.to_string(),
+						});
+					}
+				}
+			};
+
+		// Project-first identity walk (mirrors list_configured's order), but
+		// both entries are kept when the same package is listed twice.
+		let entry_source = |entry: &Value| -> Option<String> {
+			entry.as_str().map(str::to_string).or_else(|| {
+				entry
+					.get("source")
+					.and_then(Value::as_str)
+					.map(str::to_string)
+			})
+		};
+		for project_entry in &project_entries {
+			let Some(source) = entry_source(project_entry) else {
+				continue;
+			};
+			let user_entry = read_entries(&global_path).into_iter().find(|candidate| {
+				entry_source(candidate).is_some_and(|candidate| {
+					parse_source(&candidate).identity(Some(&self.cwd))
+						== parse_source(&source).identity(Some(&self.cwd))
+				})
+			});
+			resolve_one(&source, user_entry.as_ref(), Some(project_entry));
+		}
+		for user_entry in read_entries(&global_path) {
+			let Some(source) = entry_source(&user_entry) else {
+				continue;
+			};
+			resolve_one(&source, Some(&user_entry), None);
+		}
+		(items, warnings)
+	}
+
+	/// The pattern list a settings file's entry for `source` carries for a
+	/// resource type (empty when the entry or the array is absent).
+	pub fn package_type_patterns(
+		&self,
+		source: &str,
+		resource_type: ResourceType,
+		local: bool,
+	) -> Vec<String> {
+		let identity = parse_source(source).identity(Some(&self.cwd));
+		let path = if local {
+			match self.settings_paths().1 {
+				Some(path) => path,
+				None => return Vec::new(),
+			}
+		} else {
+			self.settings_paths().0
+		};
+		read_entries(&path)
+			.into_iter()
+			.find(|entry| {
+				entry
+					.as_str()
+					.map(str::to_string)
+					.or_else(|| {
+						entry
+							.get("source")
+							.and_then(Value::as_str)
+							.map(str::to_string)
+					})
+					.is_some_and(|candidate| {
+						parse_source(&candidate).identity(Some(&self.cwd)) == identity
+					})
+			})
+			.map(|entry| entry_patterns(&entry, resource_type))
+			.unwrap_or_default()
+	}
+
+	/// Read-modify-write one settings file's package entry pattern array —
+	/// upstream `togglePackageResource`/`setProjectPackageOverride` persistence:
+	/// find the entry by identity (promoting string entries to objects), set
+	/// (`Some`) or clear (`None`) the type's array, then collapse objects with
+	/// no filter arrays left back to plain sources — removing override-only
+	/// entries (`autoload: false`) entirely, like upstream.
+	pub fn set_package_patterns(
+		&self,
+		source: &str,
+		resource_type: ResourceType,
+		patterns: Option<&[String]>,
+		local: bool,
+	) -> Result<(), String> {
+		let identity = parse_source(source).identity(Some(&self.cwd));
+		let path = if local {
+			self.assert_project_trusted()?;
+			self.settings_paths().1.expect("project path with cwd")
+		} else {
+			self.settings_paths().0
+		};
+		edit_packages(&path, |mut packages| {
+			let index = packages.iter().position(|entry| {
+				entry
+					.as_str()
+					.map(str::to_string)
+					.or_else(|| {
+						entry
+							.get("source")
+							.and_then(Value::as_str)
+							.map(str::to_string)
+					})
+					.is_some_and(|candidate| {
+						parse_source(&candidate).identity(Some(&self.cwd)) == identity
+					})
+			});
+			let Some(index) = index else {
+				// Selector-created override entries start as autoload:false
+				// objects (upstream `createPackageOverrideSource`).
+				let list = patterns.filter(|list| !list.is_empty())?;
+				packages.push(serde_json::json!({
+					"source": source,
+					"autoload": false,
+					resource_type.as_str(): list,
+				}));
+				return Some(packages);
+			};
+			let entry = packages[index].clone();
+			let mut object = match entry {
+				Value::Object(object) => object,
+				Value::String(source) => {
+					let mut object = serde_json::Map::new();
+					object.insert("source".to_string(), Value::String(source));
+					object
+				}
+				_ => return None,
+			};
+			match patterns {
+				Some(list) if !list.is_empty() => {
+					object.insert(
+						resource_type.as_str().to_string(),
+						Value::Array(list.iter().map(|p| Value::String(p.clone())).collect()),
+					);
+				}
+				_ => {
+					object.remove(resource_type.as_str());
+				}
+			}
+			let has_filters = ResourceType::ALL
+				.iter()
+				.any(|ty| object.contains_key(ty.as_str()));
+			if has_filters {
+				packages[index] = Value::Object(object);
+			} else if object.get("autoload").and_then(Value::as_bool) == Some(false) {
+				packages.remove(index);
+			} else {
+				packages[index] = object
+					.get("source")
+					.cloned()
+					.unwrap_or(Value::String(source.to_string()));
+			}
+			Some(packages)
+		})
 	}
 }
 
@@ -1238,7 +1710,29 @@ fn collect_pattern_files_inner(
 /// Discover every resource type under one installed package root — upstream
 /// `collectDefaultResources`: the manifest's `pi.<type>` entries win, else
 /// the `<root>/<type>/` convention directory is walked.
-fn collect_package_resources(package_root: &Path, resources: &mut PackageResources) {
+/// Per-type discovered files inside one package root — the raw material the
+/// pattern filters select from.
+#[derive(Debug, Default, Clone)]
+struct PackageFiles {
+	extensions: Vec<PathBuf>,
+	skills: Vec<PathBuf>,
+	prompts: Vec<PathBuf>,
+	themes: Vec<PathBuf>,
+}
+
+impl PackageFiles {
+	fn for_type(&self, resource_type: ResourceType) -> &Vec<PathBuf> {
+		match resource_type {
+			ResourceType::Extensions => &self.extensions,
+			ResourceType::Skills => &self.skills,
+			ResourceType::Prompts => &self.prompts,
+			ResourceType::Themes => &self.themes,
+		}
+	}
+}
+
+fn collect_package_files(package_root: &Path) -> PackageFiles {
+	let mut files = PackageFiles::default();
 	let manifest = read_pi_manifest(package_root);
 	for (resource_type, extension, sink) in [
 		("extensions", None, 0usize),
@@ -1247,7 +1741,7 @@ fn collect_package_resources(package_root: &Path, resources: &mut PackageResourc
 		("themes", Some("json"), 3),
 	] {
 		// Manifest entries first (existing paths only; glob/negation
-		// patterns are a declared reduction).
+		// patterns in manifests are a declared reduction).
 		if let Some(Value::Array(entries)) = manifest
 			.as_ref()
 			.and_then(|manifest| manifest.get(resource_type))
@@ -1260,10 +1754,10 @@ fn collect_package_resources(package_root: &Path, resources: &mut PackageResourc
 				.collect();
 			if !resolved.is_empty() {
 				match sink {
-					0 => resources.extensions.extend(resolved),
-					1 => resources.skills.extend(resolved),
-					2 => resources.prompts.extend(resolved),
-					_ => resources.themes.extend(resolved),
+					0 => files.extensions.extend(resolved),
+					1 => files.skills.extend(resolved),
+					2 => files.prompts.extend(resolved),
+					_ => files.themes.extend(resolved),
 				}
 				continue;
 			}
@@ -1272,7 +1766,7 @@ fn collect_package_resources(package_root: &Path, resources: &mut PackageResourc
 		if !dir.exists() {
 			continue;
 		}
-		let files = match extension {
+		let discovered = match extension {
 			None => {
 				if resource_type == "extensions" {
 					collect_auto_extension_entries(&dir)
@@ -1283,12 +1777,13 @@ fn collect_package_resources(package_root: &Path, resources: &mut PackageResourc
 			Some(extension) => collect_pattern_files(&dir, extension),
 		};
 		match sink {
-			0 => resources.extensions.extend(files),
-			1 => resources.skills.extend(files),
-			2 => resources.prompts.extend(files),
-			_ => resources.themes.extend(files),
+			0 => files.extensions.extend(discovered),
+			1 => files.skills.extend(discovered),
+			2 => files.prompts.extend(discovered),
+			_ => files.themes.extend(discovered),
 		}
 	}
+	files
 }
 
 #[cfg(test)]
@@ -1301,6 +1796,7 @@ mod tests {
 	/// installs need a registry and are exercised through the CLI instead.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn local_package_round_trips_through_settings_and_resources() {
+		let _guard = ENV_LOCK.lock().await;
 		let root = std::env::temp_dir().join(format!(
 			"pi-pm-e2e-{}-{}",
 			std::process::id(),
@@ -1362,6 +1858,7 @@ mod tests {
 			eprintln!("skipping: git not available");
 			return;
 		}
+		let _guard = ENV_LOCK.lock().await;
 		let root = std::env::temp_dir().join(format!(
 			"pi-pm-git-{}-{}",
 			std::process::id(),
@@ -1572,8 +2069,7 @@ mod tests {
 		// addIgnoreRules(ig, dir, root) with dir == the walk root).
 		std::fs::write(pkg.join("extensions/.gitignore"), "skipped/\n").unwrap();
 
-		let mut resources = PackageResources::default();
-		collect_package_resources(&pkg, &mut resources);
+		let files = collect_package_files(&pkg);
 		let names = |paths: &[PathBuf]| -> Vec<String> {
 			paths
 				.iter()
@@ -1586,24 +2082,21 @@ mod tests {
 				.collect()
 		};
 		assert_eq!(
-			names(&resources.extensions),
+			names(&files.extensions),
 			vec![
 				"extensions/tools/index.js".to_string(),
 				"extensions/util.ts".to_string()
 			]
 		);
 		assert_eq!(
-			names(&resources.skills),
+			names(&files.skills),
 			vec!["skills/nested/SKILL.md".to_string()]
 		);
 		assert_eq!(
-			names(&resources.prompts),
+			names(&files.prompts),
 			vec!["prompts/SKILL.md".to_string(), "prompts/one.md".to_string()]
 		);
-		assert_eq!(
-			names(&resources.themes),
-			vec!["themes/dark.json".to_string()]
-		);
+		assert_eq!(names(&files.themes), vec!["themes/dark.json".to_string()]);
 		let _ = std::fs::remove_dir_all(&root);
 	}
 
@@ -1623,10 +2116,252 @@ mod tests {
 				.to_string(),
 		)
 		.unwrap();
-		let mut resources = PackageResources::default();
-		collect_package_resources(&pkg, &mut resources);
-		assert_eq!(resources.extensions, vec![pkg.join("custom.ts")]);
-		assert_eq!(resources.prompts, vec![pkg.join("docs.md")]);
+		let files = collect_package_files(&pkg);
+		assert_eq!(files.extensions, vec![pkg.join("custom.ts")]);
+		assert_eq!(files.prompts, vec![pkg.join("docs.md")]);
 		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// Serializes tests that repoint `PI_RS_AGENT_DIR` (cargo runs tests in
+	/// threads within one process; the env var is process-global). A tokio
+	/// mutex because the async round trips hold it across awaits.
+	static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+	#[test]
+	fn pattern_filters_follow_the_upstream_order() {
+		let root = std::env::temp_dir().join(format!("pi-pm-pat-{}", std::process::id()));
+		std::fs::create_dir_all(root.join("skills/nested")).unwrap();
+		std::fs::create_dir_all(root.join("extensions/tools")).unwrap();
+		let util = root.join("extensions/util.ts");
+		let tool = root.join("extensions/tools/index.js");
+		let skill = root.join("skills/nested/SKILL.md");
+		for path in [&util, &tool, &skill] {
+			std::fs::write(path, "").unwrap();
+		}
+		let files = vec![util.clone(), tool.clone(), skill.clone()];
+		let enabled = |patterns: &[String]| -> Vec<String> {
+			let mut names: Vec<String> = apply_patterns(&files, patterns, &root)
+				.into_iter()
+				.map(|path| relative_posix(&root, &path))
+				.collect();
+			names.sort();
+			names
+		};
+
+		// No patterns → everything enabled.
+		assert_eq!(
+			enabled(&[]),
+			vec![
+				"extensions/tools/index.js",
+				"extensions/util.ts",
+				"skills/nested/SKILL.md"
+			]
+		);
+		// Plain patterns include by glob (rel path, basename, or full path).
+		assert_eq!(
+			enabled(&["extensions/*.ts".into()]),
+			vec!["extensions/util.ts"]
+		);
+		assert_eq!(enabled(&["util.ts".into()]), vec!["extensions/util.ts"]);
+		// `!` excludes by glob; a SKILL.md also matches its parent dir forms.
+		assert_eq!(
+			enabled(&["!skills/nested".into()]),
+			vec!["extensions/tools/index.js", "extensions/util.ts"]
+		);
+		// `+` force-includes exactly and beats `!`; `-` force-excludes exactly
+		// and beats `+`.
+		assert_eq!(
+			enabled(&["!skills".into(), "+./skills/nested/SKILL.md".into()]),
+			vec![
+				"extensions/tools/index.js",
+				"extensions/util.ts",
+				"skills/nested/SKILL.md"
+			]
+		);
+		// The force-exclude removes only the skill — the extensions were
+		// never touched.
+		assert_eq!(
+			enabled(&[
+				"+skills/nested/SKILL.md".into(),
+				"-skills/nested/SKILL.md".into()
+			]),
+			vec!["extensions/tools/index.js", "extensions/util.ts"]
+		);
+		// Exact patterns also accept the SKILL parent dir form.
+		assert_eq!(
+			enabled(&["!skills/**".into(), "+nested".into()]),
+			vec![
+				"extensions/tools/index.js",
+				"extensions/util.ts",
+				"skills/nested/SKILL.md"
+			]
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn override_state_reads_project_entries_like_upstream() {
+		let entry = |value: Value| value;
+		// Missing array inherits; explicit empty array unloads; an
+		// autoload:false shell with an empty array inherits.
+		assert_eq!(
+			project_override_state(&entry(json!({"source": "x"})), ResourceType::Skills, "s"),
+			None
+		);
+		assert_eq!(
+			project_override_state(
+				&entry(json!({"source": "x", "skills": []})),
+				ResourceType::Skills,
+				"s"
+			),
+			Some(false)
+		);
+		assert_eq!(
+			project_override_state(
+				&entry(json!({"source": "x", "autoload": false, "skills": []})),
+				ResourceType::Skills,
+				"s"
+			),
+			None
+		);
+		// `+` loads, `-`/`!` unloads, later entries win, unrelated targets
+		// inherit, `./` prefixes normalize.
+		let patterns = json!({"source": "x", "skills": ["+./SKILLS.md", "-other.md"]});
+		assert_eq!(
+			project_override_state(&entry(patterns), ResourceType::Skills, "SKILLS.md"),
+			Some(true)
+		);
+		let patterns =
+			json!({"source": "x", "skills": ["!skills/a/SKILL.md", "+skills/a/SKILL.md"]});
+		assert_eq!(
+			project_override_state(&entry(patterns), ResourceType::Skills, "skills/a/SKILL.md"),
+			Some(true)
+		);
+		let patterns = json!({"source": "x", "skills": ["-skills/a/SKILL.md"]});
+		assert_eq!(
+			project_override_state(&entry(patterns), ResourceType::Skills, "skills/b/SKILL.md"),
+			None
+		);
+	}
+
+	#[test]
+	fn package_patterns_round_trip_through_settings() {
+		// The global settings path comes from `PI_RS_AGENT_DIR`
+		// (`config::settings_json_path`), so the env var must point at the
+		// fixture agent dir — serialized with the other env-touching tests.
+		let _guard = futures::executor::block_on(ENV_LOCK.lock());
+		let root = std::env::temp_dir().join(format!(
+			"pi-pm-rt-{}-{}",
+			std::process::id(),
+			pi_ai::types::now_ms()
+		));
+		let agent_dir = root.join("agent");
+		let cwd = root.join("project");
+		let pkg = root.join("pkg");
+		std::fs::create_dir_all(&agent_dir).unwrap();
+		std::fs::create_dir_all(&cwd).unwrap();
+		std::fs::create_dir_all(pkg.join("extensions")).unwrap();
+		std::fs::create_dir_all(pkg.join("skills/nested")).unwrap();
+		std::fs::write(pkg.join("extensions/util.ts"), "").unwrap();
+		std::fs::write(pkg.join("skills/nested/SKILL.md"), "# s").unwrap();
+		let source = pkg.display().to_string();
+		let settings = agent_dir.join("settings.json");
+		std::fs::write(&settings, json!({"packages": [source]}).to_string()).unwrap();
+		let previous = std::env::var(crate::config::AGENT_DIR_ENV).ok();
+		unsafe { std::env::set_var(crate::config::AGENT_DIR_ENV, &agent_dir) };
+
+		let result = package_patterns_round_trip_body(&cwd, &agent_dir, &pkg, &source, &settings);
+		match previous {
+			Some(value) => unsafe { std::env::set_var(crate::config::AGENT_DIR_ENV, value) },
+			None => unsafe { std::env::remove_var(crate::config::AGENT_DIR_ENV) },
+		}
+		result.unwrap();
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	fn package_patterns_round_trip_body(
+		cwd: &Path,
+		agent_dir: &Path,
+		pkg: &Path,
+		source: &str,
+		settings: &Path,
+	) -> Result<(), String> {
+		let manager = PackageManager::new(cwd, agent_dir, true);
+		let find = |items: &[ResourceItem], ty: ResourceType| {
+			items
+				.iter()
+				.find(|item| item.resource_type == ty)
+				.unwrap()
+				.clone()
+		};
+		let (items, warnings) = manager.resolve_items();
+		assert!(warnings.is_empty());
+		assert!(find(&items, ResourceType::Extensions).enabled);
+		assert!(find(&items, ResourceType::Skills).enabled);
+		assert_eq!(
+			find(&items, ResourceType::Extensions).project_override,
+			None
+		);
+
+		// Disable one extension globally: entry promoted to an object with a
+		// `-` pattern.
+		manager.set_package_patterns(
+			source,
+			ResourceType::Extensions,
+			Some(&["-extensions/util.ts".to_string()]),
+			false,
+		)?;
+		let (items, _) = manager.resolve_items();
+		assert!(!find(&items, ResourceType::Extensions).enabled);
+		assert_eq!(
+			read_entries(settings),
+			vec![json!({"source": source, "extensions": ["-extensions/util.ts"]})]
+		);
+
+		// Project override: force-load the skill from the project settings —
+		// an autoload:false shell entry appears there.
+		let project_settings = crate::config::project_pi_dir(cwd).join("settings.json");
+		manager.set_package_patterns(
+			source,
+			ResourceType::Skills,
+			Some(&["+skills/nested/SKILL.md".to_string()]),
+			true,
+		)?;
+		let (items, _) = manager.resolve_items();
+		let skill = find(&items, ResourceType::Skills);
+		assert!(
+			skill.enabled,
+			"the defining (global) entry still enables it"
+		);
+		assert_eq!(skill.project_override, Some(true));
+		let extension = find(&items, ResourceType::Extensions);
+		assert_eq!(
+			extension.project_override, None,
+			"types without an array in the project shell inherit"
+		);
+		assert_eq!(
+			read_entries(&project_settings),
+			vec![json!({
+				"source": source,
+				"autoload": false,
+				"skills": ["+skills/nested/SKILL.md"],
+			})]
+		);
+
+		// Startup keeps only effectively-enabled files.
+		let resources = manager.resolve_resources();
+		assert!(resources.extensions.is_empty());
+		assert_eq!(resources.skills, vec![pkg.join("skills/nested/SKILL.md")]);
+
+		// Clearing the global array collapses the object back to a string;
+		// clearing the override-only project entry removes it.
+		manager.set_package_patterns(source, ResourceType::Extensions, None, false)?;
+		manager.set_package_patterns(source, ResourceType::Skills, None, true)?;
+		assert_eq!(read_entries(settings), vec![json!(source)]);
+		assert!(read_entries(&project_settings).is_empty());
+		let (items, _) = manager.resolve_items();
+		assert!(find(&items, ResourceType::Extensions).enabled);
+		assert_eq!(find(&items, ResourceType::Skills).project_override, None);
+		Ok(())
 	}
 }

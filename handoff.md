@@ -573,3 +573,25 @@ google-generative-ai 流处理重构（process_payload_streamed）、google-vert
 
 **交接事项（下一轮候选）**：`pi config` 选择器（config-selector.ts 交互面）；包 glob/否定模式与 per-resource settings 条目；上游 npm 托管安装/self-update（cargo 二进制不适用——永久声明或设计 cargo 版）；D5 turn_end 边界语义轮。改动未提交，等用户指令。
 
+
+## 第四十九轮：`pi-rs config` 资源选择器 + per-package 模式过滤（2026-11-09，主会话单线）
+
+基线 `4758481`。上游对照：`package-manager-cli.ts` 的 handleConfigCommand（815-894）+ `modes/interactive/components/config-selector.ts`（951 行）+ `package-manager.ts` 的模式引擎（674-845：matchesAnyPattern/Exact、isEnabledByOverrides、applyPatterns）。承接第四十八轮交接事项首位的 `pi config` 选择器，并顺带落地其依赖的 per-resource settings 条目（第四十七轮的声明缺口）。
+
+- **模式引擎**（`core/package_manager.rs`）：
+  - `matches_any_pattern`：glob（globset）匹配 rel 路径/文件名/全路径，SKILL.md 额外匹配父目录三形态（对照 minimatch 候选集）；不可编译的 pattern 退化为字面相等。
+  - `matches_any_exact`：`./` 剥离后与 rel/全路径精确相等 + SKILL.md 父目录形态（含父目录名）。
+  - `apply_patterns`：上游四步序——plain include（glob）→ `!` exclude（glob）→ `+` force-include（精确，胜过 `!`）→ `-` force-exclude（精确，胜过一切）。
+- **数据模型**：`ConfiguredPackage` 携带原始 entry（对象条目含 `<type>` 模式数组与 `autoload`）；`resolve_items` 分别遍历全局/项目两个 settings 文件（identity 合并但两侧 entry 都保留——修复了首版"defining entry 赢得去重后 base/override 来源颠倒"的模型缺陷），产出 `ResourceItem { path, rel, type, enabled(定义侧), project_override(另一侧同源条目), scope, source }`；`project_override_state` 移植 getOverrideStateFromEntries（缺数组=inherit、显式空数组=unload-all 除非 autoload:false、`+`/`-`/`!` 按目标相等判定、后写胜出）；`resolve_resources` 变为 effective-only 包装（main.rs 零改动，启动即尊重过滤器）。
+- **写侧** `set_package_patterns`：按 identity 找条目（字符串→对象提升），设置/清除类型数组，无过滤器剩余时对象塌缩回字符串、autoload:false 的 override-only 条目整个移除（对照 setProjectPackageOverride）；选择器创建的 override 条目以 `{source, autoload:false}` 起步。
+- **TUI 选择器**（`modes/config_selector.rs` 新文件，独立 ratatui 循环 + `pi_tui::TerminalGuard`）：
+  - 分组行/子组行（Extensions/Skills/Prompts/Themes）/条目行三级行模型，排序对照 buildGroups（项目包优先、类型序、条目按显示名规则：extensions 子目录 `parent/file`、SKILL.md 显示目录名）。
+  - 双写域：Tab 切换（项目受信任时）；全局域只列 user 包，项目域合并列出（user 包标记 `inherited global` 并变暗）；space 全局域 toggle（`±rel` 写入全局条目）/项目域三态循环 inherit→load/unload→inherit（对照 getNextOverrideState 的四象限语义）；每次写盘后从盘上重新 resolve（settings 文件为单一事实源），光标尽量留在原条目。
+  - 搜索（名字/类型/路径大小写不敏感子串，组行随命中条目保留）、↑/↓ 跳条目、PgUp/PgDn、滚动指示 `(i/n)`、状态行显示写盘错误、Esc 关闭、ctrl+c 退出 0。
+- **CLI**（`cli_package.rs` + main.rs）：`pi-rs config [-l] [-a/--approve] [-na/--no-approve] [-h]`，help/usage/错误文案对照上游（CONFIG_COMMAND_USAGE 形状）；`-l` 未信任项目报上游同文案；resolve 警告（未安装包）以 `Warning:` 前缀走 stderr；main.rs 在 package 分支后 clap 前短路。
+- **测试**：+7（全工作区 **1037**）：pattern 引擎（四步序/SKILL 父目录形态/`./` 归一）、override 状态机六态、settings 往返（全局禁用→项目强制加载→清除塌缩/移除，effective 过滤进启动 resolve）、选择器 upsert/strip 纯函数、显示名规则、CLI 参数、pty 冒烟 `tui_config.rs`（列表渲染→space 写 `-extensions/util.ts` 入 settings→`[ ]` 重绘→Esc 退出 0）。**坑**：①`settings_json_path()` 读 `PI_RS_AGENT_DIR` 环境变量而非 PackageManager 构造参数——env 测试必须设变量，且三个 env 测试（local/git/patterns 往返）用 `tokio::sync::Mutex` 串行化防并行交叉污染（std MutexGuard 跨 await 不 Send）；②Python 3.14 的 `Path.join` 不存在，pty 脚本用 `/` 运算符。
+- **文档**：README 路线图更新（pi config 完成）。
+
+**声明差异**：选择器只列包来源资源（顶层 user/project 目录资源的 per-type settings 数组仍未建模——上游把它们也列进选择器）；本地路径包源不按项目根相对化（上游 createPackageOverrideSource 会 relativize）；视觉 chrome 是 ratatui 而非 pi-tui 组件树（信息等价）。写盘在下次 `pi-rs` 启动生效（选择器不热加载运行中会话）。
+
+**交接事项（下一轮候选）**：D5 turn_end/agent_before_settle 边界语义轮（custom-entry/context-edit 桥接）；顶层资源的 per-type settings 数组建模（选择器列全 + 启动尊重）；SDK 导出面；上游 npm 托管安装/self-update（永久声明）。改动未提交，等用户指令。

@@ -1,13 +1,14 @@
 //! `pi package` — install, remove, update, and list resource packages —
 //! port of the package surface of
 //! `pi/packages/coding-agent/src/package-manager-cli.ts` (`handlePackageCommand`
-//! minus the self-update machinery, which belongs to the npm launcher; the
-//! `pi config` selector is a declared deferral).
+//! minus the self-update machinery, which belongs to the npm launcher), plus
+//! `pi config` (`handleConfigCommand` → the resource selector TUI).
 
 use crate::core::package_manager::{PackageManager, parse_source};
 use serde_json::json;
 
 const APP_NAME: &str = "pi-rs";
+const CONFIG_COMMAND_USAGE: &str = "pi-rs config [-l] [--approve|--no-approve]";
 
 fn help(command: Option<&str>) -> String {
 	match command {
@@ -187,6 +188,69 @@ pub async fn run_package_command(args: &[String]) -> Option<i32> {
 	}
 }
 
+fn config_help() -> String {
+	format!(
+		"Usage:\n  {CONFIG_COMMAND_USAGE}\n\n\
+Open the resource configuration TUI to enable or disable package resources.\n\
+Without -l, starts in global settings (~/.pi-rs/agent/settings.json).\n\
+Press Tab in the TUI to switch between global and project-local modes.\n\n\
+Options:\n  \
+-l, --local       Edit project overrides (.pi/settings.json)\n  \
+-a, --approve     Trust project-local files for this command with -l\n  \
+-na, --no-approve Ignore project-local files for this command with -l\n"
+	)
+}
+
+/// Run `pi config <args>` and return the exit code — upstream
+/// `handleConfigCommand` (package-manager-cli.ts:815-894): flag parsing with
+/// the upstream error shapes, project-trust gate for `-l`, install warnings
+/// on stderr, then the selector TUI (modes/config_selector.rs).
+pub fn run_config_command(args: &[String]) -> i32 {
+	if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+		println!("{}", config_help());
+		return 0;
+	}
+
+	let mut local = false;
+	let mut project_trust_override: Option<bool> = None;
+	for arg in args {
+		match arg.as_str() {
+			"-l" | "--local" => local = true,
+			"-a" | "--approve" => project_trust_override = Some(true),
+			"-na" | "--no-approve" => project_trust_override = Some(false),
+			other if other.starts_with('-') => {
+				eprintln!("Unknown option {other} for \"config\".");
+				eprintln!("Use \"{APP_NAME} --help\" or \"{CONFIG_COMMAND_USAGE}\".");
+				return 1;
+			}
+			other => {
+				eprintln!("Unexpected argument {other}.");
+				eprintln!("Usage: {CONFIG_COMMAND_USAGE}");
+				return 1;
+			}
+		}
+	}
+
+	let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+	let agent_dir = crate::config::agent_dir();
+	let project_trusted =
+		project_trust_override.unwrap_or_else(|| crate::core::trust::is_trusted(&cwd));
+	if local && !project_trusted {
+		eprintln!("Project is not trusted. Use --approve to modify local resource config.");
+		return 1;
+	}
+	let manager = PackageManager::new(&cwd, &agent_dir, project_trusted);
+
+	// Install warnings from both scopes (upstream formats
+	// `installFailures` via formatPackageInstallWarning).
+	let (_, warnings) = manager.resolve_items();
+	for warning in &warnings {
+		eprintln!("Warning: {warning}");
+	}
+
+	crate::modes::config_selector::run(manager, agent_dir, local, project_trusted)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -212,5 +276,18 @@ mod tests {
 		assert_eq!(run(&["--help"]), Some(0));
 		assert_eq!(run(&["install", "--wat"]), Some(1));
 		assert_eq!(run(&["install"]), Some(1));
+	}
+
+	#[test]
+	fn config_command_parses_flags_and_rejects_unknown_input() {
+		let run_config = |list: &[&str]| {
+			let argv = args(list);
+			run_config_command(&argv)
+		};
+		// Help short-circuits before any TTY need.
+		assert_eq!(run_config(&["--help"]), 0);
+		assert_eq!(run_config(&["-h"]), 0);
+		assert_eq!(run_config(&["--wat"]), 1);
+		assert_eq!(run_config(&["unexpected"]), 1);
 	}
 }

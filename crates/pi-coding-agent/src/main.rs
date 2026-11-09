@@ -926,6 +926,12 @@ async fn main() -> anyhow::Result<()> {
 		{
 			std::process::exit(code);
 		}
+		// `pi-rs config …` opens the resource selector TUI (upstream
+		// `handleConfigCommand`).
+		if argv.get(1).map(String::as_str) == Some("config") {
+			let code = cli_package::run_config_command(&argv[2..]);
+			std::process::exit(code);
+		}
 		Cli::parse_from(rewrite_combined_short_args(argv))
 	};
 	let startup_cwd = std::env::current_dir()?;
